@@ -10,9 +10,9 @@ use rusqlite::Connection;
 
 use super::*;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::MAX_RESPONSE_BYTES;
 use crate::graph::queries;
 use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::response_bound::MAX_RESPONSE_BYTES;
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};

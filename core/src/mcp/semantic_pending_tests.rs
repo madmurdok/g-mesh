@@ -12,7 +12,7 @@ use super::session_hints::SessionHints;
 use super::{find_callers_callees, find_implementations, find_references};
 use super::{FindImplementationsParams, SymbolQueryParams};
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::MAX_RESPONSE_BYTES;
+use crate::mcp::response_bound::MAX_RESPONSE_BYTES;
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::storage::connection::open_staging;
 use crate::storage::index_store::IndexStore;

@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use crate::graph::pagination;
 use crate::graph::queries;
+use crate::mcp::response_bound;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
@@ -124,7 +125,7 @@ impl Outline {
 
 /// Paginates the `DEFINES` edges out of `file_node_id`, in source order, at
 /// most `page_size` rows and at most `max_bytes` of serialized response
-/// (`pagination::bound_defines_page`). Split out from `handle` so tests can
+/// (`response_bound::bound_defines_page`). Split out from `handle` so tests can
 /// drive it with a small `page_size` or another budget without needing those
 /// fields on the public tool parameters.
 fn list_outline(
@@ -136,13 +137,13 @@ fn list_outline(
     max_bytes: usize,
 ) -> anyhow::Result<Outline> {
     let page = pagination::paginate_defines(conn, file_node_id, page_size, cursor)?;
-    let page = pagination::bound_defines_page(
+    let page = response_bound::bound_defines_page(
         page,
         |n| render(n, detail),
         |results, has_more, next_cursor| {
-            pagination::wire_len(&OutlinePage {
+            response_bound::wire_len(&OutlinePage {
                 results,
-                total: pagination::widest_total(has_more),
+                total: response_bound::widest_total(has_more),
                 has_more,
                 next_cursor,
             })
@@ -195,7 +196,7 @@ pub(super) fn handle_covered(
         page_size,
         params.cursor.as_deref(),
         params.detail.unwrap_or_default(),
-        pagination::OUTLINE_MAX_RESPONSE_BYTES,
+        response_bound::OUTLINE_MAX_RESPONSE_BYTES,
     )
     .map_err(|e| internal_error("failed to list file outline", e))?;
 
@@ -428,7 +429,7 @@ mod tests {
     // GM-523: the byte budget, compact/full rows, `total`
     // -----------------------------------------------------------------
 
-    const BUDGET: usize = pagination::OUTLINE_MAX_RESPONSE_BYTES;
+    const BUDGET: usize = response_bound::OUTLINE_MAX_RESPONSE_BYTES;
 
     /// The id of the `i`th row of a [`big_file`], in source order.
     fn row_id(i: usize) -> String {

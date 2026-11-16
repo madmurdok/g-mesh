@@ -54,8 +54,9 @@ use rusqlite::{params, Connection};
 use crate::embedding::pipeline::ComputedBatch;
 use crate::embedding::text::{node_text, EmbedInput};
 use crate::embedding::EmbeddingPipeline;
+use crate::storage::embed_row::{embed_columns, EmbedRow};
 use crate::storage::schema;
-use crate::storage::write::{Diff, NodeRecord};
+use crate::storage::write::Diff;
 use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
 use g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND;
 
@@ -381,66 +382,39 @@ fn plan_attached(
 /// deletes that vector.
 fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
     let mut statement = tx
-        .prepare(
-            "SELECT s.id, s.kind, s.name, s.qualifiedName, s.filePath, s.docComment, s.signature, s.generated,
-                    l.id IS NOT NULL, l.kind, l.name, l.qualifiedName, l.filePath, l.docComment, l.signature,
-                    l.generated,
-                    v.embeddingVersion
+        .prepare(&format!(
+            "SELECT s.id, {staged_columns}, l.id IS NOT NULL, {live_columns}, v.embeddingVersion
              FROM plan_upsert_nodes p
              JOIN main.nodes s ON s.id = p.id
              LEFT JOIN live.nodes l ON l.id = s.id
              LEFT JOIN live.vectors v ON v.nodeId = s.id",
-        )
+            staged_columns = embed_columns("s."),
+            live_columns = embed_columns("l."),
+        ))
         .context("failed to prepare the embedding plan")?;
-    struct Side {
-        kind: Option<String>,
-        name: Option<String>,
-        qualified_name: Option<String>,
-        file_path: Option<String>,
-        doc: Option<String>,
-        signature: Option<String>,
-        /// `None` on the live side of a node live does not have.
-        generated: Option<bool>,
-    }
-    impl Side {
-        fn read(row: &rusqlite::Row, at: usize) -> rusqlite::Result<Self> {
-            Ok(Side {
-                kind: row.get(at)?,
-                name: row.get(at + 1)?,
-                qualified_name: row.get(at + 2)?,
-                file_path: row.get(at + 3)?,
-                doc: row.get(at + 4)?,
-                signature: row.get(at + 5)?,
-                generated: row.get(at + 6)?,
-            })
-        }
-        fn text(&self) -> Option<String> {
-            node_text(&EmbedInput {
-                kind: self.kind.as_deref().unwrap_or_default(),
-                name: self.name.as_deref().unwrap_or_default(),
-                qualified_name: self.qualified_name.as_deref().unwrap_or_default(),
-                file_path: self.file_path.as_deref().unwrap_or_default(),
-                doc: self.doc.as_deref(),
-                signature: self.signature.as_deref(),
-                generated: self.generated.unwrap_or_default(),
-            })
-        }
-    }
-    type Row = (String, Side, bool, Side, Option<String>);
+    type Row = (String, EmbedRow, bool, Option<EmbedRow>, Option<String>);
     let rows: Vec<Row> = statement
         .query_map([], |row| {
-            Ok((row.get(0)?, Side::read(row, 1)?, row.get(8)?, Side::read(row, 9)?, row.get(16)?))
+            Ok((
+                row.get(0)?,
+                EmbedRow::from_row(row, 1)?,
+                row.get(8)?,
+                EmbedRow::from_nullable_row(row, 9)?,
+                row.get(16)?,
+            ))
         })
         .context("failed to read the embedding plan")?
         .collect::<rusqlite::Result<_>>()
         .context("failed to read the embedding plan")?;
     drop(statement);
 
+    let text = |row: &EmbedRow| node_text(&EmbedInput::from_row(row));
     let mut to_embed = Diff::default();
     for (id, staged, in_live, live, live_version) in rows {
-        let staged_text = staged.text();
-        let text_changed =
-            in_live && (live.text() != staged_text || (staged_text.is_none() && live_version.is_some()));
+        let staged_text = text(&staged);
+        let text_changed = in_live
+            && (live.as_ref().and_then(text) != staged_text
+                || (staged_text.is_none() && live_version.is_some()));
         if text_changed {
             tx.execute("INSERT INTO plan_text_changed (id) VALUES (?1)", params![id])
                 .context("failed to record a node whose text changed")?;
@@ -449,18 +423,7 @@ fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
         if staged_text.is_some() && owed {
             // `staged_text` is `None` for a generated node, so it is never
             // staged here.
-            let Side { kind, name, qualified_name, file_path, doc, signature, .. } = staged;
-            let mut node = NodeRecord::new(
-                id,
-                kind.unwrap_or_default(),
-                name.unwrap_or_default(),
-                qualified_name.unwrap_or_default(),
-                file_path.unwrap_or_default(),
-                "",
-            );
-            node.doc_comment = doc;
-            node.signature = signature;
-            to_embed.upsert_nodes.push(node);
+            to_embed.upsert_nodes.push(staged.into_node_record(id));
         }
     }
     Ok(to_embed)

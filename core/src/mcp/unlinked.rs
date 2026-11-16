@@ -24,6 +24,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::graph::pagination::{self, FileTally};
+use crate::mcp::response_bound;
 use crate::protocol::types::PathSegment;
 use crate::storage::qualified_path;
 use crate::storage::write::NodeRecord;
@@ -88,7 +89,7 @@ impl CandidateTally {
         by_file.truncate(MAX_UNLINKED_FILE_TALLY);
         let mut files: Vec<FileTally> =
             by_file.into_iter().map(|(path, refs)| FileTally { path, refs }).collect();
-        let over_bytes = pagination::truncate_to_bytes(&mut files, MAX_UNLINKED_FILE_TALLY_BYTES);
+        let over_bytes = response_bound::truncate_to_bytes(&mut files, MAX_UNLINKED_FILE_TALLY_BYTES);
         let files_truncated = over_count || over_bytes;
         Some(Self { count, files, files_truncated, hint })
     }

@@ -16,10 +16,12 @@ use serde::Serialize;
 
 use crate::daemon::registry::PathCoverage;
 use crate::graph::containers::{self, DefiningContainer};
-use crate::graph::pagination::{self, Direction};
+use crate::graph::pagination;
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
+use crate::graph::Direction;
+use crate::mcp::response_bound;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
@@ -234,7 +236,7 @@ fn wire_name(cause: TruncatedBy) -> &'static str {
 /// bounds the *total size* of a whole level, only depth (how many levels) or
 /// fanout (one node's own children) individually - a node can be depth- and
 /// fanout-bounded and still, summed across every node reached at a given
-/// depth, produce a response too large for `pagination::MAX_RESPONSE_BYTES`.
+/// depth, produce a response too large for `response_bound::MAX_RESPONSE_BYTES`.
 ///
 /// Reuses the exact resume-token mechanism `traversal::traverse`'s own
 /// exploration-budget cut already relies on (`graph::resume_token`), just
@@ -289,7 +291,7 @@ fn bound_walk(
         }
     }
 
-    let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES) else {
+    let Some(cut) = response_bound::longest_prefix_fitting(&dtos, response_bound::MAX_RESPONSE_BYTES) else {
         return DependencyWalk {
             results: dtos,
             truncated: result.truncated,

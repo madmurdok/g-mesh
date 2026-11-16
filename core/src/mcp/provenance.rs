@@ -180,7 +180,7 @@ use std::collections::HashMap;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::graph::pagination;
+use crate::mcp::response_bound;
 use crate::plugin_manifest::Capabilities;
 use crate::storage::schema;
 
@@ -381,7 +381,7 @@ impl Resolved {
         }
         let found = pending.len();
         pending.truncate(MAX_PENDING_FILES);
-        pagination::truncate_to_bytes(&mut pending, PENDING_FILES_MAX_BYTES);
+        response_bound::truncate_to_bytes(&mut pending, PENDING_FILES_MAX_BYTES);
         let omitted = (found > pending.len()).then_some(found - pending.len());
         let mut provenance = Provenance::absent(language);
         match since {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::mcp::response_bound;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
@@ -361,7 +362,7 @@ fn a_fanout_cut_reports_max_fanout_and_hands_back_no_continuation_field() {
 /// token it hands back continues it exactly where it left off.
 ///
 /// `DEFAULT_EXPLORATION_BUDGET` rows (5000) of `DependencyNode` JSON is
-/// nowhere near `pagination::MAX_RESPONSE_BYTES` (20,000 bytes), so a
+/// nowhere near `response_bound::MAX_RESPONSE_BYTES` (20,000 bytes), so a
 /// walk wide enough to hit the exploration budget always earns its own,
 /// stricter `responseSize` cut before `explorationBudget` is ever visible
 /// on the wire - see `bound_walk`'s doc comment. That row-count-scale
@@ -481,7 +482,7 @@ fn a_wide_fan_in_too_big_for_one_response_truncates_with_a_resume_token_instead_
     assert_eq!(body["hint"].as_str(), session_hints::truncated_by("responseSize"));
     let raw_len = serde_json::to_vec(results).unwrap().len();
     assert!(
-        raw_len <= pagination::MAX_RESPONSE_BYTES,
+        raw_len <= response_bound::MAX_RESPONSE_BYTES,
         "the truncated page itself must respect the budget: {raw_len}"
     );
 

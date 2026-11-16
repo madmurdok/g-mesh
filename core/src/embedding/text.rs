@@ -101,6 +101,9 @@ pub(crate) fn text_to_embed(doc_comment: Option<&str>, signature: Option<&str>) 
     full_text(trimmed.as_deref(), signature).or_else(|| full_text(doc_comment, signature))
 }
 
+pub(crate) use crate::storage::embed_row::EmbedRow;
+use crate::storage::write::NodeRecord;
+
 /// What [`is_noise`] and [`node_text`] read of a node.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EmbedInput<'a> {
@@ -113,6 +116,35 @@ pub(crate) struct EmbedInput<'a> {
     pub(crate) signature: Option<&'a str>,
     /// The node's file is generated code (`nodes.generated`).
     pub(crate) generated: bool,
+}
+
+impl<'a> From<&'a NodeRecord> for EmbedInput<'a> {
+    fn from(node: &'a NodeRecord) -> Self {
+        EmbedInput {
+            kind: &node.kind,
+            name: &node.name,
+            qualified_name: &node.qualified_name,
+            file_path: &node.file_path,
+            doc: node.doc_comment.as_deref(),
+            signature: node.signature.as_deref(),
+            generated: node.generated,
+        }
+    }
+}
+
+impl<'a> EmbedInput<'a> {
+    /// Borrows `row`'s columns; the one constructor for a row read from SQL.
+    pub(crate) fn from_row(row: &'a EmbedRow) -> Self {
+        EmbedInput {
+            kind: &row.kind,
+            name: &row.name,
+            qualified_name: &row.qualified_name,
+            file_path: &row.file_path,
+            doc: row.doc.as_deref(),
+            signature: row.signature.as_deref(),
+            generated: row.generated,
+        }
+    }
 }
 
 /// The generation of [`is_noise`]'s rule. An index records the generation

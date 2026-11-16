@@ -60,7 +60,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::config::EmbeddingConfig;
 use crate::embedding::cache::{self, EmbeddingCache, Hash, OpenError};
@@ -70,8 +70,9 @@ use crate::embedding::model::{
 };
 use crate::embedding::rerank::Reranker;
 use crate::embedding::text::{node_text, EmbedInput};
+use crate::storage::embed_row;
 use crate::storage::vectors;
-use crate::storage::write::{Diff, NodeRecord};
+use crate::storage::write::Diff;
 
 /// Turns one text into one vector. [`EmbeddingModel`] in production; a
 /// deterministic fake in tests that count inference calls.
@@ -857,46 +858,15 @@ impl ComputedBatch {
     }
 }
 
-impl<'a> From<&'a NodeRecord> for EmbedInput<'a> {
-    fn from(node: &'a NodeRecord) -> Self {
-        EmbedInput {
-            kind: &node.kind,
-            name: &node.name,
-            qualified_name: &node.qualified_name,
-            file_path: &node.file_path,
-            doc: node.doc_comment.as_deref(),
-            signature: node.signature.as_deref(),
-            generated: node.generated,
-        }
-    }
-}
-
 /// The text a node's *current* row would embed as, or `None` if it has none
 /// (or the node no longer exists at all) - [`EmbeddingPipeline::store`]'s own
 /// half of the GM-396 staleness check, re-deriving exactly what
 /// [`node_text`] would have produced had `compute` run against this row
 /// right now instead of whenever it actually ran.
 fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<String>> {
-    type Row = (String, String, String, String, Option<String>, Option<String>, bool);
-    let row: Option<Row> = conn
-        .query_row(
-            "SELECT kind, name, qualifiedName, filePath, docComment, signature, generated FROM nodes WHERE id = ?1",
-            [node_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
-        )
-        .optional()
-        .context("failed to read node for its embedding staleness check")?;
-    Ok(row.and_then(|(kind, name, qualified_name, file_path, doc, signature, generated)| {
-        node_text(&EmbedInput {
-            kind: &kind,
-            name: &name,
-            qualified_name: &qualified_name,
-            file_path: &file_path,
-            doc: doc.as_deref(),
-            signature: signature.as_deref(),
-            generated,
-        })
-    }))
+    let row =
+        embed_row::read(conn, node_id).context("failed to read node for its embedding staleness check")?;
+    Ok(row.and_then(|row| node_text(&EmbedInput::from_row(&row))))
 }
 
 /// Embeds one node's [`node_text`] and stores the result, or does nothing
@@ -1069,6 +1039,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::embedding::text::text_to_embed;
+    use crate::storage::write::NodeRecord;
 
     /// A model directory whose `model.onnx` is a sparse file of `onnx_size`
     /// bytes: the weight check reads a length, never the bytes.

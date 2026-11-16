@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod embed_row;
 pub mod file_rows;
 pub mod index_store;
 pub mod language_outcome;
