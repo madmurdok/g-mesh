@@ -15,9 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    CallToolResult, Implementation, ProgressNotificationParam, ServerCapabilities, ServerInfo,
-};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
@@ -33,6 +31,8 @@ use crate::ipc::AsyncStream;
 use crate::plugin_manifest::Capabilities;
 use crate::protocol::types::Position;
 use crate::storage::index_store::IndexStore;
+
+use self::progress::{Beat, Cancel};
 
 mod anchor;
 mod answer;
@@ -52,6 +52,7 @@ mod instructions;
 mod member_name_collision_tests;
 mod not_indexed;
 mod overrides;
+mod progress;
 mod provenance;
 pub(crate) mod query_shapes;
 #[cfg(test)]
@@ -309,40 +310,15 @@ impl GMeshMcpServer {
         let store = Arc::clone(&self.store);
         let started = Instant::now();
         let task = tokio::task::spawn_blocking(move || registry.replay_pending(&store));
-        tokio::pin!(task);
-
-        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
-        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
-            interval.max(Duration::from_millis(1)),
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut sent = 0u32;
-
-        let joined = loop {
-            tokio::select! {
-                biased;
-                joined = &mut task => break joined,
-                _ = ticker.tick(), if token.is_some() => {
-                    let token = token.clone().expect("the branch is only enabled with a token");
-                    let message = format!(
-                        "indexing {}: replaying queued changes for {summary} before answering ({} so far)",
-                        self.registry.project_root().display(),
-                        human_duration(started.elapsed())
-                    );
-                    let param = ProgressNotificationParam::new(token, call_started.elapsed().as_secs_f64())
-                        .with_message(message);
-                    match ctx.peer.notify_progress(param).await {
-                        Ok(()) => sent += 1,
-                        Err(err) => crate::log_line!(
-                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
-                            ctx.id
-                        ),
-                    }
-                }
-            }
-        };
+        let (beat, sent) = progress::with_heartbeat(ctx, started, call_started, Cancel::Ignore, task, || {
+            format!(
+                "indexing {}: replaying queued changes for {summary} before answering ({} so far)",
+                self.registry.project_root().display(),
+                human_duration(started.elapsed())
+            )
+        })
+        .await;
+        let Beat::Done(joined) = beat else { unreachable!("Cancel::Ignore never yields Cancelled") };
 
         let replayed = match joined {
             Ok(count) => count,
@@ -404,40 +380,15 @@ impl GMeshMcpServer {
         let task_path = owned_path.clone();
         let started = Instant::now();
         let task = tokio::task::spawn_blocking(move || registry.ensure_fresh(&store, &task_path));
-        tokio::pin!(task);
-
-        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
-        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
-            interval.max(Duration::from_millis(1)),
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut sent = 0u32;
-
-        let joined = loop {
-            tokio::select! {
-                biased;
-                joined = &mut task => break joined,
-                _ = ticker.tick(), if token.is_some() => {
-                    let token = token.clone().expect("the branch is only enabled with a token");
-                    let message = format!(
-                        "indexing {}: bringing {owned_path} up to date before answering ({} so far)",
-                        self.registry.project_root().display(),
-                        human_duration(started.elapsed())
-                    );
-                    let param = ProgressNotificationParam::new(token, call_started.elapsed().as_secs_f64())
-                        .with_message(message);
-                    match ctx.peer.notify_progress(param).await {
-                        Ok(()) => sent += 1,
-                        Err(err) => crate::log_line!(
-                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
-                            ctx.id
-                        ),
-                    }
-                }
-            }
-        };
+        let (beat, sent) = progress::with_heartbeat(ctx, started, call_started, Cancel::Ignore, task, || {
+            format!(
+                "indexing {}: bringing {owned_path} up to date before answering ({} so far)",
+                self.registry.project_root().display(),
+                human_duration(started.elapsed())
+            )
+        })
+        .await;
+        let Beat::Done(joined) = beat else { unreachable!("Cancel::Ignore never yields Cancelled") };
 
         let outcome = match &joined {
             Ok(Ok(Some(outcome))) => format!("{outcome:?}"),
@@ -518,52 +469,28 @@ impl GMeshMcpServer {
         started: Instant,
         deadline: Option<Instant>,
     ) -> Result<WaitOutcome, ErrorData> {
-        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
-        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
-
-        // The ticker's first tick is one interval in, not immediately: a
-        // call that resolves on the fast path, or within one interval, sends
-        // nothing. `Delay` so a notification send that stalled does not come
-        // back to a burst of catch-up ticks.
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
-            interval.max(Duration::from_millis(1)),
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut sent = 0u32;
-
-        let wait = self.indexing.wait_for(need, deadline);
-        tokio::pin!(wait);
-        let outcome = loop {
-            tokio::select! {
-                // Biased, wait first: an outcome that is ready wins over a
-                // tick or a cancellation that happens to be ready as well.
-                biased;
-                outcome = &mut wait => break outcome,
-                () = ctx.ct.cancelled() => {
-                    trace_call(format_args!(
-                        "prepare: cancelled tool={tool} request={} waited_ms={} progress_sent={sent}",
-                        ctx.id,
-                        started.elapsed().as_millis()
-                    ));
-                    return Err(ErrorData::internal_error(
-                        "g-mesh: the request was cancelled while it waited for the index; the index keeps \
-                         building in the background",
-                        None,
-                    ));
-                }
-                _ = ticker.tick(), if token.is_some() => {
-                    let token = token.clone().expect("the branch is only enabled with a token");
-                    let param = ProgressNotificationParam::new(token, started.elapsed().as_secs_f64())
-                        .with_message(self.indexing.progress_message(self.registry.project_root()));
-                    match ctx.peer.notify_progress(param).await {
-                        Ok(()) => sent += 1,
-                        Err(err) => crate::log_line!(
-                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
-                            ctx.id
-                        ),
-                    }
-                }
+        let (beat, sent) = progress::with_heartbeat(
+            ctx,
+            started,
+            started,
+            Cancel::Honour,
+            self.indexing.wait_for(need, deadline),
+            || self.indexing.progress_message(self.registry.project_root()),
+        )
+        .await;
+        let outcome = match beat {
+            Beat::Done(outcome) => outcome,
+            Beat::Cancelled => {
+                trace_call(format_args!(
+                    "prepare: cancelled tool={tool} request={} waited_ms={} progress_sent={sent}",
+                    ctx.id,
+                    started.elapsed().as_millis()
+                ));
+                return Err(ErrorData::internal_error(
+                    "g-mesh: the request was cancelled while it waited for the index; the index keeps \
+                     building in the background",
+                    None,
+                ));
             }
         };
 
