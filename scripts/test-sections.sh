@@ -111,7 +111,7 @@ section_filter() {
 	plugin-typescript) echo 'package(g-mesh-plugin-typescript)' ;;
 	plugin-rust) echo 'package(g-mesh-plugin-rust)' ;;
 	plugin-python) echo 'package(g-mesh-plugin-python)' ;;
-	wire) echo 'package(g-mesh-wire)' ;;
+	wire) echo 'package(g-mesh-wire) | package(g-mesh-walk)' ;;
 	*) return 1 ;;
 	esac
 }

@@ -123,6 +123,7 @@ mod tests {
     use super::*;
     use crate::control::fixture_tests::*;
     use crate::control::purge::{root_state, RootState};
+    #[cfg(target_os = "macos")]
     use std::path::PathBuf;
     use std::time::Instant;
 
