@@ -15,8 +15,8 @@ use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
+use crate::model::NodeRecord;
 use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
 
 use super::not_indexed;
 use super::query_shapes::QueryShapes;

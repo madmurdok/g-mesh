@@ -20,7 +20,7 @@ pub use crate::paths::state_dir::{ensure_project_dir, project_dir, projects_root
 /// Cross-file edges are lazy by design: when a symbol another file points at
 /// is deleted or renamed, an edge into it that no placeholder carried is left
 /// dangling until its file is reindexed, and an import linked to a deleted
-/// file until core re-extracts the importer (see `graph::imports::link_diff`
+/// file until core re-extracts the importer (see `link::imports::link_diff`
 /// and `storage::write::apply_diff`). And the TS
 /// plugin reports any change to a symbol as a delete plus an upsert of the
 /// same id, without re-sending the unchanged edges into it - so under
@@ -39,7 +39,7 @@ pub use crate::paths::state_dir::{ensure_project_dir, project_dir, projects_root
 ///
 /// Because nothing cascades, a delete from `nodes` owes its dependents an
 /// explicit delete of their own - `storage::write::apply_diff`,
-/// `graph::containers`' empty-container delete, `graph::imports`' placeholder
+/// `graph::containers`' empty-container delete, `link::imports`' placeholder
 /// drop and `storage::language_swap::swap` all do this.
 /// `ON DELETE CASCADE` in the DDL is still honoured where a connection turns
 /// enforcement on (many unit tests do, to catch an edge pointed at a node that

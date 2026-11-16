@@ -15,8 +15,8 @@ use serde::Serialize;
 use crate::graph::pagination;
 use crate::graph::queries;
 use crate::mcp::response_bound;
+use crate::model::NodeRecord;
 use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
 
 use crate::daemon::registry::PathCoverage;
 
@@ -206,9 +206,9 @@ pub(super) fn handle_covered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::queries::{upsert_edge, upsert_node};
+    use crate::model::EdgeRecord;
     use crate::storage::schema;
-    use crate::storage::write::EdgeRecord;
+    use crate::storage::write::{upsert_edge, upsert_node};
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

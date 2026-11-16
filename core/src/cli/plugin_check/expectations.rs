@@ -495,7 +495,7 @@
 //!   declaration at all - `stream-order` requires both endpoints to be nodes
 //!   of the edge's own file - so it travels as a placeholder, and a
 //!   placeholder edge the linker repoints is set `resolved = 1` by
-//!   `graph::symbol_links` whatever the plugin said. Measured: flipping all
+//!   `link::symbol_links` whatever the plugin said. Measured: flipping all
 //!   ten edges the Go plugin's `go/types` tier answers with changes nothing
 //!   in the index, because every one of them lands on a placeholder core
 //!   then resolves.

@@ -101,8 +101,27 @@ pub(crate) fn text_to_embed(doc_comment: Option<&str>, signature: Option<&str>) 
     full_text(trimmed.as_deref(), signature).or_else(|| full_text(doc_comment, signature))
 }
 
+use crate::model::NodeRecord;
 pub(crate) use crate::storage::embed_row::EmbedRow;
-use crate::storage::write::NodeRecord;
+use crate::storage::embed_row::NodeText;
+
+/// [`node_text`] as storage's [`NodeText`] seam, tagged with the pipeline's
+/// embedding version (`EmbeddingPipeline::text_rule`): what `plan` calls to
+/// decide which staged nodes are owed a vector.
+#[derive(Debug, Clone, Copy)]
+pub struct TextRule<'a> {
+    pub version: &'a str,
+}
+
+impl NodeText for TextRule<'_> {
+    fn embedding_version(&self) -> &str {
+        self.version
+    }
+
+    fn text(&self, row: &EmbedRow) -> Option<String> {
+        node_text(&EmbedInput::from_row(row))
+    }
+}
 
 /// What [`is_noise`] and [`node_text`] read of a node.
 #[derive(Debug, Clone, Copy)]

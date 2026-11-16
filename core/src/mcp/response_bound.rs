@@ -11,7 +11,7 @@ use crate::graph::pagination::{
     encode_cursor, source_order_cursor, tally_edge_files_limited, EdgeRow, FileTally, Page, MAX_FILE_TALLY,
 };
 use crate::graph::Direction;
-use crate::storage::write::NodeRecord;
+use crate::model::NodeRecord;
 
 /// Ceiling on a single MCP tool response body, in serialized-JSON bytes of
 /// the whole response: rows, tallies, hints and every other field.

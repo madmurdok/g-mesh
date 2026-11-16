@@ -20,13 +20,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::daemon::{path_case, plugin};
 use crate::indexing_status::IndexingStatus;
 use crate::languages;
+use crate::model::Diff;
 use crate::plugin_manifest::{DiscoveredPlugins, PluginManifest};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::language_outcome::{self, LanguageOutcome};
 use crate::storage::schema;
-use crate::storage::write::Diff;
 use crate::watcher::apply::{to_edge_record, to_node_record, PathWarnings};
 use crate::watcher::staleness;
 
@@ -80,11 +80,11 @@ pub struct BulkIndexSummary {
     /// one symbol, not the project's whole index.
     pub skipped_lines: usize,
     /// `IMPORTS` edges the post-walk linking pass repointed from a module
-    /// placeholder onto the real file it names (`graph::imports`).
+    /// placeholder onto the real file it names (`link::imports`).
     pub linked_imports: usize,
     /// `CALLS`/`REFERENCES`/`SUPERTYPE_OF` edges the post-walk linking pass
     /// repointed from a pending-symbol placeholder onto the symbol another
-    /// file exports (`graph::symbol_links`).
+    /// file exports (`link::symbol_links`).
     pub linked_symbols: usize,
     /// What the walk did for each discovered language, keyed by language.
     /// The counts above cover only the languages that ended `Indexed`.
@@ -122,7 +122,7 @@ impl<'a> WalkContext<'a> {
 /// edges are foreign keys onto nodes: a plugin emits a file's nodes before
 /// that same file's edges, and never an edge between files (see the
 /// dangling-edge guard in extract.ts). Every cross-file edge appears only
-/// afterwards, when `graph::imports` and `graph::symbol_links` link the walk's
+/// afterwards, when `link::imports` and `link::symbol_links` link the walk's
 /// placeholders - once, project-wide, after every language's stream is over,
 /// because only then does every node that will exist, exist.
 pub fn run(
@@ -1123,7 +1123,7 @@ mod tests {
     /// (the row `src/a.beta-src`'s delete owes `src/b.beta-src` stays).
     #[test]
     fn purging_a_language_leaves_none_of_its_owed_re_extracts() {
-        use crate::storage::write::{EdgeRecord, NodeRecord};
+        use crate::model::{EdgeRecord, NodeRecord};
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         schema::apply(&conn).unwrap();

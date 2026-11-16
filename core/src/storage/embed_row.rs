@@ -6,7 +6,19 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row};
 
-use crate::storage::write::NodeRecord;
+use crate::model::NodeRecord;
+
+/// The rule that turns a row into embedded text, as storage needs it while
+/// planning a per-language swap: the text itself, and the version tag a live
+/// vector must carry to be kept. Implemented by `embedding::text::TextRule`;
+/// storage only calls it, inside `plan`'s staging transaction.
+pub trait NodeText {
+    /// The embedding version vectors made by this rule are tagged with.
+    fn embedding_version(&self) -> &str;
+    /// The text a node with `row`'s columns embeds, or `None` for one that
+    /// embeds nothing (noise, generated).
+    fn text(&self, row: &EmbedRow) -> Option<String>;
+}
 
 /// The columns of `nodes` an [`EmbedRow`] reads, in [`EmbedRow::from_row`]'s
 /// order.

@@ -51,12 +51,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-use crate::embedding::pipeline::ComputedBatch;
-use crate::embedding::text::{node_text, EmbedInput};
-use crate::embedding::EmbeddingPipeline;
-use crate::storage::embed_row::{embed_columns, EmbedRow};
+use crate::model::Diff;
+use crate::storage::embed_row::{embed_columns, EmbedRow, NodeText};
 use crate::storage::schema;
-use crate::storage::write::Diff;
+use crate::storage::vectors::VectorWrite;
 use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
 use g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND;
 
@@ -126,7 +124,7 @@ impl PlanCounts {
 
 /// What [`plan`] leaves for the caller: the counts, and the upserted nodes
 /// that need a vector computed (id, doc comment and signature only) as a
-/// [`Diff`] for [`EmbeddingPipeline::compute`].
+/// [`Diff`] for `EmbeddingPipeline::compute`.
 pub struct Plan {
     pub counts: PlanCounts,
     pub to_embed: Diff,
@@ -155,20 +153,20 @@ fn read_only_uri(path: &str) -> String {
 /// Compares `staging` (one freshly walked and linked language) with the live
 /// index at `live_path`, attached read-only, and writes the plan tables into
 /// `staging`. Reads live inside one transaction, so the plan describes one
-/// snapshot of it. `embedding_version` is the pipeline's, for spotting a live
-/// vector made by another model. `keep_semantic_placeholders`: whether the
+/// snapshot of it. `text` is the pipeline's text rule: the text each node
+/// embeds, and the version for spotting a live vector made by another model. `keep_semantic_placeholders`: whether the
 /// live placeholders staging lacks are kept (module doc).
 pub fn plan(
     staging: &mut Connection,
     live_path: &str,
     language: &str,
-    embedding_version: &str,
+    text: &dyn NodeText,
     keep_semantic_placeholders: bool,
 ) -> Result<Plan> {
     staging
         .execute("ATTACH DATABASE ?1 AS live", params![read_only_uri(live_path)])
         .with_context(|| format!("failed to attach the live index {live_path} to the staging index"))?;
-    let planned = plan_attached(staging, language, embedding_version, keep_semantic_placeholders);
+    let planned = plan_attached(staging, language, text, keep_semantic_placeholders);
     let detached = staging.execute("DETACH DATABASE live", []);
     let planned = planned?;
     detached.context("failed to detach the live index from the staging index")?;
@@ -178,7 +176,7 @@ pub fn plan(
 fn plan_attached(
     staging: &mut Connection,
     language: &str,
-    embedding_version: &str,
+    text: &dyn NodeText,
     keep_semantic_placeholders: bool,
 ) -> Result<Plan> {
     let tx = staging.transaction().context("failed to start the plan transaction")?;
@@ -355,7 +353,7 @@ fn plan_attached(
         "the containers to upsert",
     )?;
 
-    let to_embed = plan_embeddings(&tx, embedding_version)?;
+    let to_embed = plan_embeddings(&tx, text)?;
     tx.commit().context("failed to commit the plan")?;
 
     Ok(Plan {
@@ -374,13 +372,13 @@ fn plan_attached(
 }
 
 /// Fills `plan_text_changed` and returns the upserted nodes owed a vector:
-/// new nodes, nodes whose embedded text ([`node_text`]) changed, and nodes
+/// new nodes, nodes whose embedded text ([`NodeText::text`]) changed, and nodes
 /// whose live vector is missing or was made by another model. Every other
 /// node keeps its live vector, which is the vector its unchanged text would
 /// get again. A node with no text that still has a live vector (one made
 /// before it became noise or generated) counts as changed, so the swap
 /// deletes that vector.
-fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
+fn plan_embeddings(tx: &Connection, rule: &dyn NodeText) -> Result<Diff> {
     let mut statement = tx
         .prepare(&format!(
             "SELECT s.id, {staged_columns}, l.id IS NOT NULL, {live_columns}, v.embeddingVersion
@@ -408,7 +406,7 @@ fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
         .context("failed to read the embedding plan")?;
     drop(statement);
 
-    let text = |row: &EmbedRow| node_text(&EmbedInput::from_row(row));
+    let text = |row: &EmbedRow| rule.text(row);
     let mut to_embed = Diff::default();
     for (id, staged, in_live, live, live_version) in rows {
         let staged_text = text(&staged);
@@ -419,7 +417,7 @@ fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
             tx.execute("INSERT INTO plan_text_changed (id) VALUES (?1)", params![id])
                 .context("failed to record a node whose text changed")?;
         }
-        let owed = !in_live || text_changed || live_version.as_deref() != Some(embedding_version);
+        let owed = !in_live || text_changed || live_version.as_deref() != Some(rule.embedding_version());
         if staged_text.is_some() && owed {
             // `staged_text` is `None` for a generated node, so it is never
             // staged here.
@@ -456,7 +454,7 @@ pub struct SwapBookkeeping<'a> {
 pub fn swap(
     live: &mut Connection,
     staging_path: &Path,
-    vectors: Option<(&EmbeddingPipeline, &ComputedBatch)>,
+    vectors: Option<&dyn VectorWrite>,
     bookkeeping: &SwapBookkeeping<'_>,
 ) -> Result<Vec<String>> {
     let staging_path = staging_path.to_str().context("the staging index path is not valid UTF-8")?;
@@ -471,7 +469,7 @@ pub fn swap(
 
 fn swap_attached(
     live: &mut Connection,
-    vectors: Option<(&EmbeddingPipeline, &ComputedBatch)>,
+    vectors: Option<&dyn VectorWrite>,
     bookkeeping: &SwapBookkeeping<'_>,
 ) -> Result<Vec<String>> {
     let tx = live.transaction().context("failed to start the swap transaction")?;
@@ -584,8 +582,10 @@ fn swap_attached(
         "the container upserts",
     )?;
 
-    if let Some((embedding, computed)) = vectors {
-        embedding.store(&tx, computed);
+    // On `tx`, not `live`: the vectors commit or roll back with the rows
+    // above and the bookkeeping below (`VectorWrite`).
+    if let Some(vectors) = vectors {
+        vectors.write(&tx);
     }
 
     let SwapBookkeeping { language, plugin_fingerprint, semantic_pass_languages, retried } = bookkeeping;
@@ -701,8 +701,10 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::embedding::text::TextRule;
+    use crate::model::{EdgeRecord, NodeRecord};
     use crate::storage::connection::open_staging;
-    use crate::storage::write::{apply_diff, EdgeRecord, NodeRecord};
+    use crate::storage::write::apply_diff;
 
     #[test]
     fn a_path_becomes_a_read_only_uri_on_either_platform() {
@@ -747,7 +749,9 @@ mod tests {
         )
         .unwrap();
 
-        let plan = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        let plan =
+            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
+                .unwrap();
         drop(staging);
         assert_eq!(
             plan.counts,
@@ -851,7 +855,9 @@ mod tests {
             },
         )
         .unwrap();
-        let plan = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        let plan =
+            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
+                .unwrap();
         (dir, live, staging_path, plan)
     }
 
@@ -1026,7 +1032,9 @@ mod tests {
         apply_diff(&mut live, &Diff { upsert_nodes: vec![live_node], ..Default::default() }).unwrap();
         let mut staging = open_staging(&staging_path).unwrap();
         apply_diff(&mut staging, &Diff { upsert_nodes: vec![staged_node], ..Default::default() }).unwrap();
-        let planned = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        let planned =
+            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
+                .unwrap();
         drop(staging);
         swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
         (dir, live, planned.counts)
@@ -1072,7 +1080,7 @@ mod tests {
     fn keyed_placeholder(split: bool) -> NodeRecord {
         let mut node = NodeRecord::new("p1", "Module", "f", "a.rs#f", "src/b.rs", "rust");
         node.native_kind = Some(PENDING_SYMBOL_NATIVE_KIND.to_string());
-        node.target = Some(crate::storage::write::PlaceholderTargetRecord {
+        node.target = Some(crate::model::PlaceholderTargetRecord {
             scope_kind: "file".to_string(),
             scope: "src/a.rs".to_string(),
             key_kind: "qualifiedName".to_string(),
@@ -1123,7 +1131,7 @@ mod tests {
     fn also_placeholder(also: &[&str]) -> NodeRecord {
         let mut node = NodeRecord::new("p1", "Module", "@env/a", "@env/a", "src/b.rs", "rust");
         node.native_kind = Some("resolved_module".to_string());
-        node.target = Some(crate::storage::write::PlaceholderTargetRecord {
+        node.target = Some(crate::model::PlaceholderTargetRecord {
             scope_kind: "file".to_string(),
             scope: "generated/a".to_string(),
             key_kind: "name".to_string(),
@@ -1297,7 +1305,8 @@ mod tests {
         .unwrap();
         let staged_paths: Vec<String> = staged_paths.iter().map(|path| path.to_string()).collect();
         schema::set_resolution_facts(&staging, "rust", staged_facts, &staged_paths).unwrap();
-        plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
+            .unwrap();
         drop(staging);
         swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
         (dir, live)
@@ -1395,7 +1404,8 @@ mod tests {
             },
         )
         .unwrap();
-        plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
+            .unwrap();
         drop(staging);
         swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
         (dir, live)
@@ -1475,7 +1485,9 @@ mod tests {
         )
         .unwrap();
 
-        let planned = plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        let planned =
+            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
+                .unwrap();
         drop(staging);
         let mut staged: Vec<&str> =
             planned.to_embed.upsert_nodes.iter().map(|node| node.id.as_str()).collect();

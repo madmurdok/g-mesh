@@ -18,9 +18,9 @@ use crate::graph::pagination;
 use crate::graph::queries;
 use crate::graph::Direction;
 use crate::mcp::response_bound;
+use crate::model::NodeRecord;
 use crate::plugin_manifest::{Capabilities, MemberOverrides};
 use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
 
 use super::not_indexed::{self, NotIndexed};
 use super::overrides::{self, OverriddenMember, Overrides};
@@ -452,9 +452,9 @@ pub(crate) fn handle_in_covered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::queries::{upsert_edge, upsert_node};
+    use crate::model::{EdgeRecord, NodeRecord};
     use crate::storage::schema;
-    use crate::storage::write::{EdgeRecord, NodeRecord};
+    use crate::storage::write::{upsert_edge, upsert_node};
 
     /// The capability map every test in this module passes: empty, so
     /// `provenance::resolve` reads "no plugin here declares a semantic

@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
-use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
+use crate::model::{EdgeRecord, NodeRecord};
+
 use g_mesh_wire::native_kind::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
-use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 
 // Every "which symbol is this?" lookup below - by name, by qualifiedName, by
 // position, or by the stem of the file it sits in ([`find_in_file_named`]) -
@@ -74,7 +73,7 @@ use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND}
 // exclusions produce into a sentence naming the specifier and the tool that
 // does answer for it.
 //
-// `graph::symbol_links::is_declaration` asks the same question one step
+// `link::symbol_links::is_declaration` asks the same question one step
 // earlier - which nodes may be *linked onto*, while the index is being
 // written - and since GM-372 it reads this same list rather than a fourth
 // copy of it. GM-367 left it a four-kind copy on purpose: it was missing
@@ -87,35 +86,7 @@ use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND}
 // one step later - and excluded the kind anyway, on the contract rather than
 // on observed damage. That module's `is_declaration` carries the argument.
 
-/// The `nativeKind`s that never answer a name, qualifiedName or position
-/// lookup - see this module's header for what each one is and why it is here.
-/// One list, because [`find_by_name`], [`find_by_qualified_name`],
-/// [`find_by_position`] and `mcp::find_definition`'s candidate page all have
-/// to agree about it.
-pub(crate) const NON_DECLARATION_NATIVE_KINDS: [&str; 5] = [
-    PENDING_SYMBOL_NATIVE_KIND,
-    REEXPORT_NATIVE_KIND,
-    RESOLVED_MODULE_NATIVE_KIND,
-    EXTERNAL_MODULE_NATIVE_KIND,
-    CONTAINER_NATIVE_KIND,
-];
-
-/// [`NON_DECLARATION_NATIVE_KINDS`] as a SQL condition on a `nodes` row.
-/// `prefix` is the table alias and its dot (`"n."`), or `""` for an
-/// unaliased `nodes`.
-///
-/// `nativeKind IS NULL OR ... NOT IN (...)` rather than the chain of `IS NOT`
-/// this replaces: an ordinary declaration's `nativeKind` *is* NULL, and
-/// `NULL NOT IN (...)` evaluates to NULL rather than true, so without the
-/// explicit null arm the filter would exclude every real declaration. The
-/// values interpolated are this crate's own `&'static str` constants and
-/// never caller input, which is why they are written into the SQL rather than
-/// bound - binding five of them at four call sites is what let the lists
-/// drift in the first place.
-pub(crate) fn declaration_only(prefix: &str) -> String {
-    let kinds = NON_DECLARATION_NATIVE_KINDS.map(|kind| format!("'{kind}'")).join(", ");
-    format!("({prefix}nativeKind IS NULL OR {prefix}nativeKind NOT IN ({kinds}))")
-}
+pub(crate) use crate::model::kinds::{declaration_only, NON_DECLARATION_NATIVE_KINDS};
 
 pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
     Ok(NodeRecord {
@@ -163,7 +134,7 @@ pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
         qualified_path: row
             .get::<_, Option<String>>("qualifiedPath")?
             .as_deref()
-            .and_then(crate::storage::qualified_path::decode),
+            .and_then(crate::model::qualified_path::decode),
         alias_paths: Vec::new(),
         untyped_calls: Vec::new(),
     })
@@ -183,33 +154,10 @@ fn map_edge_row(row: &Row) -> rusqlite::Result<EdgeRecord> {
     })
 }
 
-pub fn upsert_node(conn: &mut Connection, node: NodeRecord) -> Result<()> {
-    write::apply_diff(conn, &Diff { upsert_nodes: vec![node], ..Default::default() })
-}
-
 pub fn get_node(conn: &Connection, id: &str) -> Result<Option<NodeRecord>> {
     conn.query_row("SELECT * FROM nodes WHERE id = ?1", params![id], map_node_row)
         .optional()
         .context("failed to look up node by id")
-}
-
-/// Deletes a node and every edge incident to it (fromId or toId), atomically.
-pub fn delete_node(conn: &mut Connection, id: &str) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT id FROM edges WHERE fromId = ?1 OR toId = ?1")?;
-    let incident_edge_ids: Vec<String> = stmt
-        .query_map(params![id], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()
-        .context("failed to look up incident edges")?;
-    drop(stmt);
-
-    write::apply_diff(
-        conn,
-        &Diff {
-            delete_edge_ids: incident_edge_ids,
-            delete_node_ids: vec![id.to_string()],
-            ..Default::default()
-        },
-    )
 }
 
 pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> Result<Vec<NodeRecord>> {
@@ -233,7 +181,7 @@ pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> R
 /// Exists for one failure that looks like a bug to whoever hits it: a default
 /// import binds the exporting file's declaration under whatever local name the
 /// importer chose (`import DropdownMenuGroup from "./DropdownMenuGroup"`), and
-/// that local name is never indexed - see `graph::symbol_links`' module doc,
+/// that local name is never indexed - see `link::symbol_links`' module doc,
 /// "the local name never reaches this index at all". So the name a caller is
 /// reading at every use site resolves to nothing, while the declaration it
 /// binds sits in the index under a different name. The file's own name is the
@@ -619,7 +567,7 @@ pub fn find_by_qualified_suffix(conn: &Connection, suffix: &str) -> Result<Vec<N
 /// The mirror image of [`find_by_name`]: it answers over exactly the module
 /// placeholder rows that one excludes (`resolved_module` and
 /// `external_module`; the two symbol placeholders carry a symbol's name, not
-/// a specifier, and belong to `graph::symbol_links`' own lookups). Its only
+/// a specifier, and belong to `link::symbol_links`' own lookups). Its only
 /// caller is `mcp::find_definition::import_only_refusal`, which is why it
 /// returns counts rather than rows: `net/http` on gin is 63 identical
 /// placeholders, and the useful fact about them is that there are 63, not
@@ -732,24 +680,19 @@ pub fn find_by_position(
     .context("failed to look up node by position")
 }
 
-pub fn upsert_edge(conn: &mut Connection, edge: EdgeRecord) -> Result<()> {
-    write::apply_diff(conn, &Diff { upsert_edges: vec![edge], ..Default::default() })
-}
-
 pub fn get_edge(conn: &Connection, id: &str) -> Result<Option<EdgeRecord>> {
     conn.query_row("SELECT * FROM edges WHERE id = ?1", params![id], map_edge_row)
         .optional()
         .context("failed to look up edge by id")
 }
 
-pub fn delete_edge(conn: &mut Connection, id: &str) -> Result<()> {
-    write::apply_diff(conn, &Diff { delete_edge_ids: vec![id.to_string()], ..Default::default() })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Diff;
     use crate::storage::schema;
+    use crate::storage::write::{self, delete_edge, delete_node, upsert_edge, upsert_node};
+    use g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND;
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

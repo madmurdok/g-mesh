@@ -27,7 +27,7 @@ use serde::Serialize;
 
 use crate::graph::pagination;
 use crate::graph::queries;
-use crate::storage::write::NodeRecord;
+use crate::model::NodeRecord;
 
 use super::find_definition;
 use super::tool_result::{error, internal_error};
@@ -165,8 +165,8 @@ pub(super) fn by_id(conn: &Connection, symbol_id: &str) -> Anchor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::queries::upsert_node;
     use crate::storage::schema;
+    use crate::storage::write::upsert_node;
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

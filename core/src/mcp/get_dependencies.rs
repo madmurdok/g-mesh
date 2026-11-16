@@ -22,8 +22,8 @@ use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
 use crate::graph::Direction;
 use crate::mcp::response_bound;
+use crate::model::NodeRecord;
 use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
 
 use super::not_indexed;
 use super::session_hints::{self, HintKey, SessionHints};
@@ -91,7 +91,7 @@ struct DependencyNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     qualified_name: Option<String>,
     /// The file this dependency *is*, and null when it is not one. An import
-    /// `graph::imports` could not link - a package, or a relative path with
+    /// `link::imports` could not link - a package, or a relative path with
     /// nothing indexed behind it - stays a `Module` placeholder whose stored
     /// `filePath` is the *importing* file, because that is where the
     /// specifier is written. Echoing that column here would name the wrong
@@ -676,7 +676,7 @@ fn is_entry_point(file_path: &str, entry_points: &[String]) -> bool {
 /// as a suggestion and nothing more - a name matching a directory does not
 /// establish that the package lives there.
 ///
-/// The specifier itself cannot help: `graph::imports` keeps a placeholder
+/// The specifier itself cannot help: `link::imports` keeps a placeholder
 /// `Module` node per import specifier, but only for the ones that never
 /// resolved (`react` survives, `@excalidraw/math` became an edge to a file and
 /// its placeholder is gone). So there is nothing to look the package name up

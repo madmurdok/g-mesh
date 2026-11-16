@@ -6,7 +6,7 @@
 //!
 //! A workspace file decides where module and crate boundaries are, which
 //! every other file's container key (`graph::containers`) and every
-//! placeholder's scope (`graph::symbol_links`, `graph::imports`) were
+//! placeholder's scope (`link::symbol_links`, `link::imports`) were
 //! computed against, so a single-file diff cannot correct it: the language
 //! is walked again from nothing, with the same one-shot `--bulk-index`
 //! machinery the cold start uses, restricted to one manifest.
@@ -96,6 +96,7 @@ use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
 use crate::storage::schema;
+use crate::storage::vectors::VectorWrite;
 use crate::watcher::apply::SemanticPassOutcome;
 use crate::watcher::staleness;
 
@@ -439,7 +440,7 @@ fn rebuild(
         &mut staged,
         live_path,
         language,
-        embedding.embedding_version(),
+        &embedding.text_rule(),
         keep_semantic_placeholders,
     )?;
     drop(staged);
@@ -452,8 +453,9 @@ fn rebuild(
 
     let semantic_pass_languages: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
     let fingerprint = plugin::fingerprint(manifest);
+    let write = embedding.vector_write(&computed);
     let vectors = match kind {
-        Rebuild::Reindex => Some((embedding.as_ref(), &computed)),
+        Rebuild::Reindex => Some(&write as &dyn VectorWrite),
         Rebuild::Retry => None,
     };
     store.swap_language(
@@ -495,8 +497,9 @@ mod tests {
     use super::*;
     use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
+    use crate::model::{Diff, NodeRecord};
     use crate::plugin_manifest::discover;
-    use crate::storage::write::{apply_diff, Diff, NodeRecord};
+    use crate::storage::write::apply_diff;
 
     /// A file-backed index in `project`'s state directory, where the daemon
     /// keeps it: the swap attaches the live index by its path. Foreign keys
@@ -1145,11 +1148,11 @@ mod tests {
     // the test writes (`test_plugin::set_bulk_stream`).
     // -----------------------------------------------------------------
 
+    use crate::model::EdgeRecord;
     use crate::protocol::types::{
         EdgeKind, NodeKind, PlaceholderTarget, Position, QualifiedPath, Range, SourceTier, TargetKey,
         TargetScope, Visibility, WireDeclaration, WireEdge, WireNode,
     };
-    use crate::storage::write::EdgeRecord;
 
     fn wire_node(id: &str, file_path: &str) -> WireNode {
         WireNode {

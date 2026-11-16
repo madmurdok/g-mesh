@@ -10,11 +10,12 @@ use rusqlite::Connection;
 
 use super::*;
 use crate::daemon::test_plugin;
+use crate::model::{Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 use crate::plugin_manifest::discover;
 use crate::protocol::types::{
     EdgeKind, Matcher, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
 };
-use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
+use crate::storage::write::apply_diff;
 
 // -------------------------------------------------------------------------
 // select_affected, on a seeded in-memory index

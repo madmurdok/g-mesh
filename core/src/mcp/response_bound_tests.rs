@@ -19,10 +19,11 @@ use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::decode_cursor;
 use crate::mcp::query_shapes::QueryShapes;
 use crate::mcp::response_bound::{self, EXCLUDED_TALLY_MAX_BYTES, FILE_TALLY_MAX_BYTES, MAX_RESPONSE_BYTES};
+use crate::model::{Diff, EdgeRecord, NodeRecord};
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
+use crate::storage::write::apply_diff;
 
 /// `provenance::PENDING_FILES_MAX_BYTES`.
 const PENDING_FILES_MAX_BYTES: usize = 1_500;

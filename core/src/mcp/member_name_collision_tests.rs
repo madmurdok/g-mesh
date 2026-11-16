@@ -223,7 +223,7 @@ pub fn use_field(s: &S) -> u32 { s.x }
 /// usages, and the field-vs-method pair of `U` stays as it is.
 ///
 /// Control: return all of `candidates` at the top of
-/// `Resolver::drop_type_members` (`graph::symbol_links`): `m::x` and `m::y`
+/// `Resolver::drop_type_members` (`link::symbol_links`): `m::x` and `m::y`
 /// lose their `src/user.rs` rows and report `unlinkedUsages`.
 #[test]
 fn rust_a_module_scoped_name_lands_on_the_free_fn_beside_a_same_named_member() {
@@ -338,7 +338,7 @@ const RUST_TRAIT_OTHER: &str = "pub trait Tr {\n    fn y();\n}\n\npub fn y() {}\
 /// and stays unresolved - it must not land on the trait-impl method.
 ///
 /// Control: drop the alias-suffix loop from `Resolver::is_type_member`
-/// (`graph::symbol_links`) - the call lands on `m::<S as Tr>::y`.
+/// (`link::symbol_links`) - the call lands on `m::<S as Tr>::y`.
 #[test]
 fn rust_a_name_beside_an_inherent_and_a_trait_impl_method_lands_on_neither() {
     let walked = Walked::new(
@@ -418,7 +418,7 @@ func UseMembers(t m.T, s m.S) int { return t.Y() + s.X }
 /// `m.Y()` lands on `func Y`, not on method `T.Y` of the same package.
 ///
 /// Controls: return all of `candidates` at the top of
-/// `Resolver::drop_type_members` (`graph::symbol_links`), or look the
+/// `Resolver::drop_type_members` (`link::symbol_links`), or look the
 /// receiver type up in the member's file instead of its container
 /// (`type_in_file` for every candidate): `Y` loses `UseFree` and reports
 /// `unlinkedUsages`.
@@ -473,7 +473,7 @@ def use_members(t: T) -> int:
 /// `from pkg.a import y` and `y()` land on `def y`, not on method `T.y`.
 ///
 /// Control: return all of `candidates` at the top of
-/// `Resolver::drop_type_members` (`graph::symbol_links`): `y` loses its
+/// `Resolver::drop_type_members` (`link::symbol_links`): `y` loses its
 /// `pkg/b.py` rows and reports `unlinkedUsages`.
 #[test]
 fn python_an_imported_name_lands_on_the_function_beside_a_same_named_method() {
@@ -520,7 +520,7 @@ export function useMembers(t: T): number { return t.y(); }
 /// is dropped and the free functions keep their usages.
 ///
 /// Control: return all of `candidates` at the top of
-/// `Resolver::drop_type_members` (`graph::symbol_links`): `y` reports an
+/// `Resolver::drop_type_members` (`link::symbol_links`): `y` reports an
 /// `unlinkedUsages` row in `src/b.ts`.
 #[test]
 fn typescript_free_functions_beside_same_named_members_link_as_before() {
@@ -560,7 +560,7 @@ export function run(): number {
 ///
 /// Controls: restore `Resolver::sole_non_member` after the kind rule
 /// (b259cd1^), or do not call `Resolver::drop_type_members` in `link`
-/// (`graph::symbol_links`): `run` calls `Router#handler`.
+/// (`link::symbol_links`): `run` calls `Router#handler`.
 #[test]
 fn typescript_an_imported_const_call_does_not_land_on_a_same_named_method() {
     let walked = Walked::new("typescript", ".ts", &[("src/x.ts", T01_X), ("src/main.ts", T01_MAIN)]);

@@ -24,6 +24,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
+use crate::model::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, LinkedEdge, PathError,
@@ -33,7 +34,6 @@ use crate::protocol::types::{
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::schema;
-use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 
 /// Sends a `FileChanged` request (tagged with `request_id`) for `file_path`
 /// over `writer`, reads the plugin's `FileChangeResponse` off `reader`,
@@ -854,7 +854,7 @@ pub(crate) fn linked_edges(
 /// Deletes every edge with `source = 'semantic'` whose `fromId` is a node of
 /// `language` and whose id is not in `kept`, in one transaction, and returns
 /// how many went. Placeholder nodes the deleted edges pointed at stay, as
-/// every linked-away placeholder does (`graph::symbol_links`, "Why the
+/// every linked-away placeholder does (`link::symbol_links`, "Why the
 /// placeholder is kept").
 pub(crate) fn sweep_semantic_edges(
     conn: &mut rusqlite::Connection,
@@ -1087,7 +1087,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
 
     // Best-effort, like a failed semantic pass: a diff that is already
     // committed and linked is not undone by an optional layer on top of it.
-    store.store_vectors(embedding, &computed);
+    store.store_vectors(&embedding.vector_write(&computed));
     crate::log_timing!("rt_vectors id={}", timing_id(&request_id));
     Ok(RoundTrip {
         incomplete: response.incomplete,
@@ -1270,7 +1270,7 @@ pub(crate) fn to_node_record(node: WireNode, warnings: &mut PathWarnings) -> Nod
         // The read-side mirror of the database's `GENERATED ALWAYS exported`
         // column - see `NodeRecord.exported`'s own doc comment for why this
         // still has to be set correctly here even though `apply_diff` never
-        // writes it: `graph::symbol_links::link_diff` filters this very
+        // writes it: `link::symbol_links::link_diff` filters this very
         // `Diff` in memory, before anything is read back from storage.
         exported: matches!(node.visibility, Visibility::Public),
         visibility,
@@ -1325,7 +1325,7 @@ fn to_storage_visibility(visibility: &Visibility) -> (String, Option<String>) {
 /// PlaceholderTargetRecord`. Notably does *not* set a `from_file` - the wire
 /// type has no such field, because it is already available for free as the
 /// placeholder node's own `filePath` (the existing "a placeholder's filePath
-/// is the importing file" convention - `graph::symbol_links`'s module doc),
+/// is the importing file" convention - `link::symbol_links`'s module doc),
 /// so `storage::write::apply_diff` fills `placeholder_targets.fromFile` from
 /// `NodeRecord.file_path` directly rather than threading it through this
 /// record - see that table's own DDL comment.

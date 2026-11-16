@@ -69,10 +69,10 @@ use crate::embedding::model::{
     InferenceOptions, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
 use crate::embedding::rerank::Reranker;
-use crate::embedding::text::{node_text, EmbedInput};
+use crate::embedding::text::{node_text, EmbedInput, TextRule};
+use crate::model::Diff;
 use crate::storage::embed_row;
-use crate::storage::vectors;
-use crate::storage::write::Diff;
+use crate::storage::vectors::{self, VectorWrite};
 
 /// Turns one text into one vector. [`EmbeddingModel`] in production; a
 /// deterministic fake in tests that count inference calls.
@@ -337,6 +337,19 @@ impl EmbeddingPipeline {
     /// The `embeddingVersion` this pipeline tags every vector it stores with.
     pub(crate) fn embedding_version(&self) -> &str {
         &self.version
+    }
+
+    /// This pipeline's text rule, for `storage::language_swap::plan`.
+    pub fn text_rule(&self) -> TextRule<'_> {
+        TextRule { version: &self.version }
+    }
+
+    /// [`EmbeddingPipeline::store`] of `computed` as storage's
+    /// [`VectorWrite`] seam. It writes on whatever connection it is handed -
+    /// inside a swap, the swap's own transaction - and never opens or
+    /// commits one itself.
+    pub fn vector_write<'a>(&'a self, computed: &'a ComputedBatch) -> impl VectorWrite + 'a {
+        move |conn: &Connection| self.store(conn, computed)
     }
 
     /// Cheap check for whether the embedding backfill pass
@@ -1039,7 +1052,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::embedding::text::text_to_embed;
-    use crate::storage::write::NodeRecord;
+    use crate::model::NodeRecord;
 
     /// A model directory whose `model.onnx` is a sparse file of `onnx_size`
     /// bytes: the weight check reads a length, never the bytes.
@@ -1160,7 +1173,7 @@ mod tests {
 
         let pipeline = EmbeddingPipeline::disabled();
         let diff = Diff {
-            upsert_nodes: vec![crate::storage::write::NodeRecord::new(
+            upsert_nodes: vec![crate::model::NodeRecord::new(
                 "n1",
                 "Function",
                 "foo",
@@ -1197,7 +1210,7 @@ mod tests {
 
         let pipeline = EmbeddingPipeline::disabled();
         let diff = Diff {
-            upsert_nodes: vec![crate::storage::write::NodeRecord::new(
+            upsert_nodes: vec![crate::model::NodeRecord::new(
                 "n1",
                 "Function",
                 "foo",
@@ -1350,8 +1363,8 @@ mod tests {
         cache_at, fake_batching_pipeline, fake_model_dir, fake_pipeline, fake_vector, Counters,
     };
 
-    fn documented(id: &str, doc: &str) -> crate::storage::write::NodeRecord {
-        let mut node = crate::storage::write::NodeRecord::new(id, "Function", id, id, "src/lib.rs", "rust");
+    fn documented(id: &str, doc: &str) -> crate::model::NodeRecord {
+        let mut node = crate::model::NodeRecord::new(id, "Function", id, id, "src/lib.rs", "rust");
         node.doc_comment = Some(doc.to_string());
         node.signature = Some(format!("fn {id}()"));
         node

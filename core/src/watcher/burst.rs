@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::storage::write::{apply_diff, Diff};
+use crate::model::Diff;
+
+use crate::storage::write::apply_diff;
 
 /// Coalesces the diffs from a burst of watcher events across *many
 /// different files* (a `git checkout`/`git pull` touching dozens of files
@@ -99,8 +101,8 @@ impl BurstBatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::NodeRecord;
     use crate::storage::schema;
-    use crate::storage::write::NodeRecord;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 

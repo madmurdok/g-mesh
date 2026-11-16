@@ -2,12 +2,13 @@ use std::io::{BufReader, Cursor};
 use std::time::Duration;
 
 use g_mesh::embedding::EmbeddingPipeline;
+use g_mesh::model::{Diff, EdgeRecord, NodeRecord};
 use g_mesh::protocol::conformance::{check_bulk_output, check_control_plane_output};
 use g_mesh::protocol::jsonrpc::read_message;
 use g_mesh::protocol::types::{ControlEnvelope, ControlMessage, RequestId};
 use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
-use g_mesh::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
+use g_mesh::storage::write::apply_diff;
 use g_mesh::watcher::apply::apply_semantic_pass;
 use rusqlite::Connection;
 

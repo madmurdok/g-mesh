@@ -1,11 +1,11 @@
 use super::*;
 use std::collections::HashMap;
 
-use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::model::EdgeRecord;
 use crate::protocol::types::QualifiedPath;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::EdgeRecord;
+use crate::storage::write::{upsert_edge, upsert_node};
 
 /// A project root with nothing in it, for the tests that are about
 /// resolution rather than about source. Every snippet lookup under it
@@ -1276,7 +1276,7 @@ fn a_rust_field_suffix_matches_only_the_field() {
 /// alias `shapes::Square::area` is what `Square::area` matches.
 ///
 /// **Control.** Drop the `for alias in aliases` loop from
-/// `storage::qualified_path::suffixes`: `Square::area` is refused, while the
+/// `model::qualified_path::suffixes`: `Square::area` is refused, while the
 /// primary-path suffix `<Square as Shape>::area` still resolves.
 #[test]
 fn a_trait_impl_member_is_found_through_its_alias() {

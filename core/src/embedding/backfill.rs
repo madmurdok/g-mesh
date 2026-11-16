@@ -102,9 +102,9 @@ use rusqlite::{Connection, Result as SqlResult};
 use crate::embedding::text::{embed_tier, is_noise, EmbedInput, EmbedTier, NOISE_RULE_VERSION};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::indexing_status::IndexingStatus;
+use crate::model::{Diff, NodeRecord};
 use crate::storage::embed_row::{embed_columns, EmbedRow};
 use crate::storage::index_store::{IndexStore, Unit};
-use crate::storage::write::{Diff, NodeRecord};
 use crate::storage::{schema, vectors};
 
 /// Keyset page size. Small enough that one page's inference plus its commit
@@ -246,7 +246,7 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
                 // Inference runs between the unit's steps.
                 let computed = embedding.compute(&diff, &mut stats);
                 filtered += computed.dropped_len();
-                store.store_vectors(embedding, &computed);
+                store.store_vectors(&embedding.vector_write(&computed));
                 progress.add_embed_done(nodes_len as u64);
             }
             crate::log_line!(
@@ -992,7 +992,8 @@ mod tests {
         let diff =
             Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
         let computed = reference_pipeline.compute(&diff, &mut EmbedStats::default());
-        id_order.unit(Unit::Backfill, |store| store.store_vectors(&reference_pipeline, &computed));
+        id_order
+            .unit(Unit::Backfill, |store| store.store_vectors(&reference_pipeline.vector_write(&computed)));
 
         let rows = vector_rows(&tiered_store);
         assert_eq!(rows.len(), 30, "{:?}", rows.iter().map(|r| &r.0).collect::<Vec<_>>());

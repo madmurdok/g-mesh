@@ -11,10 +11,10 @@ use super::query_shapes::QueryShapes;
 use super::session_hints::SessionHints;
 use super::{find_callers_callees, find_references, Answer, SymbolQueryParams};
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::model::{EdgeRecord, NodeRecord};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::{EdgeRecord, NodeRecord};
+use crate::storage::write::{upsert_edge, upsert_node};
 
 #[derive(Clone, Copy)]
 enum Tool {

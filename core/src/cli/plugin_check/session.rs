@@ -6,7 +6,7 @@
 //! The protocol-level work goes through the daemon's own functions, unchanged:
 //! the handshake is verified by `protocol::handshake::verify`, each bulk
 //! stream is committed by `daemon::bulk_index::ingest` (the real batching)
-//! and linked by `graph::imports::link_all` + `graph::symbol_links::link_all`,
+//! and linked by `link::imports::link_all` + `link::symbol_links::link_all`,
 //! and every control-plane round trip is `watcher::apply::apply_file_change`
 //! / `apply_semantic_pass` - including the `semantic_pass` capability gate
 //! `apply_file_change` applies itself - so the diffs land through the real
@@ -565,7 +565,7 @@ pub(crate) fn ingest_and_link(conn: &IndexStore, bytes: &[u8]) -> Result<()> {
 ///
 /// Read from the index rather than from the plugin's own output on both
 /// sides, because linking legitimately removes nodes a plugin emitted:
-/// `graph::imports` drops a `resolved_module` placeholder once it has
+/// `link::imports` drops a `resolved_module` placeholder once it has
 /// repointed its edge onto the real file. Comparing raw bulk output against
 /// the index would report every linked import as a missing id.
 pub(crate) fn file_node_ids(store: &IndexStore, file: &str) -> Result<BTreeSet<String>> {

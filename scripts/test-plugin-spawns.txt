@@ -104,7 +104,7 @@ lib:daemon::plugin::tests                                typescript
 lib:mcp::member_name_collision_tests                     typescript rust python go
 lib:mcp::unlinked::tests                                 rust
 lib:mcp::instructions::tests                             none
-lib:graph::symbol_links::tests                           none
+lib:link::symbol_links::tests                            none
 lib:languages::tests                                     none
 lib:cli::status::tests                                   none
 lib:cli::agent_instructions                              none

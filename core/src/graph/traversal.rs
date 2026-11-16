@@ -6,7 +6,7 @@ use rusqlite::{Connection, ToSql};
 use crate::graph::queries::map_node_row;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::Direction;
-use crate::storage::write::{EdgeRecord, NodeRecord};
+use crate::model::{EdgeRecord, NodeRecord};
 
 /// Response-level limits: how deep the walk goes and how many children a
 /// single node expands per level. Unvalidated defaults per the requirements

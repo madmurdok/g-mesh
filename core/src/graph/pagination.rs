@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, Row};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::graph::Direction;
-use crate::storage::write::{EdgeRecord, NodeRecord};
+use crate::model::{EdgeRecord, NodeRecord};
 
 /// Page size `find_references`/`find_callers`/`find_callees`/
 /// `find_implementations` use when the caller doesn't supply `limit`.
