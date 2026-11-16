@@ -1502,4 +1502,156 @@ mod tests {
             "the swap carries the flag into live"
         );
     }
+
+    // -----------------------------------------------------------------
+    // The vectors are written on the swap's transaction.
+    // -----------------------------------------------------------------
+
+    fn vector_ids_and_versions(conn: &Connection) -> Vec<String> {
+        column(conn, "SELECT nodeId || ':' || embeddingVersion FROM vectors ORDER BY nodeId")
+    }
+
+    fn a_vector(conn: &Connection, id: &str, version: &str) {
+        crate::storage::vectors::insert(conn, id, &[0.0; crate::embedding::EMBEDDING_DIM], version).unwrap();
+    }
+
+    /// A swap that fails in its bookkeeping, after the vectors are written,
+    /// leaves no vector: the `VectorWrite` ran on the swap's transaction and
+    /// rolled back with it. `ran` keeps the check from passing because the
+    /// write never happened.
+    /// Control: move `vectors.write(&tx)` after `tx.commit()` in
+    /// `swap_attached` (the write never runs on a failed swap: `ran` is false).
+    #[test]
+    fn a_swap_that_fails_after_its_vector_write_rolls_the_vectors_back() {
+        let (_dir, mut live, staging_path, _plan) = planned_reindex();
+        live.execute_batch(
+            "CREATE TRIGGER fail_swap BEFORE INSERT ON language_state BEGIN SELECT RAISE(ABORT, 'forced'); END;",
+        )
+        .unwrap();
+        let ran = std::cell::Cell::new(false);
+        let write = |conn: &Connection| {
+            a_vector(conn, "a1", "model");
+            ran.set(true);
+        };
+
+        swap(&mut live, &staging_path, Some(&write), &bookkeeping(&HashSet::new()))
+            .expect_err("the trigger fails the swap");
+
+        assert!(ran.get(), "the vector write runs before the failing bookkeeping");
+        assert!(vector_ids_and_versions(&live).is_empty(), "the vector rolled back with the swap");
+        assert_eq!(
+            column(&live, "SELECT signature FROM nodes WHERE id = 'a1'"),
+            vec!["fn a()"],
+            "the rows rolled back too"
+        );
+    }
+
+    /// The `VectorWrite` gets the swap's own transaction after the row
+    /// changes: it reads the staged signature of `a1`, no longer sees the
+    /// deleted `d1`, and finds the stale vectors (of `a1`, whose text
+    /// changed, and of `d1`) already gone; what it writes commits with the
+    /// swap, beside the unchanged `c1`'s kept vector.
+    /// Control: move `vectors.write(&tx)` in `swap_attached` before the
+    /// deletes (it sees `fn a()`, `d1` and the stale vectors).
+    #[test]
+    fn the_vector_write_sees_the_swapped_rows_and_commits_with_them() {
+        let (_dir, mut live, staging_path, _plan) = planned_reindex();
+        for id in ["a1", "c1", "d1"] {
+            a_vector(&live, id, "old");
+        }
+        let seen = std::cell::RefCell::new(None);
+        let write = |conn: &Connection| {
+            *seen.borrow_mut() = Some((
+                column(conn, "SELECT signature FROM nodes WHERE id IN ('a1', 'd1') ORDER BY id"),
+                vector_ids_and_versions(conn),
+            ));
+            a_vector(conn, "a1", "model");
+        };
+
+        swap(&mut live, &staging_path, Some(&write), &bookkeeping(&HashSet::new())).unwrap();
+
+        let (signatures, vectors) = seen.into_inner().expect("the swap calls the vector write");
+        assert_eq!(signatures, vec!["fn a(x: u32)"], "the staged a1, and no d1");
+        assert_eq!(vectors, vec!["c1:old"], "the stale vectors were deleted first");
+        assert_eq!(vector_ids_and_versions(&live), vec!["a1:model", "c1:old"]);
+    }
+
+    // -----------------------------------------------------------------
+    // `plan_embeddings`: which upserted nodes are owed a vector.
+    // -----------------------------------------------------------------
+
+    /// Every node below is upserted (its row differs); only `edited`'s text
+    /// changes. Live vectors are tagged "model" unless named otherwise.
+    /// - `same`: moved, same text, live vector -> kept (not owed, unchanged).
+    /// - `unvectored`: moved, same text, no live vector -> owed.
+    /// - `older`: moved, same text, a vector of another model -> owed, its
+    ///   text unchanged.
+    /// - `edited`: new signature, live vector -> owed, text changed.
+    /// - `bare`: no text on either side, but a live vector -> text changed
+    ///   (the swap deletes the vector), not owed.
+    /// - `fresh`: new -> owed.
+    ///
+    /// Controls: drop the `live_version != rule.embedding_version()` arm of
+    /// `owed` (`older` and `unvectored` are not owed); drop the
+    /// `staged_text.is_none() && live_version.is_some()` arm (`bare` is not
+    /// recorded as changed).
+    #[test]
+    fn the_plan_owes_a_vector_to_new_changed_and_unvectored_nodes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("index.db");
+        let staging_path = dir.path().join("staging-rust.db");
+        let at = |id: &str, signature: Option<&str>, line: i64| {
+            let mut node = NodeRecord::new(id, "Function", id, id, "a.rs", "rust");
+            node.signature = signature.map(str::to_string);
+            node.start_line = line;
+            node
+        };
+        let mut live = open_staging(&live_path).unwrap();
+        apply_diff(
+            &mut live,
+            &Diff {
+                upsert_nodes: vec![
+                    at("same", Some("fn same()"), 1),
+                    at("unvectored", Some("fn unvectored()"), 1),
+                    at("older", Some("fn older()"), 1),
+                    at("edited", Some("fn edited()"), 1),
+                    at("bare", None, 1),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (id, version) in
+            [("same", "model"), ("older", "older-model"), ("edited", "model"), ("bare", "model")]
+        {
+            a_vector(&live, id, version);
+        }
+        drop(live);
+        let mut staging = open_staging(&staging_path).unwrap();
+        apply_diff(
+            &mut staging,
+            &Diff {
+                upsert_nodes: vec![
+                    at("same", Some("fn same()"), 2),
+                    at("unvectored", Some("fn unvectored()"), 2),
+                    at("older", Some("fn older()"), 2),
+                    at("edited", Some("fn edited(x: u8)"), 2),
+                    at("bare", None, 2),
+                    at("fresh", Some("fn fresh()"), 2),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let planned =
+            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
+                .unwrap();
+
+        assert_eq!(planned.counts.upsert_nodes, 6, "every node is upserted");
+        let mut owed: Vec<&str> = planned.to_embed.upsert_nodes.iter().map(|node| node.id.as_str()).collect();
+        owed.sort_unstable();
+        assert_eq!(owed, vec!["edited", "fresh", "older", "unvectored"]);
+        assert_eq!(column(&staging, "SELECT id FROM plan_text_changed ORDER BY id"), vec!["bare", "edited"]);
+    }
 }

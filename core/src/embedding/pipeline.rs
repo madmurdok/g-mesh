@@ -2124,4 +2124,39 @@ mod tests {
 
         assert_eq!(vector_count(&conn), 0, "a node that is generated now must get no vector");
     }
+
+    /// `vector_write` is `store` on the connection it is handed, with no
+    /// transaction of its own: inside an outer transaction that rolls back,
+    /// its vector goes too, and inside one that commits, it stays. Its text
+    /// rule carries the pipeline's embedding version.
+    /// Control: have `vector_write` commit the connection's transaction after
+    /// `store` (`conn.execute_batch("COMMIT")`) - the vector survives the
+    /// rollback.
+    #[test]
+    fn vector_write_writes_inside_the_callers_transaction() {
+        use crate::storage::embed_row::NodeText;
+
+        crate::storage::vectors::register_extension();
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let pipeline = fake_pipeline(&model_dir, None, &Counters::default());
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+        insert_node(&conn, "hand", "Written by hand.", "fn hand()");
+        let diff = Diff { upsert_nodes: vec![documented("hand", "Written by hand.")], ..Default::default() };
+        let computed = pipeline.compute(&diff, &mut EmbedStats::default());
+        let write = pipeline.vector_write(&computed);
+
+        let tx = conn.transaction().unwrap();
+        write.write(&tx);
+        assert_eq!(vector_ids(&tx), vec!["hand"], "the write lands on the transaction");
+        tx.rollback().unwrap();
+        assert_eq!(vector_ids(&conn), Vec::<String>::new(), "and rolls back with it");
+
+        let tx = conn.transaction().unwrap();
+        write.write(&tx);
+        tx.commit().unwrap();
+        assert_eq!(vector_ids(&conn), vec!["hand"]);
+        assert_eq!(pipeline.text_rule().embedding_version(), pipeline.embedding_version());
+    }
 }
