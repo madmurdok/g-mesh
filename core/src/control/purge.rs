@@ -553,4 +553,24 @@ mod tests {
         assert!(started.elapsed() < WATCH, "a trying purge must not wait on the lock");
         assert!(state.exists());
     }
+
+    /// A daemon lock that cannot be opened counts as held: the directory is
+    /// kept, as for an unreadable pid file.
+    ///
+    /// Control: probe with `OnUnreadable::Free` in the judge: the directory
+    /// is deleted.
+    #[cfg(unix)]
+    #[test]
+    fn a_purge_keeps_an_orphaned_directory_whose_daemon_lock_cannot_be_opened() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        if !crate::paths::state_dir::make_daemon_lock_unopenable(&StateDir::at(&state)) {
+            return;
+        }
+
+        let purge = purge_orphaned_state_dir(&state, LockWait::Try).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a daemon or plugin is still running for it"));
+        assert!(state.exists());
+    }
 }

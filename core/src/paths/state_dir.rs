@@ -567,6 +567,23 @@ pub fn orphan_sweep_stamp(home: &Path) -> PathBuf {
     home.join(ORPHAN_SWEEP_STAMP)
 }
 
+/// Creates `state_dir`'s daemon lock file and makes it unopenable (`chmod
+/// 000`). `false` when it still opens (running as root bypasses permissions):
+/// the caller then has nothing to test and says so.
+#[cfg(all(test, unix))]
+#[allow(clippy::disallowed_macros)]
+pub(crate) fn make_daemon_lock_unopenable(state_dir: &StateDir) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = state_dir.daemon_lock_file();
+    File::create(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    if File::options().write(true).open(&path).is_ok() {
+        eprintln!("note: {} still opens after chmod 000 (running as root?); skipped", path.display());
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +710,183 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["daemon.phase"], "the temp file must be renamed into place, not left beside it");
+    }
+
+    // -----------------------------------------------------------------
+    // `daemon_lock_held`: each `OnUnreadable` arm
+    // -----------------------------------------------------------------
+
+    const ARMS: [OnUnreadable; 2] = [OnUnreadable::Free, OnUnreadable::Held];
+
+    /// No lock file means no daemon, whichever way unreadable reads.
+    ///
+    /// Control: fold `NotFound` into the unreadable arm: `Held` reads a
+    /// missing file as held.
+    #[test]
+    fn a_missing_daemon_lock_is_not_held_under_either_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        for arm in ARMS {
+            assert!(!StateDir::at(dir.path()).daemon_lock_held(arm).unwrap(), "{arm:?}");
+        }
+    }
+
+    /// A lock file nobody holds is free and one held on another open file
+    /// description is held, under both arms. Each probe gets its own
+    /// directory: a probe's own instant lock, inherited by a child another
+    /// test thread forks, must not read as held by the next probe.
+    #[test]
+    fn a_free_daemon_lock_is_free_and_a_held_one_held_under_either_arm() {
+        for arm in ARMS {
+            let free = tempfile::tempdir().unwrap();
+            File::create(StateDir::at(free.path()).daemon_lock_file()).unwrap();
+            assert!(!StateDir::at(free.path()).daemon_lock_held(arm).unwrap(), "free, {arm:?}");
+
+            let held = tempfile::tempdir().unwrap();
+            let holder = File::create(StateDir::at(held.path()).daemon_lock_file()).unwrap();
+            holder.try_lock().unwrap();
+            assert!(StateDir::at(held.path()).daemon_lock_held(arm).unwrap(), "held, {arm:?}");
+        }
+    }
+
+    /// The polarity itself: a lock file that exists but cannot be opened
+    /// reads as free under `Free` and as held under `Held`, and neither errs.
+    ///
+    /// Control: answer the open failure with `!=` instead of `==`: both arms
+    /// read the opposite way.
+    #[cfg(unix)]
+    #[test]
+    fn an_unopenable_daemon_lock_reads_as_free_under_free_and_held_under_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = StateDir::at(dir.path());
+        if !make_daemon_lock_unopenable(&sd) {
+            return;
+        }
+        assert!(!sd.daemon_lock_held(OnUnreadable::Free).unwrap(), "Free: an unopenable lock is not held");
+        assert!(sd.daemon_lock_held(OnUnreadable::Held).unwrap(), "Held: an unopenable lock is held");
+    }
+
+    #[test]
+    fn a_staging_db_name_round_trips_and_the_id_is_the_final_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = StateDir::at(dir.path().join("abc123"));
+        let staging = sd.staging_db("rust");
+        assert_eq!(staging.parent(), Some(sd.path()));
+        assert!(StateDir::is_staging_db(staging.file_name().unwrap().to_str().unwrap()));
+        for other in [INDEX_DB_FILE, SEED_TMP_FILE, PID_FILE, "staging-rust.db-journal"] {
+            assert!(!StateDir::is_staging_db(other), "{other}");
+        }
+        assert_eq!(sd.id(), Some("abc123"));
+    }
+
+    // -----------------------------------------------------------------
+    // Every state file name has one home: this file
+    // -----------------------------------------------------------------
+
+    /// Literals spelled outside this file that are not state file names.
+    /// `(path under core/src, literal as spelled)`.
+    const NOT_STATE_FILES: &[(&str, &str)] = &[
+        // A JSON key of `g-mesh status --json`, not the directory.
+        ("cli/status/json.rs", "\"projects\""),
+    ];
+
+    /// Whether `rel` (under `core/src`, `/`-separated) is a test-only file.
+    fn is_test_file(rel: &str) -> bool {
+        rel.ends_with("/tests.rs")
+            || rel == "tests.rs"
+            || rel.ends_with("_tests.rs")
+            || rel.split('/').any(|part| part == "tests")
+    }
+
+    /// `source` up to its inline `#[cfg(..test..)] mod tests {`, without
+    /// `//` comment lines.
+    fn production_lines(source: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut kept = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let next = lines.get(i + 1).map(|l| l.trim()).unwrap_or("");
+            if trimmed.starts_with("#[cfg(")
+                && trimmed.contains("test")
+                && (next == "mod tests {" || next == "pub(crate) mod tests {")
+            {
+                break;
+            }
+            if !trimmed.starts_with("//") {
+                kept.push((i + 1, *line));
+            }
+        }
+        kept
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every section 4 name (GM-706 design) is spelled only in this file in
+    /// non-test code: a state file renamed here is renamed everywhere.
+    ///
+    /// Control: spell `"daemon.pid"` in `daemon/mod.rs` again.
+    #[test]
+    fn every_state_file_name_is_spelled_only_in_state_dir_rs() {
+        let mut needles: Vec<String> = [
+            PROJECTS_DIR,
+            ROOT_FILE,
+            DEVICE_FILE,
+            INDEX_DB_FILE,
+            CONFIG_FILE,
+            DAEMON_LOG_FILE,
+            PID_FILE,
+            BUILD_STAMP_FILE,
+            BOOTSTRAP_LOCK_FILE,
+            DAEMON_LOCK_FILE,
+            DAEMON_SERVING_FILE,
+            REBUILD_MARKER_FILE,
+            PHASE_FILE,
+            PROGRESS_FILE,
+            RERANK_FILE,
+            SEED_TMP_FILE,
+            ORPHAN_SWEEP_STAMP,
+        ]
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect();
+        #[cfg(unix)]
+        needles.push(format!("\"{SOCKET_FILE}\""));
+        needles.push(format!("\"{PLUGIN_PREFIX}"));
+        needles.push(format!("\"{STAGING_PREFIX}"));
+        needles.push(format!("{SUSPENDED_SUFFIX}\""));
+
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        let mut offenders = Vec::new();
+        for file in files {
+            let rel = file.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/");
+            if rel == "paths/state_dir.rs" || is_test_file(&rel) {
+                continue;
+            }
+            let source = fs::read_to_string(&file).unwrap();
+            for (number, line) in production_lines(&source) {
+                for needle in &needles {
+                    if line.contains(needle.as_str())
+                        && !NOT_STATE_FILES.contains(&(rel.as_str(), needle.as_str()))
+                    {
+                        offenders.push(format!("{rel}:{number}: {needle}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "state file names spelled outside paths/state_dir.rs:\n{}",
+            offenders.join("\n")
+        );
     }
 }

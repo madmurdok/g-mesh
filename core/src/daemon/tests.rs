@@ -948,6 +948,99 @@ fn a_rebuild_marker_counts_only_while_its_pid_lives_and_the_daemon_lock_is_held(
     assert_eq!(rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), None, "an unreadable marker");
 }
 
+/// A live marker under a daemon lock that cannot be opened is no rebuild:
+/// the lock reads as free, so the shim may bootstrap.
+///
+/// Control: probe with `OnUnreadable::Held` in `rebuild_in_progress_in`: the
+/// marker reads as a rebuild.
+#[cfg(unix)]
+#[test]
+fn a_live_rebuild_marker_under_an_unopenable_daemon_lock_is_no_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = StateDir::at(dir.path());
+    state_dir.write_rebuild_marker("reindex").unwrap();
+    if !crate::paths::state_dir::make_daemon_lock_unopenable(&state_dir) {
+        return;
+    }
+    assert_eq!(rebuild_in_progress_in(&state_dir).unwrap(), None);
+}
+
+/// Every compat wrapper names the same file, endpoint or record as the
+/// `StateDir` method it wraps, over one temp state directory (`_in` forms)
+/// and one temp project root (root forms, under the environment's home).
+///
+/// Control: point one wrapper at another method (`phase_path_in` at
+/// `progress_file`): its row mismatches.
+#[test]
+fn every_compat_wrapper_names_what_its_state_dir_method_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let sd = StateDir::at(dir.path());
+    let root = tempfile::tempdir().unwrap();
+    let of = StateDir::of(root.path()).unwrap();
+    let home = crate::paths::g_mesh_home().unwrap();
+
+    let mut rows: Vec<(&str, PathBuf, PathBuf)> = vec![
+        ("pid_path", pid_path(root.path()).unwrap(), of.pid_file()),
+        ("pid_path_in", pid_path_in(dir.path()), sd.pid_file()),
+        (
+            "plugin_pid_path",
+            plugin_pid_path(root.path()).unwrap(),
+            of.plugin_pid_file(plugin::BUNDLED_LANGUAGE),
+        ),
+        ("plugin_pid_path_in", plugin_pid_path_in(dir.path()), sd.plugin_pid_file(plugin::BUNDLED_LANGUAGE)),
+        ("phase_path_in", phase_path_in(dir.path()), sd.phase_file()),
+        ("progress_path_in", progress_path_in(dir.path()), sd.progress_file()),
+        ("rerank_outcome_path_in", rerank_outcome_path_in(dir.path()), sd.rerank_outcome_file()),
+        ("build_stamp_path", build_stamp_path(root.path()).unwrap(), of.build_stamp_file()),
+        ("build_stamp_path_in", build_stamp_path_in(dir.path()), sd.build_stamp_file()),
+        ("rebuild_marker_path_in", rebuild_marker_path_in(dir.path()), sd.rebuild_marker_file()),
+        ("daemon_lock_path_in", daemon_lock_path_in(dir.path()), sd.daemon_lock_file()),
+        ("lock_path", lock_path(root.path()).unwrap(), of.bootstrap_lock_file()),
+        ("shim::DAEMON_LOG_FILE", dir.path().join(crate::shim::DAEMON_LOG_FILE), sd.daemon_log_file()),
+        (
+            "config::project_config_path",
+            crate::config::project_config_path(root.path()).unwrap(),
+            of.config_file(),
+        ),
+        (
+            "config::global_config_path",
+            crate::config::global_config_path().unwrap(),
+            crate::paths::state_dir::global_config_file(&home),
+        ),
+    ];
+    #[cfg(unix)]
+    rows.push(("socket_path", socket_path(root.path()).unwrap(), of.socket_file()));
+    let mismatches: Vec<String> = rows
+        .iter()
+        .filter(|(_, wrapper, method)| wrapper != method)
+        .map(|(name, wrapper, method)| format!("{name}: {} != {}", wrapper.display(), method.display()))
+        .collect();
+    assert!(mismatches.is_empty(), "wrappers that disagree with StateDir:\n{}", mismatches.join("\n"));
+
+    assert_eq!(endpoint_in(dir.path()), ipc::endpoint_for(&sd), "endpoint_in");
+    assert_eq!(endpoint(root.path()).unwrap(), ipc::endpoint_for(&of).unwrap(), "endpoint");
+
+    std::fs::write(sd.plugin_pid_file("rust"), "1\n").unwrap();
+    std::fs::write(sd.plugin_suspended_marker("go"), "crashed\n").unwrap();
+    assert_eq!(registry::discovered_pid_files(dir.path()), sd.plugin_pid_files());
+    assert_eq!(sd.plugin_pid_files().len(), 1);
+    assert_eq!(registry::discovered_suspended_markers(dir.path()), sd.suspended_markers());
+    assert_eq!(sd.suspended_markers(), vec![("go".to_string(), "crashed".to_string())]);
+
+    let snapshot = indexing_status::ProgressSnapshot { pid: 7, phase: "walk".into(), ..Default::default() };
+    std::fs::write(sd.progress_file(), serde_json::to_string(&snapshot).unwrap()).unwrap();
+    assert_eq!(read_progress_in(dir.path()), indexing_status::read_progress(&sd));
+    assert_eq!(read_progress_in(dir.path()), Some(snapshot));
+
+    std::fs::write(sd.phase_file(), "walk\n").unwrap();
+    assert_eq!(read_phase_in(dir.path()), sd.read_phase());
+    assert_eq!(read_phase_in(dir.path()).as_deref(), Some("walk"));
+
+    sd.record_serving_owner(4321);
+    assert_eq!(serving_owner_in(dir.path()), sd.serving_owner());
+    assert_eq!(serving_owner_in(dir.path()), Some(4321));
+}
+
 // --- GM-616: a Rescan reconciles the subtree whose events the OS dropped ---
 // Numbers name the behaviours in docs/design/GM-616-fsevents-rescan.md §6.
 //

@@ -65,3 +65,24 @@ pub(crate) fn endpoint(state_dir: &StateDir) -> Result<ipc::Endpoint> {
     ipc::endpoint_for(state_dir)
         .with_context(|| format!("failed to derive the daemon endpoint from {}", state_dir.path().display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lock file that cannot be opened reads as free: eviction fails
+    /// towards leaving processes alone.
+    ///
+    /// Control: probe with `OnUnreadable::Held` here: the lock reads as
+    /// `Starting`.
+    #[cfg(unix)]
+    #[test]
+    fn an_unopenable_daemon_lock_reads_as_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::at(dir.path());
+        if !crate::paths::state_dir::make_daemon_lock_unopenable(&state_dir) {
+            return;
+        }
+        assert_eq!(inspect_daemon_lock_in(&state_dir, false).unwrap(), DaemonLock::Free);
+    }
+}
