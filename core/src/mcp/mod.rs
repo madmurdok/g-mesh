@@ -21,8 +21,6 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::registry::{PathCoverage, PluginRegistry};
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
 use crate::graph::pagination::Direction;
@@ -47,6 +45,9 @@ pub(crate) mod find_references;
 pub mod front;
 pub(crate) mod get_dependencies;
 mod get_file_outline;
+mod host;
+#[cfg(test)]
+mod host_fake;
 mod instructions;
 #[cfg(test)]
 mod member_name_collision_tests;
@@ -76,6 +77,8 @@ mod tool_result;
 mod tools_list_tests;
 mod unlinked;
 mod untyped;
+
+pub use self::host::{Activity, McpHost, PathCoverage};
 
 // The embedding eval (`cli::embed_eval`) scores against the same ranking and
 // the same shipped floors the tools use, not copies of them.
@@ -187,12 +190,11 @@ fn walk_failed(message: &str) -> CallToolResult {
 pub async fn serve_connection(
     stream: AsyncStream,
     store: Arc<IndexStore>,
-    registry: Arc<PluginRegistry>,
-    core_activity: Arc<CoreActivity>,
+    host: Arc<dyn McpHost>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
 ) -> Result<()> {
-    let service = GMeshMcpServer::new(store, registry, core_activity, indexing, embedding)
+    let service = GMeshMcpServer::new(store, host, indexing, embedding)
         .serve(stream)
         .await
         .context("MCP initialization failed")?;
@@ -201,14 +203,13 @@ pub async fn serve_connection(
 }
 
 /// The structural query surface. Every handler answers out of `store` alone;
-/// `registry` is there to be woken, not queried: a tool call replays the files
-/// queued while a plugin slept before the index is read (see
-/// `daemon::lifecycle`), and it cannot know ahead which languages it touches.
+/// `host` is there to be woken, not queried: a tool call replays the files
+/// queued while a plugin slept before the index is read (the [`McpHost`] lock
+/// order), and it cannot know ahead which languages it touches.
 #[derive(Clone)]
 pub struct GMeshMcpServer {
     store: Arc<IndexStore>,
-    registry: Arc<PluginRegistry>,
-    core_activity: Arc<CoreActivity>,
+    host: Arc<dyn McpHost>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
     shapes: Arc<query_shapes::QueryShapes>,
@@ -223,16 +224,16 @@ pub struct GMeshMcpServer {
 impl GMeshMcpServer {
     pub fn new(
         store: Arc<IndexStore>,
-        registry: Arc<PluginRegistry>,
-        core_activity: Arc<CoreActivity>,
+        host: Arc<dyn McpHost>,
         indexing: IndexingStatus,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
-        let shapes = Arc::new(registry.query_shapes());
+        // Every discovered language's `[plugin.non_symbol_queries]`, for the
+        // semantic rung; fixed for the host's lifetime, as discovery is.
+        let shapes = Arc::new(query_shapes::QueryShapes::from_manifests(host.manifests()));
         Self {
             store,
-            registry,
-            core_activity,
+            host,
             indexing,
             embedding,
             shapes,
@@ -291,10 +292,10 @@ impl GMeshMcpServer {
     /// Replays whatever changed while a plugin was asleep; takes no lock when
     /// nothing did. On the blocking pool: waking a plugin spawns a process,
     /// and the accept loop's runtime has only two workers. Failures are logged
-    /// in `PluginRegistry::replay_pending`, never returned (the queue stays for
+    /// in `McpHost::replay_pending`, never returned (the queue stays for
     /// the next call to retry). Heartbeats like
     /// [`ensure_file_fresh`](Self::ensure_file_fresh), with a
-    /// [`PluginRegistry::pending_summary`] read once before the queue drains.
+    /// [`McpHost::pending_summary`] read once before the queue drains.
     /// Not cancellable.
     async fn replay_queued_changes(
         &self,
@@ -302,18 +303,18 @@ impl GMeshMcpServer {
         tool: &str,
         call_started: Instant,
     ) {
-        if !self.registry.has_pending() {
+        if !self.host.has_pending() {
             return;
         }
-        let summary = self.registry.pending_summary();
-        let registry = Arc::clone(&self.registry);
+        let summary = self.host.pending_summary();
+        let host = Arc::clone(&self.host);
         let store = Arc::clone(&self.store);
         let started = Instant::now();
-        let task = tokio::task::spawn_blocking(move || registry.replay_pending(&store));
+        let task = tokio::task::spawn_blocking(move || host.replay_pending(&store));
         let (beat, sent) = progress::with_heartbeat(ctx, started, call_started, Cancel::Ignore, task, || {
             format!(
                 "indexing {}: replaying queued changes for {summary} before answering ({} so far)",
-                self.registry.project_root().display(),
+                self.host.project_root().display(),
                 human_duration(started.elapsed())
             )
         })
@@ -340,18 +341,18 @@ impl GMeshMcpServer {
     /// call: it never changes while the daemon runs
     /// (`plugin_manifest::discover`), so a cache would save nothing.
     fn capabilities(&self) -> HashMap<String, Capabilities> {
-        self.registry.receiver_call_capabilities()
+        self.host.receiver_call_capabilities()
     }
 
     /// The `file_paths` filter entries of a find tool whose language is not
     /// indexed here (plugin absent or failed), each with that coverage
-    /// (`PluginRegistry::path_coverage`, no I/O). Empty with no filter or a
+    /// (`McpHost::path_coverage`, no I/O). Empty with no filter or a
     /// fully covered one; the handlers group it into `notIndexed`.
     fn filter_coverage(&self, file_paths: Option<&[String]>) -> Vec<(String, PathCoverage)> {
         file_paths
             .unwrap_or_default()
             .iter()
-            .filter_map(|path| self.registry.path_coverage(path).map(|coverage| (path.clone(), coverage)))
+            .filter_map(|path| self.host.path_coverage(path).map(|coverage| (path.clone(), coverage)))
             .collect()
     }
 
@@ -374,16 +375,16 @@ impl GMeshMcpServer {
         call_started: Instant,
         file_path: &str,
     ) {
-        let registry = Arc::clone(&self.registry);
+        let host = Arc::clone(&self.host);
         let store = Arc::clone(&self.store);
         let owned_path = file_path.to_string();
         let task_path = owned_path.clone();
         let started = Instant::now();
-        let task = tokio::task::spawn_blocking(move || registry.ensure_fresh(&store, &task_path));
+        let task = tokio::task::spawn_blocking(move || host.ensure_fresh(&store, &task_path));
         let (beat, sent) = progress::with_heartbeat(ctx, started, call_started, Cancel::Ignore, task, || {
             format!(
                 "indexing {}: bringing {owned_path} up to date before answering ({} so far)",
-                self.registry.project_root().display(),
+                self.host.project_root().display(),
                 human_duration(started.elapsed())
             )
         })
@@ -391,7 +392,7 @@ impl GMeshMcpServer {
         let Beat::Done(joined) = beat else { unreachable!("Cancel::Ignore never yields Cancelled") };
 
         let outcome = match &joined {
-            Ok(Ok(Some(outcome))) => format!("{outcome:?}"),
+            Ok(Ok(Some(outcome))) => outcome.clone(),
             Ok(Ok(None)) => "no_plugin".to_string(),
             Ok(Err(_)) => "failed".to_string(),
             Err(_) => "task_failed".to_string(),
@@ -449,7 +450,7 @@ impl GMeshMcpServer {
                 Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
                     "g-mesh: the index for {} is still being built ({}; this call waited {}). No answer was \
                  computed - call this tool again; the index keeps building in the background.",
-                    self.registry.project_root().display(),
+                    self.host.project_root().display(),
                     self.indexing.progress_detail(),
                     human_duration(started.elapsed())
                 ))]))
@@ -475,7 +476,7 @@ impl GMeshMcpServer {
             started,
             Cancel::Honour,
             self.indexing.wait_for(need, deadline),
-            || self.indexing.progress_message(self.registry.project_root()),
+            || self.indexing.progress_message(self.host.project_root()),
         )
         .await;
         let outcome = match beat {
@@ -547,7 +548,7 @@ impl GMeshMcpServer {
                     embedded,
                     total,
                     (!spent).then(|| started.elapsed()),
-                    self.registry.project_root(),
+                    self.host.project_root(),
                 )
                 .map_or(Ok(None), |coverage| Ok(Some(coverage)))
             }
@@ -556,13 +557,13 @@ impl GMeshMcpServer {
 
     /// Advances the project's durable `lastUsed` stamp (`gc::last_used`, read
     /// by a later GC scan) and this process's in-memory idle clock
-    /// (`daemon::lifecycle::CoreActivity`); neither can stand in for the
+    /// ([`Activity::request`]); neither can stand in for the
     /// other. Called per tool call, not per connection: a client holds one
     /// session for its whole lifetime. Best-effort: a failure is logged, never
     /// a tool error. The store is taken and released here, before the
     /// handler's own read guard.
     fn mark_used(&self) {
-        self.core_activity.request();
+        self.host.request();
         if let Err(err) = self.store.with(last_used::touch) {
             crate::log_line!("g-mesh daemon: failed to record lastUsed: {err:#}");
         }
@@ -580,8 +581,8 @@ impl GMeshMcpServer {
     /// store read. A failed read falls back to the no-I/O cold-start wording
     /// for the part it could not read.
     fn instructions(&self) -> String {
-        let capabilities = self.registry.receiver_call_capabilities();
-        let missing = || self.registry.missing_languages().into_iter().map(str::to_string).collect();
+        let capabilities = self.host.receiver_call_capabilities();
+        let missing = || self.host.missing_languages().into_iter().map(str::to_string).collect();
         let installed = || instructions::present_languages(capabilities.keys().cloned(), &capabilities);
 
         let phase = self.indexing.phase();
@@ -591,7 +592,7 @@ impl GMeshMcpServer {
                 uncovered: instructions::Uncovered::missing(missing()),
             };
             return instructions::cold_start(
-                self.registry.project_root(),
+                self.host.project_root(),
                 phase == Phase::Walking,
                 self.indexing.cold_cause(),
                 &coverage,
@@ -666,9 +667,9 @@ impl GMeshMcpServer {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
         let store = Arc::clone(&self.store);
-        let project_root = self.registry.project_root().to_path_buf();
+        let project_root = self.host.project_root().to_path_buf();
         let params = params.0;
-        let coverage = params.file_path.as_deref().and_then(|path| self.registry.path_coverage(path));
+        let coverage = params.file_path.as_deref().and_then(|path| self.host.path_coverage(path));
         find_definition::resolve_lazily_off_worker(
             Arc::clone(&self.embedding),
             Arc::clone(&self.shapes),
@@ -820,7 +821,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
-        let coverage = self.registry.path_coverage(&params.0.file_path);
+        let coverage = self.host.path_coverage(&params.0.file_path);
         get_file_outline::handle_covered(&self.store, coverage.as_ref(), params.0)
     }
 
@@ -841,11 +842,11 @@ impl GMeshMcpServer {
             self.ensure_file_fresh(&ctx, "get_dependencies", call_started, file_path).await;
         }
         // The union of every plugin's declared entry points (see
-        // `PluginRegistry::entry_points` and
+        // `McpHost::entry_points` and
         // `graph::queries::entry_point_rank_expr`). Read fresh per call: it
         // never changes while the daemon runs.
-        let entry_points = self.registry.entry_points();
-        let coverage = params.0.file_path.as_deref().and_then(|path| self.registry.path_coverage(path));
+        let entry_points = self.host.entry_points();
+        let coverage = params.0.file_path.as_deref().and_then(|path| self.host.path_coverage(path));
         get_dependencies::handle_covered(&self.store, &entry_points, &self.hints, coverage.as_ref(), params.0)
     }
 
@@ -872,7 +873,7 @@ impl GMeshMcpServer {
             self.hints.clone(),
             params.0,
             coverage,
-            Some(self.registry.project_root().to_path_buf()),
+            Some(self.host.project_root().to_path_buf()),
         )
         .await
     }

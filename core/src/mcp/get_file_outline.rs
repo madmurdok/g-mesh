@@ -17,7 +17,7 @@ use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
-use crate::daemon::registry::PathCoverage;
+use crate::mcp::PathCoverage;
 
 use super::not_indexed;
 use super::tool_result::{internal_error, success};

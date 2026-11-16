@@ -589,13 +589,14 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
-use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::registry::PluginRegistry;
+use crate::mcp::host_fake::FakeHost;
+
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::queries::upsert_node;
 use crate::indexing_status::{IndexingStatus, Phase};
 use crate::languages::{self, CATALOGUE};
 use crate::mcp::GMeshMcpServer;
+use crate::mcp::McpHost;
 use crate::plugin_manifest::{discover, DiscoveredPlugins};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -1504,26 +1505,11 @@ fn server_over(
     phase: Phase,
 ) -> GMeshMcpServer {
     let root = dir.path().join("project");
-    let state = dir.path().join("state");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
     let indexing = IndexingStatus::structural();
     indexing.set_phase(phase);
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        found,
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
-    GMeshMcpServer::new(
-        store,
-        registry,
-        CoreActivity::new(),
-        indexing,
-        Arc::new(EmbeddingPipeline::disabled()),
-    )
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::over(&root, found));
+    GMeshMcpServer::new(store, host, indexing, Arc::new(EmbeddingPipeline::disabled()))
 }
 
 /// Absent languages come from the recorded outcomes, not re-derived from the

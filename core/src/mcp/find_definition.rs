@@ -11,10 +11,10 @@ use rmcp::ErrorData;
 use rusqlite::{Connection, Row};
 use serde::Serialize;
 
-use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
+use crate::mcp::PathCoverage;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 

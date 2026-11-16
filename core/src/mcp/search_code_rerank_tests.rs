@@ -845,17 +845,14 @@ fn an_unreadable_file_or_span_gives_a_text_and_no_root_gives_no_body() {
 async fn the_tool_reads_the_body_under_the_project_root() {
     use super::search_code_worker_tests::{call, connect};
     use super::GMeshMcpServer;
-    use crate::daemon::lifecycle::CoreActivity;
-    use crate::daemon::registry::PluginRegistry;
     use crate::indexing_status::{IndexingStatus, Phase};
-    use crate::plugin_manifest::DiscoveredPlugins;
+    use crate::mcp::host_fake::FakeHost;
+    use crate::mcp::McpHost;
 
     let query = "parseConfig";
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
-    let state = dir.path().join("state");
     std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
     std::fs::write(root.join("src/config.rs"), "fn n00() {\n    read_the_file();\n}\n").unwrap();
     std::fs::write(root.join("src/other.rs"), "fn n01() {\n    parse_it();\n}\n").unwrap();
 
@@ -885,15 +882,8 @@ async fn the_tool_reads_the_body_under_the_project_root() {
     let embedding = Arc::new(fake(&dir.path().join("model")).with_reranker(reranker));
     let indexing = IndexingStatus::structural();
     indexing.set_phase(Phase::Ready);
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        DiscoveredPlugins::default(),
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
-    let server = GMeshMcpServer::new(store, registry, CoreActivity::new(), indexing, embedding);
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::new(&root));
+    let server = GMeshMcpServer::new(store, host, indexing, embedding);
 
     let client = connect(server).await;
     let result = call(&client, "search_code", serde_json::json!({ "query": query })).await;

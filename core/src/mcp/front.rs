@@ -28,8 +28,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::{instructions, GMeshMcpServer};
-use crate::daemon::lifecycle::CoreActivity;
+use super::{instructions, Activity, GMeshMcpServer};
 use crate::ipc::AsyncStream;
 use crate::project_detect::{self as candidates, relative_to_root, segments, Candidate, Detection, Limits};
 
@@ -252,7 +251,7 @@ fn containing_candidate<'a>(
 pub async fn serve_connection(
     stream: AsyncStream,
     front: Arc<Front>,
-    core_activity: Arc<CoreActivity>,
+    core_activity: Arc<dyn Activity>,
 ) -> Result<()> {
     // `get_info` is synchronous and runs inside `serve`, so the walk comes first.
     let instructions = front.instructions().await;
@@ -269,7 +268,7 @@ pub struct FrontServer {
     front: Arc<Front>,
     /// Built for this connection when it opened.
     instructions: String,
-    core_activity: Arc<CoreActivity>,
+    core_activity: Arc<dyn Activity>,
 }
 
 impl ServerHandler for FrontServer {

@@ -17,13 +17,13 @@ use serde_json::{json, Value};
 
 use super::search_code_worker_tests::{call, connect, Gate, GatedEmbedder};
 use super::{find_definition, FindDefinitionParams, GMeshMcpServer};
-use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::registry::PluginRegistry;
 use crate::embedding::model::EMBEDDING_DIM;
 use crate::embedding::pipeline::Embedder;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::queries::upsert_node;
 use crate::indexing_status::{IndexingStatus, Phase};
+use crate::mcp::host_fake::FakeHost;
+use crate::mcp::McpHost;
 use crate::plugin_manifest::{DiscoveredPlugins, NonSymbolShapes, PluginManifest};
 use crate::protocol::types::QualifiedPath;
 use crate::storage::index_store::IndexStore;
@@ -81,20 +81,11 @@ fn server_with(
     discovered: DiscoveredPlugins,
 ) -> GMeshMcpServer {
     let root = dir.join("project");
-    let state = dir.join("state");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
     let indexing = IndexingStatus::structural();
     indexing.set_phase(Phase::Ready);
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        discovered,
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
-    GMeshMcpServer::new(store, registry, CoreActivity::new(), indexing, embedding)
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::over(&root, discovered));
+    GMeshMcpServer::new(store, host, indexing, embedding)
 }
 
 fn body(result: &CallToolResult) -> Value {

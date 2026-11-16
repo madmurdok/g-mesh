@@ -26,8 +26,8 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::registry::PathCoverage;
 use crate::languages::CatalogueEntry;
+use crate::mcp::PathCoverage;
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{self, MAX_LANGUAGE_RETRIES};
 
@@ -222,8 +222,8 @@ pub(super) mod test_support {
     use rmcp::model::{CallToolResult, ContentBlock};
     use rusqlite::Connection;
 
-    use crate::daemon::registry::PathCoverage;
     use crate::languages;
+    use crate::mcp::PathCoverage;
     use crate::storage::language_outcome::LanguageOutcome;
     use crate::storage::schema;
 
