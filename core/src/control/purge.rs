@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::daemon;
+use crate::paths::state_dir::{read_pid_file_result, OnUnreadable, StateDir, DEVICE_FILE, ROOT_FILE};
 
 /// What the recorded project root of a state directory says about it.
 ///
@@ -141,19 +141,23 @@ pub(crate) fn purge_orphaned_state_dir(state_dir: &Path, wait: LockWait) -> Resu
         LockWait::Try => None,
         LockWait::UpTo(bound) => Some(Instant::now() + bound),
     };
+    let sd = StateDir::at(state_dir);
     // `None` when the directory may go; a held singleton lock is polled under
     // `UpTo`, since a sweeper's probe holds it for an instant.
     let judge = || -> Option<Purge> {
         loop {
-            let root = crate::paths::state_dir::read_project_root(state_dir);
-            let device = crate::paths::state_dir::read_root_device(state_dir);
+            let root = sd.project_root();
+            let device = sd.root_device();
             if root_state(root.as_deref(), device) != RootState::Orphaned {
                 return Some(Purge::Kept("its project root exists, is unreachable, or is not recorded"));
             }
             if daemon_is_running(state_dir) {
                 return Some(Purge::Kept(RUNNING));
             }
-            if !singleton_lock_is_held(state_dir) {
+            // A lock that cannot be checked counts as held, for the reason
+            // [`daemon_is_running`] gives for an unreadable pid file. `Held`
+            // never errs; `unwrap_or(true)` states the same polarity again.
+            if !sd.daemon_lock_held(OnUnreadable::Held).unwrap_or(true) {
                 return None;
             }
             match deadline {
@@ -169,7 +173,7 @@ pub(crate) fn purge_orphaned_state_dir(state_dir: &Path, wait: LockWait) -> Resu
         return Ok(kept);
     }
 
-    let lock_path = daemon::bootstrap_lock_path_in(state_dir);
+    let lock_path = sd.bootstrap_lock_file();
     let lock = match fs::File::options().create(true).write(true).truncate(false).open(&lock_path) {
         Ok(file) => file,
         // The directory went between the judgement and here: someone else
@@ -239,7 +243,7 @@ fn delete_root_record_last(state_dir: &Path) -> Result<()> {
             Err(err) => return Err(err).with_context(|| format!("failed to delete {}", path.display())),
         }
     }
-    for name in [crate::paths::state_dir::ROOT_FILE, crate::paths::state_dir::DEVICE_FILE] {
+    for name in [ROOT_FILE, DEVICE_FILE] {
         match fs::remove_file(state_dir.join(name)) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -249,21 +253,9 @@ fn delete_root_record_last(state_dir: &Path) -> Result<()> {
     delete(state_dir)
 }
 
-/// Whether some process holds the daemon's singleton lock in `state_dir`.
-/// A lock that cannot be checked counts as held, for the reason
-/// [`daemon_is_running`] gives for an unreadable pid file.
-fn singleton_lock_is_held(state_dir: &Path) -> bool {
-    let path = daemon::daemon_lock_path_in(state_dir);
-    let file = match fs::File::options().read(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(err) => return err.kind() != std::io::ErrorKind::NotFound,
-    };
-    !matches!(file.try_lock(), Ok(()))
-}
-
 /// Whether anything is still running for this state directory - the core, or
 /// any language's plugin that outlived it. Lists every `plugin-<language>.pid`
-/// file actually present (`daemon::registry::discovered_pid_files`) rather
+/// file actually present (`StateDir::plugin_pid_files`) rather
 /// than assuming one hardcoded plugin - a live Python plugin orphaned by a
 /// dead core must stop this project from being cleaned up exactly as much as
 /// a live JS/TS one always has.
@@ -273,10 +265,11 @@ fn singleton_lock_is_held(state_dir: &Path) -> bool {
 /// safe one. Collapsing the error into `None` put it with the other (GM-247).
 #[allow(clippy::disallowed_macros)]
 pub(crate) fn daemon_is_running(state_dir: &Path) -> bool {
-    let mut pid_files = vec![daemon::pid_path_in(state_dir)];
-    pid_files.extend(daemon::registry::discovered_pid_files(state_dir).into_iter().map(|(_, path)| path));
-    pid_files.iter().any(|path| match daemon::read_pid_file_result(path) {
-        Ok(Some(pid)) => daemon::is_process_alive(pid),
+    let sd = StateDir::at(state_dir);
+    let mut pid_files = vec![sd.pid_file()];
+    pid_files.extend(sd.plugin_pid_files().into_iter().map(|(_, path)| path));
+    pid_files.iter().any(|path| match read_pid_file_result(path) {
+        Ok(Some(pid)) => crate::process::is_alive(pid),
         Ok(None) => false,
         Err(err) => {
             eprintln!(
@@ -296,7 +289,7 @@ pub(crate) fn delete(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::test_fixture::*;
+    use crate::control::fixture_tests::*;
 
     /// The classification itself, stated as the four cases rather than only
     /// exercised through a fixture - `root_state` is where the volume guard
@@ -388,7 +381,7 @@ mod tests {
     /// Takes `state`'s bootstrap lock on a file of its own, as a
     /// bootstrapping shim or another process's sweep holds it.
     fn hold_bootstrap_lock(state: &Path) -> fs::File {
-        let lock = fs::File::create(daemon::bootstrap_lock_path_in(state)).unwrap();
+        let lock = fs::File::create(StateDir::at(state).bootstrap_lock_file()).unwrap();
         lock.try_lock().unwrap();
         lock
     }
@@ -498,7 +491,7 @@ mod tests {
     /// Takes `state`'s singleton lock on a file of its own, as a running
     /// daemon holds it or another process's sweep probes it.
     fn hold_singleton_lock(state: &Path) -> fs::File {
-        let lock = fs::File::create(daemon::daemon_lock_path_in(state)).unwrap();
+        let lock = fs::File::create(StateDir::at(state).daemon_lock_file()).unwrap();
         lock.try_lock().unwrap();
         lock
     }

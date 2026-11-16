@@ -51,9 +51,7 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::paths::state_dir::project_dir;
-
-const CONFIG_FILE_NAME: &str = "config.toml";
+use crate::paths::state_dir::StateDir;
 
 // ---------------------------------------------------------------------------
 // Per-project config
@@ -222,12 +220,12 @@ impl Default for CleanupConfig {
 /// `storage::connection::project_dir` computes for `index.db`, so a
 /// project's config and its index always agree on where they live.
 pub fn project_config_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(CONFIG_FILE_NAME))
+    Ok(StateDir::of(root)?.config_file())
 }
 
 /// `~/.g-mesh/config.toml`, or `$G_MESH_HOME/config.toml`.
 pub fn global_config_path() -> Result<PathBuf> {
-    Ok(crate::paths::g_mesh_home()?.join(CONFIG_FILE_NAME))
+    Ok(crate::paths::state_dir::global_config_file(&crate::paths::g_mesh_home()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +246,7 @@ pub fn read_project_config(root: &Path) -> Result<ProjectConfig> {
 /// never indexed still records which root it belongs to - otherwise it would
 /// be the one kind of state directory `clean orphaned` could never judge.
 pub fn write_project_config(root: &Path, config: &ProjectConfig) -> Result<()> {
-    crate::paths::state_dir::ensure_project_dir(root)?;
+    StateDir::ensure(root)?;
     write_toml(&project_config_path(root)?, config)
 }
 
@@ -291,6 +289,7 @@ fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::state_dir::project_dir;
 
     #[test]
     fn a_missing_project_config_reads_as_documented_defaults() {

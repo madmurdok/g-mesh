@@ -12,7 +12,7 @@
 //! Since task 155, "every plugin" is not one hardcoded process: `daemon
 //! ::registry::PluginRegistry` gives each language its own pid file
 //! (`plugin-<language>.pid`), so this command lists whatever is present
-//! (`daemon::registry::discovered_pid_files`) rather than assuming exactly
+//! (`StateDir::plugin_pid_files`) rather than assuming exactly
 //! one. A language asleep on *its own* idle timeout is not something this
 //! command has to handle specially, and that is by construction: its
 //! supervisor removes its pid file when it puts that language to sleep, so a
@@ -51,8 +51,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::daemon;
-use crate::paths::state_dir::project_dir;
+use crate::control::lock::{self, DaemonLock};
+use crate::paths::state_dir::{read_pid_file, StateDir};
 use crate::process;
 
 /// How long a process that has been asked to stop is given before the next,
@@ -92,7 +92,7 @@ impl Stopped {
 pub struct Outcome {
     pub core: Option<Stopped>,
     /// One entry per language that had a live pid file, in the order
-    /// `daemon::registry::discovered_pid_files` reports them (sorted by
+    /// `StateDir::plugin_pid_files` reports them (sorted by
     /// language).
     pub plugins: Vec<(String, Stopped)>,
     /// Whether the core this command stopped was found through the daemon
@@ -125,18 +125,19 @@ pub fn stop(project_root: &Path) -> Result<Outcome> {
     // check keyed off that file, and holds the project's lock for as long as
     // it lives - so the lock, not the pid file, is the source of truth this
     // has to agree with `daemon::acquire_singleton_lock` on.
-    let core_pid = match live_pid(&daemon::pid_path(project_root)?) {
+    let state_dir = StateDir::of(project_root)?;
+    let core_pid = match live_pid(&state_dir.pid_file()) {
         Some(pid) => Some(pid),
-        None => match daemon::inspect_daemon_lock(project_root)? {
-            daemon::DaemonLock::Wedged { pid } => {
+        None => match lock::inspect_daemon_lock(project_root)? {
+            DaemonLock::Wedged { pid } => {
                 outcome.core_was_wedged = true;
                 Some(pid)
             }
             _ => None,
         },
     };
-    let state_dir = project_dir(project_root).context("failed to resolve the project's state directory")?;
-    let plugin_pids: Vec<(String, u32)> = daemon::registry::discovered_pid_files(&state_dir)
+    let plugin_pids: Vec<(String, u32)> = state_dir
+        .plugin_pid_files()
         .into_iter()
         .filter_map(|(language, path)| live_pid(&path).map(|pid| (language, pid)))
         .collect();
@@ -161,14 +162,14 @@ pub fn stop(project_root: &Path) -> Result<Outcome> {
         outcome.plugins.push((language, stopped));
     }
 
-    tidy_state_files(project_root)?;
+    tidy_state_files(&state_dir)?;
     Ok(outcome)
 }
 
 /// The pid recorded in `path`, if it names a process that is actually
 /// running. A pid file left behind by a crashed daemon reads as `None`.
 fn live_pid(path: &Path) -> Option<u32> {
-    daemon::read_pid_file(path).filter(|&pid| daemon::is_process_alive(pid))
+    read_pid_file(path).filter(|&pid| process::is_alive(pid))
 }
 
 /// Ask, then insist, waiting for the process to go after each
@@ -254,7 +255,7 @@ fn wait_until_group_gone(pgid: u32, timeout: Duration) -> bool {
 fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if !daemon::is_process_alive(pid) {
+        if !process::is_alive(pid) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -270,10 +271,9 @@ fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
 /// command just stopped something": `stop` also runs against projects whose
 /// daemon crashed, and it must not delete the socket of a daemon that is
 /// somehow still serving (e.g. one whose pid file was removed by hand).
-fn tidy_state_files(project_root: &Path) -> Result<()> {
-    let state_dir = project_dir(project_root).context("failed to resolve the project's state directory")?;
-    let mut paths = vec![daemon::pid_path(project_root)?];
-    paths.extend(daemon::registry::discovered_pid_files(&state_dir).into_iter().map(|(_, path)| path));
+fn tidy_state_files(state_dir: &StateDir) -> Result<()> {
+    let mut paths = vec![state_dir.pid_file()];
+    paths.extend(state_dir.plugin_pid_files().into_iter().map(|(_, path)| path));
     for path in paths {
         if live_pid(&path).is_none() {
             let _ = fs::remove_file(&path);
@@ -291,9 +291,9 @@ fn tidy_state_files(project_root: &Path) -> Result<()> {
     // endpoint, so once nothing is answering there it describes nobody. Keyed
     // off the endpoint rather than off the pid file the loop above may have
     // just removed, which would read as "nothing running" whatever the truth.
-    if !daemon::is_listening(project_root)? {
-        daemon::endpoint(project_root)?.clear_stale();
-        let _ = fs::remove_file(daemon::build_stamp_path(project_root)?);
+    if !lock::is_listening(state_dir)? {
+        lock::endpoint(state_dir)?.clear_stale();
+        let _ = fs::remove_file(state_dir.build_stamp_file());
         // Same condition, same reasoning, one more kind of state that
         // describes nobody once nothing is serving this project: a
         // `plugin-<language>.suspended` marker (task GM-274's memory-limit
@@ -303,7 +303,7 @@ fn tidy_state_files(project_root: &Path) -> Result<()> {
         // already happened - `stop` is as much a restart boundary as the next
         // `daemon::run` clearing the same markers on its own way up (see that
         // call's own comment).
-        daemon::registry::clear_stale_suspension_markers(&state_dir);
+        state_dir.clear_suspension_markers();
     }
     Ok(())
 }

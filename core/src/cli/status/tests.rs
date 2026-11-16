@@ -1,5 +1,6 @@
 use super::*;
 use crate::indexing_status::{EmbedProgress, SemanticProgress, WalkProgress};
+use crate::paths::state_dir::project_dir;
 use crate::storage::schema;
 
 /// The plugins this checkout ships - their real `plugin.toml`s, read from

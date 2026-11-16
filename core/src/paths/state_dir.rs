@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -116,7 +116,7 @@ pub fn projects_root() -> Result<PathBuf> {
 
 /// [`projects_root`] under the g-mesh home `home`.
 pub(crate) fn projects_root_under(home: &Path) -> PathBuf {
-    home.join("projects")
+    home.join(PROJECTS_DIR)
 }
 
 /// `~/.g-mesh/projects/<hash>/` for the given (canonicalized) project root.
@@ -169,7 +169,7 @@ pub(crate) fn ensure_project_dir_under(home: &Path, root: &Path) -> Result<PathB
     Ok(dir)
 }
 
-/// The temp-then-rename write behind `daemon::write_pid_file`, also used for the phase file.
+/// The temp-then-rename write behind [`write_pid_file`], also used for the phase file.
 pub(crate) fn write_state_file_atomic(path: &Path, contents: &str, what: &str) {
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     if let Err(err) = fs::write(&temporary, contents) {
@@ -180,6 +180,391 @@ pub(crate) fn write_state_file_atomic(path: &Path, contents: &str, what: &str) {
         crate::log_line!("g-mesh daemon: failed to put {what} {} in place: {err}", path.display());
         let _ = fs::remove_file(&temporary);
     }
+}
+
+// ---- File names. Every state file's name is spelled here and nowhere else in the crate. ----
+
+/// The directory under the g-mesh home that holds every project's state directory.
+pub const PROJECTS_DIR: &str = "projects";
+/// The project's SQLite index.
+pub const INDEX_DB_FILE: &str = "index.db";
+/// The per-project config (in a state directory) and the global one (in the home).
+pub const CONFIG_FILE: &str = "config.toml";
+/// The daemon's stderr, appended to by every daemon a shim spawns for the project.
+pub const DAEMON_LOG_FILE: &str = "daemon.log";
+/// Unix only: on Windows the endpoint is a pipe name (see `ipc::windows`).
+#[cfg(unix)]
+pub const SOCKET_FILE: &str = "daemon.sock";
+/// The live daemon's pid, next to its socket.
+pub const PID_FILE: &str = "daemon.pid";
+/// The build the live daemon started from (see `daemon::build_stamp`).
+pub const BUILD_STAMP_FILE: &str = "daemon.build";
+/// Held by a shim while it bootstraps a daemon (`shim::connect_or_bootstrap`).
+pub const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
+/// Held by a running daemon for its whole lifetime: its holder owns the
+/// project's socket. Not the bootstrap lock: the shim holds that one while
+/// spawning the daemon, so sharing it would deadlock.
+pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
+/// Where the lock's holder records that it has begun serving. Beside the lock,
+/// not inside it: on Windows a second handle cannot read a locked file. Only
+/// the holder writes it: after taking the lock, and the next taker clears it.
+pub const DAEMON_SERVING_FILE: &str = "daemon.serving";
+/// Written by `g-mesh reindex` and `g-mesh init` for as long as they rebuild
+/// the project's index: their pid, start time and command, one per line.
+pub const REBUILD_MARKER_FILE: &str = "reindex.pid";
+/// The cold-start phase, one lowercased `indexing_status::Phase` word. Written
+/// on every transition, removed on the way out, so outside readers tell "never
+/// indexed" from "building".
+pub const PHASE_FILE: &str = "index.phase";
+/// The progress counters as JSON, written atomically and throttled by
+/// `indexing_status::IndexingStatus`. A killed daemon leaves it behind, so a
+/// reader must check its `pid` against the live daemon before trusting it.
+pub const PROGRESS_FILE: &str = "index.progress";
+/// How the daemon resolved its rerank (`embedding::rerank::OutcomeRecord`).
+/// A killed daemon leaves it behind, so a reader checks its `pid` against the
+/// live daemon.
+pub const RERANK_FILE: &str = "rerank.outcome";
+/// The temp file a seed is copied into before its rename to [`INDEX_DB_FILE`].
+pub const SEED_TMP_FILE: &str = "index.db.seed-tmp";
+/// Under the home: the shim's orphan sweep's clock (mtime) and lock.
+pub const ORPHAN_SWEEP_STAMP: &str = "orphan-sweep.stamp";
+const PLUGIN_PREFIX: &str = "plugin-";
+const PID_SUFFIX: &str = ".pid";
+const SUSPENDED_SUFFIX: &str = ".suspended";
+const STAGING_PREFIX: &str = "staging-";
+const STAGING_SUFFIX: &str = ".db";
+
+/// What a probe answers when the file it probes cannot be opened or locked for
+/// a reason other than "not there". Named at every call site: the callers want
+/// opposite answers on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUnreadable {
+    /// Unreadable reads as held.
+    Held,
+    /// Unreadable reads as free.
+    Free,
+}
+
+/// One project's state directory (`<home>/projects/<project_hash>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateDir(PathBuf);
+
+impl AsRef<Path> for StateDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// A CLI rebuild's marker, as written: who, since when, and which command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildMarker {
+    pub pid: u32,
+    pub started_unix_secs: u64,
+    pub command: String,
+}
+
+impl StateDir {
+    /// The state directory of the project at `root` (not created).
+    pub fn of(root: &Path) -> Result<Self> {
+        project_dir(root).map(Self)
+    }
+
+    /// [`StateDir::of`] under the g-mesh home `home`.
+    pub(crate) fn of_under(home: &Path, root: &Path) -> Result<Self> {
+        project_dir_under(home, root).map(Self)
+    }
+
+    /// The state directory of the project at `root`, created and recording its
+    /// root (see [`ensure_project_dir`]).
+    pub fn ensure(root: &Path) -> Result<Self> {
+        ensure_project_dir(root).map(Self)
+    }
+
+    /// [`StateDir::ensure`] under the g-mesh home `home`.
+    pub(crate) fn ensure_under(home: &Path, root: &Path) -> Result<Self> {
+        ensure_project_dir_under(home, root).map(Self)
+    }
+
+    /// A directory already known (listing `projects/`), whose root may be gone.
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// The final component (the project hash): the Windows pipe name.
+    pub fn id(&self) -> Option<&str> {
+        self.0.file_name()?.to_str()
+    }
+
+    pub fn index_db(&self) -> PathBuf {
+        self.0.join(INDEX_DB_FILE)
+    }
+
+    pub fn config_file(&self) -> PathBuf {
+        self.0.join(CONFIG_FILE)
+    }
+
+    pub fn daemon_log_file(&self) -> PathBuf {
+        self.0.join(DAEMON_LOG_FILE)
+    }
+
+    #[cfg(unix)]
+    pub fn socket_file(&self) -> PathBuf {
+        self.0.join(SOCKET_FILE)
+    }
+
+    pub fn pid_file(&self) -> PathBuf {
+        self.0.join(PID_FILE)
+    }
+
+    /// `plugin-<language>.pid`: one pid file per language.
+    pub fn plugin_pid_file(&self, language: &str) -> PathBuf {
+        self.0.join(format!("{PLUGIN_PREFIX}{language}{PID_SUFFIX}"))
+    }
+
+    /// `plugin-<language>.suspended`: the memory-limit suspension marker, named
+    /// like that language's pid file.
+    pub fn plugin_suspended_marker(&self, language: &str) -> PathBuf {
+        self.0.join(format!("{PLUGIN_PREFIX}{language}{SUSPENDED_SUFFIX}"))
+    }
+
+    pub fn build_stamp_file(&self) -> PathBuf {
+        self.0.join(BUILD_STAMP_FILE)
+    }
+
+    pub fn bootstrap_lock_file(&self) -> PathBuf {
+        self.0.join(BOOTSTRAP_LOCK_FILE)
+    }
+
+    pub fn daemon_lock_file(&self) -> PathBuf {
+        self.0.join(DAEMON_LOCK_FILE)
+    }
+
+    pub fn rebuild_marker_file(&self) -> PathBuf {
+        self.0.join(REBUILD_MARKER_FILE)
+    }
+
+    pub fn phase_file(&self) -> PathBuf {
+        self.0.join(PHASE_FILE)
+    }
+
+    pub fn progress_file(&self) -> PathBuf {
+        self.0.join(PROGRESS_FILE)
+    }
+
+    pub fn rerank_outcome_file(&self) -> PathBuf {
+        self.0.join(RERANK_FILE)
+    }
+
+    pub fn seed_tmp_file(&self) -> PathBuf {
+        self.0.join(SEED_TMP_FILE)
+    }
+
+    /// Where `language`'s staging index lives (`staging-<language>.db`).
+    pub fn staging_db(&self, language: &str) -> PathBuf {
+        self.0.join(format!("{STAGING_PREFIX}{language}{STAGING_SUFFIX}"))
+    }
+
+    /// Whether a file name in a state directory is a staging index.
+    pub fn is_staging_db(file_name: &str) -> bool {
+        file_name.starts_with(STAGING_PREFIX) && file_name.ends_with(STAGING_SUFFIX)
+    }
+
+    fn serving_file(&self) -> PathBuf {
+        self.0.join(DAEMON_SERVING_FILE)
+    }
+
+    /// Every `<prefix><language><suffix>` file present, paired with its language,
+    /// sorted by language. Empty for a directory that does not exist or cannot
+    /// be listed.
+    fn plugin_files(&self, suffix: &str) -> Vec<(String, PathBuf)> {
+        let mut files = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.0) else { return files };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(language) = name.strip_prefix(PLUGIN_PREFIX).and_then(|n| n.strip_suffix(suffix)) {
+                files.push((language.to_string(), entry.path()));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    /// Every `plugin-<language>.pid` file present, paired with the language its
+    /// name encodes, sorted. For tooling with no running daemon to ask: empty,
+    /// not an error, for a directory that does not exist or cannot be listed
+    /// ("unreadable means nothing recorded").
+    pub fn plugin_pid_files(&self) -> Vec<(String, PathBuf)> {
+        self.plugin_files(PID_SUFFIX)
+    }
+
+    /// Every `plugin-<language>.suspended` marker present, paired with its
+    /// language and the reason written into it, sorted. Independent of
+    /// [`StateDir::plugin_pid_files`]: a suspended language has no pid file. A
+    /// marker that exists but cannot be read reports `"(unreadable)"`: it is
+    /// still evidence something suspended that language.
+    pub fn suspended_markers(&self) -> Vec<(String, String)> {
+        self.plugin_files(SUSPENDED_SUFFIX)
+            .into_iter()
+            .map(|(language, path)| {
+                let reason = fs::read_to_string(path)
+                    .map(|contents| contents.trim().to_string())
+                    .unwrap_or_else(|_| "(unreadable)".to_string());
+                (language, reason)
+            })
+            .collect()
+    }
+
+    /// Removes every suspension marker. Called while nothing serves the project
+    /// (daemon start under the singleton lock, `stop`). Best-effort: a marker
+    /// left behind is stale, and the next call clears it.
+    pub fn clear_suspension_markers(&self) {
+        for (_, path) in self.plugin_files(SUSPENDED_SUFFIX) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// The root [`record_project_root`] wrote here (see [`read_project_root`]).
+    pub fn project_root(&self) -> Option<PathBuf> {
+        read_project_root(&self.0)
+    }
+
+    /// The device id [`record_project_root`] wrote here (see [`read_root_device`]).
+    pub fn root_device(&self) -> Option<u64> {
+        read_root_device(&self.0)
+    }
+
+    /// Whether anything holds the daemon lock, probed by taking and dropping it.
+    /// A missing lock file is not held. `on_unreadable` answers a lock file
+    /// that cannot be opened, and (`Held` only) one whose lock cannot be
+    /// probed; with `Free` a probe error is returned. `Held` never errs.
+    pub fn daemon_lock_held(&self, on_unreadable: OnUnreadable) -> Result<bool> {
+        let path = self.daemon_lock_file();
+        let file = match File::options().write(true).truncate(false).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Ok(on_unreadable == OnUnreadable::Held),
+        };
+        match file.try_lock() {
+            // Held by nobody: taken here for an instant and released by this drop.
+            Ok(()) => Ok(false),
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(err)) => match on_unreadable {
+                OnUnreadable::Held => Ok(true),
+                OnUnreadable::Free => Err(err).with_context(|| format!("failed to probe {}", path.display())),
+            },
+        }
+    }
+
+    /// The pid the lock's holder recorded once serving. `None` for a missing,
+    /// empty, unparseable or newline-less record: all mean "nothing recorded".
+    pub fn serving_owner(&self) -> Option<u32> {
+        let recorded = fs::read_to_string(self.serving_file()).ok()?;
+        recorded.strip_suffix('\n')?.trim().parse().ok()
+    }
+
+    /// Records that the lock's holder (`pid`) is now serving. Called after the
+    /// socket is bound, never before: a holder with no pid recorded is starting
+    /// up and must be left alone; one whose recorded pid is alive while nothing
+    /// answers is wedged and can be evicted. The record is newline-terminated and
+    /// [`StateDir::serving_owner`] refuses one without it: a reader may signal
+    /// the pid it reads, so a partial record must read as nothing. Best-effort:
+    /// a failure reads as `Starting`, which is left alone.
+    pub(crate) fn record_serving_owner(&self, pid: u32) {
+        write_pid_file(&self.serving_file(), pid);
+    }
+
+    /// Removes the serving record, so a fresh lock holder does not inherit its
+    /// predecessor's claim. Called under the lock, which keeps "only the holder
+    /// writes this" true.
+    pub(crate) fn clear_serving_owner(&self) {
+        let path = self.serving_file();
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => crate::log_line!("g-mesh daemon: failed to clear {}: {err}", path.display()),
+        }
+    }
+
+    /// The phase word a running daemon published; `None` when no daemon is
+    /// running (it removes the file on exit) or none ever ran.
+    pub fn read_phase(&self) -> Option<String> {
+        fs::read_to_string(self.phase_file()).ok().map(|contents| contents.trim().to_string())
+    }
+
+    /// The rebuild marker as written, without judging whether it is live.
+    /// `None` for a missing file or one without a pid and a start time.
+    pub fn rebuild_marker(&self) -> Option<RebuildMarker> {
+        let contents = fs::read_to_string(self.rebuild_marker_file()).ok()?;
+        let mut lines = contents.lines();
+        let (Some(Ok(pid)), Some(Ok(started_unix_secs))) =
+            (lines.next().map(str::parse::<u32>), lines.next().map(str::parse::<u64>))
+        else {
+            return None;
+        };
+        let command = lines.next().unwrap_or("reindex").to_string();
+        Some(RebuildMarker { pid, started_unix_secs, command })
+    }
+
+    /// Records that this process is rebuilding this index on behalf of
+    /// `g-mesh <command>`.
+    pub(crate) fn write_rebuild_marker(&self, command: &str) -> Result<()> {
+        let path = self.rebuild_marker_file();
+        let started =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        fs::write(&path, format!("{}\n{started}\n{command}\n", std::process::id()))
+            .with_context(|| format!("failed to write the rebuild marker {}", path.display()))
+    }
+
+    /// Removes the rebuild marker a crashed `g-mesh reindex`/`init` left behind.
+    /// Only a normal daemon calls this, after taking the singleton lock; never
+    /// the lock acquisition itself, which the rebuild also goes through.
+    pub(crate) fn clear_stale_rebuild_marker(&self) {
+        let path = self.rebuild_marker_file();
+        match fs::remove_file(&path) {
+            Ok(()) => crate::log_line!("g-mesh daemon: removed a stale rebuild marker {}", path.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => crate::log_line!("g-mesh daemon: failed to remove {}: {err}", path.display()),
+        }
+    }
+}
+
+/// Reads a pid from a pid file; `None` for "nothing recorded". See
+/// [`read_pid_file_result`] where "could not tell" must differ from that.
+pub fn read_pid_file(path: &Path) -> Option<u32> {
+    read_pid_file_result(path).ok().flatten()
+}
+
+/// Like [`read_pid_file`], but an unreadable file is an error: a caller deciding
+/// a deletion must not read "could not tell" as "safe". A present but
+/// unparseable file stays `Ok(None)`, which callers depend on.
+pub fn read_pid_file_result(path: &Path) -> std::io::Result<Option<u32>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(contents.trim().parse().ok()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Records a pid atomically (a per-process temporary renamed into place), so a
+/// reader never sees a truncated file, which reads as "no daemon". Best-effort:
+/// every reader handles "nothing recorded".
+pub fn write_pid_file(path: &Path, pid: u32) {
+    write_state_file_atomic(path, &format!("{pid}\n"), "pid file");
+}
+
+/// The global config file, directly under the g-mesh home.
+pub fn global_config_file(home: &Path) -> PathBuf {
+    home.join(CONFIG_FILE)
+}
+
+/// The orphan sweep's stamp file, directly under the g-mesh home.
+pub fn orphan_sweep_stamp(home: &Path) -> PathBuf {
+    home.join(ORPHAN_SWEEP_STAMP)
 }
 
 #[cfg(test)]

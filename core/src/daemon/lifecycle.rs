@@ -36,6 +36,7 @@ use anyhow::{bail, Context, Result};
 use crate::config::ProjectConfig;
 use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
+use crate::paths::state_dir::StateDir;
 use crate::plugin_manifest::PluginManifest;
 use crate::protocol::jsonrpc::is_timeout;
 use crate::storage::index_store::{self, IndexStore};
@@ -259,7 +260,7 @@ impl PluginSupervisor {
     ) -> Result<Arc<Self>> {
         let process = PluginProcess::spawn(project_root, &manifest, pid_file.clone())
             .with_context(|| format!("failed to start the {} plugin", manifest.language))?;
-        super::write_pid_file(&pid_file, process.pid());
+        crate::paths::state_dir::write_pid_file(&pid_file, process.pid());
 
         Ok(Arc::new(Self {
             project_root: project_root.to_path_buf(),
@@ -368,7 +369,7 @@ impl PluginSupervisor {
         if inner.process.is_none() {
             let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
                 .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
-            super::write_pid_file(&self.pid_file, process.pid());
+            crate::paths::state_dir::write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
 
@@ -472,7 +473,7 @@ impl PluginSupervisor {
         if inner.process.is_none() {
             let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
                 .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
-            super::write_pid_file(&self.pid_file, process.pid());
+            crate::paths::state_dir::write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
         self.touch();
@@ -513,7 +514,7 @@ impl PluginSupervisor {
                         self.manifest.language
                     )
                 })?;
-            super::write_pid_file(&self.pid_file, process.pid());
+            crate::paths::state_dir::write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
         self.touch();
@@ -662,14 +663,14 @@ impl PluginSupervisor {
     /// This language's suspension marker: next to the pid file and named the same
     /// way, so `cli::status`/`cli::stop` find it by listing the state directory.
     fn suspended_marker_path(&self) -> PathBuf {
-        self.pid_file
-            .parent()
-            .expect("a pid file is always inside the project's state directory")
-            .join(super::registry::plugin_suspended_marker_file_name(&self.manifest.language))
+        StateDir::at(
+            self.pid_file.parent().expect("a pid file is always inside the project's state directory"),
+        )
+        .plugin_suspended_marker(&self.manifest.language)
     }
 
     /// Best-effort write of the suspension marker, temp-then-rename like
-    /// [`super::write_pid_file`] so a reader never sees a half-written one;
+    /// [`crate::paths::state_dir::write_pid_file`] so a reader never sees a half-written one;
     /// `reason` is the only record of why a language was suspended.
     fn write_suspended_marker(&self, reason: &str) {
         let path = self.suspended_marker_path();
@@ -1044,20 +1045,22 @@ pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
 /// that the daemon is gone, so nothing it describes may outlive it (GM-446).
 /// The endpoint stays last, as before.
 fn release_state_files(state_dir: &Path) {
-    for (_, pid_file) in super::registry::discovered_pid_files(state_dir) {
+    let sd = StateDir::at(state_dir);
+    for (_, pid_file) in sd.plugin_pid_files() {
         let _ = fs::remove_file(pid_file);
     }
-    let _ = fs::remove_file(super::build_stamp_path_in(state_dir));
+    let _ = fs::remove_file(sd.build_stamp_file());
     // The phase file exists only while a daemon publishes it, so no outside
     // reader mistakes a stale phase for a live one's (D13 in
     // `docs/architecture/lazy-indexing.md`).
-    let _ = fs::remove_file(super::phase_path_in(state_dir));
-    let _ = fs::remove_file(super::progress_path_in(state_dir));
-    let _ = fs::remove_file(super::rerank_outcome_path_in(state_dir));
-    let _ = fs::remove_file(super::pid_path_in(state_dir));
-    // Derived through the parent module so what a daemon binds and what it
-    // releases are the same endpoint by construction. No-op on Windows.
-    if let Some(endpoint) = super::endpoint_in(state_dir) {
+    let _ = fs::remove_file(sd.phase_file());
+    let _ = fs::remove_file(sd.progress_file());
+    let _ = fs::remove_file(sd.rerank_outcome_file());
+    let _ = fs::remove_file(sd.pid_file());
+    // Derived through `ipc::endpoint_for`, as `daemon::run` binds it, so what a
+    // daemon binds and what it releases are the same endpoint by construction.
+    // No-op on Windows.
+    if let Some(endpoint) = crate::ipc::endpoint_for(&sd) {
         endpoint.clear_stale();
     }
 }

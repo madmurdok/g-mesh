@@ -37,7 +37,7 @@ use crate::gc::last_used;
 use crate::indexing_status::{ColdCause, IndexingStatus};
 use crate::ipc;
 use crate::mcp;
-use crate::paths::state_dir::{ensure_project_dir, project_dir};
+use crate::paths::state_dir::{OnUnreadable, StateDir};
 use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -47,168 +47,106 @@ use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
 use crate::watcher::rescan::RescanScheduler;
 use crate::watcher::{Change, ProjectWatcher};
 
-/// Unix only: on Windows the endpoint is a pipe name (see `ipc::windows`).
-#[cfg(unix)]
-const SOCKET_FILE: &str = "daemon.sock";
-const PID_FILE: &str = "daemon.pid";
-/// The build the live daemon started from (see `daemon::build_stamp`).
-const BUILD_STAMP_FILE: &str = "daemon.build";
-/// Held by a shim while it bootstraps a daemon (`shim::connect_or_bootstrap`).
-const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
-/// Held by a running daemon for its whole lifetime: its holder owns the
-/// project's socket. Not the bootstrap lock: the shim holds that one while
-/// spawning the daemon, so sharing it would deadlock.
-const DAEMON_LOCK_FILE: &str = "daemon.lock";
-/// Written by `g-mesh reindex` and `g-mesh init` for as long as they rebuild
-/// the project's index: their pid, start time and command, one per line.
-const REBUILD_MARKER_FILE: &str = "reindex.pid";
-
-/// Where the lock's holder records that it has begun serving. Beside the lock,
-/// not inside it: on Windows a second handle cannot read a locked file. Only
-/// the holder writes it: after taking the lock, and the next taker clears it.
-const DAEMON_SERVING_FILE: &str = "daemon.serving";
-
-/// The cold-start phase, one lowercased [`indexing_status::Phase`] word (D13 in
-/// `docs/architecture/lazy-indexing.md`). Written on every transition, removed
-/// on the way out, so outside readers tell "never indexed" from "building".
-const PHASE_FILE: &str = "index.phase";
-
-/// The progress counters as JSON, written atomically and throttled by
-/// [`indexing_status::IndexingStatus`]. A killed daemon leaves it behind, so a
-/// reader must check its `pid` against the live daemon before trusting it.
-const PROGRESS_FILE: &str = "index.progress";
-
-/// How the daemon resolved its rerank (`embedding::rerank::OutcomeRecord`),
-/// written once, on the first `search_code` call that asks. A killed daemon
-/// leaves it behind, so a reader checks its `pid` against the live daemon.
-const RERANK_FILE: &str = "rerank.outcome";
-
 /// The watcher's debounce window and its loop's poll bound: a path is reparsed
 /// once quiet this long, and a settled burst is drained only when the loop
 /// wakes, so this must stay short. Unrelated to the idle timeouts.
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
+// ---- Compat wrappers over `paths::state_dir::StateDir`, kept for the integration
+// tests that call them; production code uses `StateDir` directly. ----
+
+pub use crate::control::lock::{inspect_daemon_lock, DaemonLock};
+pub use crate::paths::state_dir::{read_pid_file, read_pid_file_result, write_pid_file};
+
 /// Where a project's daemon listens; the shim derives the same endpoint from
 /// its cwd. A socket file on Unix, a pipe name on Windows (`ipc::windows`).
 pub fn endpoint(root: &Path) -> Result<ipc::Endpoint> {
-    let dir = project_dir(root)?;
-    endpoint_in(&dir).with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))
+    crate::control::lock::endpoint(&StateDir::of(root)?)
 }
 
-/// [`endpoint`] from an already-known state directory, which is named after
-/// the project hash. `None` only for a path with no final component.
+/// [`endpoint`] from an already-known state directory (`ipc::endpoint_for`).
 pub fn endpoint_in(state_dir: &Path) -> Option<ipc::Endpoint> {
-    #[cfg(unix)]
-    {
-        Some(ipc::Endpoint::at_path(state_dir.join(SOCKET_FILE)))
-    }
-    #[cfg(windows)]
-    {
-        Some(ipc::Endpoint::named(state_dir.file_name()?.to_str()?))
-    }
+    ipc::endpoint_for(&StateDir::at(state_dir))
 }
 
-/// The AF_UNIX socket file a project's daemon listens on. Callers that only
-/// need to reach the daemon use [`endpoint`].
 #[cfg(unix)]
 pub fn socket_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(SOCKET_FILE))
+    Ok(StateDir::of(root)?.socket_file())
 }
 
-/// Records the live daemon's pid next to its socket, so tooling can tell a
-/// stale socket file from a running daemon.
 pub fn pid_path(root: &Path) -> Result<PathBuf> {
-    Ok(pid_path_in(&project_dir(root)?))
+    Ok(StateDir::of(root)?.pid_file())
 }
 
-/// The bundled JS/TS plugin's pid file. Multi-language tooling lists every
-/// `plugin-*.pid` instead (`daemon::registry::discovered_pid_files`).
+/// The bundled JS/TS plugin's pid file.
 pub fn plugin_pid_path(root: &Path) -> Result<PathBuf> {
-    Ok(plugin_pid_path_in(&project_dir(root)?))
+    Ok(plugin_pid_path_in(StateDir::of(root)?.path()))
 }
 
-/// The same paths from an already-known state directory, for callers whose
-/// project root may no longer exist (`cli::clean`).
 pub fn pid_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(PID_FILE)
+    StateDir::at(state_dir).pid_file()
 }
 
 pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(registry::plugin_pid_file_name(plugin::BUNDLED_LANGUAGE))
+    StateDir::at(state_dir).plugin_pid_file(plugin::BUNDLED_LANGUAGE)
 }
 
-/// Where [`PHASE_FILE`] lives for a given state directory.
 pub fn phase_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(PHASE_FILE)
+    StateDir::at(state_dir).phase_file()
 }
 
-/// Where [`RERANK_FILE`] lives for a given state directory.
 pub fn rerank_outcome_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(RERANK_FILE)
+    StateDir::at(state_dir).rerank_outcome_file()
 }
 
-/// Where [`PROGRESS_FILE`] lives for a given state directory.
 pub fn progress_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(PROGRESS_FILE)
+    StateDir::at(state_dir).progress_file()
 }
 
-/// The progress snapshot a daemon last published for this state directory,
-/// whoever wrote it: `None` for a missing or unparseable file. The snapshot's
-/// `pid` says which daemon wrote it; this does not check that it is alive.
 pub fn read_progress_in(state_dir: &Path) -> Option<indexing_status::ProgressSnapshot> {
-    let contents = fs::read_to_string(progress_path_in(state_dir)).ok()?;
-    serde_json::from_str(&contents).ok()
+    indexing_status::read_progress(&StateDir::at(state_dir))
 }
 
-/// The phase word a running daemon published here; `None` when no daemon is
-/// running (it removes the file on exit) or none ever ran.
 pub fn read_phase_in(state_dir: &Path) -> Option<String> {
-    fs::read_to_string(phase_path_in(state_dir)).ok().map(|contents| contents.trim().to_string())
+    StateDir::at(state_dir).read_phase()
 }
 
-/// Where the live daemon records the build it started from.
 pub fn build_stamp_path(root: &Path) -> Result<PathBuf> {
-    Ok(build_stamp_path_in(&project_dir(root)?))
+    Ok(StateDir::of(root)?.build_stamp_file())
 }
 
 pub fn build_stamp_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(BUILD_STAMP_FILE)
+    StateDir::at(state_dir).build_stamp_file()
 }
 
-/// The file shims serialize their bootstrap on, derived exactly like the
-/// socket and pid paths so every process agrees on it without configuration.
+/// The file shims serialize their bootstrap on.
 pub fn lock_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(BOOTSTRAP_LOCK_FILE))
-}
-
-/// [`lock_path`] inside an already-known state directory, for a caller whose
-/// project root may be gone (`project_hash` cannot be computed for it then).
-pub(crate) fn bootstrap_lock_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(BOOTSTRAP_LOCK_FILE)
-}
-
-/// [`lock_path`] under the g-mesh home `home` rather than the one the
-/// environment names (see `paths::state_dir::project_dir_under`).
-pub(crate) fn lock_path_under(home: &Path, root: &Path) -> Result<PathBuf> {
-    Ok(crate::paths::state_dir::project_dir_under(home, root)?.join(BOOTSTRAP_LOCK_FILE))
-}
-
-/// The singleton lock a running daemon holds for its whole lifetime.
-pub fn daemon_lock_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(DAEMON_LOCK_FILE))
+    Ok(StateDir::of(root)?.bootstrap_lock_file())
 }
 
 pub fn daemon_lock_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(DAEMON_LOCK_FILE)
-}
-
-fn serving_owner_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(DAEMON_SERVING_FILE)
+    StateDir::at(state_dir).daemon_lock_file()
 }
 
 pub fn rebuild_marker_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(REBUILD_MARKER_FILE)
+    StateDir::at(state_dir).rebuild_marker_file()
 }
+
+pub fn serving_owner_in(state_dir: &Path) -> Option<u32> {
+    StateDir::at(state_dir).serving_owner()
+}
+
+/// Whether a process with this pid exists: a snapshot, and pids are reused, so
+/// callers that care corroborate it with the endpoint.
+pub fn is_process_alive(pid: u32) -> bool {
+    crate::process::is_alive(pid)
+}
+
+pub fn is_listening(root: &Path) -> Result<bool> {
+    crate::control::lock::is_listening(&StateDir::of(root)?)
+}
+
+// ---- end of compat wrappers ----
 
 /// A CLI rebuild of a project's index in progress, as its marker records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,73 +157,27 @@ pub struct Rebuild {
     pub command: String,
 }
 
-/// Records that this process is rebuilding the index whose state directory
-/// holds `path`, on behalf of `g-mesh <command>`.
-pub(crate) fn write_rebuild_marker(path: &Path, command: &str) -> Result<()> {
-    let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    fs::write(path, format!("{}\n{started}\n{command}\n", std::process::id()))
-        .with_context(|| format!("failed to write the rebuild marker {}", path.display()))
-}
-
 /// The rebuild holding `root`'s index, if one is running. A marker counts only
 /// while its pid is alive and the daemon lock is held: a rebuild that crashed
 /// leaves a marker naming a dead (or reused) pid, and the kernel has already
 /// released its lock, so the project reads as free.
 pub fn rebuild_in_progress(root: &Path) -> Result<Option<Rebuild>> {
-    rebuild_in_progress_in(&project_dir(root)?)
+    rebuild_in_progress_in(&StateDir::of(root)?)
 }
 
-fn rebuild_in_progress_in(state_dir: &Path) -> Result<Option<Rebuild>> {
-    let Ok(contents) = fs::read_to_string(rebuild_marker_path_in(state_dir)) else {
+/// An unopenable lock file reads as free (no rebuild), so the shim may bootstrap.
+fn rebuild_in_progress_in(state_dir: &StateDir) -> Result<Option<Rebuild>> {
+    let Some(marker) = state_dir.rebuild_marker() else {
         return Ok(None);
     };
-    let mut lines = contents.lines();
-    let (Some(Ok(pid)), Some(Ok(started))) =
-        (lines.next().map(str::parse::<u32>), lines.next().map(str::parse::<u64>))
-    else {
-        return Ok(None);
-    };
-    let command = lines.next().unwrap_or("reindex").to_string();
-    if !is_process_alive(pid) || !daemon_lock_is_held(state_dir)? {
+    if !crate::process::is_alive(marker.pid) || !state_dir.daemon_lock_held(OnUnreadable::Free)? {
         return Ok(None);
     }
-    Ok(Some(Rebuild { pid, started: UNIX_EPOCH + Duration::from_secs(started), command }))
-}
-
-/// Reads a pid from one of the files above; `None` for "nothing recorded". See
-/// [`read_pid_file_result`] where "could not tell" must differ from that.
-pub fn read_pid_file(path: &Path) -> Option<u32> {
-    read_pid_file_result(path).ok().flatten()
-}
-
-/// Like [`read_pid_file`], but an unreadable file is an error: a caller deciding
-/// a deletion must not read "could not tell" as "safe". A present but
-/// unparseable file stays `Ok(None)`, which callers depend on.
-pub fn read_pid_file_result(path: &Path) -> std::io::Result<Option<u32>> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(contents.trim().parse().ok()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-/// Records a pid atomically (a per-process temporary renamed into place), so a
-/// reader never sees a truncated file, which reads as "no daemon". Best-effort:
-/// every reader handles "nothing recorded".
-pub fn write_pid_file(path: &Path, pid: u32) {
-    crate::paths::state_dir::write_state_file_atomic(path, &format!("{pid}\n"), "pid file");
-}
-
-/// Whether a process with this pid exists: a snapshot, and pids are reused, so
-/// callers that care corroborate it with the endpoint.
-pub fn is_process_alive(pid: u32) -> bool {
-    crate::process::is_alive(pid)
-}
-
-/// Whether something accepts connections on this project's endpoint now; not
-/// fooled by a recycled pid. The probe connection is dropped at once.
-pub fn is_listening(root: &Path) -> Result<bool> {
-    Ok(ipc::Stream::connect(&endpoint(root)?).is_ok())
+    Ok(Some(Rebuild {
+        pid: marker.pid,
+        started: UNIX_EPOCH + Duration::from_secs(marker.started_unix_secs),
+        command: marker.command,
+    }))
 }
 
 /// Per-project daemon core: opens the index, binds the endpoint, and serves an
@@ -294,9 +186,9 @@ pub fn is_listening(root: &Path) -> Result<bool> {
 /// races the socket appearing); a tool call that needs the graph waits for it
 /// (`daemon::indexing_status`), so no one is served off a partial graph.
 pub fn run(root: &Path) -> Result<()> {
-    // `ensure_project_dir`: a state directory without its `project.root` file
+    // `StateDir::ensure`: a state directory without its `project.root` file
     // is invisible to `clean orphaned` forever.
-    let dir = ensure_project_dir(root)?;
+    let dir = StateDir::ensure(root)?;
 
     // Singleton guard, before anything else touches the project's files.
     // Losing it is the healthy outcome: the caller connects to the incumbent.
@@ -307,13 +199,13 @@ pub fn run(root: &Path) -> Result<()> {
     // A daemon holding the lock means no rebuild holds it (a rebuild takes
     // the same lock), so any marker left here is a crashed rebuild's: once
     // its pid is reused it would read as live and turn every shim away.
-    clear_stale_rebuild_marker(&dir);
+    dir.clear_stale_rebuild_marker();
 
     // After the singleton lock, before the bind (never transiently missing).
     // Not fatal: a daemon that reads as outdated gets replaced.
     match build_stamp::of_running_process() {
         Ok(stamp) => {
-            if let Err(err) = build_stamp::write(&build_stamp_path_in(&dir), &stamp) {
+            if let Err(err) = build_stamp::write(&dir.build_stamp_file(), &stamp) {
                 crate::log_line!("g-mesh daemon: could not publish its build stamp: {err:#}");
             }
         }
@@ -322,7 +214,7 @@ pub fn run(root: &Path) -> Result<()> {
 
     // D10/D11: a folder of projects is served by the front, which needs no
     // plugin discovery and never creates an `index.db`.
-    let detection = candidates::detect_in(root, &dir, candidates::Limits::default());
+    let detection = candidates::detect_in(root, dir.path(), candidates::Limits::default());
     if detection.mode == candidates::Mode::Multi {
         return front::run(root, &dir, singleton, detection);
     }
@@ -335,10 +227,10 @@ pub fn run(root: &Path) -> Result<()> {
 
     // Before the index is opened and before any reindex can run: a staging
     // file left here belongs to a reindex that died.
-    workspace_reindex::remove_stale_staging(&dir);
-    seed::remove_stale_seed_tmp(&dir);
+    workspace_reindex::remove_stale_staging(dir.path());
+    seed::remove_stale_seed_tmp(dir.path());
     // Before `connection::open`, which would create an empty `index.db`.
-    if let Some(origin) = seed::seed_if_eligible(root, &dir, &registry::indexer_version(&discovered)) {
+    if let Some(origin) = seed::seed_if_eligible(root, dir.path(), &registry::indexer_version(&discovered)) {
         crate::log_line!(
             "g-mesh daemon: index seeded from {} in {} ms",
             origin.source_root.display(),
@@ -414,14 +306,13 @@ pub fn run(root: &Path) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
 
-    let endpoint = endpoint_in(&dir)
-        .with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))?;
+    let endpoint = crate::control::lock::endpoint(&dir)?;
     // A socket file left by a crashed daemon makes bind() fail forever; the
     // singleton lock guarantees any socket here is a dead one's.
     endpoint.clear_stale();
     // Suspension lasts until the daemon restarts, and this is that restart:
     // every stale marker is cleared, like the socket.
-    registry::clear_stale_suspension_markers(&dir);
+    dir.clear_suspension_markers();
     // From here a shim's `connect()` succeeds (queued on the backlog until the
     // accept loop is up), which is what its bootstrap timeout waits for.
     let listener = ipc::Listener::bind(&endpoint)
@@ -429,7 +320,7 @@ pub fn run(root: &Path) -> Result<()> {
 
     // Right after the bind, so "the pid file exists" means "something is
     // listening"; `meta.bulkIndexedAt`, not this, records a complete index.
-    let pid_file = dir.join(PID_FILE);
+    let pid_file = dir.pid_file();
     write_pid_file(&pid_file, std::process::id());
 
     // Unwalked: `Unindexed` until the first index-needing tool call; walked:
@@ -443,14 +334,14 @@ pub fn run(root: &Path) -> Result<()> {
     } else {
         IndexingStatus::structural()
     };
-    indexing.attach_phase_file(phase_path_in(&dir));
-    indexing.attach_progress_file(progress_path_in(&dir));
+    indexing.attach_phase_file(dir.phase_file());
+    indexing.attach_progress_file(dir.progress_file());
     // Attached before the accept loop can hand `indexing` to any session, so
     // no tool call ever finds it with nothing to trigger.
     let activation_trigger = indexing.attach_activation();
 
     // After the bind: the record means the holder got as far as serving.
-    record_serving_owner(&dir);
+    dir.record_serving_owner(std::process::id());
 
     // Resolved once, from config.toml or its defaults (`daemon::lifecycle`).
     let project_config =
@@ -461,8 +352,8 @@ pub fn run(root: &Path) -> Result<()> {
     // restart budgets): the first `apply` pays for it on its own thread. A
     // missing model does not stop the daemon, which never fetches one.
     let embedding = Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
-    let _ = fs::remove_file(rerank_outcome_path_in(&dir));
-    embedding.reranker().record_outcome_to(rerank_outcome_path_in(&dir));
+    let _ = fs::remove_file(dir.rerank_outcome_file());
+    embedding.reranker().record_outcome_to(dir.rerank_outcome_file());
 
     // The bulk walk spawns one-shot processes from the manifests, not the
     // registry's supervisors, so it takes its own copy before `discovered` moves.
@@ -471,7 +362,7 @@ pub fn run(root: &Path) -> Result<()> {
     // Spawns nothing: each language's plugin starts lazily (`daemon::registry`).
     let registry = Arc::new(PluginRegistry::new(
         &canonical_root,
-        dir.clone(),
+        dir.path().to_path_buf(),
         discovered,
         timeouts.plugin,
         project_config.plugin.memory_limit_mb,
@@ -572,7 +463,7 @@ pub fn run(root: &Path) -> Result<()> {
     // everything else resolved against.
     let outcome = lifecycle::supervise(
         &canonical_root,
-        &dir,
+        dir.path(),
         &registry,
         &core_activity,
         Some(&indexing_for_teardown),
@@ -586,7 +477,7 @@ pub fn run(root: &Path) -> Result<()> {
     let exit = outcome?;
     // After the lock, so the purge judges the directory as `clean` would; the
     // index this process still has open is no obstacle (see the function).
-    lifecycle::purge_state_dir(&dir, &exit);
+    lifecycle::purge_state_dir(dir.path(), &exit);
     Ok(())
 }
 
@@ -893,8 +784,8 @@ const SINGLETON_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// returned `File` must live as long as the daemon: the lock is tied to the
 /// open file, so exit or death releases it. A contended lock is retried because
 /// the kernel releases a `kill -9`'d holder's `flock` slightly after it dies.
-pub(crate) fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
-    let path = dir.join(DAEMON_LOCK_FILE);
+pub(crate) fn acquire_singleton_lock(dir: &StateDir) -> Result<Option<File>> {
+    let path = dir.daemon_lock_file();
     let file = File::options()
         .create(true)
         .write(true)
@@ -908,7 +799,7 @@ pub(crate) fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
             Ok(()) => {
                 // Cleared as soon as the lock is taken, so the state reads "not
                 // serving yet" for exactly as long as that is true.
-                clear_serving_owner(dir);
+                dir.clear_serving_owner();
                 return Ok(Some(file));
             }
             Err(TryLockError::WouldBlock) => {
@@ -922,106 +813,6 @@ pub(crate) fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
             }
         }
     }
-}
-
-/// What holds a project's daemon lock right now, judged from outside the
-/// holder. The lock alone decides who may serve a project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DaemonLock {
-    /// Nobody holds it: the project has no daemon and a bootstrap may go ahead.
-    Free,
-    /// Held by a daemon answering on the project's socket: the only state in
-    /// which another daemon must stand down.
-    Serving,
-    /// Held, but the holder has not published itself as serving yet. Entitled to
-    /// a moment: nothing may evict it on this alone.
-    Starting,
-    /// Held by a live process that published itself as serving and no longer
-    /// answers: no client can reach it, and it keeps the project until it exits.
-    Wedged { pid: u32 },
-}
-
-/// Diagnoses [`DaemonLock`] for `root`: the socket first (an answer means
-/// healthy), then the lock, probed by taking and dropping it. A daemon racing
-/// for the lock does not notice the probe only because it retries for
-/// `SINGLETON_LOCK_RETRY_BUDGET`, orders of magnitude longer than the probe
-/// holds it.
-pub fn inspect_daemon_lock(root: &Path) -> Result<DaemonLock> {
-    let listening = is_listening(root)?;
-    inspect_daemon_lock_in(&project_dir(root)?, listening)
-}
-
-/// [`inspect_daemon_lock`] with the state directory and "is anything
-/// listening" given, so the judgement is testable without a real socket.
-fn inspect_daemon_lock_in(state_dir: &Path, listening: bool) -> Result<DaemonLock> {
-    if listening {
-        return Ok(DaemonLock::Serving);
-    }
-    if !daemon_lock_is_held(state_dir)? {
-        return Ok(DaemonLock::Free);
-    }
-    match serving_owner_in(state_dir).filter(|&pid| is_process_alive(pid)) {
-        Some(pid) => Ok(DaemonLock::Wedged { pid }),
-        None => Ok(DaemonLock::Starting),
-    }
-}
-
-/// Whether anything holds the project's daemon lock. A lock file that cannot be
-/// opened reads as "not held": eviction must fail towards leaving processes alone.
-fn daemon_lock_is_held(state_dir: &Path) -> Result<bool> {
-    let path = daemon_lock_path_in(state_dir);
-    let Ok(file) = File::options().write(true).truncate(false).open(&path) else {
-        return Ok(false);
-    };
-    match file.try_lock() {
-        // Held by nobody: taken here for an instant and released by this drop.
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(err)) => {
-            Err(err).with_context(|| format!("failed to probe {}", path.display()))
-        }
-    }
-}
-
-/// Records that the lock's holder is now serving: its pid, beside the lock.
-/// Called after the socket is bound, never before: a holder with no pid
-/// recorded is starting up and must be left alone; one whose recorded pid is
-/// alive while nothing answers is wedged and can be evicted. The record is
-/// newline-terminated and [`serving_owner_in`] refuses one without it: a
-/// reader may signal the pid it reads, so a partial record must read as
-/// nothing. Best-effort: a failure reads as `Starting`, which is left alone.
-fn record_serving_owner(state_dir: &Path) {
-    write_pid_file(&serving_owner_path_in(state_dir), std::process::id());
-}
-
-/// Removes the rebuild marker a crashed `g-mesh reindex`/`init` left behind.
-/// Only a normal daemon calls this, after taking the singleton lock; never
-/// `acquire_singleton_lock` itself, which the rebuild also goes through.
-fn clear_stale_rebuild_marker(state_dir: &Path) {
-    let path = rebuild_marker_path_in(state_dir);
-    match fs::remove_file(&path) {
-        Ok(()) => crate::log_line!("g-mesh daemon: removed a stale rebuild marker {}", path.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => crate::log_line!("g-mesh daemon: failed to remove {}: {err}", path.display()),
-    }
-}
-
-/// Removes the record, so a fresh holder does not inherit its predecessor's
-/// claim. Called under the lock, which keeps "only the holder writes this" true.
-fn clear_serving_owner(state_dir: &Path) {
-    let path = serving_owner_path_in(state_dir);
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => crate::log_line!("g-mesh daemon: failed to clear {}: {err}", path.display()),
-    }
-}
-
-/// The pid the lock's holder recorded once serving. `None` for a missing,
-/// empty, unparseable or newline-less record: all mean "nothing recorded".
-pub fn serving_owner_in(state_dir: &Path) -> Option<u32> {
-    let recorded = fs::read_to_string(serving_owner_path_in(state_dir)).ok()?;
-    recorded.strip_suffix('\n')?.trim().parse().ok()
 }
 
 #[cfg(test)]

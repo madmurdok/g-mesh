@@ -14,11 +14,11 @@
 //!   (`daemon::build_stamp`), compared with this command's own; nothing else
 //!   in the report can show up a daemon that outlived an upgrade.
 //! - **Plugins**: one line per `plugin-<language>.pid` file
-//!   (`daemon::registry::discovered_pid_files`). A language with no pid file
+//!   (`StateDir::plugin_pid_files`). A language with no pid file
 //!   is not reported by name: "never touched" and "spawned, now asleep" are
 //!   indistinguishable from outside the daemon, so only "active", "orphaned"
 //!   and one summary line when there are none are reported.
-//! - **Index phase**: the word in `index.phase` (`daemon::read_phase_in`):
+//! - **Index phase**: the word in `index.phase` (`StateDir::read_phase`):
 //!   `unindexed`, `walking`, `structural`, `embedding`, `ready` or `failed`.
 //!   A project can sit `unindexed` under a live, idle daemon, so a live
 //!   daemon does not imply a walk.
@@ -45,13 +45,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
+use crate::control::lock::{self, DaemonLock};
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
 use crate::embedding::rerank::{OutcomeRecord, RerankModelState, RerankOutcome};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
 use crate::indexing_status::{group_thousands, ProgressSnapshot};
-use crate::paths::state_dir::project_dir;
+use crate::paths::state_dir::{read_pid_file, StateDir};
 use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::project_walk;
 use crate::storage::language_outcome::LanguageOutcome;
@@ -128,7 +129,7 @@ pub struct PluginReport {
 /// One language whose semantic passes are suspended right now: written by a
 /// running daemon's `PluginSupervisor::check_memory_limit` when `[plugin]
 /// memoryLimitMb` catches its process tree over the limit, and read here off
-/// disk (`daemon::registry::discovered_suspended_markers`). A listing of its
+/// disk (`StateDir::suspended_markers`). A listing of its
 /// own, not a field on [`PluginReport`]: a suspended plugin has no pid file
 /// (suspension removes it, like idle sleep), so the marker is the only trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,7 +354,7 @@ fn rerank_status(core: CoreState, state_dir: &Path) -> RerankStatus {
         CoreState::Running { pid } | CoreState::NotAccepting { pid } | CoreState::Wedged { pid } => Some(pid),
         CoreState::NotRunning => None,
     };
-    match OutcomeRecord::read(&daemon::rerank_outcome_path_in(state_dir))
+    match OutcomeRecord::read(&StateDir::at(state_dir).rerank_outcome_file())
         .filter(|record| Some(record.pid) == live_pid)
     {
         Some(record) => RerankStatus::Daemon(record),
@@ -397,12 +398,13 @@ pub fn run(full: bool, json: bool) -> Result<()> {
 /// Gathers every field of the report for `project_root`. Only
 /// [`Mode::Full`] walks the project's files.
 pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
-    let state_dir = project_dir(project_root).context("failed to resolve the project's state directory")?;
+    let sd = StateDir::of(project_root).context("failed to resolve the project's state directory")?;
+    let state_dir = sd.path().to_path_buf();
     let project_id =
         state_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
     let core = core_state(project_root)?;
-    let phase = daemon::read_phase_in(&state_dir);
+    let phase = sd.read_phase();
     let front = (phase.as_deref() == Some(daemon::front::FRONT_PHASE)).then(|| {
         let walk = crate::project_detect::walk(project_root, crate::project_detect::Limits::default());
         FrontSummary { projects: walk.candidates.len(), truncated: walk.truncated }
@@ -427,7 +429,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
     };
     let plugins = discovered.unwrap_or_default();
 
-    let db_path = state_dir.join("index.db");
+    let db_path = sd.index_db();
     let (index, section) = if front.is_some() {
         let index = IndexStatus {
             bulk_indexed: false,
@@ -465,7 +467,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
         index,
         phase,
         front,
-        progress: daemon::read_progress_in(&state_dir),
+        progress: crate::indexing_status::read_progress(&sd),
         languages: LanguagesReport { section, installed, retries },
         rerank_model: rerank_status(core, &state_dir),
         project_root: project_root.to_path_buf(),
@@ -541,19 +543,19 @@ pub(crate) fn open_index(db_path: &Path) -> Result<Connection> {
 }
 
 fn core_state(project_root: &Path) -> Result<CoreState> {
-    let recorded =
-        daemon::read_pid_file(&daemon::pid_path(project_root)?).filter(|&pid| daemon::is_process_alive(pid));
+    let state_dir = StateDir::of(project_root)?;
+    let recorded = read_pid_file(&state_dir.pid_file()).filter(|&pid| crate::process::is_alive(pid));
     let Some(pid) = recorded else {
         // No live pid file does not end the enquiry: a daemon that removed its
         // pid file and failed to exit still holds the singleton lock. The lock
         // is what `daemon::acquire_singleton_lock` acts on, so this report and
         // the next bootstrap cannot disagree.
-        return Ok(match daemon::inspect_daemon_lock(project_root)? {
-            daemon::DaemonLock::Wedged { pid } => CoreState::Wedged { pid },
+        return Ok(match lock::inspect_daemon_lock(project_root)? {
+            DaemonLock::Wedged { pid } => CoreState::Wedged { pid },
             _ => CoreState::NotRunning,
         });
     };
-    Ok(if daemon::is_listening(project_root)? {
+    Ok(if lock::is_listening(&state_dir)? {
         CoreState::Running { pid }
     } else {
         CoreState::NotAccepting { pid }
@@ -572,7 +574,7 @@ fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
     let Ok(ours) = build_stamp::of_running_process() else {
         return BuildState::Unknown;
     };
-    let published = build_stamp::read(&daemon::build_stamp_path_in(state_dir));
+    let published = build_stamp::read(&StateDir::at(state_dir).build_stamp_file());
     match build_stamp::vintage(published.as_ref(), &ours) {
         Vintage::Current => BuildState::Current,
         Vintage::Outdated => BuildState::Outdated,
@@ -582,13 +584,14 @@ fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
 }
 
 /// Every language with a live pid file in `state_dir`, sorted by language
-/// (the order `discovered_pid_files` returns). A pid file naming a dead
+/// (the order `StateDir::plugin_pid_files` returns). A pid file naming a dead
 /// process is dropped, as in every pid-file read in this daemon.
 fn plugin_reports(state_dir: &Path, core: CoreState) -> Vec<PluginReport> {
-    crate::daemon::registry::discovered_pid_files(state_dir)
+    StateDir::at(state_dir)
+        .plugin_pid_files()
         .into_iter()
         .filter_map(|(language, path)| {
-            let pid = daemon::read_pid_file(&path).filter(|&pid| daemon::is_process_alive(pid))?;
+            let pid = read_pid_file(&path).filter(|&pid| crate::process::is_alive(pid))?;
             Some(PluginReport { language, state: classify_plugin(pid, core) })
         })
         .collect()
@@ -598,7 +601,8 @@ fn plugin_reports(state_dir: &Path, core: CoreState) -> Vec<PluginReport> {
 /// [`plugin_reports`] it does not depend on `core`: a suspension is a fact
 /// about the state directory, not about a running daemon.
 fn suspended_language_reports(state_dir: &Path) -> Vec<SuspendedLanguage> {
-    crate::daemon::registry::discovered_suspended_markers(state_dir)
+    StateDir::at(state_dir)
+        .suspended_markers()
         .into_iter()
         .map(|(language, reason)| SuspendedLanguage { language, reason })
         .collect()

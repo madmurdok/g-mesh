@@ -213,7 +213,7 @@ fn completed_index_in(state_dir: &Path) -> bool {
 /// existence by a check. Never through `connection::open`, which creates the
 /// file.
 fn open_existing_index(state_dir: &Path) -> Option<Connection> {
-    let db_path = state_dir.join("index.db");
+    let db_path = crate::paths::state_dir::StateDir::at(state_dir).index_db();
     if fs::symlink_metadata(&db_path).is_err() {
         return None;
     }

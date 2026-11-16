@@ -449,8 +449,8 @@ pub fn render(outcome: &Outcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::fixture_tests::*;
     use crate::control::sweep::sweep_orphaned;
-    use crate::control::test_fixture::*;
 
     /// A cwd that is not any of the fixture's projects.
     fn unrelated_cwd() -> tempfile::TempDir {

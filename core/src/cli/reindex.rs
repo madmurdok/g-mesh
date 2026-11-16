@@ -177,11 +177,10 @@ impl Drop for MarkerFile {
 /// daemon can be bootstrapped between the stop and the rebuild.
 pub(crate) fn stop_for_rebuild(project_root: &Path, command: &str) -> Result<(stop::Outcome, RebuildHold)> {
     let bootstrap = crate::shim::acquire_bootstrap_lock(project_root)?;
-    let state_dir = crate::paths::state_dir::project_dir(project_root)
+    let state_dir = crate::paths::state_dir::StateDir::of(project_root)
         .context("failed to resolve the project's state directory")?;
-    let marker_path = daemon::rebuild_marker_path_in(&state_dir);
-    daemon::write_rebuild_marker(&marker_path, command)?;
-    let marker = MarkerFile(marker_path);
+    state_dir.write_rebuild_marker(command)?;
+    let marker = MarkerFile(state_dir.rebuild_marker_file());
 
     let stopped = stop::stop(project_root)?;
     let Some(daemon_lock) = daemon::acquire_singleton_lock(&state_dir)? else {
@@ -360,7 +359,9 @@ mod tests {
     fn a_rebuild_refuses_a_project_whose_daemon_lock_is_held() {
         let project = tempfile::tempdir().unwrap();
         let state = State(crate::paths::state_dir::ensure_project_dir(project.path()).unwrap());
-        let _other = daemon::acquire_singleton_lock(&state.0).unwrap().expect("the fixture's lock is free");
+        let _other = daemon::acquire_singleton_lock(&crate::paths::state_dir::StateDir::at(&state.0))
+            .unwrap()
+            .expect("the fixture's lock is free");
 
         let refused = stop_for_rebuild(project.path(), "init").err().expect("the rebuild must refuse");
         assert!(format!("{refused:#}").contains("still holds the daemon lock"), "{refused:#}");

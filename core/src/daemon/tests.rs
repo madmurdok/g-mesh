@@ -30,6 +30,7 @@ fn writing_a_pid_file_leaves_no_temporary_behind() {
     assert!(leftovers.is_empty(), "the temporary must be renamed, not left: {leftovers:?}");
 }
 use super::*;
+use crate::paths::state_dir::{project_dir, DAEMON_LOCK_FILE, DAEMON_SERVING_FILE};
 use crate::storage::index_store::IndexStore;
 
 /// Forces the exact shape of task 165's race deterministically, instead
@@ -65,8 +66,8 @@ fn a_lock_released_shortly_after_the_first_attempt_is_still_acquired() {
     // this cannot flake the other way - `acquire_singleton_lock` winning
     // a lock nobody was contending yet.
     ready_rx.recv().unwrap();
-    let acquired =
-        acquire_singleton_lock(dir.path()).expect("acquire_singleton_lock must not error on contention");
+    let acquired = acquire_singleton_lock(&StateDir::at(dir.path()))
+        .expect("acquire_singleton_lock must not error on contention");
     releaser.join().unwrap();
 
     assert!(
@@ -87,8 +88,8 @@ fn a_lock_held_past_the_retry_budget_is_not_acquired() {
     let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
     holder.lock().expect("failed to take the stand-in lock");
 
-    let acquired =
-        acquire_singleton_lock(dir.path()).expect("acquire_singleton_lock must not error on contention");
+    let acquired = acquire_singleton_lock(&StateDir::at(dir.path()))
+        .expect("acquire_singleton_lock must not error on contention");
 
     assert!(
         acquired.is_none(),
@@ -104,7 +105,7 @@ fn a_lock_held_past_the_retry_budget_is_not_acquired() {
 /// exactly as another process's would - the same property task 165's
 /// tests above already rely on.
 fn held_lock(dir: &Path) -> File {
-    acquire_singleton_lock(dir)
+    acquire_singleton_lock(&StateDir::at(dir))
         .expect("taking the lock must not error")
         .expect("nothing else holds this fixture's lock")
 }
@@ -134,15 +135,21 @@ fn eventually<T>(mut probe: impl FnMut() -> T, done: impl Fn(&T) -> bool) -> T {
 #[test]
 fn an_unheld_lock_reads_as_free() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(inspect_daemon_lock_in(dir.path(), false).unwrap(), DaemonLock::Free);
+    assert_eq!(
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
+        DaemonLock::Free
+    );
 
     // Including once a daemon has held it and let it go - the pid it
     // recorded while serving must not outlive the lock itself, or a
     // recycled pid would read as a wedged incumbent.
     let lock = held_lock(dir.path());
-    record_serving_owner(dir.path());
+    StateDir::at(dir.path()).record_serving_owner(std::process::id());
     drop(lock);
-    let state = eventually(|| inspect_daemon_lock_in(dir.path(), false).unwrap(), |s| *s == DaemonLock::Free);
+    let state = eventually(
+        || crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
+        |s| *s == DaemonLock::Free,
+    );
     assert_eq!(state, DaemonLock::Free, "a released lock is free however recently its holder was serving");
 }
 
@@ -156,7 +163,7 @@ fn a_lock_held_by_a_daemon_that_has_not_begun_serving_reads_as_starting() {
     let _lock = held_lock(dir.path());
 
     assert_eq!(
-        inspect_daemon_lock_in(dir.path(), false).unwrap(),
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
         DaemonLock::Starting,
         "a holder that never published itself as serving is starting up, not wedged"
     );
@@ -169,10 +176,10 @@ fn a_lock_held_by_a_daemon_that_has_not_begun_serving_reads_as_starting() {
 fn a_live_holder_that_served_and_stopped_listening_reads_as_wedged() {
     let dir = tempfile::tempdir().unwrap();
     let _lock = held_lock(dir.path());
-    record_serving_owner(dir.path());
+    StateDir::at(dir.path()).record_serving_owner(std::process::id());
 
     assert_eq!(
-        inspect_daemon_lock_in(dir.path(), false).unwrap(),
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
         DaemonLock::Wedged { pid: std::process::id() },
         "a live holder that was serving and answers nothing is the wedge, and it must be \
          named by pid so `stop` and the shim can act on it"
@@ -186,10 +193,10 @@ fn a_live_holder_that_served_and_stopped_listening_reads_as_wedged() {
 fn a_holder_that_is_still_answering_is_never_wedged() {
     let dir = tempfile::tempdir().unwrap();
     let _lock = held_lock(dir.path());
-    record_serving_owner(dir.path());
+    StateDir::at(dir.path()).record_serving_owner(std::process::id());
 
     assert_eq!(
-        inspect_daemon_lock_in(dir.path(), true).unwrap(),
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), true).unwrap(),
         DaemonLock::Serving,
         "a daemon answering on its socket must never be a candidate for eviction"
     );
@@ -202,13 +209,16 @@ fn a_holder_that_is_still_answering_is_never_wedged() {
 fn a_new_holder_does_not_inherit_its_predecessors_claim_to_be_serving() {
     let dir = tempfile::tempdir().unwrap();
     let first = held_lock(dir.path());
-    record_serving_owner(dir.path());
-    assert_eq!(serving_owner_in(dir.path()), Some(std::process::id()));
+    StateDir::at(dir.path()).record_serving_owner(std::process::id());
+    assert_eq!(StateDir::at(dir.path()).serving_owner(), Some(std::process::id()));
     drop(first);
 
     let _second = held_lock(dir.path());
-    assert_eq!(serving_owner_in(dir.path()), None, "taking the lock clears the record");
-    assert_eq!(inspect_daemon_lock_in(dir.path(), false).unwrap(), DaemonLock::Starting);
+    assert_eq!(StateDir::at(dir.path()).serving_owner(), None, "taking the lock clears the record");
+    assert_eq!(
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
+        DaemonLock::Starting
+    );
 }
 
 /// A lock file from a build that predates the record reads as `Starting` -
@@ -224,8 +234,11 @@ fn a_lock_file_with_no_record_in_it_is_never_treated_as_wedged() {
     let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
     holder.lock().unwrap();
 
-    assert_eq!(serving_owner_in(dir.path()), None);
-    assert_eq!(inspect_daemon_lock_in(dir.path(), false).unwrap(), DaemonLock::Starting);
+    assert_eq!(StateDir::at(dir.path()).serving_owner(), None);
+    assert_eq!(
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
+        DaemonLock::Starting
+    );
 }
 
 /// The record is what decides whether a live process gets signalled, so a
@@ -241,14 +254,14 @@ fn a_record_without_its_terminating_newline_is_not_a_record() {
     for partial in ["", "1", "12", "1234"] {
         fs::write(&path, partial).unwrap();
         assert_eq!(
-            serving_owner_in(dir.path()),
+            StateDir::at(dir.path()).serving_owner(),
             None,
             "{partial:?} is not a finished record and must not name anything to signal"
         );
     }
 
     fs::write(&path, "1234\n").unwrap();
-    assert_eq!(serving_owner_in(dir.path()), Some(1234));
+    assert_eq!(StateDir::at(dir.path()).serving_owner(), Some(1234));
 }
 
 /// A registry over `languages`, each installed as a fake plugin
@@ -908,30 +921,31 @@ fn exited_pid() -> u32 {
 /// A rebuild marker counts only while the pid it names is alive and the
 /// daemon lock is held; a missing or unreadable marker is no rebuild.
 ///
-/// Control: drop the `is_process_alive`/`daemon_lock_is_held` check in
+/// Control: drop the `is_alive`/`daemon_lock_held` check in
 /// `rebuild_in_progress_in`: the marker reads as a rebuild after its lock is
 /// released.
 #[test]
 fn a_rebuild_marker_counts_only_while_its_pid_lives_and_the_daemon_lock_is_held() {
     let dir = tempfile::tempdir().unwrap();
     let marker = rebuild_marker_path_in(dir.path());
-    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "no marker");
+    assert_eq!(rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), None, "no marker");
 
-    write_rebuild_marker(&marker, "init").unwrap();
+    StateDir::at(dir.path()).write_rebuild_marker("init").unwrap();
     let lock = held_lock(dir.path());
-    let rebuild = rebuild_in_progress_in(dir.path()).unwrap().expect("a live marker under a held lock");
+    let rebuild =
+        rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap().expect("a live marker under a held lock");
     assert_eq!((rebuild.pid, rebuild.command.as_str()), (std::process::id(), "init"));
 
     drop(lock);
-    let rebuild = eventually(|| rebuild_in_progress_in(dir.path()).unwrap(), |r| r.is_none());
+    let rebuild = eventually(|| rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), |r| r.is_none());
     assert_eq!(rebuild, None, "the lock was released");
 
     let _lock = held_lock(dir.path());
     std::fs::write(&marker, format!("{}\n0\nreindex\n", exited_pid())).unwrap();
-    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "the pid is dead");
+    assert_eq!(rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), None, "the pid is dead");
 
     std::fs::write(&marker, "not a pid\n").unwrap();
-    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "an unreadable marker");
+    assert_eq!(rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), None, "an unreadable marker");
 }
 
 // --- GM-616: a Rescan reconciles the subtree whose events the OS dropped ---

@@ -49,10 +49,6 @@ pub(crate) fn sweep_orphaned(projects_root: &Path) -> Result<usize> {
 /// correctness - so a few times a day is plenty.
 pub(crate) const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// The marker whose mtime records the last sweep, in the g-mesh home rather
-/// than in `projects/`, where it would be one more entry for every scan.
-const ORPHAN_SWEEP_MARKER: &str = "orphan-sweep.stamp";
-
 /// What [`sweep_orphaned_if_due`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sweep {
@@ -73,7 +69,9 @@ pub(crate) enum Sweep {
 /// counts as due.
 pub(crate) fn sweep_orphaned_if_due(home: &Path, interval: Duration) -> Result<Sweep> {
     fs::create_dir_all(home).with_context(|| format!("failed to create {}", home.display()))?;
-    let marker_path = home.join(ORPHAN_SWEEP_MARKER);
+    // In the g-mesh home rather than in `projects/`, where it would be one
+    // more entry for every scan.
+    let marker_path = crate::paths::state_dir::orphan_sweep_stamp(home);
     let marker = fs::File::options()
         .create(true)
         .write(true)
@@ -123,9 +121,8 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::fixture_tests::*;
     use crate::control::purge::{root_state, RootState};
-    use crate::control::test_fixture::*;
-    use crate::daemon;
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -157,7 +154,8 @@ mod tests {
     fn the_sweep_keeps_state_whose_daemon_lock_is_held() {
         let fixture = orphan_fixture();
         let state = fixture.projects.root().join("bbbb2222");
-        let lock = fs::File::create(daemon::daemon_lock_path_in(&state)).unwrap();
+        let lock =
+            fs::File::create(crate::paths::state_dir::StateDir::at(&state).daemon_lock_file()).unwrap();
         lock.lock().unwrap();
 
         assert_eq!(sweep_orphaned(fixture.projects.root()).unwrap(), 0);
@@ -209,7 +207,8 @@ mod tests {
     fn the_sweep_steps_aside_while_another_one_runs() {
         let fixture = SweepHome::new();
         let orphan = fixture.add_orphan("aaaa1111");
-        let marker = fs::File::create(fixture.home.path().join(ORPHAN_SWEEP_MARKER)).unwrap();
+        let marker =
+            fs::File::create(crate::paths::state_dir::orphan_sweep_stamp(fixture.home.path())).unwrap();
         marker.lock().unwrap();
 
         assert_eq!(sweep_orphaned_if_due(fixture.home.path(), Duration::ZERO).unwrap(), Sweep::Busy);
