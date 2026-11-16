@@ -82,7 +82,9 @@ pub use self::host::{Activity, McpHost, PathCoverage};
 
 // The embedding eval (`cli::embed_eval`) scores against the same ranking and
 // the same shipped floors the tools use, not copies of them.
+#[cfg(feature = "embed-eval")]
 pub(crate) use search_code::top_k_for_eval;
+#[cfg(feature = "embed-eval")]
 pub(crate) use similarity::floor as shipped_similarity_floor;
 
 /// Logs a step of request handling when [`TRACE_CALLS_ENV`] is set. Every

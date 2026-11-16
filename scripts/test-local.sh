@@ -273,12 +273,14 @@ if [ -n "$lib_filter" ]; then
 			while [ $# -gt 0 ]; do
 				crate="${1#--crate=}"
 				shift
+				feat=""
+				[ "$crate" = g-mesh ] && feat=embed-eval
 				names=()
 				while [ $# -gt 0 ] && [ "${1#--crate=}" = "$1" ]; do
 					names+=("$1")
 					shift
 				done
-				cargo test -p "$crate" --lib -- --exact "${names[@]}" 2>&1 | tee -a "$log"
+				cargo test -p "$crate" ${feat:+--features "$feat"} --lib -- --exact "${names[@]}" 2>&1 | tee -a "$log"
 				s="${PIPESTATUS[0]}"
 				[ "$s" -eq 0 ] || status="$s"
 			done

@@ -33,6 +33,9 @@ run_fmt() {
 run_clippy() {
     echo "== cargo clippy --workspace --all-targets -- -D warnings"
     cargo clippy --workspace --all-targets -- -D warnings
+    # The hidden embedding eval is off by default; keep it linted too.
+    echo "== cargo clippy -p g-mesh --all-targets --features embed-eval -- -D warnings"
+    cargo clippy -p g-mesh --all-targets --features embed-eval -- -D warnings
 }
 
 case "${1:-all}" in

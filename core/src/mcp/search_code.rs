@@ -276,6 +276,7 @@ pub(super) fn search(
 /// The first `k` rows [`search`] returns for `query`, as (node id, score):
 /// exactly what `search_code` would rank. The embedding eval's harness-parity
 /// check (`cli::embed_eval`) compares its own ranking against this.
+#[cfg(feature = "embed-eval")]
 pub(crate) fn top_k_for_eval(
     conn: &Connection,
     query: &[f32],

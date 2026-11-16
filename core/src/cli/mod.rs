@@ -34,6 +34,7 @@ pub mod clean;
 pub mod config_wizard;
 pub mod debug_candidates;
 pub mod deps;
+#[cfg(feature = "embed-eval")]
 pub mod embed_eval;
 pub mod init;
 pub mod model;
@@ -236,6 +237,7 @@ pub enum Command {
     /// parity. An instrument for choosing the model - not a user-facing
     /// command.
     #[command(hide = true)]
+    #[cfg(feature = "embed-eval")]
     DebugEmbedEval {
         #[command(subcommand)]
         command: embed_eval::EmbedEvalCommand,
@@ -381,6 +383,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::McpShim => shim::run(),
         Command::Daemon { project_root } => daemon::run(&project_root),
         Command::DebugCandidates { dir, json } => debug_candidates::run(dir, json),
+        #[cfg(feature = "embed-eval")]
         Command::DebugEmbedEval { command } => embed_eval::run(command),
     }
 }

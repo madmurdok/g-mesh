@@ -13,10 +13,15 @@ name = "g-mesh"
 path = "src/main.rs"
 
 [features]
+# Compiles the embedding search-quality eval (`g-mesh debug-embed-eval`, hidden
+# subcommand). Off by default: the shipped binary carries no eval code. Tests
+# and clippy in CI build with it so the eval stays checked.
+embed-eval = []
 # Links ONNX Runtime's CoreML execution provider (and CoreML.framework) so
-# `debug-embed-eval run --ep coreml` can time it. Off by default: release and
-# CI builds stay CPU-only and the daemon never reads the switch.
-ep-coreml = ["ort/coreml", "dep:tracing-subscriber"]
+# `debug-embed-eval run --ep coreml` can time it, hence it implies `embed-eval`.
+# Off by default: release and CI builds stay CPU-only and the daemon never
+# reads the switch.
+ep-coreml = ["embed-eval", "ort/coreml", "dep:tracing-subscriber"]
 
 [dependencies]
 anyhow = "1"
