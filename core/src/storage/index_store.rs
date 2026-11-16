@@ -64,7 +64,7 @@ pub enum Unit {
     /// One plugin round trip: commit and link its diff, then store the
     /// vectors computed from it.
     WatcherApply,
-    /// `watcher::staleness::ensure_fresh`: decide, reindex, record the baseline.
+    /// `ingest::staleness::ensure_fresh`: decide, reindex, record the baseline.
     QueryTimeReindex,
     /// One language's bulk walk: its batch commits and its bookkeeping row.
     BulkWalk,

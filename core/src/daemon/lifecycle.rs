@@ -36,12 +36,12 @@ use anyhow::{bail, Context, Result};
 use crate::config::ProjectConfig;
 use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
+use crate::ingest::apply::{FileChangeOutcome, SemanticPassOutcome};
+use crate::ingest::staleness::{self, StalenessOutcome};
 use crate::paths::state_dir::StateDir;
 use crate::plugin_manifest::PluginManifest;
 use crate::protocol::jsonrpc::is_timeout;
 use crate::storage::index_store::{self, IndexStore};
-use crate::watcher::apply::{FileChangeOutcome, SemanticPassOutcome};
-use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s default.
 pub const DEFAULT_PLUGIN_IDLE: Duration = Duration::from_secs(60 * 60);

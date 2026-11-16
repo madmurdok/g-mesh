@@ -43,7 +43,7 @@
 //! that refuses to start because an optional model is missing; the daemon
 //! logs once and every write from then on simply skips embedding, exactly
 //! the way a failed semantic pass is reported and dropped rather than taking
-//! the reparse down with it (`watcher::apply::apply_file_change`'s doc
+//! the reparse down with it (`ingest::apply::apply_file_change`'s doc
 //! comment argues the identical trade-off for the type checker).
 //!
 //! # The embedding cache
@@ -676,7 +676,7 @@ impl EmbeddingPipeline {
     /// # GM-396: a node's content may have moved on since it was computed
     ///
     /// `compute` and `store` run under two separate `conn` locks with the
-    /// lock released in between (`watcher::apply::round_trip`,
+    /// lock released in between (`ingest::apply::round_trip`,
     /// `daemon::bulk_index::commit`), precisely so that a slow inference step
     /// never holds up a concurrent reader - but that same gap is a window in
     /// which some *other* writer (a second reparse of the same file replayed
@@ -1299,7 +1299,7 @@ mod tests {
 
     /// The actual regression this check exists for: `compute` ran against a
     /// node's *old* doc comment/signature, and by the time `store` runs (with
-    /// the connection lock reacquired, per `watcher::apply::round_trip`'s own
+    /// the connection lock reacquired, per `ingest::apply::round_trip`'s own
     /// "GM-396" doc section) some other writer has already committed newer
     /// content for that same node id. Storing the stale embedding anyway
     /// would silently attach it to content it was never computed from - this

@@ -1,9 +1,9 @@
 use super::*;
 use rusqlite::Connection;
 
-use crate::daemon::test_plugin;
 use crate::plugin_manifest::discover;
 use crate::storage::schema;
+use crate::test_plugin;
 
 /// A registry over `languages`, each installed as a fake plugin claiming
 /// one extension named after it (`python` -> `.python-src`), deliberately
@@ -298,7 +298,7 @@ fn routing_resolves_an_extension_to_its_language_and_ignores_case() {
 
 /// [`PluginRegistry::entry_points`]'s own test: built directly from
 /// `PluginManifest` literals rather than [`registry_over`]'s fixture
-/// plugins - `daemon::test_plugin`'s stub manifests never set
+/// plugins - `test_plugin`'s stub manifests never set
 /// `[plugin.workspace] entry_points`, and this method's whole job is to
 /// surface exactly that field. Proves the union-of-discovered-manifests
 /// plumbing GM-273 wires `mcp::get_dependencies` through (see

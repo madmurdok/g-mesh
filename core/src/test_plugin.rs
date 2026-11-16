@@ -63,7 +63,7 @@
 //! entries - what `PluginSupervisor::file_changed`/`apply_file_change`
 //! actually sends per incremental reparse - excluding the `semanticPass`
 //! request `apply_file_change` also always sends on the very same round trip
-//! (`watcher::apply::apply_file_change`'s own doc comment): that one is a
+//! (`ingest::apply::apply_file_change`'s own doc comment): that one is a
 //! fixed 1:1 side effect of a `fileChanged` request, not a second thing a
 //! debounce test is checking, so counting both together would double every
 //! number for a reason unrelated to what changed.
@@ -195,7 +195,7 @@ pub(crate) fn install_with_workspace_semantic_pass_capable(
 /// semantic_pass = true` - GM-270's fixture for a language whose plugin
 /// `daemon::semantic::run_with_registry`/`run_once` must ask for a
 /// whole-project pass, and whose per-file `fileChanged` round trip
-/// (`watcher::apply::apply_file_change`) must be followed by a `semanticPass`
+/// (`ingest::apply::apply_file_change`) must be followed by a `semanticPass`
 /// request too.
 ///
 /// The fake plugin's own wire behaviour is unchanged either way - it answers
@@ -564,7 +564,7 @@ pub(crate) fn declare_files_created(plugin_dir: &Path) {
 /// `apply_file_change` round trip, the granularity task 129's debounce test
 /// cares about. Deliberately excludes the `semanticPass` request
 /// `apply_file_change` also always sends on the same round trip
-/// (`watcher::apply::apply_file_change`'s own doc): that one is a fixed,
+/// (`ingest::apply::apply_file_change`'s own doc): that one is a fixed,
 /// pre-existing 1:1 side effect of *this* one, not a second thing debouncing
 /// could coalesce away, and counting it in would double every number below
 /// for a reason that has nothing to do with what this test is checking.

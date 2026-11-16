@@ -19,6 +19,8 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::daemon::{path_case, plugin};
 use crate::indexing_status::IndexingStatus;
+use crate::ingest::convert::{to_edge_record, to_node_record, PathWarnings};
+use crate::ingest::staleness;
 use crate::languages;
 use crate::plugin_manifest::{DiscoveredPlugins, PluginManifest};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
@@ -27,8 +29,6 @@ use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::language_outcome::{self, LanguageOutcome};
 use crate::storage::schema;
 use crate::storage::write::Diff;
-use crate::watcher::apply::{to_edge_record, to_node_record, PathWarnings};
-use crate::watcher::staleness;
 
 /// Puts the plugin in one-shot bulk-index mode; must stay in sync with
 /// `BULK_INDEX_FLAG` in plugins/sdk/src/run.rs.
@@ -47,7 +47,7 @@ pub(crate) const BULK_STDIN_LIFELINE_ENV: &str = "G_MESH_BULK_STDIN_LIFELINE";
 /// memory held before a write and the number of transactions.
 const BATCH_ITEMS: usize = 2_000;
 
-/// `NodeKind::File`'s storage spelling (`watcher::apply::to_node_record`).
+/// `NodeKind::File`'s storage spelling (`ingest::convert::to_node_record`).
 const FILE_NODE_KIND: &str = "File";
 
 /// Test-only: holds a finished walk open for this many milliseconds before
@@ -706,7 +706,7 @@ mod tests {
     /// Discovering two languages must spawn
     /// *both* plugins' one-shot `--bulk-index` mode and add their
     /// contributions together into one summary, not just walk the first (or
-    /// only) one found. Each fake plugin (`daemon::test_plugin`) emits a
+    /// only) one found. Each fake plugin (`test_plugin`) emits a
     /// fixed two nodes and one edge in bulk-index mode, so two languages
     /// summing to four nodes and two edges is only possible if both were
     /// actually spawned and both streams actually landed in the same index.
@@ -714,8 +714,8 @@ mod tests {
     fn discovering_two_languages_walks_both_and_sums_their_contributions() {
         let project = tempfile::tempdir().unwrap();
         let plugins = tempfile::tempdir().unwrap();
-        crate::daemon::test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
-        crate::daemon::test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
+        crate::test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
+        crate::test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
         let discovered = crate::plugin_manifest::discover(&[plugins.path().to_path_buf()])
             .expect("the fixture plugins must discover cleanly");
         assert_eq!(discovered.manifests.len(), 2, "both fixture languages must have been discovered");
@@ -738,7 +738,7 @@ mod tests {
     fn a_single_discovered_language_is_walked_same_as_before_the_registry_took_over() {
         let project = tempfile::tempdir().unwrap();
         let plugins = tempfile::tempdir().unwrap();
-        crate::daemon::test_plugin::install(plugins.path(), "solo", &[".solo-src"]);
+        crate::test_plugin::install(plugins.path(), "solo", &[".solo-src"]);
         let discovered = crate::plugin_manifest::discover(&[plugins.path().to_path_buf()])
             .expect("the fixture plugin must discover cleanly");
 
@@ -772,8 +772,8 @@ mod tests {
     // itself, and the walk fails only when every discovered one failed.
     // -----------------------------------------------------------------
 
-    use crate::daemon::test_plugin;
     use crate::storage::language_outcome::LanguageOutcome;
+    use crate::test_plugin;
 
     /// One NDJSON node line in the fake plugins' wire shape.
     fn node_of(id: &str, kind: &str, file_path: &str, language: &str) -> String {

@@ -24,10 +24,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
+use g_mesh::ingest::apply::HOLD_COMPUTE_FILE_ENV;
 use g_mesh::ipc;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
-use g_mesh::watcher::apply::HOLD_COMPUTE_FILE_ENV;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 

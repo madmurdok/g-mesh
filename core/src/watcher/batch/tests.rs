@@ -1,6 +1,6 @@
 use super::*;
-use crate::daemon::test_plugin;
 use crate::storage::write::upsert_indexed_file;
+use crate::test_plugin;
 use std::fs;
 
 use SettledKind::{Created, Deleted, Modified};

@@ -11,7 +11,7 @@
 //! safety net: before a handler answers a query that touches a given file, it
 //! calls [`ensure_fresh`], which compares the file's on-disk state against
 //! what's recorded in the `indexed_files` table and, on a mismatch,
-//! synchronously reindexes it via `watcher::apply::apply_file_change` before
+//! synchronously reindexes it via `ingest::apply::apply_file_change` before
 //! the caller proceeds - so no tool response is ever silently based on
 //! stale data.
 //!
@@ -75,10 +75,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::embedding::EmbeddingPipeline;
+use crate::fsutil::mtime_millis;
+use crate::ingest::apply::{apply_file_change_in, FileChangeOutcome};
 use crate::protocol::types::RequestId;
 use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::write::upsert_indexed_file;
-use crate::watcher::apply::{apply_file_change_in, FileChangeOutcome};
 
 /// What [`ensure_fresh`] did to bring a file's index up to date. All three
 /// non-fresh variants imply `apply_file_change` was actually invoked
@@ -132,7 +133,7 @@ impl std::fmt::Display for ReindexFailed {
 /// Compares `file_path` (resolved against `project_root`) against the
 /// baseline recorded in the `indexed_files` table and, on a mismatch,
 /// synchronously reindexes it by calling
-/// `watcher::apply::apply_file_change` (which sends a `FileChanged`
+/// `ingest::apply::apply_file_change` (which sends a `FileChanged`
 /// request over `writer`, reads the plugin's diff back off `reader`, and
 /// commits it). See the module docs for the full two-tier mtime/hash
 /// decision procedure.
@@ -415,19 +416,6 @@ fn walk_baseline_for(project_root: &Path, file_path: &str, cutoff_millis: i64) -
     Some((mtime, hash))
 }
 
-/// Milliseconds since the Unix epoch, per `metadata.modified()`. Kept as a
-/// plain integer (rather than e.g. an RFC3339 string) so the fast-path
-/// comparison in `ensure_fresh` is a cheap integer equality check.
-///
-/// Shared with `cli::status`, which compares the same recorded baselines to
-/// count how many files the index still owes work for - it has to read an
-/// `indexed_files` row exactly the way the code that wrote it does.
-pub(crate) fn mtime_millis(metadata: &fs::Metadata) -> Result<i64> {
-    let modified = metadata.modified().context("filesystem does not report mtimes")?;
-    let duration = modified.duration_since(UNIX_EPOCH).context("mtime is before the Unix epoch")?;
-    Ok(duration.as_millis() as i64)
-}
-
 /// Hex-encoded SHA-256 of the file's full content. Only called on the
 /// (comparatively rare) mtime-mismatch path, never on the fast path.
 fn hash_file(path: &Path) -> Result<String> {
@@ -448,7 +436,7 @@ mod tests {
     use std::io::BufReader;
     use std::sync::mpsc;
 
-    /// See `watcher::apply`'s own test module for why this exists and what it
+    /// See `ingest::apply`'s own test module for why this exists and what it
     /// is deliberately not testing - every stub plugin below answers
     /// immediately, so nothing here should ever wait this long.
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -499,7 +487,7 @@ mod tests {
     }
 
     /// Spawns a stub plugin thread that reads one `FileChanged` request and
-    /// replies with `response`, exactly like `watcher::apply`'s own tests.
+    /// replies with `response`, exactly like `ingest::apply`'s own tests.
     /// Sends `()` down `invoked_tx` right before replying so a test can
     /// assert on the *number* of times the plugin transport was actually
     /// used (the mechanism for proving the fast/skip paths never invoke it).
@@ -508,7 +496,7 @@ mod tests {
     /// reparse has settled - a query-time catch-up is a reparse settling
     /// like any other, so this transport carries both round trips. The
     /// empty diff keeps these tests about staleness: what a real pass would
-    /// answer is `watcher::apply`'s subject, not this module's.
+    /// answer is `ingest::apply`'s subject, not this module's.
     fn spawn_stub_plugin(
         mut reader: std::io::PipeReader,
         mut writer: std::io::PipeWriter,

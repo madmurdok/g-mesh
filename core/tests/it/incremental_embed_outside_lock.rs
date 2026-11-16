@@ -1,10 +1,10 @@
 //! Acceptance test for GM-396: computing embeddings for an *incremental*
 //! reparse must not hold the daemon's one SQLite mutex - the same defect
 //! GM-394 fixed for a cold-start bulk-index batch, but for
-//! `watcher::apply::round_trip` (a watcher event, `ensure_fresh`, or a
+//! `ingest::apply::round_trip` (a watcher event, `ensure_fresh`, or a
 //! replayed queued change) instead of `daemon::bulk_index::commit`.
 //!
-//! [`g_mesh::watcher::apply::HOLD_COMPUTE_FILE_ENV`] is `round_trip`'s own
+//! [`g_mesh::ingest::apply::HOLD_COMPUTE_FILE_ENV`] is `round_trip`'s own
 //! test-only knob (see its doc comment): it parks a round trip open, with the
 //! connection lock already released, at exactly the point a real
 //! `EmbeddingPipeline::compute`'s inference would run. This file uses it to
@@ -35,7 +35,7 @@
 //! [`a_tool_call_against_an_unrelated_file_is_not_blocked_by_a_reparses_lock_free_embedding_window`]
 //! is meaningless on its own without having been shown to fail against the
 //! pre-fix code. That control was run separately (a worktree of
-//! `release-3.11.1` with only this file and a copy of `watcher::apply::
+//! `release-3.11.1` with only this file and a copy of `ingest::apply::
 //! round_trip`'s hold hook added at the equivalent point - the code before
 //! GM-396 holds the connection lock across the whole round trip, so the hook
 //! fires from inside it instead of after it releases): it failed the
@@ -49,10 +49,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
+use g_mesh::ingest::apply::HOLD_COMPUTE_FILE_ENV;
 use g_mesh::ipc;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
-use g_mesh::watcher::apply::HOLD_COMPUTE_FILE_ENV;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -264,7 +264,7 @@ fn outline_symbol_names(response: &Value) -> Vec<String> {
 /// registered - the one whose reparse gets held. `b.ts` is never touched
 /// after the warm-up query below records its baseline, so its own
 /// `ensure_fresh` fast path needs only `conn`'s lock, briefly
-/// (`watcher::staleness`'s own module doc) - never `daemon::lifecycle::
+/// (`ingest::staleness`'s own module doc) - never `daemon::lifecycle::
 /// PluginSupervisor::inner`/`daemon::plugin::PluginProcess::state`, the
 /// *other* lock `a.ts`'s stuck round trip is holding for its whole duration
 /// (`daemon::lifecycle`'s "Lock order" section) and which this test is
@@ -273,7 +273,7 @@ fn outline_symbol_names(response: &Value) -> Vec<String> {
 /// # Why the fixtures are backdated, and the warm-up query
 ///
 /// `b.ts` must hit `is_stale`'s fast path - a stat against its
-/// `indexed_files` baseline, the table `watcher::staleness::ensure_fresh`'s
+/// `indexed_files` baseline, the table `ingest::staleness::ensure_fresh`'s
 /// two-tier check reads - when the measured query arrives. Without a
 /// baseline it would look "never indexed" and need a real round trip of its
 /// own (`Decision::NeedsReindex`), competing for the very same
@@ -282,7 +282,7 @@ fn outline_symbol_names(response: &Value) -> Vec<String> {
 ///
 /// A bulk walk (`g-mesh init`'s here) records a baseline only for a file
 /// whose mtime predates the walk's start by
-/// `watcher::staleness::WALK_BASELINE_MTIME_MARGIN`; fixtures written just
+/// `ingest::staleness::WALK_BASELINE_MTIME_MARGIN`; fixtures written just
 /// before `init` do not, so both are dated an hour back
 /// (`common::backdate_an_hour`). That also keeps the daemon's startup
 /// offline-change reconcile from sending round trips of its own that the
