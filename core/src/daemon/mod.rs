@@ -3,6 +3,8 @@
 mod activation;
 pub mod build_stamp;
 pub mod bulk_index;
+mod startup;
+pub(crate) mod watch_loop;
 pub use crate::project_detect as candidates;
 pub mod client;
 pub(crate) mod config_reindex;
@@ -19,35 +21,22 @@ pub mod seed;
 pub mod semantic;
 pub mod workspace_reindex;
 
-use std::fs::{self, File, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
-use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts};
+use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::registry::PluginRegistry;
-use crate::gc::last_used;
-use crate::indexing_status::{ColdCause, IndexingStatus};
+use crate::daemon::startup::StartupPlan;
+use crate::indexing_status::IndexingStatus;
 use crate::ipc;
 use crate::mcp;
 use crate::paths::state_dir::{OnUnreadable, StateDir};
-use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
-use crate::storage::schema;
-use crate::watcher::batch::{classify_settled, order_for_routing};
-use crate::watcher::debounce::Debouncer;
-use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
-use crate::watcher::rescan::RescanScheduler;
-use crate::watcher::{Change, ProjectWatcher};
-
-/// The watcher's debounce window and its loop's poll bound: a path is reparsed
-/// once quiet this long, and a settled burst is drained only when the loop
-/// wakes, so this must stay short. Unrelated to the idle timeouts.
-const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
 // ---- Compat wrappers over `paths::state_dir::StateDir`, kept for the integration
 // tests that call them; production code uses `StateDir` directly. ----
@@ -186,28 +175,9 @@ pub fn run(root: &Path) -> Result<()> {
     // `StateDir::ensure`: a state directory without its `project.root` file
     // is invisible to `clean orphaned` forever.
     let dir = StateDir::ensure(root)?;
-
-    // Singleton guard, before anything else touches the project's files.
-    // Losing it is the healthy outcome: the caller connects to the incumbent.
-    let singleton = match acquire_singleton_lock(&dir)? {
-        Some(lock) => lock,
-        None => return stand_down(root),
+    let Some(singleton) = startup::claim(&dir)? else {
+        return stand_down(root);
     };
-    // A daemon holding the lock means no rebuild holds it (a rebuild takes
-    // the same lock), so any marker left here is a crashed rebuild's: once
-    // its pid is reused it would read as live and turn every shim away.
-    dir.clear_stale_rebuild_marker();
-
-    // After the singleton lock, before the bind (never transiently missing).
-    // Not fatal: a daemon that reads as outdated gets replaced.
-    match build_stamp::of_running_process() {
-        Ok(stamp) => {
-            if let Err(err) = build_stamp::write(&dir.build_stamp_file(), &stamp) {
-                crate::log_line!("g-mesh daemon: could not publish its build stamp: {err:#}");
-            }
-        }
-        Err(err) => crate::log_line!("g-mesh daemon: could not describe its own build: {err:#}"),
-    }
 
     // D10/D11: a folder of projects is served by the front, which needs no
     // plugin discovery and never creates an `index.db`.
@@ -216,266 +186,22 @@ pub fn run(root: &Path) -> Result<()> {
         return front::run(root, &dir, singleton, detection);
     }
 
-    // Discovery comes before the index (the generation check below needs it)
-    // and before the bind, so a malformed manifest or two plugins claiming one
-    // extension fail startup before a socket or pid file is published.
-    let discovered = crate::plugin_manifest::discover(&crate::plugin_manifest::default_roots())
-        .context("failed to discover language plugins")?;
-
-    // Before the index is opened and before any reindex can run: a staging
-    // file left here belongs to a reindex that died.
-    workspace_reindex::remove_stale_staging(dir.path());
-    seed::remove_stale_seed_tmp(dir.path());
-    // Before `connection::open`, which would create an empty `index.db`.
-    if let Some(origin) = seed::seed_if_eligible(root, dir.path(), &registry::indexer_version(&discovered)) {
-        crate::log_line!(
-            "g-mesh daemon: index seeded from {} in {} ms",
-            origin.source_root.display(),
-            origin.copy_ms
-        );
-    }
-    let conn = connection::open(root).context("failed to open the project's SQLite index")?;
-    // Read before `ensure_current`, whose reset would hide that one existed:
-    // the session instructions say whether a cold start throws an index away.
-    let had_generation = schema::stored_generation(&conn).is_some();
-    // The generation names every discovered plugin's build and core's
-    // pipeline, so an index built by a since-rebuilt plugin is thrown away.
-    let reinitialized = schema::ensure_current(&conn, &registry::indexer_version(&discovered))
-        .context("failed to check the index's schema and indexer versions")?;
-    if reinitialized {
-        crate::log_line!("g-mesh daemon: index (re)initialized - a full reindex is needed");
-    }
-    let cold_cause = match (had_generation, reinitialized) {
-        (false, _) => ColdCause::Fresh,
-        (true, true) => ColdCause::Discarded,
-        (true, false) => ColdCause::Incomplete,
-    };
-    // Next to the staging cleanup above, once the tables exist: pending rows
-    // no pass will clear (a removed plugin, a clear that failed) go.
-    workspace_reindex::remove_stale_semantic_pending(&conn, &discovered.manifests);
-    // Recorded at open, not once serving: a long cold walk must not read as
-    // idleness to a concurrent GC scan.
-    last_used::touch(&conn).context("failed to record that the project was used")?;
-    // A recorded fact, not schema freshness: a walk killed half way leaves a
-    // current schema behind a partial graph.
-    let needs_bulk_index = !schema::bulk_index_completed(&conn)
-        .context("failed to check whether the project has been indexed")?;
-    // A walked project can still owe its semantic pass, if an earlier attempt
-    // was interrupted after `bulkIndexedAt` was recorded (`daemon::semantic`).
-    let needs_semantic_pass_retry = !needs_bulk_index
-        && !schema::semantic_pass_completed(&conn)
-            .context("failed to check whether the project's semantic pass has completed")?;
-    // The languages the last full walk failed that a start still retries
-    // (ADR 0021): only on a walked project, whose walk would otherwise never
-    // revisit them. Unreadable, nothing is retried this start.
-    let retry_languages = if needs_bulk_index {
-        Vec::new()
-    } else {
-        let discovered_languages: Vec<&str> = discovered.manifests.keys().map(String::as_str).collect();
-        schema::languages_owed_a_retry(&conn, &discovered_languages).unwrap_or_else(|err| {
-            crate::log_line!(
-                "g-mesh daemon: could not read which failed languages to retry - none is: {err:#}"
-            );
-            Vec::new()
-        })
-    };
-    // A seed copied before this open (or by a start that died before its
-    // reconcile finished) is served only after that reconcile.
-    let seeded = !needs_bulk_index
-        && schema::seed_pending(&conn).unwrap_or_else(|err| {
-            crate::log_line!(
-                "g-mesh daemon: could not read whether the index is an unreconciled seed: {err:#}"
-            );
-            false
-        });
-    if seeded {
-        crate::log_line!(
-            "g-mesh daemon: the index is a seed - reconciling it with this worktree before tool calls answer"
-        );
-    }
-    let conn = Arc::new(
-        IndexStore::new(conn)
-            .with_link_rules(crate::plugin_manifest::link_rules(discovered.manifests.values())),
-    );
-
-    // Canonicalized like `ProjectWatcher`'s paths, so `relative_wire_path` can strip it.
-    let canonical_root = root
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
-
-    let endpoint = crate::control::lock::endpoint(&dir)?;
-    // A socket file left by a crashed daemon makes bind() fail forever; the
-    // singleton lock guarantees any socket here is a dead one's.
-    endpoint.clear_stale();
-    // Suspension lasts until the daemon restarts, and this is that restart:
-    // every stale marker is cleared, like the socket.
-    dir.clear_suspension_markers();
-    // From here a shim's `connect()` succeeds (queued on the backlog until the
-    // accept loop is up), which is what its bootstrap timeout waits for.
-    let listener = ipc::Listener::bind(&endpoint)
-        .with_context(|| format!("failed to bind the daemon endpoint at {endpoint}"))?;
-
-    // Right after the bind, so "the pid file exists" means "something is
-    // listening"; `meta.bulkIndexedAt`, not this, records a complete index.
-    let pid_file = dir.pid_file();
-    write_pid_file(&pid_file, std::process::id());
-
-    // Unwalked: `Unindexed` until the first index-needing tool call; walked:
-    // `Structural` (the embedding backfill is still owed); an unreconciled
-    // seed: `Walking` until its reconcile opens the gate. The phase file is
-    // published next to the pid file, before its absence could mean anything.
-    let indexing = if needs_bulk_index {
-        IndexingStatus::unindexed_because(cold_cause)
-    } else if seeded {
-        IndexingStatus::walking_because(ColdCause::Seeded)
-    } else {
-        IndexingStatus::structural()
-    };
-    indexing.attach_phase_file(dir.phase_file());
-    indexing.attach_progress_file(dir.progress_file());
-    // Attached before the accept loop can hand `indexing` to any session, so
-    // no tool call ever finds it with nothing to trigger.
-    let activation_trigger = indexing.attach_activation();
-
-    // After the bind: the record means the holder got as far as serving.
-    dir.record_serving_owner(std::process::id());
-
-    // Resolved once, from config.toml or its defaults (`daemon::lifecycle`).
-    let project_config =
-        crate::config::read_project_config(root).context("failed to read the project's config.toml")?;
-    let timeouts = IdleTimeouts::from_config(&project_config);
-
-    // Not loaded here, not even in the background (a startup thread broke the
-    // restart budgets): the first `apply` pays for it on its own thread. A
-    // missing model does not stop the daemon, which never fetches one.
-    let embedding = Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
-    let _ = fs::remove_file(dir.rerank_outcome_file());
-    embedding.reranker().record_outcome_to(dir.rerank_outcome_file());
-
-    // The bulk walk spawns one-shot processes from the manifests, not the
-    // registry's supervisors, so it takes its own copy before `discovered` moves.
-    let discovered_for_bulk_index = discovered.clone();
-
-    // Spawns nothing: each language's plugin starts lazily (`daemon::registry`).
-    let registry = Arc::new(PluginRegistry::new(
-        &canonical_root,
-        dir.path().to_path_buf(),
-        discovered,
-        timeouts.plugin,
-        project_config.plugin.memory_limit_mb,
-        Arc::clone(&embedding),
-    ));
-    // Before the tool listener and the watcher's consumer below: both route
-    // files, and neither may reach a language the last walk failed (ADR 0021,
-    // section 2).
-    registry.seed_failed_languages(&conn);
-
-    // Starts ticking now, so a daemon nobody connects to still exits.
-    let core_activity = CoreActivity::new();
-
-    // The accept loop and activation get threads of their own; this thread
-    // supervises. The accept outcome comes over a channel, not `join`, so the
-    // supervisor can wake on its own schedule.
-    let (accept_result, accept_loop) = mpsc::channel();
-    {
-        let conn = Arc::clone(&conn);
-        let registry = Arc::clone(&registry);
-        let core_activity = Arc::clone(&core_activity);
-        let indexing = indexing.clone();
-        let embedding = Arc::clone(&embedding);
-        thread::spawn(move || {
-            let _ = accept_result.send(serve_forever(
-                listener,
-                conn,
-                registry,
-                core_activity,
-                indexing,
-                embedding,
-            ));
-        });
-    }
-
-    // The watcher (D8 in `docs/architecture/lazy-indexing.md`): an unindexed
-    // project gets it from activation, right before its walk. A walked one gets
-    // it now, and its consumer too unless a semantic-pass retry is owed, which
-    // must run before any incremental pass, or a failed language's retry is,
-    // so that no edit of it routes while it is still failed (activation
-    // starts the consumer after those).
-    // A watcher failure here is fatal: this is startup, with no session to lose.
-    // A seeded start's gate goes with the watcher to whoever starts its
-    // consumer; the activation waits on `seed_reconciled` before its backfill.
-    let (mut seed_gate, seed_reconciled) = if seeded {
-        let (gate, reconciled) = seed::SeedGate::new(indexing.clone());
-        (Some(gate), Some(reconciled))
-    } else {
-        (None, None)
-    };
-    let pending_watcher = if needs_bulk_index {
-        None
-    } else {
-        let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
-        if needs_semantic_pass_retry || !retry_languages.is_empty() {
-            Some(watcher)
-        } else {
-            let start = match seed_gate.take() {
-                Some(gate) => ConsumerStart::Seeded(gate),
-                None => ConsumerStart::Reconcile,
-            };
-            spawn_watch_consumer(
-                watcher,
-                Arc::clone(&conn),
-                Arc::clone(&registry),
-                canonical_root.clone(),
-                start,
-            );
-            None
-        }
-    };
-
-    // Kept for `supervise`, which detaches the state files before releasing
-    // them (GM-605); the original moves into the activation thread.
-    let indexing_for_teardown = indexing.clone();
-    // Parked until the first tool call - see `daemon::activation`.
-    activation::spawn(
-        activation::ActivationCtx {
-            conn: Arc::clone(&conn),
-            registry: Arc::clone(&registry),
-            embedding: Arc::clone(&embedding),
-            discovered_for_bulk_index,
-            canonical_root: canonical_root.clone(),
-            root: root.to_path_buf(),
-            indexing,
-            core_activity: Arc::clone(&core_activity),
-            needs_walk: needs_bulk_index,
-            needs_semantic_pass_retry,
-            retry_languages,
-            watcher: pending_watcher,
-            seed_gate,
-            seed_reconciled,
-        },
+    let opened = startup::open_index(root, &dir)?;
+    let plan = StartupPlan::decide(&opened.facts);
+    let canonical_root = startup::canonical_root(root)?;
+    let startup::Published { listener, indexing, activation_trigger } = startup::publish(&dir, &plan)?;
+    let (services, discovered_for_bulk_index) =
+        startup::start_services(root, &dir, opened, &canonical_root, listener, &indexing)?;
+    let indexing_for_teardown = startup::start_watcher_and_activation(
+        root,
+        plan,
+        &services,
+        discovered_for_bulk_index,
+        indexing,
         activation_trigger,
-    )?;
-
-    // `canonical_root`: the orphan check must stat the same spelling
-    // everything else resolved against.
-    let outcome = lifecycle::supervise(
         &canonical_root,
-        dir.path(),
-        &registry,
-        &core_activity,
-        Some(&indexing_for_teardown),
-        timeouts,
-        accept_loop,
-    );
-
-    // Released explicitly: the lock is now the only claim on this project, and
-    // a slow teardown while holding it would wedge the project.
-    drop(singleton);
-    let exit = outcome?;
-    // After the lock, so the purge judges the directory as `clean` would; the
-    // index this process still has open is no obstacle (see the function).
-    lifecycle::purge_state_dir(dir.path(), &exit);
-    Ok(())
+    )?;
+    startup::supervise_and_tear_down(&canonical_root, &dir, singleton, services, &indexing_for_teardown)
 }
 
 /// What a daemon that lost the singleton race does: quiet success against a
@@ -495,219 +221,6 @@ fn stand_down(root: &Path) -> Result<()> {
             crate::log_line!("g-mesh daemon: another daemon already serves {} - exiting", root.display());
             Ok(())
         }
-    }
-}
-
-/// What the watcher's consumer does before its first batch.
-pub(crate) enum ConsumerStart {
-    /// The index was walked in this process: only the `.gitignore` re-check.
-    AfterWalk,
-    /// The index may predate the files on disk (no walk in this process):
-    /// the `.gitignore` re-check, then the plain reconcile.
-    Reconcile,
-    /// The index is an unreconciled seed (`daemon::seed`): the seeded
-    /// reconcile, no `.gitignore` re-check (every `.gitignore` of a fresh
-    /// checkout is newer than the copied walk), then the gate opens, the
-    /// watch files are compared with the seed's source, and the seed is
-    /// stamped reconciled.
-    Seeded(seed::SeedGate),
-}
-
-/// Starts the watcher's consumer thread, once no structural walk or
-/// whole-project semantic pass can still race it; `start` says what it does
-/// before its first batch, after which every start runs the scoped semantic
-/// pass over the semantic-pending files still owed
-/// ([`PluginRegistry::owed_semantic_file_passes`]).
-fn spawn_watch_consumer(
-    watcher: ProjectWatcher,
-    conn: Arc<IndexStore>,
-    registry: Arc<PluginRegistry>,
-    root: PathBuf,
-    start: ConsumerStart,
-) {
-    thread::spawn(move || {
-        // Taken before the start's own `.gitignore` recheck and reconcile,
-        // which count as the first run for a later Rescan's recheck.
-        let mut rescans = Rescans::new();
-        // On this thread, before the first batch, as an in-session edit would
-        // be; events meanwhile queue in the watcher's channel.
-        match start {
-            ConsumerStart::AfterWalk => registry.recheck_gitignores_since_index(&conn),
-            ConsumerStart::Reconcile => {
-                // `.gitignore` edits made while no daemon watched, then every
-                // other file changed meanwhile.
-                registry.recheck_gitignores_since_index(&conn);
-                registry.reconcile_since_index(
-                    &conn,
-                    registry::ReconcileMode::Plain,
-                    registry::ReconcileScope::Start,
-                );
-            }
-            ConsumerStart::Seeded(gate) => {
-                seed::hold_the_seeded_reconcile_for_tests();
-                // The reparsed files are recorded semantic-pending; the
-                // start's scoped pass below reads them back.
-                registry.reconcile_since_index(
-                    &conn,
-                    registry::ReconcileMode::Seeded,
-                    registry::ReconcileScope::Start,
-                );
-                gate.open();
-                // After the gate, as the watcher's reindex of a live edit
-                // serves the old graph until its swap; before the stamp, so a
-                // daemon killed meanwhile compares them again.
-                registry.reconcile_watch_files_with_seed(&conn);
-                // A daemon killed before this line repeats the seeded
-                // reconcile, which finds the files fresh.
-                if let Err(err) = conn.with(schema::record_seed_reconciled) {
-                    crate::log_line!(
-                        "g-mesh daemon: could not record that the seeded index was reconciled - the next start \
-                         reconciles it again: {err:#}"
-                    );
-                }
-            }
-        }
-        // Any start: files a per-file pass still owes (a seeded reparse, or
-        // one an earlier start's death left semantic-pending).
-        registry.owed_semantic_file_passes(&conn);
-        let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
-        loop {
-            watch_and_route_once(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry);
-        }
-    });
-}
-
-/// The watcher loop's dropped-event state (GM-616), beside its
-/// [`Debouncer`]: the scheduler holding the subtrees to reconcile, and the
-/// `.gitignore` watermark.
-pub(crate) struct Rescans {
-    pub(crate) scheduler: RescanScheduler,
-    /// Unix seconds when the previous reconcile started (at first, the
-    /// consumer's start): a `.gitignore` with a newer mtime goes through
-    /// [`PluginRegistry::gitignore_changed`] at the next Rescan run.
-    pub(crate) gitignores_since: i64,
-}
-
-impl Rescans {
-    /// The daemon's timings, the watermark at now.
-    pub(crate) fn new() -> Self {
-        Self::with_scheduler(RescanScheduler::new())
-    }
-
-    /// `scheduler`, the watermark at now.
-    pub(crate) fn with_scheduler(scheduler: RescanScheduler) -> Self {
-        Self { scheduler, gitignores_since: gitignore_watermark() }
-    }
-}
-
-/// The `.gitignore` watermark for a reconcile starting now: one second before
-/// now. mtimes are compared in whole seconds and strictly, so a `.gitignore`
-/// written in the same second the run starts, after the run has read it, is
-/// still newer than the next run's watermark. The cost is rechecking a file
-/// once more, which the gate in [`PluginRegistry::gitignore_changed`] absorbs.
-fn gitignore_watermark() -> i64 {
-    unix_now_secs() - 1
-}
-
-/// Whole seconds since the epoch, now (0 if the clock is before it).
-fn unix_now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
-}
-
-/// A path as a timing line names it (GM-435): project-relative when it is
-/// inside `root`, as given otherwise.
-fn timing_path(root: &Path, path: &Path) -> String {
-    relative_wire_path(root, path).unwrap_or_else(|| path.display().to_string())
-}
-
-/// One iteration of the watcher loop: waits up to [`DEBOUNCE_WINDOW`] for a
-/// raw change, records it, then routes every settled path to `registry` in
-/// [`order_for_routing`]'s order (deletions, creations, modifications; ADR 0023).
-/// Between the deletions and the creations, the batch's created paths are
-/// announced per language ([`PluginRegistry::announce_created`]), so a plugin
-/// knows all of them before it extracts the first; each is still routed once.
-///
-/// A settled `.gitignore`, directory or link first reloads the watcher's
-/// layers and link table; the batch is then filtered again under the current
-/// ones, a file link's own path placed as the walk lists it; after
-/// routing, the batch's `.gitignore` paths and the links whose row the reload
-/// changed go through [`PluginRegistry::gitignore_changed`], which reindexes
-/// each language whose indexed files they changed.
-///
-/// A Rescan (events the OS dropped, GM-616) skips the debouncer: it goes to
-/// `rescans`' scheduler, and after the batch, when the scheduler says a run is
-/// due, [`PluginRegistry::rescan_subtrees`] reconciles the pending subtrees
-/// with the disk.
-fn watch_and_route_once(
-    watcher: &ProjectWatcher,
-    debouncer: &mut Debouncer,
-    rescans: &mut Rescans,
-    root: &Path,
-    conn: &IndexStore,
-    registry: &PluginRegistry,
-) {
-    match watcher.next_change(DEBOUNCE_WINDOW) {
-        Some(Change::Path(path)) => {
-            crate::log_timing!("fs_event path={}", timing_path(root, &path));
-            debouncer.record(path)
-        }
-        // `next_change` widens a Rescan outside the root to the root; `""`
-        // is the root here as well.
-        Some(Change::Rescan(path)) => {
-            rescans.scheduler.record(relative_wire_path(root, &path).unwrap_or_default())
-        }
-        None => {}
-    }
-    let mut settled_paths = debouncer.drain_ready();
-    if !settled_paths.is_empty() && crate::log::timing_enabled() {
-        let names: Vec<String> = settled_paths.iter().map(|path| timing_path(root, path)).collect();
-        crate::log_timing!("settled paths={} names={}", names.len(), names.join(","));
-    }
-    let mut links = Vec::new();
-    if let Some(changed_links) = watcher.reload_ignores_if_changed(&settled_paths) {
-        links = changed_links;
-    }
-    // Always, not only after a reload: it also places a file link's own path
-    // (kept by `next_change`) where the walk lists it.
-    watcher.retain_unignored(&mut settled_paths);
-    let mut gitignores = Vec::new();
-    let mut batch = Vec::new();
-    for settled in settled_paths {
-        let Some(file_path) = relative_wire_path(root, &settled) else {
-            // Outside the project root: nothing to route.
-            continue;
-        };
-        if file_path.is_empty() {
-            // The project root itself (macOS reports it for a write inside it): not
-            // a file, and must not enter a sleeping plugin's replay queue.
-            continue;
-        }
-        if settled.file_name() == Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME)) {
-            gitignores.push(file_path.clone());
-        }
-        batch.push((classify_settled(conn, &settled, &file_path), file_path));
-    }
-    let order = order_for_routing(batch);
-    // A watch file (`[plugin.workspace] watch_files`, or a stored watch path)
-    // triggers that language's reindex; anything else is applied or queued by
-    // its supervisor.
-    for file_path in order.deleted {
-        registry.route_settled_path(conn, file_path);
-    }
-    registry.announce_created(conn, &order.created);
-    for file_path in order.created.into_iter().chain(order.modified) {
-        registry.route_settled_path(conn, file_path);
-    }
-    // After routing: a file deleted or created in this batch is already in
-    // the graph's new state, so the gate compares against it.
-    if !gitignores.is_empty() || !links.is_empty() {
-        registry.gitignore_changed(conn, &gitignores, &links);
-    }
-    if let Some(subtrees) = rescans.scheduler.due() {
-        let started = std::time::Instant::now();
-        let gitignores_since = std::mem::replace(&mut rescans.gitignores_since, gitignore_watermark());
-        registry.rescan_subtrees(conn, &subtrees, watcher, gitignores_since);
-        rescans.scheduler.ran(started.elapsed());
     }
 }
 
@@ -756,17 +269,6 @@ fn serve_forever(
             });
         }
     })
-}
-
-/// An absolute, canonicalized path as the project-relative, forward-slash
-/// wire path (like the plugin's `toPosixPath`); `None` outside `root`.
-fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {
-    let rel = absolute.strip_prefix(root).ok()?;
-    let mut parts = Vec::new();
-    for component in rel.components() {
-        parts.push(component.as_os_str().to_str()?.to_string());
-    }
-    Some(parts.join("/"))
 }
 
 /// How long [`acquire_singleton_lock`] retries a contended lock: well under

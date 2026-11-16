@@ -30,9 +30,18 @@ fn writing_a_pid_file_leaves_no_temporary_behind() {
     assert!(leftovers.is_empty(), "the temporary must be renamed, not left: {leftovers:?}");
 }
 use super::*;
+use std::fs;
+use std::sync::mpsc;
+
+use super::watch_loop::{watch_and_route_once, Rescans, DEBOUNCE_WINDOW};
 use crate::paths::state_dir::{project_dir, DAEMON_LOCK_FILE, DAEMON_SERVING_FILE};
 use crate::storage::index_store::IndexStore;
+use crate::storage::schema;
 use crate::test_plugin;
+use crate::watcher::debounce::Debouncer;
+use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
+use crate::watcher::rescan::RescanScheduler;
+use crate::watcher::ProjectWatcher;
 
 /// Forces the exact shape of task 165's race deterministically, instead
 /// of relying on a real `kill -9`'s unpredictable teardown delay the way
