@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use super::*;
-use crate::daemon::test_plugin;
 use crate::plugin_manifest::discover;
 use crate::storage::connection;
+use crate::test_plugin;
 
 const GENERATION: &str = "test-generation";
 const ALPHA_FILE: &str = "src/a.alpha-src";

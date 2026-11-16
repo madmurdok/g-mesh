@@ -1113,9 +1113,9 @@ fn idle_durations_read_the_way_a_human_would_say_them() {
 #[test]
 fn a_daemon_suspended_language_is_reported_by_a_separate_status_read() {
     use crate::daemon::lifecycle::PluginSupervisor;
-    use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
     use crate::plugin_manifest::read_manifest;
+    use crate::test_plugin;
     use std::sync::Arc;
 
     let project = tempfile::tempdir().unwrap();

@@ -6,7 +6,7 @@
 //!
 //! The pass itself lives in each language's own plugin (for Go,
 //! `plugins/go/semantic.go`) and reaches core through
-//! `watcher::apply::apply_semantic_pass`. What lives here is only *when* it
+//! `ingest::apply::apply_semantic_pass`. What lives here is only *when* it
 //! is asked for over a whole project - which used to be one call site inside
 //! `daemon::run`'s cold-start branch, and that turned out to be a bug rather
 //! than a location.
@@ -47,7 +47,7 @@
 //! than one project-wide flag written off a single plugin's answer. A
 //! language whose manifest never declares the capability (the conservative
 //! default - see `Capabilities::default`) is never asked, exactly as it was
-//! never asked for a per-file pass either (`watcher::apply::apply_file_change`,
+//! never asked for a per-file pass either (`ingest::apply::apply_file_change`,
 //! gated the same way by `daemon::plugin::PluginProcess`, which owns the
 //! manifest that decision comes from).
 //!
@@ -124,7 +124,7 @@
 //! this language's whole-project pass ever finished", once, and is not reset
 //! by an ordinary source edit after that. Keeping the semantic layer current
 //! as files change is the incremental watcher's job already
-//! (`watcher::apply::apply_semantic_pass`, exercised end-to-end by
+//! (`ingest::apply::apply_semantic_pass`, exercised end-to-end by
 //! `core/tests/it/semantic_pass_trigger.rs`'s
 //! `core_asks_for_a_semantic_pass_after_each_incremental_reparse`) - every
 //! settled reparse gets its own per-file pass over exactly the file that
@@ -156,10 +156,10 @@ use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::PluginRegistry;
 use crate::embedding::EmbeddingPipeline;
 use crate::indexing_status::IndexingStatus;
+use crate::ingest::apply::SemanticPassOutcome;
 use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::watcher::apply::SemanticPassOutcome;
 
 /// How long a one-shot plugin gets to exit on its own before it is killed -
 /// the same budget `daemon::lifecycle` gives a supervised one, for the same
@@ -278,7 +278,7 @@ impl SemanticPassRun {
 
     /// Records what `language`'s pass produced. `None` is a pass not run (its
     /// plugin asleep or suspended). A residual outcome is already recorded
-    /// by the pass itself (`watcher::apply`), so it is only kept for the log.
+    /// by the pass itself (`ingest::apply`), so it is only kept for the log.
     fn record_outcome(
         &mut self,
         conn: &IndexStore,
@@ -623,8 +623,8 @@ mod tests {
     use rusqlite::{params, OptionalExtension};
 
     use super::*;
-    use crate::daemon::test_plugin;
     use crate::plugin_manifest::discover;
+    use crate::test_plugin;
 
     /// A `File` node for `language` at `file_path`, so `storage::schema::
     /// present_languages` (and therefore "owed") considers it present - the
@@ -1360,7 +1360,7 @@ mod tests {
     }
 
     /// An edit invalidates a residual file's record: once the edit's per-file
-    /// pass has finished it (what `watcher::apply`'s own tests pin, recorded
+    /// pass has finished it (what `ingest::apply`'s own tests pin, recorded
     /// here directly), the residual language has nothing left, and the next
     /// start records it without asking the plugin.
     #[test]

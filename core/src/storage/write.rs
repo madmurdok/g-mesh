@@ -34,7 +34,7 @@ pub struct DeclarationRecord {
 /// wire's nested `TargetScope`/`TargetKey` enums, matching this module's own
 /// convention for every other wire-shaped record here (`DeclarationRecord`,
 /// `EdgeRecord.source`): the enum-to-string mapping happens once, at the
-/// wire boundary (`watcher::apply::to_node_record`), so nothing downstream of
+/// wire boundary (`ingest::convert::to_node_record`), so nothing downstream of
 /// it has to match on a protocol type it does not otherwise depend on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderTargetRecord {
@@ -77,7 +77,7 @@ pub struct NodeRecord {
     /// was read back; since GM-266 it reads `visibility` itself, because a
     /// `container`-visible node can answer a placeholder too.) Every
     /// *constructor* of a `NodeRecord`
-    /// ([`NodeRecord::new`], `watcher::apply::to_node_record`, and this
+    /// ([`NodeRecord::new`], `ingest::convert::to_node_record`, and this
     /// module's/`graph::symbol_links`'s own test helpers) is required to set
     /// this from `visibility` at construction time; that
     /// single-writer-per-construction-path rule is what keeps the two from
@@ -229,7 +229,7 @@ impl EdgeRecord {
     /// constructor's signature - and therefore every one of its ~100 call
     /// sites - did not have to change for GM-264's real `source`/`engine`
     /// split. A caller that already has a distinct engine value (the wire
-    /// boundary, `watcher::apply::to_edge_record`) overwrites `.engine` on
+    /// boundary, `ingest::convert::to_edge_record`) overwrites `.engine` on
     /// the result afterwards, the same way `.to_declaration` is already set
     /// post-construction below.
     pub fn new(
@@ -337,7 +337,7 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
 /// so its signature, docComment, span and the rest may be newer than what
 /// core holds. Writing them would put text on the row that core has not
 /// reparsed and that the row's vector was not computed from
-/// (`watcher::apply::round_trip` keeps a re-sent node's vector). Core's own
+/// (`ingest::apply::round_trip` keeps a re-sent node's vector). Core's own
 /// reparse of that file is what brings the new text, row and vector together.
 ///
 /// A node the index has no row for (a placeholder the pass mints, or a

@@ -110,7 +110,7 @@ pub fn is_timeout(err: &anyhow::Error) -> bool {
 /// closes its stdout and is what actually unblocks the read (with an error or
 /// an EOF); this module deliberately knows nothing about child processes, to
 /// stay usable against the plain pipes its own tests fake a peer with (see
-/// this module's own tests and `watcher::apply`'s).
+/// this module's own tests and `ingest::apply`'s).
 ///
 /// [`std::thread::scope`] is what makes borrowing `reader` here possible
 /// without demanding `'static` ownership of it, and - just as importantly -

@@ -1,6 +1,6 @@
 //! GM-291's own acceptance test: `[plugin] memoryLimitMb` (GM-274) enforced
 //! against a REAL rust-analyzer, not GM-274's synthetic "memory-hungry" Node
-//! fixture (`daemon::test_plugin::install_memory_hungry`,
+//! fixture (`test_plugin::install_memory_hungry`,
 //! `core/src/daemon/lifecycle.rs`'s own
 //! `a_plugin_over_its_memory_limit_is_put_to_sleep_and_its_language_suspended`).
 //! Same shape as that test - a real [`PluginSupervisor`] driven directly, not

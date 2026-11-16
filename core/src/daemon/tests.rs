@@ -32,6 +32,7 @@ fn writing_a_pid_file_leaves_no_temporary_behind() {
 use super::*;
 use crate::paths::state_dir::{project_dir, DAEMON_LOCK_FILE, DAEMON_SERVING_FILE};
 use crate::storage::index_store::IndexStore;
+use crate::test_plugin;
 
 /// Forces the exact shape of task 165's race deterministically, instead
 /// of relying on a real `kill -9`'s unpredictable teardown delay the way
@@ -1080,7 +1081,7 @@ fn indexed_file(root: &Path, conn: &IndexStore, file_path: &str) {
     let path = root.join(file_path);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "v0").unwrap();
-    let mtime = crate::watcher::staleness::mtime_millis(&fs::metadata(&path).unwrap()).unwrap();
+    let mtime = crate::fsutil::mtime_millis(&fs::metadata(&path).unwrap()).unwrap();
     conn.with(|c| crate::storage::write::upsert_indexed_file(c, file_path, mtime, "indexed")).unwrap();
 }
 
@@ -1098,7 +1099,7 @@ fn edit(root: &Path, file_path: &str) {
 }
 
 fn is_stale(conn: &IndexStore, root: &Path, file_path: &str) -> bool {
-    conn.with(|c| crate::watcher::staleness::is_stale(c, root, file_path)).unwrap()
+    conn.with(|c| crate::ingest::staleness::is_stale(c, root, file_path)).unwrap()
 }
 
 /// Runs `watch_and_route_once` until `done` holds after an iteration, or
@@ -1192,7 +1193,7 @@ fn a_deletion_and_a_creation_whose_events_were_dropped_are_reconciled_by_a_resca
     );
     assert!(!requested(plugin_dir, "kept.python-src"), "an untouched file is not reparsed");
     let baseline = |file_path: &str| {
-        conn.with(|c| crate::watcher::staleness::has_indexed_baseline(c, file_path)).unwrap()
+        conn.with(|c| crate::ingest::staleness::has_indexed_baseline(c, file_path)).unwrap()
     };
     assert!(!baseline("gone.python-src"), "the deleted file is retired from the index");
     assert!(baseline("new.python-src"), "the created file is indexed");

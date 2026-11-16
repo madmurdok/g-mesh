@@ -87,7 +87,7 @@ fn container_of(name: &str, harness: &Harness) -> Option<String> {
 ///
 /// Controls: answer `None` from `RustExtractor::source_changed` (the child
 /// stays an orphan); drop the `affected` handling in
-/// `watcher::apply::apply_file_change_in` (likewise).
+/// `ingest::apply::apply_file_change_in` (likewise).
 #[test]
 fn a_child_file_then_its_mod_line_gets_its_container_without_a_cargo_toml_save() {
     let harness = indexed();
@@ -223,7 +223,7 @@ fn stale_query(harness: &Harness, text: &str) -> std::time::Duration {
     let started = std::time::Instant::now();
     let outcome = harness.registry.ensure_fresh(&harness.conn, "src/lib.rs").unwrap();
     let elapsed = started.elapsed();
-    use g_mesh::watcher::staleness::StalenessOutcome::{ReindexedNoPriorRecord, ReindexedViaHashMismatch};
+    use g_mesh::ingest::staleness::StalenessOutcome::{ReindexedNoPriorRecord, ReindexedViaHashMismatch};
     assert!(matches!(outcome, Some(ReindexedViaHashMismatch | ReindexedNoPriorRecord)), "{outcome:?}");
     elapsed
 }

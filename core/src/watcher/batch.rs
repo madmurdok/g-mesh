@@ -19,8 +19,8 @@
 
 use std::path::Path;
 
+use crate::ingest::staleness::has_indexed_baseline;
 use crate::storage::index_store::IndexStore;
-use crate::watcher::staleness::has_indexed_baseline;
 
 /// What a settled path is, as far as the routing order needs to know.
 /// Declaration order is routing order.

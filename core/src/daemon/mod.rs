@@ -17,9 +17,6 @@ pub mod plugin;
 pub mod registry;
 pub mod seed;
 pub mod semantic;
-/// A fake, protocol-speaking plugin for unit tests that need two languages.
-#[cfg(test)]
-pub(crate) mod test_plugin;
 pub mod workspace_reindex;
 
 use std::fs::{self, File, TryLockError};
