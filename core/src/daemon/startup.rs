@@ -502,3 +502,6 @@ pub(super) fn supervise_and_tear_down(
     lifecycle::purge_state_dir(dir.path(), &exit);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
