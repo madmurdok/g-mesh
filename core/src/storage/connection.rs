@@ -59,7 +59,7 @@ pub fn open(root: &Path) -> Result<Connection> {
 
     let dir = ensure_project_dir(root)?;
 
-    let db_path = dir.join("index.db");
+    let db_path = crate::paths::state_dir::StateDir::at(&dir).index_db();
     let conn = Connection::open(&db_path)
         .with_context(|| format!("failed to open SQLite database at {}", db_path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").context("failed to enable WAL mode")?;

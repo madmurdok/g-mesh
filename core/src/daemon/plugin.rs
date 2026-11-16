@@ -1613,7 +1613,7 @@ impl PluginProcess {
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
         let replaced = std::mem::replace(&mut *self.state(), fresh);
-        super::write_pid_file(&self.pid_file, pid);
+        crate::paths::state_dir::write_pid_file(&self.pid_file, pid);
         // Outside the state lock: the fresh process is already serving, and
         // waiting out the old one's grace period must not hold up a request.
         if let Err(err) = replaced.end(RELAUNCH_GRACE) {

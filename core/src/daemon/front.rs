@@ -27,11 +27,10 @@ use anyhow::{Context, Result};
 
 use super::lifecycle::{self, CoreActivity, IdleTimeouts};
 use super::registry::PluginRegistry;
-use super::{endpoint_in, phase_path_in, record_serving_owner, write_pid_file, PID_FILE};
 use crate::embedding::EmbeddingPipeline;
 use crate::ipc;
 use crate::mcp;
-use crate::paths::state_dir::write_state_file_atomic;
+use crate::paths::state_dir::{write_pid_file, write_state_file_atomic, StateDir};
 use crate::plugin_manifest::DiscoveredPlugins;
 use crate::project_detect::Detection;
 
@@ -53,20 +52,20 @@ fn front_core_idle() -> Option<Duration> {
 
 /// Serves `root` as a front until it idles out or is orphaned. Called by
 /// `daemon::run` right after the mode decision, holding the singleton lock.
-pub(super) fn run(root: &Path, dir: &Path, singleton: File, detection: Detection) -> Result<()> {
+pub(super) fn run(root: &Path, state_dir: &StateDir, singleton: File, detection: Detection) -> Result<()> {
     let canonical_root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
 
     // The normal daemon's publish sequence, in its order (`daemon::run`).
-    let endpoint = endpoint_in(dir)
-        .with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))?;
+    let dir = state_dir.path();
+    let endpoint = crate::control::lock::endpoint(state_dir)?;
     endpoint.clear_stale();
     let listener = ipc::Listener::bind(&endpoint)
         .with_context(|| format!("failed to bind the daemon endpoint at {endpoint}"))?;
-    write_pid_file(&dir.join(PID_FILE), std::process::id());
-    write_state_file_atomic(&phase_path_in(dir), &format!("{FRONT_PHASE}\n"), "phase file");
-    record_serving_owner(dir);
+    write_pid_file(&state_dir.pid_file(), std::process::id());
+    write_state_file_atomic(&state_dir.phase_file(), &format!("{FRONT_PHASE}\n"), "phase file");
+    state_dir.record_serving_owner(std::process::id());
 
     crate::log_line!(
         "g-mesh daemon: {} is a folder of {} projects - serving the front (no index)",

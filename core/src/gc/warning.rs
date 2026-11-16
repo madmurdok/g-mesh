@@ -3,9 +3,8 @@
 //!
 //! This is purely informational. It never deletes anything - the same
 //! division of labor as the rest of `gc` (see the module doc on
-//! `crate::gc`): this module only surfaces the fact, `cli::clean` is the only
-//! place a deletion ever happens, and only when a human explicitly asks for
-//! one.
+//! `crate::gc`): this module only surfaces the fact. Deletion is `cli::clean`
+//! when a human asks, and `control::{purge, sweep}` for orphaned state; never this module.
 //!
 //! # Only interactive commands call this
 //!

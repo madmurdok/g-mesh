@@ -12,7 +12,7 @@
 //! *this* daemon, and the evidence is in the daemon itself: it installs no
 //! signal handler anywhere. `SIGTERM` kills it outright today. Its socket
 //! file and pid file are not cleaned up by the daemon at all - they are
-//! cleaned up afterwards, from outside, by `cli::stop::tidy_state_files`, and
+//! cleaned up afterwards, from outside, by `control::stop::tidy_state_files`, and
 //! its singleton `flock` is released by the kernel as part of teardown (see
 //! `daemon::acquire_singleton_lock`'s note on exactly that).
 //!
@@ -25,7 +25,7 @@
 //!
 //! What is genuinely lost is the escalation's meaning. On Unix `SIGTERM` can
 //! be ignored, so `SIGKILL` after it distinguishes "shut down politely" from
-//! "had to be killed" (`cli::stop::Stopped`). Nothing can ignore
+//! "had to be killed" (`control::stop::Stopped`). Nothing can ignore
 //! `TerminateProcess`, so on Windows [`request_stop`] and [`force_stop`] are
 //! the same call, the escalation never escalates, and `Stopped::Killed` is
 //! unreachable. That is an honest difference in what the platform offers, not

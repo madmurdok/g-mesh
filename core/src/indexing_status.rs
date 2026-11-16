@@ -212,6 +212,14 @@ pub struct ProgressSnapshot {
     pub embeddings: EmbedProgress,
 }
 
+/// The progress snapshot a daemon last published in `state_dir`, whoever wrote
+/// it: `None` for a missing or unparseable file. The snapshot's `pid` says which
+/// daemon wrote it; this does not check that it is alive.
+pub fn read_progress(state_dir: &crate::paths::state_dir::StateDir) -> Option<ProgressSnapshot> {
+    let contents = std::fs::read_to_string(state_dir.progress_file()).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WalkProgress {

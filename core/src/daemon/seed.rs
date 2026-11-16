@@ -24,10 +24,16 @@ use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::indexing_status::{IndexingStatus, Phase};
+use crate::paths::state_dir::{StateDir, INDEX_DB_FILE};
 use crate::storage::{schema, vectors};
 
-/// The temp file a seed is copied into before its rename to `index.db`.
-const SEED_TMP: &str = "index.db.seed-tmp";
+/// `path` with `suffix` appended to its file name: SQLite's side files
+/// (`-wal`, `-shm`, `-journal`) are named this way.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
 
 /// Environment switch: `0` disables seeding (also the opt-out for a user),
 /// `1` enables it even when [`SEEDING_DEFAULT`] is off.
@@ -194,7 +200,7 @@ fn is_bare(common: &Path) -> bool {
 /// `state_dir`. Called at start, next to `remove_stale_staging`.
 pub(crate) fn remove_stale_seed_tmp(state_dir: &Path) {
     for suffix in ["", "-journal", "-wal", "-shm"] {
-        let path = state_dir.join(format!("{SEED_TMP}{suffix}"));
+        let path = with_suffix(&StateDir::at(state_dir).seed_tmp_file(), suffix);
         if let Err(err) = fs::remove_file(&path) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 crate::log_line!(
@@ -231,12 +237,12 @@ fn seed_if_eligible_under(
     state_dir: &Path,
     indexer_version: &str,
 ) -> Option<SeedOrigin> {
-    if fs::symlink_metadata(state_dir.join("index.db")).is_ok() {
+    if fs::symlink_metadata(StateDir::at(state_dir).index_db()).is_ok() {
         return None;
     }
     let source_root = main_checkout(root)?;
-    let source_db = match crate::paths::state_dir::project_dir_under(home, &source_root) {
-        Ok(dir) => dir.join("index.db"),
+    let source_db = match StateDir::of_under(home, &source_root) {
+        Ok(dir) => dir.index_db(),
         Err(err) => {
             crate::log_line!(
                 "g-mesh daemon: not seeding - no state dir for {} ({err:#})",
@@ -297,7 +303,7 @@ fn seed_from(
         return Ok(None);
     }
 
-    let tmp = state_dir.join(SEED_TMP);
+    let tmp = StateDir::at(state_dir).seed_tmp_file();
     remove_stale_seed_tmp(state_dir);
     {
         let mut dest =
@@ -335,15 +341,17 @@ fn seed_from(
         .with_context(|| format!("failed to sync {}", tmp.display()))?;
     // A crashed daemon's side files with no `index.db` would be applied to
     // the renamed copy.
-    for side in ["index.db-wal", "index.db-shm", "index.db-journal"] {
-        match fs::remove_file(state_dir.join(side)) {
+    let db = StateDir::at(state_dir).index_db();
+    for side in ["-wal", "-shm", "-journal"] {
+        match fs::remove_file(with_suffix(&db, side)) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err).with_context(|| format!("failed to remove a stale {side}")),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to remove a stale {INDEX_DB_FILE}{side}"))
+            }
         }
     }
     remove_seed_side_files(state_dir);
-    let db = state_dir.join("index.db");
     fs::rename(&tmp, &db).with_context(|| format!("failed to rename {} into place", tmp.display()))?;
     if let Ok(dir) = fs::File::open(state_dir) {
         let _ = dir.sync_all();
@@ -355,7 +363,7 @@ fn seed_from(
 /// and checkpointed, so nothing named after the temp file outlives it.
 fn remove_seed_side_files(state_dir: &Path) {
     for suffix in ["-wal", "-shm", "-journal"] {
-        let _ = fs::remove_file(state_dir.join(format!("{SEED_TMP}{suffix}")));
+        let _ = fs::remove_file(with_suffix(&StateDir::at(state_dir).seed_tmp_file(), suffix));
     }
 }
 

@@ -103,7 +103,7 @@ pub fn read(conn: &Connection) -> Result<Option<LastUsed>> {
 /// that is missing or unparseable. Only a genuinely broken database (one
 /// SQLite refuses to open, or that fails mid-query) is an error.
 pub fn read_from_project_dir(project_dir: &Path) -> Result<Option<LastUsed>> {
-    let db_path = project_dir.join("index.db");
+    let db_path = crate::paths::state_dir::StateDir::at(project_dir).index_db();
     if !db_path.exists() {
         return Ok(None);
     }

@@ -90,6 +90,7 @@ use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::embedding::pipeline::ComputedBatch;
 use crate::embedding::EmbedStats;
+use crate::paths::state_dir::StateDir;
 use crate::plugin_manifest::{self, PluginManifest};
 use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
@@ -98,12 +99,9 @@ use crate::storage::schema;
 use crate::watcher::apply::SemanticPassOutcome;
 use crate::watcher::staleness;
 
-const STAGING_PREFIX: &str = "staging-";
-const STAGING_SUFFIX: &str = ".db";
-
 /// Where `language`'s staging index lives in the project's state directory.
 fn staging_path(state_dir: &Path, language: &str) -> PathBuf {
-    state_dir.join(format!("{STAGING_PREFIX}{language}{STAGING_SUFFIX}"))
+    StateDir::at(state_dir).staging_db(language)
 }
 
 /// Removes a staging file and the journal SQLite may have left beside it.
@@ -130,7 +128,7 @@ pub(crate) fn remove_stale_staging(state_dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(STAGING_PREFIX) && name.ends_with(STAGING_SUFFIX) {
+        if StateDir::is_staging_db(name) {
             remove_staging(&entry.path());
         }
     }

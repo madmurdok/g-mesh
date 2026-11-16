@@ -32,7 +32,7 @@ use crate::cli::{
 use crate::daemon::{self, client};
 use crate::graph::containers;
 use crate::indexing_status::group_thousands;
-use crate::paths::state_dir::project_dir;
+use crate::paths::state_dir::{project_dir, StateDir};
 use crate::plugin_manifest;
 use crate::process;
 use crate::project_detect::{self as candidates, Limits, Mode};
@@ -97,7 +97,7 @@ pub fn run(args: &DepsArgs) -> Result<()> {
     wait_ready(&root, deadline)?;
 
     let state_dir = project_dir(&root).context("failed to resolve the project's state directory")?;
-    let db_path = state_dir.join("index.db");
+    let db_path = StateDir::at(&state_dir).index_db();
     if !db_path.exists() {
         return Err(unavailable(
             &root,
@@ -167,7 +167,7 @@ fn unavailable(root: &Path, state_dir: &Path, reason: String) -> anyhow::Error {
         format!(
             "the index for {} is unavailable: {reason} (daemon log: {})",
             root.display(),
-            state_dir.join(shim::DAEMON_LOG_FILE).display()
+            StateDir::at(state_dir).daemon_log_file().display()
         ),
     )
 }
@@ -263,8 +263,9 @@ fn timed_out(
 
 /// The phase word and, while walking, how far the walk got.
 fn progress_detail(state_dir: &Path) -> String {
-    let phase = daemon::read_phase_in(state_dir).unwrap_or_else(|| "starting".to_string());
-    let Some(progress) = daemon::read_progress_in(state_dir) else {
+    let sd = StateDir::at(state_dir);
+    let phase = sd.read_phase().unwrap_or_else(|| "starting".to_string());
+    let Some(progress) = crate::indexing_status::read_progress(&sd) else {
         return phase;
     };
     let walk = &progress.walk;
@@ -334,7 +335,7 @@ fn readiness_loop(
                 continue;
             }
         };
-        match daemon::read_phase_in(state_dir).as_deref() {
+        match StateDir::at(state_dir).read_phase().as_deref() {
             Some("structural" | "embedding" | "ready") => return Ok(()),
             Some("failed") => {
                 let reason = if answer.is_error && !answer.text.is_empty() {

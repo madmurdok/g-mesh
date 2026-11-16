@@ -153,7 +153,7 @@ use std::time::Duration;
 
 use crate::daemon::lifecycle::AwakeHold;
 use crate::daemon::plugin::PluginProcess;
-use crate::daemon::registry::{plugin_pid_file_name, PluginRegistry};
+use crate::daemon::registry::PluginRegistry;
 use crate::embedding::EmbeddingPipeline;
 use crate::indexing_status::IndexingStatus;
 use crate::plugin_manifest::{self, DiscoveredPlugins};
@@ -531,7 +531,7 @@ pub fn run_once(
         // Guaranteed present: `owed` only ever names languages `capable`
         // (built from `discovered.manifests` above) already contains.
         let manifest = &discovered.manifests[&language];
-        let pid_file = state_dir.join(plugin_pid_file_name(&language));
+        let pid_file = crate::paths::state_dir::StateDir::at(state_dir).plugin_pid_file(&language);
         let process = match PluginProcess::spawn(canonical_root, manifest, pid_file.clone()) {
             Ok(process) => process,
             Err(err) => {
@@ -546,7 +546,7 @@ pub fn run_once(
         // anything outside this process - `cli::status`, `cli::stop`, a
         // test's teardown - can name the checker holding a project open is
         // this file.
-        super::write_pid_file(&pid_file, process.pid());
+        crate::paths::state_dir::write_pid_file(&pid_file, process.pid());
 
         let (file_paths, file_count) = owed_pass.scope(conn, &language);
         let outcome = process.semantic_pass(conn, file_paths, file_count, embedding);
