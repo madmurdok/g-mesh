@@ -1,15 +1,16 @@
 use super::*;
-use crate::daemon::indexing_status::{EmbedProgress, SemanticProgress, WalkProgress};
+use crate::indexing_status::{EmbedProgress, SemanticProgress, WalkProgress};
+use crate::paths::state_dir::project_dir;
 use crate::storage::schema;
 
 /// The plugins this checkout ships - their real `plugin.toml`s, read from
-/// `plugins/` beside `core/` exactly as `manifest::bundled_roots` finds them in
+/// `plugins/` beside `core/` exactly as `plugin_manifest::bundled_roots` finds them in
 /// a checkout. Discovery only parses the manifests, so no plugin needs to be
 /// built. Deliberately not `default_roots`, which would also read whatever
 /// the machine running the tests has under `~/.g-mesh/plugins/`.
 fn bundled_plugins() -> DiscoveredPlugins {
     let checkout_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
-    manifest::discover(&[checkout_root]).unwrap()
+    plugin_manifest::discover(&[checkout_root]).unwrap()
 }
 
 /// A project directory with the given files, and an index database
@@ -805,9 +806,9 @@ fn the_repair_advice_is_shown_only_when_no_live_daemon_is_working() {
 #[test]
 fn embedding_progress_shows_the_daemons_own_done_and_total_as_a_percentage() {
     let dir = tempfile::tempdir().unwrap();
-    let indexing = crate::daemon::indexing_status::IndexingStatus::structural();
+    let indexing = crate::indexing_status::IndexingStatus::structural();
     indexing.attach_progress_file_every(daemon::progress_path_in(dir.path()), Duration::ZERO);
-    indexing.set_phase(crate::daemon::indexing_status::Phase::Embedding);
+    indexing.set_phase(crate::indexing_status::Phase::Embedding);
     indexing.set_embed_total(1_200);
     indexing.add_embed_done(300);
 
@@ -1112,9 +1113,9 @@ fn idle_durations_read_the_way_a_human_would_say_them() {
 #[test]
 fn a_daemon_suspended_language_is_reported_by_a_separate_status_read() {
     use crate::daemon::lifecycle::PluginSupervisor;
-    use crate::daemon::manifest::read_manifest;
     use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
+    use crate::plugin_manifest::read_manifest;
     use std::sync::Arc;
 
     let project = tempfile::tempdir().unwrap();

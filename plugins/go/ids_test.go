@@ -2,61 +2,41 @@ package main
 
 import "testing"
 
-// The expected values below were computed by running the TS plugin's own
-// id-hashing code verbatim, not recalled from memory:
+// The expected values were computed from the byte string plugins/sdk/src/ids.rs
+// hashes (tag, then each field preceded by a NUL byte), not from Go code:
 //
-//	node -e '
-//	const {createHash} = require("crypto");
-//	function hash(input){return createHash("sha256").update(input,"utf8").digest("hex").slice(0,32);}
-//	function nodeIdFor(filePath, kind, qualifiedName, nativeKind){
-//	  return hash(`node ${filePath} ${kind} ${qualifiedName} ${nativeKind ?? ""}`);
-//	}
-//	function edgeIdFor(fromId, kind, toId, toDeclaration){
-//	  const binding = toDeclaration === undefined ? "" : ` ${toDeclaration}`;
-//	  return hash(`edge ${fromId} ${kind} ${toId}${binding}`);
-//	}
-//	console.log(nodeIdFor("main.go","File","main.go",undefined));
-//	console.log(edgeIdFor("n1","DEFINES","n2",undefined));
-//	console.log(edgeIdFor("n1","CALLS","n2",2));
-//	'
+//	printf 'node\0main.go\0File\0main.go\0' | shasum -a 256 | cut -c1-32
+//	printf 'edge\0n1\0DEFINES\0n2' | shasum -a 256 | cut -c1-32
+//	printf 'edge\0n1\0CALLS\0n2\0002' | shasum -a 256 | cut -c1-32
 //
-// which printed, in order:
-//
-//	1453099e1c11aef90ca118eb6d140fe1
-//	6be2b51147fd32ef62ebf506f184329a
-//	1deb655be169c9fcfe9e081b775c7117
-//
-// (Node v20.6.1, the original TS plugin's `hash`/`nodeIdFor`/
-// `edgeIdFor` copied verbatim into the -e script above; plugins/sdk/src/ids.rs
-// pins the same scheme.) Asserting against
-// these fixed strings, rather than only against Go-computed values, is
-// the whole point: a bug that made this file's own hash function and its
-// own callers agree with each other while disagreeing with the TS scheme
-// would pass a self-consistency check and fail this one.
+// (the same recipe reproduces the SDK-pinned id in plugins/sdk/tests/id_scheme.rs).
+// Asserting against fixed strings, rather than only against Go-computed
+// values, catches a bug that keeps this file's hash function and its callers
+// consistent with each other while disagreeing with the SDK scheme.
 const (
-	tsReferenceNodeIDMainGoFile   = "1453099e1c11aef90ca118eb6d140fe1"
-	tsReferenceEdgeIDUnbound      = "6be2b51147fd32ef62ebf506f184329a"
-	tsReferenceEdgeIDBoundOrdinal = "1deb655be169c9fcfe9e081b775c7117"
+	sdkReferenceNodeIDMainGoFile   = "1c06532b9ba18d30da653a043b3ed0e1"
+	sdkReferenceEdgeIDUnbound      = "e993bb1f768d7f2f97b6b5a84a5a7a7c"
+	sdkReferenceEdgeIDBoundOrdinal = "c25c95159195db66a611a5b42f125c09"
 )
 
-func TestNodeIDForMatchesTheTSScheme(t *testing.T) {
+func TestNodeIDForMatchesTheSDKScheme(t *testing.T) {
 	got := nodeIDFor("main.go", "File", "main.go", "")
-	if got != tsReferenceNodeIDMainGoFile {
-		t.Fatalf("nodeIDFor(main.go, File, main.go, \"\") = %q, want %q (the TS-computed reference)",
-			got, tsReferenceNodeIDMainGoFile)
+	if got != sdkReferenceNodeIDMainGoFile {
+		t.Fatalf("nodeIDFor(main.go, File, main.go, \"\") = %q, want %q (the SDK reference)",
+			got, sdkReferenceNodeIDMainGoFile)
 	}
 }
 
-func TestEdgeIDForMatchesTheTSScheme(t *testing.T) {
+func TestEdgeIDForMatchesTheSDKScheme(t *testing.T) {
 	got := edgeIDFor("n1", "DEFINES", "n2", nil)
-	if got != tsReferenceEdgeIDUnbound {
-		t.Fatalf("edgeIDFor(n1, DEFINES, n2, nil) = %q, want %q", got, tsReferenceEdgeIDUnbound)
+	if got != sdkReferenceEdgeIDUnbound {
+		t.Fatalf("edgeIDFor(n1, DEFINES, n2, nil) = %q, want %q", got, sdkReferenceEdgeIDUnbound)
 	}
 
 	ordinal := 2
 	got = edgeIDFor("n1", "CALLS", "n2", &ordinal)
-	if got != tsReferenceEdgeIDBoundOrdinal {
-		t.Fatalf("edgeIDFor(n1, CALLS, n2, &2) = %q, want %q", got, tsReferenceEdgeIDBoundOrdinal)
+	if got != sdkReferenceEdgeIDBoundOrdinal {
+		t.Fatalf("edgeIDFor(n1, CALLS, n2, &2) = %q, want %q", got, sdkReferenceEdgeIDBoundOrdinal)
 	}
 }
 

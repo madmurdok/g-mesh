@@ -893,7 +893,7 @@ extensions = [".py"]
 /// where the repo happens to keep the file.
 #[test]
 fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
-    const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../../plugins/typescript/plugin.toml");
+    const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../plugins/typescript/plugin.toml");
 
     let (_root, dir) = plugin_dir("typescript", BUNDLED_JS_TS_MANIFEST);
 
@@ -1228,4 +1228,34 @@ fn the_checked_in_manifests_declare_each_languages_reexport_rule() {
         link_rules(&manifests),
         LinkRules::with_named_shadows_glob(["rust", "typescript"]).with_later_import_binds(["python"])
     );
+}
+
+/// The catalogue reads discovery only through `DiscoveredLanguages`, so the
+/// trait must answer exactly as the inherent lookups do.
+#[test]
+fn discovered_plugins_answer_the_language_trait_as_their_own_lookups_do() {
+    use crate::languages::{absent_for_path, missing, DiscoveredLanguages};
+
+    let (_root, root) = discovery_root(&[
+        ("python", &manifest_toml("python", "1.0.0", &[".py", ".pyi"])),
+        ("go", &manifest_toml("go", "1.0.0", &[".go"])),
+    ]);
+    let discovered = discover(&[root]).unwrap();
+
+    for path in ["app/main.py", "pkg/Stubs.PYI", "cmd/main.go", "src/lib.rs", "Makefile", "web/App.tsx"] {
+        assert_eq!(discovered.routed_language(path), discovered.language_for(path), "{path}");
+    }
+    assert_eq!(discovered.routed_language("pkg/Stubs.PYI"), Some("python"));
+    for language in ["python", "go", "rust", "typescript"] {
+        assert_eq!(
+            discovered.has_plugin(language),
+            discovered.manifests.contains_key(language),
+            "{language}"
+        );
+    }
+
+    let missing: Vec<&str> = missing(&discovered).iter().map(|entry| entry.language).collect();
+    assert_eq!(missing, ["typescript", "rust"]);
+    assert_eq!(absent_for_path(&discovered, "pkg/Stubs.PYI"), None);
+    assert_eq!(absent_for_path(&discovered, "src/lib.rs").map(|entry| entry.language), Some("rust"));
 }

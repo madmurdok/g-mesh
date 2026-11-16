@@ -192,9 +192,7 @@ use sha2::{Digest, Sha256};
 use crate::graph::queries::{declaration_only, NON_DECLARATION_NATIVE_KINDS};
 use crate::storage::write::{Diff, NodeRecord};
 
-/// The `nativeKind` of a core-materialized container node. Never plugin-emitted
-/// - `protocol::conformance` reports one on the wire as a violation.
-pub const CONTAINER_NATIVE_KIND: &str = "container";
+pub use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
 
 const MODULE_KIND: &str = "Module";
 const DEFINES_KIND: &str = "DEFINES";
@@ -228,7 +226,7 @@ type Key = (String, String);
 ///  - NUL, not a space, between language and key, because a key is free text
 ///    and may contain spaces (a C++ namespace never does, but nothing here
 ///    should rely on which languages exist). `language` is a plugin directory
-///    name (`daemon::manifest` requires the two to match) and no filesystem
+///    name (`plugin_manifest` requires the two to match) and no filesystem
 ///    allows NUL in one, so the split is unambiguous.
 ///
 /// A plugin that ever needs to address a container node directly computes the
@@ -240,10 +238,10 @@ pub fn container_id(language: &str, key: &str) -> String {
 }
 
 /// The id of the `DEFINES` edge from `container_node_id` to `member_id`,
-/// computed exactly as `edgeIdFor(from, "DEFINES", to)` in extract.ts would.
-/// Reusing the plugin's own edge scheme is safe because the `from` half is a
-/// container id no plugin node can have (see [`container_id`]), and it means
-/// the edge is the one any tier would name for that triple.
+/// the space-joined hash of `edge <from> DEFINES <to>`. This is core's own
+/// scheme, not the NUL-joined one in `plugins/sdk/src/ids.rs`; it cannot
+/// collide with a plugin edge id because the `from` half is a container id no
+/// plugin node can have (see [`container_id`]).
 fn defines_edge_id(container_node_id: &str, member_id: &str) -> String {
     let digest = Sha256::digest(format!("edge {container_node_id} {DEFINES_KIND} {member_id}").as_bytes());
     digest.iter().take(16).map(|b| format!("{b:02x}")).collect()

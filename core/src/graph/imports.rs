@@ -70,7 +70,7 @@
 //! about *which* export a specifier names is this module's business. A v1
 //! (TS) `resolved_module`'s legacy-derived target
 //! (`protocol::types::derive_legacy_target`) always carries `keyKind: name,
-//! key: "*"` (`graph::symbol_links::REEXPORT_ALL_NAME`, borrowed there as a
+//! key: "*"` (`g_mesh_wire::native_kind::REEXPORT_ALL_NAME`, borrowed there as a
 //! stand-in for "the whole module" - see that function's own comment) for
 //! exactly this reason: the value is a placeholder the wire shape requires,
 //! never one this module - or any module - consults.
@@ -91,29 +91,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::storage::write::Diff;
 
-/// The `nativeKind` a plugin marks a resolved import placeholder with.
-/// Mirrors `RESOLVED_MODULE_NATIVE_KIND` in plugins/typescript/src/extractor/keys.rs
-/// - the two are one wire contract and must be changed together.
-pub const RESOLVED_MODULE_NATIVE_KIND: &str = "resolved_module";
-
-/// The `nativeKind` a plugin marks an import it could *not* resolve to
-/// anything in this project with - a package, a language builtin, a crate
-/// nothing here walks. Mirrors `EXTERNAL_MODULE_NATIVE_KIND` in
-/// plugins/typescript/src/extractor/keys.rs and the same literal in the Python and
-/// Rust plugins' emitters; all of them are one wire contract.
-///
-/// Unlike [`RESOLVED_MODULE_NATIVE_KIND`] and the two placeholder kinds in
-/// `graph::symbol_links`, core never links one - there is nothing in the
-/// index for it to point at, which is what "external" means here - so it is
-/// stored as an ordinary `Module` row, and until GM-367 the symbol lookups
-/// answered with one as though it were a declaration. See `graph::queries`'
-/// own header for that, and `protocol::conformance` for why it is exempt
-/// from the "a placeholder nativeKind requires a target" rule.
-///
-/// Lives here rather than in the one module that used to spell it
-/// (`cli::plugin_check::checks`, privately) now that a second module needs
-/// it: two copies of a wire literal is how they come to disagree.
-pub const EXTERNAL_MODULE_NATIVE_KIND: &str = "external_module";
+pub use g_mesh_wire::native_kind::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
 
 const MODULE_KIND: &str = "Module";
 const FILE_KIND: &str = "File";
@@ -454,7 +432,7 @@ mod tests {
             scope_kind: FILE_SCOPE.to_string(),
             scope: path.to_string(),
             key_kind: "name".to_string(),
-            key: crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string(),
+            key: g_mesh_wire::native_kind::REEXPORT_ALL_NAME.to_string(),
             from_container: None,
             key_path: None,
             also_scopes: Vec::new(),
@@ -468,7 +446,7 @@ mod tests {
             scope_kind: CONTAINER_SCOPE.to_string(),
             scope: key.to_string(),
             key_kind: "name".to_string(),
-            key: crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string(),
+            key: g_mesh_wire::native_kind::REEXPORT_ALL_NAME.to_string(),
             from_container: None,
             key_path: None,
             also_scopes: Vec::new(),

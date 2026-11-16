@@ -35,7 +35,7 @@
 # CGO_ENABLED=0 go build -o g-mesh-plugin-go .` produces a file named
 # exactly `g-mesh-plugin-go` (a Windows PE binary, no extension) - Go only
 # appends `.exe` on its own when `-o` is *omitted*, not when it is given
-# explicitly. And `core/src/daemon/manifest.rs`'s `resolve_path_entry`
+# explicitly. And `core/src/plugin_manifest.rs`'s `resolve_path_entry`
 # performs no extension handling of its own; it only decides bare-command
 # vs. path-relative-to-the-manifest-directory.
 #

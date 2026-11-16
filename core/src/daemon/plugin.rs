@@ -5,7 +5,7 @@
 //! discovered manifest's `command`/`args` name).
 //!
 //! [`PluginProcess`]/[`PluginState`] here are generic over any one plugin;
-//! discovery and per-language routing live in `daemon::manifest`
+//! discovery and per-language routing live in `plugin_manifest`
 //! (`~/.g-mesh/plugins/<language>/plugin.toml` + the bundled root) and
 //! `daemon::registry::PluginRegistry`, which spawns one `PluginProcess` per
 //! discovered language, lazily, the first time anything needs it. Every
@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::daemon::manifest::PluginManifest;
 use crate::embedding::EmbeddingPipeline;
+use crate::plugin_manifest::PluginManifest;
 use crate::protocol::handshake;
 use crate::protocol::jsonrpc::{is_timeout, read_message_with_timeout, write_message};
 use crate::protocol::types::{
@@ -354,8 +354,8 @@ pub fn fingerprint(manifest: &PluginManifest) -> String {
     })
 }
 
-/// One digest over every plugin `daemon::manifest::discover` finds from
-/// `daemon::manifest::default_roots` - the same value `daemon::registry::indexer_version`
+/// One digest over every plugin `plugin_manifest::discover` finds from
+/// `plugin_manifest::default_roots` - the same value `daemon::registry::indexer_version`
 /// appends to the core pipeline's generation - memoized for the process's
 /// lifetime. It is what `build_stamp::of_running_process` records, so a shim
 /// can tell that a running daemon's plugins were rebuilt under an unchanged
@@ -370,7 +370,7 @@ pub fn fingerprint(manifest: &PluginManifest) -> String {
 pub fn discovered_fingerprint() -> &'static str {
     static FINGERPRINT: OnceLock<String> = OnceLock::new();
     FINGERPRINT.get_or_init(|| {
-        match crate::daemon::manifest::discover(&crate::daemon::manifest::default_roots()) {
+        match crate::plugin_manifest::discover(&crate::plugin_manifest::default_roots()) {
             Ok(discovered) => crate::daemon::registry::plugins_digest(&discovered),
             Err(err) => {
                 crate::log_line!(
@@ -505,7 +505,7 @@ struct PluginState {
 ///
 /// Triggered by the path shape the bundled cargo-workspace plugins declare
 /// (`${G_MESH_BIN_DIR}/g-mesh-plugin-<language>`, resolved by
-/// `daemon::manifest::resolve_command` against the running g-mesh
+/// `plugin_manifest::resolve_command` against the running g-mesh
 /// executable's own `target/<profile>/` directory) rather than by name, so a
 /// plugin that joins the cargo workspace the same way is covered without this
 /// function learning its name.
@@ -533,7 +533,7 @@ struct PluginState {
 /// # Which spelling the message names
 ///
 /// `command` reaching this function already went through
-/// `manifest::resolve_exe_suffix` once, at manifest-read time - so on a
+/// `plugin_manifest::resolve_exe_suffix` once, at manifest-read time - so on a
 /// platform with a non-empty [`std::env::consts::EXE_SUFFIX`] (Windows),
 /// `command` is extensionless *here* only when neither the unsuffixed nor
 /// the suffixed spelling exists (if the suffixed one did, resolution would
@@ -541,7 +541,7 @@ struct PluginState {
 /// would name a spelling cargo never produces on that platform at all -
 /// wrong in a different way than the bare `No such file or directory` this
 /// function exists to replace, not an improvement over it. So this
-/// re-derives the suffixed spelling via [`manifest::exe_suffixed`] (the same
+/// re-derives the suffixed spelling via [`plugin_manifest::exe_suffixed`] (the same
 /// pure decision `resolve_exe_suffix` itself uses) purely for the message,
 /// independent of whether that file exists - it's the name a real
 /// `cargo build --workspace` on this platform would actually produce, and
@@ -570,7 +570,7 @@ pub(crate) fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: 
     let workspace_root = target_dir.parent().filter(|root| root.join("Cargo.toml").is_file());
 
     let named =
-        crate::daemon::manifest::exe_suffixed(command, suffix).unwrap_or_else(|| command.to_path_buf());
+        crate::plugin_manifest::exe_suffixed(command, suffix).unwrap_or_else(|| command.to_path_buf());
     let build =
         if profile == "release" { "cargo build --workspace --release" } else { "cargo build --workspace" };
 
@@ -613,12 +613,12 @@ impl PluginState {
             .args(&manifest.args)
             .arg(project_root)
             // The manifest core read, so the plugin reads the same one - see
-            // `manifest::MANIFEST_PATH_ENV`. Without it an SDK plugin looks
+            // `plugin_manifest::MANIFEST_PATH_ENV`. Without it an SDK plugin looks
             // beside its own binary, which is right in an installed layout and
             // wrong in a checkout, where core would send a `semanticPass` to a
             // plugin that never found the `[plugin.semantic]` section
             // declaring the server to answer it with.
-            .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
+            .env(crate::plugin_manifest::MANIFEST_PATH_ENV, manifest.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Plugin logs are diagnostic-only today - nothing consumes them
@@ -1613,7 +1613,7 @@ impl PluginProcess {
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
         let replaced = std::mem::replace(&mut *self.state(), fresh);
-        super::write_pid_file(&self.pid_file, pid);
+        crate::paths::state_dir::write_pid_file(&self.pid_file, pid);
         // Outside the state lock: the fresh process is already serving, and
         // waiting out the old one's grace period must not hold up a request.
         if let Err(err) = replaced.end(RELAUNCH_GRACE) {

@@ -286,7 +286,7 @@ fn assert_released_everything(project: &Project, daemon_process: &mut Daemon, pl
 }
 
 /// The marker whose mtime spaces the shim's startup sweeps
-/// (`cli::clean::ORPHAN_SWEEP_MARKER`, private to that module).
+/// (`control::sweep::ORPHAN_SWEEP_MARKER`, private to that module).
 const ORPHAN_SWEEP_MARKER: &str = "orphan-sweep.stamp";
 
 /// How long one shim is given to sweep `state_dir` before another is started.
@@ -433,7 +433,7 @@ fn a_purge_that_finds_the_bootstrap_lock_held_waits_for_it() {
 /// A root whose parent is gone too is not judged deleted (it may be an
 /// unmounted volume): the daemon still stops, but keeps the project's state.
 ///
-/// Control: make `cli::clean::root_state` return `Orphaned` for a missing
+/// Control: make `control::purge::root_state` return `Orphaned` for a missing
 /// parent too: the state directory is deleted.
 #[test]
 fn a_daemon_whose_root_and_its_parent_are_gone_keeps_its_state() {

@@ -54,10 +54,10 @@ use rusqlite::{params, Connection};
 use crate::embedding::pipeline::ComputedBatch;
 use crate::embedding::text::{node_text, EmbedInput};
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::containers::CONTAINER_NATIVE_KIND;
-use crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND;
 use crate::storage::schema;
 use crate::storage::write::{Diff, NodeRecord};
+use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
+use g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND;
 
 const NODE_COLUMNS: &str = "id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
      signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, generated, container, \

@@ -15,11 +15,11 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::manifest::{Capabilities, MemberOverrides};
 use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
+use crate::plugin_manifest::{Capabilities, MemberOverrides};
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
@@ -1006,9 +1006,9 @@ mod tests {
                 semantic_prepare: false,
                 files_created: false,
                 resolution_delta: false,
-                receiver_calls: crate::daemon::manifest::ReceiverCallResolution::Resolved,
-                receiver_calls_structural: crate::daemon::manifest::ReceiverCallResolution::Unresolved,
-                member_overrides: crate::daemon::manifest::MemberOverrides::None,
+                receiver_calls: crate::plugin_manifest::ReceiverCallResolution::Resolved,
+                receiver_calls_structural: crate::plugin_manifest::ReceiverCallResolution::Unresolved,
+                member_overrides: crate::plugin_manifest::MemberOverrides::None,
             },
         )])
     }
@@ -2243,7 +2243,7 @@ mod tests {
     // `overrides`: the capability gate and both wire paths
     // -----------------------------------------------------------------
 
-    use crate::daemon::manifest::MemberOverrides;
+    use crate::plugin_manifest::MemberOverrides;
     use crate::protocol::types::{PathSegment, QualifiedPath};
 
     /// A `kind` declaration at `segments` (joined by `sep`) in `file` and

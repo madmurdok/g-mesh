@@ -74,7 +74,7 @@ use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, Pla
 ///
 /// `semantic_pass_capable` gates the second round trip entirely: a plugin
 /// whose manifest declares `capabilities.semantic_pass = false` (the
-/// conservative default - see `daemon::manifest::Capabilities::default`)
+/// conservative default - see `plugin_manifest::Capabilities::default`)
 /// never receives a `semanticPass` request at all, per the architecture
 /// doc's `plugin.toml additions` ("`false`: core never sends it, and no
 /// empty-diff answer is required"). A plain `bool` rather than the
@@ -83,7 +83,7 @@ use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, Pla
 /// caller that *does* own the manifest - `daemon::plugin::PluginProcess`,
 /// via its own `manifest.capabilities.semantic_pass` - resolves the
 /// capability and hands down only the one bit this function needs, rather
-/// than this module reaching into `daemon::manifest` for itself.
+/// than this module reaching into `plugin_manifest` for itself.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_file_change<R: BufRead + Send, W: Write>(
     reader: &mut R,

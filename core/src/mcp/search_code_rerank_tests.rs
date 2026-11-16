@@ -529,7 +529,7 @@ fn a_row_deleted_between_pages_is_skipped() {
 /// *Control:* rerank whenever `cursor` is `None`, whatever `coverage` says.
 #[test]
 fn a_partial_page_is_not_reranked() {
-    use crate::daemon::indexing_status::Phase;
+    use crate::indexing_status::Phase;
 
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
@@ -845,10 +845,10 @@ fn an_unreadable_file_or_span_gives_a_text_and_no_root_gives_no_body() {
 async fn the_tool_reads_the_body_under_the_project_root() {
     use super::search_code_worker_tests::{call, connect};
     use super::GMeshMcpServer;
-    use crate::daemon::indexing_status::{IndexingStatus, Phase};
     use crate::daemon::lifecycle::CoreActivity;
-    use crate::daemon::manifest::DiscoveredPlugins;
     use crate::daemon::registry::PluginRegistry;
+    use crate::indexing_status::{IndexingStatus, Phase};
+    use crate::plugin_manifest::DiscoveredPlugins;
 
     let query = "parseConfig";
     let dir = tempfile::tempdir().unwrap();
@@ -1097,7 +1097,7 @@ fn a_continuation_page_does_not_spend_the_hint() {
 /// -> the partial page takes the hint.
 #[test]
 fn a_partial_page_does_not_spend_the_hint() {
-    use crate::daemon::indexing_status::Phase;
+    use crate::indexing_status::Phase;
 
     let dir = tempfile::tempdir().unwrap();
     let embedding = fake(dir.path()).with_reranker(failing_reranker(None));

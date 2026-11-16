@@ -7,6 +7,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+pub mod state_dir;
+
 use anyhow::{Context, Result};
 
 /// Points g-mesh's state somewhere other than `~/.g-mesh`.

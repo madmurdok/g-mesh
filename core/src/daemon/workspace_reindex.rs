@@ -84,13 +84,14 @@ use anyhow::{Context, Result};
 
 use crate::daemon::bulk_index::{self, WalkContext};
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::manifest::{self, PluginManifest};
 use crate::daemon::plugin;
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::embedding::pipeline::ComputedBatch;
 use crate::embedding::EmbedStats;
+use crate::paths::state_dir::StateDir;
+use crate::plugin_manifest::{self, PluginManifest};
 use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
@@ -98,12 +99,9 @@ use crate::storage::schema;
 use crate::watcher::apply::SemanticPassOutcome;
 use crate::watcher::staleness;
 
-const STAGING_PREFIX: &str = "staging-";
-const STAGING_SUFFIX: &str = ".db";
-
 /// Where `language`'s staging index lives in the project's state directory.
 fn staging_path(state_dir: &Path, language: &str) -> PathBuf {
-    state_dir.join(format!("{STAGING_PREFIX}{language}{STAGING_SUFFIX}"))
+    StateDir::at(state_dir).staging_db(language)
 }
 
 /// Removes a staging file and the journal SQLite may have left beside it.
@@ -130,7 +128,7 @@ pub(crate) fn remove_stale_staging(state_dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(STAGING_PREFIX) && name.ends_with(STAGING_SUFFIX) {
+        if StateDir::is_staging_db(name) {
             remove_staging(&entry.path());
         }
     }
@@ -145,7 +143,8 @@ pub(crate) fn remove_stale_semantic_pending(
     conn: &rusqlite::Connection,
     manifests: &std::collections::HashMap<String, PluginManifest>,
 ) {
-    let capable: HashSet<String> = manifest::semantic_pass_capable_languages(manifests).into_iter().collect();
+    let capable: HashSet<String> =
+        plugin_manifest::semantic_pass_capable_languages(manifests).into_iter().collect();
     match schema::clear_stale_semantic_pending(conn, &capable) {
         Ok(0) => {}
         Ok(cleared) => {
@@ -494,9 +493,9 @@ mod tests {
     use rusqlite::OptionalExtension;
 
     use super::*;
-    use crate::daemon::manifest::discover;
     use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
+    use crate::plugin_manifest::discover;
     use crate::storage::write::{apply_diff, Diff, NodeRecord};
 
     /// A file-backed index in `project`'s state directory, where the daemon
@@ -545,7 +544,7 @@ mod tests {
 
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifests must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -728,7 +727,7 @@ mod tests {
         );
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -776,7 +775,7 @@ mod tests {
         );
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -826,7 +825,7 @@ mod tests {
         adjust(&alpha_dir);
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -922,7 +921,7 @@ mod tests {
         test_plugin::answer_first_semantic_pass_incomplete(&alpha_dir, "alpha", Some(REASON));
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -974,7 +973,7 @@ mod tests {
         );
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -1059,7 +1058,7 @@ mod tests {
         test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &["go.mod"], &[]);
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
@@ -1246,7 +1245,7 @@ mod tests {
         }
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
@@ -2429,14 +2428,16 @@ mod tests {
     fn alpha_failed_and_counted(registry: &PluginRegistry, conn: &IndexStore) {
         let outcomes = std::collections::BTreeMap::from([(
             "alpha".to_string(),
-            crate::languages::LanguageOutcome::Failed { error: "the walk failed".to_string() },
+            crate::storage::language_outcome::LanguageOutcome::Failed {
+                error: "the walk failed".to_string(),
+            },
         )]);
         conn.with(|conn| schema::record_language_outcomes(conn, &outcomes)).unwrap();
         conn.with(|conn| schema::begin_language_retry(conn, "alpha")).unwrap();
         registry.set_failed_languages(["alpha".to_string()]);
     }
 
-    fn alpha_outcome(conn: &IndexStore) -> crate::languages::LanguageOutcome {
+    fn alpha_outcome(conn: &IndexStore) -> crate::storage::language_outcome::LanguageOutcome {
         conn.with(schema::language_outcomes).unwrap().into_iter().find(|(l, _)| l == "alpha").unwrap().1
     }
 
@@ -2469,7 +2470,10 @@ mod tests {
         let failed = retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now());
 
         assert!(failed.is_err(), "a walk that exits non-zero fails the retry");
-        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Failed { .. }));
+        assert!(matches!(
+            alpha_outcome(&conn),
+            crate::storage::language_outcome::LanguageOutcome::Failed { .. }
+        ));
         assert_eq!(conn.with(schema::language_retries).unwrap().get("alpha"), Some(&1));
         assert!(registry.is_failed_language("alpha"), "a failed retry leaves the language unrouted");
         assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 0);
@@ -2479,7 +2483,10 @@ mod tests {
         retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now())
             .expect("the retry succeeds");
 
-        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Indexed { files: _ }));
+        assert!(matches!(
+            alpha_outcome(&conn),
+            crate::storage::language_outcome::LanguageOutcome::Indexed { files: _ }
+        ));
         assert!(conn.with(schema::language_retries).unwrap().is_empty(), "the swap drops the count");
         assert!(!registry.is_failed_language("alpha"), "the swapped-in language is routed");
         assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 2);

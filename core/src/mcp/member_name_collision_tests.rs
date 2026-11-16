@@ -16,10 +16,10 @@ use std::sync::Arc;
 use rmcp::model::CallToolResult;
 
 use crate::daemon::bulk_index;
-use crate::daemon::manifest::{read_manifest, Capabilities, DiscoveredPlugins};
 use crate::embedding::EmbeddingPipeline;
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
+use crate::plugin_manifest::{read_manifest, Capabilities, DiscoveredPlugins};
 use crate::storage::connection::{open, project_dir};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;

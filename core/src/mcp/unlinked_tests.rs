@@ -8,11 +8,11 @@ use rusqlite::Connection;
 
 use super::*;
 use crate::daemon::bulk_index;
-use crate::daemon::manifest::{read_manifest, Capabilities, DiscoveredPlugins};
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::queries::{self, upsert_edge, upsert_node};
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
+use crate::plugin_manifest::{read_manifest, Capabilities, DiscoveredPlugins};
 use crate::protocol::types::QualifiedPath;
 use crate::storage::connection::{open, project_dir};
 use crate::storage::index_store::IndexStore;
@@ -79,7 +79,7 @@ impl Fixture {
         let conn = open(dir.path()).expect("failed to open the project index");
         schema::ensure_current(&conn, "unlinked-usages-test").expect("failed to prepare the index");
         let discovered = rust_only();
-        let rules = crate::daemon::manifest::link_rules(discovered.manifests.values());
+        let rules = crate::plugin_manifest::link_rules(discovered.manifests.values());
         let store = IndexStore::new(conn).with_link_rules(rules);
         let summary = bulk_index::run(dir.path(), &store, &discovered).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes");

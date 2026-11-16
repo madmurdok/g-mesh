@@ -26,7 +26,7 @@ use std::process::Command;
 use rusqlite::{Connection, OpenFlags};
 
 use super::*;
-use crate::daemon::indexing_status::ColdCause;
+use crate::indexing_status::ColdCause;
 
 const VERSION: &str = "seed-test-generation";
 
@@ -113,7 +113,7 @@ fn create_index(path: &Path, version: &str, walked: bool) -> Connection {
 
 /// The source index of `main` under `home`, written and closed.
 fn source_index(home: &Path, main: &Path, version: &str, walked: bool) -> PathBuf {
-    let dir = connection::project_dir_under(home, main).unwrap();
+    let dir = crate::paths::state_dir::project_dir_under(home, main).unwrap();
     fs::create_dir_all(&dir).unwrap();
     let db = dir.join("index.db");
     let conn = create_index(&db, version, walked);

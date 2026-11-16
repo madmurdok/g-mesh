@@ -18,7 +18,8 @@ We split the suite into 12 named sections, each a nextest filterset over the
 whole workspace, held in `scripts/test-sections.sh`: `core-it`,
 `core-scripts`, `core-mcp`, `core-daemon`, `core-cli`, `core-graph`,
 `core-rest`, `sdk`, `plugin-typescript`, `plugin-rust`, `plugin-python`,
-`wire`. Core's integration tests are two binaries: `core-scripts` is
+`wire` (which also holds `g-mesh-walk`, the other leaf crate the rest build
+on). Core's integration tests are two binaries: `core-scripts` is
 `binary_id(g-mesh::scripts)` (tests whose subject is a file under
 `scripts/`), and `core-it` is the rest of core's `kind(test)`, so a new test
 binary lands in `core-it` rather than in no section (GM-671: split out so a

@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "4.30.0"
+version = "4.31.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -26,7 +26,7 @@ dirs = "5"
 flate2 = "1"
 # Already resolved into this tree as a transitive dependency of `ignore`
 # (which uses it internally for `.gitignore`-style overrides), so promoting
-# it to a direct dependency for `daemon::manifest`'s `[plugin.workspace]
+# it to a direct dependency for `plugin_manifest`'s `[plugin.workspace]
 # watch_files` glob validation (`*.csproj`, per the multi-language-plugins
 # architecture doc's paper stress test) adds no new subtree to compile -
 # `cargo tree` already has one copy. Chosen over hand-rolling glob matching

@@ -3,8 +3,9 @@
 //!
 //! The plugin SDK's walk (`g_mesh_plugin_sdk::walk`) and core's walk must
 //! agree on which spelling a file is listed under, so both run this one.
-//! It depends on `ignore` only. Which directory *names* are excluded is the
-//! caller's: the SDK passes its baseline plus a manifest's `exclude_dirs`.
+//! It depends on `ignore` only. Every walk prunes [`BASELINE_EXCLUDED_DIRS`];
+//! further directory *names* are the caller's: the SDK passes a manifest's
+//! `exclude_dirs`.
 //!
 //! # The policy, exactly
 //!
@@ -19,7 +20,8 @@
 //!   developers cannot compare.
 //! - **Hidden files are not skipped for being hidden.** `.config/build.ts` is
 //!   source. What is skipped is named explicitly, by the caller.
-//! - **The caller's `excluded` directory names**, by exact name at any depth.
+//! - **[`BASELINE_EXCLUDED_DIRS`] and the caller's `excluded` directory
+//!   names**, by exact name at any depth.
 //! - **Symlinks are followed, behind a guard.** Why, and why these rules, is
 //!   [ADR 0025](../../docs/adr/0025-project-walk-follows-symlinks.md).
 //! - **Sorted** (`sort_by_file_name`), so "first in walk order" below is the
@@ -54,6 +56,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ignore::WalkBuilder;
+
+/// Directory names excluded whatever `.gitignore` says, in every language:
+/// git's object store and Claude Code's session directory (`.claude/worktrees/`
+/// holds whole copies of the project), neither of which is ever source. Every
+/// walk here prunes them; everything language-specific (`node_modules`,
+/// `target`, `vendor`) is the plugin's own `[plugin.workspace] exclude_dirs`.
+/// Shared with `cli::status`'s coverage walk. Keep the definition on one
+/// line: the Go plugin's test reads it as text.
+pub const BASELINE_EXCLUDED_DIRS: [&str; 2] = [".git", ".claude"];
 
 /// What [`walk`] found: the files, and what became of every symlink it met.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,8 +157,8 @@ pub enum LinkRefusal {
 
 /// Every file under `root`, one per real file, with the links met.
 ///
-/// `excluded` are exact directory names, matched at any depth; the caller's
-/// whole list (this crate adds no baseline of its own).
+/// `excluded` are exact directory names, matched at any depth, on top of
+/// [`BASELINE_EXCLUDED_DIRS`], which every walk prunes.
 pub fn walk(root: &Path, excluded: &[String]) -> Walk {
     walk_filtered(root, excluded, |_| true)
 }
@@ -233,7 +244,13 @@ fn normalize(path: &str) -> String {
 /// nothing else. The guard it returns has seen every entry the builder's walk
 /// let through once that walk has run.
 fn walker(root: &Path, excluded: &[String]) -> (WalkBuilder, Arc<LinkGuard>) {
-    let excluded = excluded.to_vec();
+    let mut names: Vec<String> = BASELINE_EXCLUDED_DIRS.iter().map(|name| (*name).to_string()).collect();
+    for name in excluded {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    let excluded = names;
     let guard = Arc::new(LinkGuard::new(root, excluded.clone()));
     let mut walker = WalkBuilder::new(root);
     walker
@@ -576,3 +593,6 @@ fn innermost(err: &ignore::Error) -> (Option<&Path>, Option<&ignore::Error>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

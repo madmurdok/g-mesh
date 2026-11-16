@@ -4,16 +4,16 @@
 //!
 //! See `docs/architecture/plugin-modularity.md`'s Interfaces section for the
 //! behavior this implements: every *effective* plugin - one entry per
-//! language, exactly the set `daemon::manifest::discover` would hand the
+//! language, exactly the set `plugin_manifest::discover` would hand the
 //! daemon to spawn from these same roots - is reported, tagged with which
 //! root it came from ([`PluginStatus::Bundled`] or [`PluginStatus::Installed`]);
 //! a manifest that fails to parse is listed with an error string rather than
 //! silently dropped or aborting the whole command - unlike daemon startup
-//! (see [`crate::daemon::manifest::discover`], which hard-fails on the first
+//! (see [`crate::plugin_manifest::discover`], which hard-fails on the first
 //! bad manifest), a listing tool's job is to surface what is there,
 //! including what is broken.
 //!
-//! # Why this does not just call `daemon::manifest::discover`
+//! # Why this does not just call `plugin_manifest::discover`
 //!
 //! `discover()` returns only the merged, daemon-ready result: one manifest
 //! per language (an earlier root's entry silently shadows a same-named later
@@ -26,7 +26,7 @@
 //! duplicate `discover()`'s stance on by *not* re-checking them - a daemon-
 //! startup concern this command has no reason to raise on its own). So this
 //! module walks each root itself, calling
-//! [`crate::daemon::manifest::read_manifest`] per plugin directory found -
+//! [`crate::plugin_manifest::read_manifest`] per plugin directory found -
 //! the same per-manifest primitive `discover()` uses - rather than reusing
 //! `discover()`'s all-or-nothing merge.
 //!
@@ -56,10 +56,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::daemon::manifest::{self, Capabilities, NonSymbolShapes, SymbolQueryPrefixes};
+use crate::plugin_manifest::{self, Capabilities, NonSymbolShapes, SymbolQueryPrefixes};
 
 /// `<root>/<language-dir>/plugin.toml` - matches
-/// `daemon::manifest`'s own (private) constant of the same name.
+/// `plugin_manifest`'s own (private) constant of the same name.
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
 
 /// Which discovery root a plugin's manifest was found under.
@@ -71,7 +71,7 @@ pub enum PluginStatus {
     /// Found under `~/.g-mesh/plugins/` - a user-installed plugin, either
     /// filling in a language the bundled install does not ship, or
     /// deliberately overriding a bundled one of the same language (see
-    /// `daemon::manifest::discover`'s doc comment on shadowing).
+    /// `plugin_manifest::discover`'s doc comment on shadowing).
     Installed,
 }
 
@@ -85,7 +85,7 @@ impl PluginStatus {
 }
 
 /// What discovering one plugin directory produced: a usable manifest, or -
-/// unlike `daemon::manifest::discover`, which hard-fails here - the reason
+/// unlike `plugin_manifest::discover`, which hard-fails here - the reason
 /// it could not be read. Kept as a plain error string (not the root
 /// `anyhow::Error`) so [`PluginInfo`] stays `Clone + PartialEq + Eq` like
 /// the rest of this module's public types.
@@ -95,7 +95,7 @@ pub enum PluginOutcome {
         version: String,
         status: PluginStatus,
         /// What this plugin declares it can do - see
-        /// `daemon::manifest::Capabilities`'s own doc comment. Carried
+        /// `plugin_manifest::Capabilities`'s own doc comment. Carried
         /// through so `render` can show it: capabilities are read from the
         /// manifest specifically so they are knowable without spawning
         /// anything (see that type's doc comment), which is exactly the
@@ -133,7 +133,7 @@ pub fn run() -> Result<()> {
 }
 
 /// Every plugin this install has - one entry per language, the same
-/// language set `daemon::manifest::discover` would hand the daemon to spawn
+/// language set `plugin_manifest::discover` would hand the daemon to spawn
 /// from these same roots (see [`list_from_roots`] for the shadow rule that
 /// guarantees this).
 pub fn list() -> Result<Vec<PluginInfo>> {
@@ -142,11 +142,11 @@ pub fn list() -> Result<Vec<PluginInfo>> {
 
 /// The roots `list()` scans, in the order they are reported: the user's own
 /// `~/.g-mesh/plugins/` first, then the bundled roots - the same precedence
-/// order `daemon::manifest::discover`'s doc comment documents
+/// order `plugin_manifest::discover`'s doc comment documents
 /// (`~/.g-mesh/plugins/` is scanned before the bundled root, so a
 /// user-installed plugin can intentionally override a bundled one).
 ///
-/// Delegating the bundled half to [`manifest::bundled_roots`] rather than
+/// Delegating the bundled half to [`plugin_manifest::bundled_roots`] rather than
 /// re-deriving it is what keeps this listing honest about what the daemon
 /// would actually spawn: both the installed layout (a release archive's
 /// `plugins/` beside the executable) and the checkout layout are reported.
@@ -164,7 +164,7 @@ fn default_roots() -> Result<Vec<(PathBuf, PluginStatus)>> {
     let home = dirs::home_dir().context("could not resolve home directory")?;
     let user_root = home.join(".g-mesh").join("plugins");
     let mut roots = vec![(user_root, PluginStatus::Installed)];
-    roots.extend(manifest::bundled_roots().into_iter().map(|root| (root, PluginStatus::Bundled)));
+    roots.extend(plugin_manifest::bundled_roots().into_iter().map(|root| (root, PluginStatus::Bundled)));
     Ok(roots)
 }
 
@@ -178,7 +178,7 @@ fn default_roots() -> Result<Vec<(PathBuf, PluginStatus)>> {
 /// A language already reported from an earlier root is skipped when the
 /// same language turns up again under a later one - `HashSet`-tracked as
 /// entries accumulate, in the same root order `roots` was given in. This is
-/// not a display-only policy invented here: it is `daemon::manifest::discover`'s
+/// not a display-only policy invented here: it is `plugin_manifest::discover`'s
 /// own "an earlier root's entry silently shadows a same-named later one"
 /// rule (see that function's doc comment), reapplied so that what this
 /// command prints never disagrees with what the daemon would actually spawn
@@ -212,7 +212,7 @@ fn list_from_roots(roots: &[(PathBuf, PluginStatus)]) -> Result<Vec<PluginInfo>>
 }
 
 /// Lists every plugin directory directly under `root` (one level, matching
-/// `daemon::manifest::discover`'s own scan shape), tagging each with
+/// `plugin_manifest::discover`'s own scan shape), tagging each with
 /// `status`.
 ///
 /// A root that does not exist, or is otherwise unreadable, contributes
@@ -239,7 +239,7 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
         let dir_name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("?").to_string();
         let shown_dir = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
 
-        let outcome = match manifest::read_manifest(&dir) {
+        let outcome = match plugin_manifest::read_manifest(&dir) {
             Ok(manifest) => {
                 infos.push(PluginInfo {
                     language: manifest.language,
@@ -304,7 +304,7 @@ pub fn render(plugins: &[PluginInfo]) -> String {
 /// `semantic_pass` as `yes`/`no` (there is no third state to distinguish
 /// from a boolean, unlike the two receiver-call fields) and the two
 /// receiver-call fields via [`ReceiverCallResolution`]'s own `Display`
-/// impl and `member_overrides` via [`manifest::MemberOverrides`]'s, so this
+/// impl and `member_overrides` via [`plugin_manifest::MemberOverrides`]'s, so this
 /// has no second mapping to keep in sync with the one on each type.
 fn render_capabilities(capabilities: &Capabilities) -> String {
     format!(
@@ -322,7 +322,7 @@ mod tests {
 
     /// The bundled JS/TS plugin's own `plugin.toml`, embedded at compile
     /// time so this test tracks the committed file, not a copy - same
-    /// approach `daemon::manifest`'s own
+    /// approach `plugin_manifest`'s own
     /// `the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly`
     /// test uses. Its containing directory on disk is named `typescript`
     /// (task 155 renamed it from `js-ts` precisely so it would satisfy
@@ -353,21 +353,21 @@ mod tests {
     /// parse path every assertion below is really checking.
     fn bundled_plugin_capabilities() -> Capabilities {
         let (_root, dir) = fixture_root(&[("typescript", BUNDLED_JS_TS_MANIFEST)]);
-        manifest::read_manifest(&dir.join("typescript"))
+        plugin_manifest::read_manifest(&dir.join("typescript"))
             .expect("the bundled plugin's manifest must parse")
             .capabilities
     }
 
     fn bundled_plugin_non_symbol_queries() -> NonSymbolShapes {
         let (_root, dir) = fixture_root(&[("typescript", BUNDLED_JS_TS_MANIFEST)]);
-        manifest::read_manifest(&dir.join("typescript"))
+        plugin_manifest::read_manifest(&dir.join("typescript"))
             .expect("the bundled plugin's manifest must parse")
             .non_symbol_queries
     }
 
     fn bundled_plugin_symbol_query_prefixes() -> SymbolQueryPrefixes {
         let (_root, dir) = fixture_root(&[("typescript", BUNDLED_JS_TS_MANIFEST)]);
-        manifest::read_manifest(&dir.join("typescript"))
+        plugin_manifest::read_manifest(&dir.join("typescript"))
             .expect("the bundled plugin's manifest must parse")
             .symbol_query_prefixes
     }
@@ -472,7 +472,7 @@ mod tests {
     }
 
     /// A root that does not exist contributes nothing and is not an error -
-    /// same convention `daemon::manifest::discover` uses.
+    /// same convention `plugin_manifest::discover` uses.
     #[test]
     fn a_root_that_does_not_exist_contributes_nothing() {
         let root = tempfile::tempdir().unwrap();
@@ -571,7 +571,7 @@ mod tests {
     }
 
     /// A minimal well-formed `plugin.toml` body for a given language and
-    /// version - the `list_from_roots` analog of `daemon::manifest`'s own
+    /// version - the `list_from_roots` analog of `plugin_manifest`'s own
     /// `manifest_toml` test helper, needed here because this module's tests
     /// otherwise only ever exercise the *real* bundled JS/TS manifest
     /// ([`BUNDLED_JS_TS_MANIFEST`]), which cannot vary its own version to
@@ -624,7 +624,7 @@ extensions = [".{language}"]
     /// and an installed root actually hit in practice (see the module doc
     /// comment) - is a decided, tested behavior, not an accident of
     /// iteration order. The decision: the *earlier*, higher-precedence root
-    /// wins, matching `daemon::manifest::discover`'s own shadow rule (see
+    /// wins, matching `plugin_manifest::discover`'s own shadow rule (see
     /// [`list_from_roots`]'s doc comment) - so what a user reads from
     /// `plugins list` always names the version the daemon would actually
     /// spawn from these same roots, never the shadowed one.
@@ -712,9 +712,9 @@ extensions = [".{language}"]
                     semantic_prepare: false,
                     files_created: false,
                     resolution_delta: false,
-                    receiver_calls: manifest::ReceiverCallResolution::Resolved,
-                    receiver_calls_structural: manifest::ReceiverCallResolution::Unresolved,
-                    member_overrides: crate::daemon::manifest::MemberOverrides::None,
+                    receiver_calls: plugin_manifest::ReceiverCallResolution::Resolved,
+                    receiver_calls_structural: plugin_manifest::ReceiverCallResolution::Unresolved,
+                    member_overrides: crate::plugin_manifest::MemberOverrides::None,
                 },
                 non_symbol_queries: NonSymbolShapes::default(),
                 symbol_query_prefixes: SymbolQueryPrefixes::default(),

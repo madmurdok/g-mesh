@@ -57,7 +57,7 @@ fn error_text(result: &CallToolResult) -> String {
 /// sitting on the import line of the file that wrote it.
 fn import_placeholder(id: &str, name: &str, specifier: &str, file: &str) -> NodeRecord {
     let mut node = NodeRecord::new(id, "Module", name, specifier, file, "go");
-    node.native_kind = Some(crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND.to_string());
+    node.native_kind = Some(g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND.to_string());
     node.start_line = 8;
     node.end_line = 8;
     node.end_col = 20;
@@ -951,8 +951,8 @@ fn unloaded_pipeline() -> EmbeddingPipeline {
     )
 }
 
-fn shapes(starts_with: &[&str], contains: &[&str]) -> crate::daemon::manifest::NonSymbolShapes {
-    crate::daemon::manifest::NonSymbolShapes {
+fn shapes(starts_with: &[&str], contains: &[&str]) -> crate::plugin_manifest::NonSymbolShapes {
+    crate::plugin_manifest::NonSymbolShapes {
         starts_with: starts_with.iter().map(|s| s.to_string()).collect(),
         contains: contains.iter().map(|s| s.to_string()).collect(),
     }
@@ -1515,7 +1515,7 @@ fn a_prefixed_path_is_still_refused() {
 fn a_scoped_package_keeps_its_import_note() {
     let mut conn = setup();
     let mut ph = NodeRecord::new("ph", "Module", "pkg", "@scope/pkg", "src/a.ts", "typescript");
-    ph.native_kind = Some(crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND.to_string());
+    ph.native_kind = Some(g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND.to_string());
     upsert_node(&mut conn, ph).unwrap();
     ts_decl(&mut conn, "deco", "Component", "Component", "typescript");
 

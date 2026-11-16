@@ -42,10 +42,19 @@ import (
 // two equal, order included.
 var manifestExcludeDirs = []string{"vendor", "testdata"}
 
-// hardExcludedDirs is manifestExcludeDirs plus .git, which every plugin
-// excludes unconditionally regardless of the manifest.
+// baselineExcludedDirs is the set every plugin excludes unconditionally,
+// regardless of the manifest. It mirrors the Rust constant
+// BASELINE_EXCLUDED_DIRS in walk/src/lib.rs, which core and the SDK both
+// re-export; the Go test TestBaselineExcludedDirsEqualRustBaseline pins the
+// two equal.
+var baselineExcludedDirs = []string{".git", ".claude"}
+
+// hardExcludedDirs is manifestExcludeDirs plus baselineExcludedDirs.
 var hardExcludedDirs = func() map[string]bool {
-	dirs := map[string]bool{".git": true}
+	dirs := map[string]bool{}
+	for _, dir := range baselineExcludedDirs {
+		dirs[dir] = true
+	}
 	for _, dir := range manifestExcludeDirs {
 		dirs[dir] = true
 	}

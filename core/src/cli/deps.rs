@@ -29,16 +29,17 @@ use crate::cli::{
     language_outcome_lines, status, DepsArgs, ExitStatus, INDEX_UNAVAILABLE_EXIT_CODE,
     NOT_A_PROJECT_EXIT_CODE, TIMEOUT_EXIT_CODE,
 };
-use crate::daemon::candidates::{self, Limits, Mode};
-use crate::daemon::indexing_status::group_thousands;
-use crate::daemon::{self, client, manifest};
+use crate::daemon::{self, client};
 use crate::graph::containers;
-use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
-use crate::languages::LanguageOutcome;
+use crate::indexing_status::group_thousands;
+use crate::paths::state_dir::{project_dir, StateDir};
+use crate::plugin_manifest;
 use crate::process;
+use crate::project_detect::{self as candidates, Limits, Mode};
 use crate::shim;
-use crate::storage::connection::project_dir;
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema;
+use g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND;
 
 /// The JSON format's version. Removing or renaming a key, or changing a
 /// field's meaning or type, bumps it; adding a key or a new `kind`/`status`
@@ -96,7 +97,7 @@ pub fn run(args: &DepsArgs) -> Result<()> {
     wait_ready(&root, deadline)?;
 
     let state_dir = project_dir(&root).context("failed to resolve the project's state directory")?;
-    let db_path = state_dir.join("index.db");
+    let db_path = StateDir::at(&state_dir).index_db();
     if !db_path.exists() {
         return Err(unavailable(
             &root,
@@ -166,7 +167,7 @@ fn unavailable(root: &Path, state_dir: &Path, reason: String) -> anyhow::Error {
         format!(
             "the index for {} is unavailable: {reason} (daemon log: {})",
             root.display(),
-            state_dir.join(shim::DAEMON_LOG_FILE).display()
+            StateDir::at(state_dir).daemon_log_file().display()
         ),
     )
 }
@@ -262,8 +263,9 @@ fn timed_out(
 
 /// The phase word and, while walking, how far the walk got.
 fn progress_detail(state_dir: &Path) -> String {
-    let phase = daemon::read_phase_in(state_dir).unwrap_or_else(|| "starting".to_string());
-    let Some(progress) = daemon::read_progress_in(state_dir) else {
+    let sd = StateDir::at(state_dir);
+    let phase = sd.read_phase().unwrap_or_else(|| "starting".to_string());
+    let Some(progress) = crate::indexing_status::read_progress(&sd) else {
         return phase;
     };
     let walk = &progress.walk;
@@ -333,7 +335,7 @@ fn readiness_loop(
                 continue;
             }
         };
-        match daemon::read_phase_in(state_dir).as_deref() {
+        match StateDir::at(state_dir).read_phase().as_deref() {
             Some("structural" | "embedding" | "ready") => return Ok(()),
             Some("failed") => {
                 let reason = if answer.is_error && !answer.text.is_empty() {
@@ -362,7 +364,7 @@ fn open_read_only(db_path: &Path) -> Result<Connection> {
 /// Each discovered plugin's extensions, sorted. Empty when discovery fails:
 /// they only annotate `coverage`.
 fn plugin_extensions() -> HashMap<String, Vec<String>> {
-    let Ok(discovered) = manifest::discover(&manifest::default_roots()) else {
+    let Ok(discovered) = plugin_manifest::discover(&plugin_manifest::default_roots()) else {
         return HashMap::new();
     };
     discovered
@@ -569,7 +571,7 @@ pub fn export(
                 unresolved: None,
                 external: None,
                 extensions: None,
-                error: Some(crate::languages::error_on_one_line(error)),
+                error: Some(crate::storage::language_outcome::error_on_one_line(error)),
             },
         };
         coverage.insert(language.clone(), entry);

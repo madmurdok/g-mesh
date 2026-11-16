@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-sdk"
-version = "4.30.0"
+version = "4.31.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Everything a g-mesh language plugin needs that is not its language: protocol loop, project walk, incremental diff, ids"
@@ -19,7 +19,7 @@ path = "src/lib.rs"
 # `toy/main.rs`, not `tests/toy/main.rs`: cargo auto-discovers `tests/*/main.rs`
 # as an integration test target, so a bin pointed there would also be compiled
 # and run as a test harness. It is not shipped: shipping a plugin means a
-# `plugin.toml` in a discovery root (`daemon::manifest::default_roots`), and
+# `plugin.toml` in a discovery root (`plugin_manifest::default_roots`), and
 # nothing installs one for this - the test writes a manifest into a scratch
 # directory for the length of one check.
 [[bin]]

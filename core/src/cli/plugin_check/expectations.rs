@@ -625,7 +625,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
-use crate::daemon::manifest::Capabilities;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::mcp::query_shapes::QueryShapes;
@@ -634,6 +633,7 @@ use crate::mcp::{
     find_callers_callees, find_definition, find_implementations, find_references, get_dependencies,
     FindDefinitionParams, FindImplementationsParams, GetDependenciesParams, SymbolQueryParams,
 };
+use crate::plugin_manifest::Capabilities;
 use crate::storage::index_store::IndexStore;
 
 /// The whole `--expect` file. Every list defaults to empty, so a fixture

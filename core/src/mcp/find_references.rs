@@ -12,11 +12,11 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::manifest::{Capabilities, MemberOverrides};
 use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
+use crate::plugin_manifest::{Capabilities, MemberOverrides};
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
@@ -1806,8 +1806,8 @@ mod tests {
     // `overrides` (GM-536): the same field and session hint as find_callers'
     // -----------------------------------------------------------------
 
-    use crate::daemon::manifest::MemberOverrides;
     use crate::mcp::find_callers_callees::handle_callers;
+    use crate::plugin_manifest::MemberOverrides;
     use crate::protocol::types::{PathSegment, QualifiedPath};
 
     /// A `kind` declaration at `segments` (joined by `sep`) in `file` and

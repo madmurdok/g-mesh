@@ -89,7 +89,7 @@
 #                                plugins/sdk and wire/ never ship separately
 #
 # `rust` as the directory name is required, not cosmetic:
-# `core/src/daemon/manifest.rs` enforces that a manifest's `language` equals
+# `core/src/plugin_manifest.rs` enforces that a manifest's `language` equals
 # its containing directory's name (the same rule plugins/typescript's and
 # plugins/go's manifests document).
 

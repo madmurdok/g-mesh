@@ -101,9 +101,10 @@ const (
 	engineName          = "go-parser"
 	sourceTierSyntactic = "syntactic"
 
-	// Core's placeholder kinds (core/src/protocol/conformance.rs's
-	// PLACEHOLDER_NATIVE_KINDS). A node carrying one of these *must* carry a
-	// `target`, which the kit's shape check enforces.
+	// Core's placeholder kinds, defined in wire/src/native_kind.rs and listed
+	// in core/src/protocol/conformance.rs's PLACEHOLDER_NATIVE_KINDS. A node
+	// carrying one of these *must* carry a `target`, which the kit's shape
+	// check enforces.
 	pendingSymbolNativeKind  = "pending_symbol"
 	resolvedModuleNativeKind = "resolved_module"
 	// externalModuleNativeKind is not one of core's placeholder kinds: core

@@ -14,7 +14,7 @@
 //!
 //! - **The name has to carry the project hash itself.** [`Endpoint::named`]
 //!   builds `\\.\pipe\g-mesh-<hash>` from the same
-//!   `daemon::identity::project_hash` the state directory is named after, so
+//!   `crate::paths::state_dir::project_hash` the state directory is named after, so
 //!   the shim and the daemon still derive one identity from the project root
 //!   and nothing else. The pid, lock and build-stamp files stay exactly where
 //!   they are: they are ordinary files and need no porting.

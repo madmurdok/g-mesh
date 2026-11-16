@@ -24,7 +24,7 @@ const (
 	// compares the two (unlike protocol_version, which `handshake::verify`
 	// does check), so manifest_test.go's
 	// TestPluginVersionMatchesTheManifest is what keeps them from drifting -
-	// the Go-side equivalent of the test daemon::manifest has for the TS
+	// the Go-side equivalent of the test plugin_manifest has for the TS
 	// plugin's package.json/plugin.toml pair.
 	//
 	// 0.2.0 is GM-281: the plugin grew a second tier (go/types through

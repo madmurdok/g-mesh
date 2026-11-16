@@ -1,5 +1,5 @@
 //! Which query shapes each discovered language declares are never its
-//! symbols (`[plugin.non_symbol_queries]`, `daemon::manifest::NonSymbolShapes`),
+//! symbols (`[plugin.non_symbol_queries]`, `plugin_manifest::NonSymbolShapes`),
 //! and which prefixes, stripped, can leave one of its symbols
 //! (`[plugin.symbol_query_prefixes]`), keyed by language. Core holds no such
 //! shape or prefix of its own: a language's declarations only ever set aside,
@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::daemon::manifest::{NonSymbolShapes, PluginManifest};
+use crate::plugin_manifest::{NonSymbolShapes, PluginManifest};
 
 /// One language's two declarations.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -88,7 +88,7 @@ impl QueryShapes {
                 manifests
                     .into_iter()
                     .map(|(language, contents)| {
-                        let (refused, prefixes) = crate::daemon::manifest::query_tables_of(contents)
+                        let (refused, prefixes) = crate::plugin_manifest::query_tables_of(contents)
                             .unwrap_or_else(|e| panic!("the shipped {language} manifest: {e:#}"));
                         (language.to_string(), LanguageShapes { refused, strip: prefixes.strip })
                     })

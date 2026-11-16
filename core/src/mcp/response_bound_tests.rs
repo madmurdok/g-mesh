@@ -15,10 +15,10 @@ use super::session_hints::SessionHints;
 use super::unlinked::CandidateTally;
 use super::{find_callers_callees, find_implementations, find_references};
 use super::{Answer, FindImplementationsParams, SymbolQueryParams};
-use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, EXCLUDED_TALLY_MAX_BYTES, FILE_TALLY_MAX_BYTES, MAX_RESPONSE_BYTES};
 use crate::mcp::query_shapes::QueryShapes;
+use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
@@ -143,7 +143,7 @@ fn capabilities(pending: bool) -> HashMap<String, Capabilities> {
             resolution_delta: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
-            member_overrides: crate::daemon::manifest::MemberOverrides::None,
+            member_overrides: crate::plugin_manifest::MemberOverrides::None,
         },
     )])
 }

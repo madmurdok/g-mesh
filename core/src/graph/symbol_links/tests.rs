@@ -12,7 +12,7 @@ fn bundled_rules() -> LinkRules {
     static RULES: std::sync::OnceLock<LinkRules> = std::sync::OnceLock::new();
     RULES
         .get_or_init(|| {
-            use crate::daemon::manifest::{link_rules, read_manifest};
+            use crate::plugin_manifest::{link_rules, read_manifest};
             let plugins = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
             let manifests: Vec<_> = ["rust", "typescript", "python", "go"]
                 .iter()
@@ -133,7 +133,7 @@ fn an_import_record_no_longer_makes_a_name_ambiguous() {
     let mut conn = setup();
     let mut import_record = symbol("target.ts", "mutate", MODULE_KIND, true);
     import_record.id = "external:target.ts:mutate".to_string();
-    import_record.native_kind = Some(crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND.to_string());
+    import_record.native_kind = Some(g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND.to_string());
     apply_diff(
         &mut conn,
         &Diff {

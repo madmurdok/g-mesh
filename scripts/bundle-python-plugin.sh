@@ -77,7 +77,7 @@
 #                                  the structural tier
 #
 # `python` as the directory name is required, not cosmetic:
-# `core/src/daemon/manifest.rs` enforces that a manifest's `language` equals
+# `core/src/plugin_manifest.rs` enforces that a manifest's `language` equals
 # its containing directory's name (the same rule plugins/rust's manifest
 # documents for itself).
 

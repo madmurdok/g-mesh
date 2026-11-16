@@ -27,7 +27,8 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::daemon::registry::PathCoverage;
-use crate::languages::{CatalogueEntry, LanguageOutcome};
+use crate::languages::CatalogueEntry;
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{self, MAX_LANGUAGE_RETRIES};
 
 use super::instructions::error_cause;
@@ -79,7 +80,7 @@ impl NotIndexed {
         }
     }
 
-    /// `error` is the stored error chain (`languages::failed_error`), or
+    /// `error` is the stored error chain (`storage::language_outcome::failed_error`), or
     /// `None` when no outcome was recorded for the language.
     pub(super) fn failed(language: &str, error: Option<&str>) -> Self {
         Self {
@@ -222,13 +223,14 @@ pub(super) mod test_support {
     use rusqlite::Connection;
 
     use crate::daemon::registry::PathCoverage;
-    use crate::languages::{self, LanguageOutcome};
+    use crate::languages;
+    use crate::storage::language_outcome::LanguageOutcome;
     use crate::storage::schema;
 
     /// The innermost cause of [`FAILED_CHAIN`], as the field carries it.
     pub(in crate::mcp) const INNERMOST: &str = "No such file or directory (os error 2)";
 
-    /// A stored failed-outcome chain (`languages::failed_error`'s shape):
+    /// A stored failed-outcome chain (`storage::language_outcome::failed_error`'s shape):
     /// outermost first, one cause per line.
     pub(in crate::mcp) const FAILED_CHAIN: &str =
         "python plugin failed its bulk walk\nfailed to spawn g-mesh-plugin-python\nNo such file or directory (os error 2)";

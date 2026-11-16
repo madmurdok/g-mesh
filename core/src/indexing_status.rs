@@ -212,6 +212,14 @@ pub struct ProgressSnapshot {
     pub embeddings: EmbedProgress,
 }
 
+/// The progress snapshot a daemon last published in `state_dir`, whoever wrote
+/// it: `None` for a missing or unparseable file. The snapshot's `pid` says which
+/// daemon wrote it; this does not check that it is alive.
+pub fn read_progress(state_dir: &crate::paths::state_dir::StateDir) -> Option<ProgressSnapshot> {
+    let contents = std::fs::read_to_string(state_dir.progress_file()).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WalkProgress {
@@ -351,7 +359,7 @@ impl IndexingStatus {
     fn publish_phase_file(&self, word: &str) {
         let guard = self.0.phase_file.lock().unwrap();
         if let Some(path) = guard.as_ref() {
-            super::write_state_file_atomic(path, word, "phase file");
+            crate::paths::state_dir::write_state_file_atomic(path, word, "phase file");
         }
     }
 
@@ -489,7 +497,7 @@ impl IndexingStatus {
             return;
         }
         match serde_json::to_string(&self.progress_snapshot()) {
-            Ok(json) => super::write_state_file_atomic(&path, &json, "progress file"),
+            Ok(json) => crate::paths::state_dir::write_state_file_atomic(&path, &json, "progress file"),
             Err(err) => crate::log_line!("g-mesh daemon: failed to serialize indexing progress: {err}"),
         }
         file.last_write = Some(now);

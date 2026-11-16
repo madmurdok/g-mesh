@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::storage::connection::project_dir;
+use crate::paths::state_dir::project_dir;
 use crate::storage::schema;
 
 /// What marks a directory as a project. Each is probed with one
@@ -213,7 +213,7 @@ fn completed_index_in(state_dir: &Path) -> bool {
 /// existence by a check. Never through `connection::open`, which creates the
 /// file.
 fn open_existing_index(state_dir: &Path) -> Option<Connection> {
-    let db_path = state_dir.join("index.db");
+    let db_path = crate::paths::state_dir::StateDir::at(state_dir).index_db();
     if fs::symlink_metadata(&db_path).is_err() {
         return None;
     }

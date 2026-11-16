@@ -9,13 +9,13 @@ use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
 use super::*;
-use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::MAX_RESPONSE_BYTES;
 use crate::graph::queries;
 use crate::mcp::query_shapes::QueryShapes;
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
+use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::protocol::types::{PathSegment, QualifiedPath};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -316,7 +316,7 @@ fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
             resolution_delta: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
-            member_overrides: crate::daemon::manifest::MemberOverrides::None,
+            member_overrides: crate::plugin_manifest::MemberOverrides::None,
         },
     )])
 }
