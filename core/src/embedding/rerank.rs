@@ -51,10 +51,10 @@ pub(crate) const RERANK_TOKENIZER_SHA256: &str =
 
 /// Overrides the cross-encoder's directory. Separate from
 /// `G_MESH_MODEL_DIR`, which names the embedding model's own directory.
-pub const RERANK_MODEL_DIR_ENV: &str = "G_MESH_RERANK_MODEL_DIR";
+pub const RERANK_MODEL_DIR_ENV: &str = crate::knobs::RERANK_MODEL_DIR.name;
 
 /// `off` (any case) switches the rerank off, whatever the global config says.
-pub const RERANK_ENV: &str = "G_MESH_RERANK";
+pub const RERANK_ENV: &str = crate::knobs::RERANK.name;
 
 /// How many of the embedding ranking's first rows are reordered.
 pub const WINDOW: usize = 30;

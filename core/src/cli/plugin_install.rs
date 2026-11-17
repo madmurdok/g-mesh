@@ -63,12 +63,6 @@ pub struct InstallArgs {
 /// `<root>/<language>/plugin.toml`, the file discovery looks for.
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
 
-/// Base for `<version-tag>/<asset>` URLs, the same variable and meaning as in
-/// `scripts/install.sh`.
-const DOWNLOAD_BASE_ENV: &str = "G_MESH_DOWNLOAD_BASE";
-
-/// `owner/repo` the default download base points at, as in `scripts/install.sh`.
-const REPO_ENV: &str = "G_MESH_REPO";
 const DEFAULT_REPO: &str = "madmurdok/g-mesh";
 
 /// Printed after every successful install and remove: discovery runs once, at
@@ -101,7 +95,7 @@ pub fn remove(language: &str) -> Result<()> {
 
 /// The root plugins are installed into and removed from.
 fn install_root() -> Result<PathBuf> {
-    install_root_from(std::env::var_os(plugin_manifest::PLUGIN_ROOTS_OVERRIDE_ENV).map(PathBuf::from))
+    install_root_from(crate::knobs::os_raw(&crate::knobs::PLUGIN_ROOTS_OVERRIDE).map(PathBuf::from))
 }
 
 /// The override replaces the root exactly as it replaces discovery's roots
@@ -115,9 +109,9 @@ fn install_root_from(override_root: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn download_base() -> String {
-    let non_empty = |name| std::env::var(name).ok().filter(|value: &String| !value.is_empty());
-    non_empty(DOWNLOAD_BASE_ENV).unwrap_or_else(|| {
-        let repo = non_empty(REPO_ENV).unwrap_or_else(|| DEFAULT_REPO.to_string());
+    crate::knobs::string_non_empty(&crate::knobs::DOWNLOAD_BASE).unwrap_or_else(|| {
+        let repo =
+            crate::knobs::string_non_empty(&crate::knobs::REPO).unwrap_or_else(|| DEFAULT_REPO.to_string());
         format!("https://github.com/{repo}/releases/download")
     })
 }

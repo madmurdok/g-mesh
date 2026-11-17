@@ -37,7 +37,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 /// Environment switch: `0` disables seeding (also the opt-out for a user),
 /// `1` enables it even when [`SEEDING_DEFAULT`] is off.
-pub const SEED_ENV: &str = "G_MESH_SEED";
+pub const SEED_ENV: &str = crate::knobs::SEED.name;
 
 /// Whether a daemon seeds without [`SEED_ENV`] set.
 const SEEDING_DEFAULT: bool = true;
@@ -52,7 +52,7 @@ pub struct SeedOrigin {
 /// Whether seeding is switched on, from `G_MESH_SEED` and
 /// [`SEEDING_DEFAULT`].
 fn seed_enabled() -> bool {
-    seed_enabled_from(std::env::var(SEED_ENV).ok().as_deref())
+    seed_enabled_from(crate::knobs::string_raw(&crate::knobs::SEED).as_deref())
 }
 
 /// [`seed_enabled`] with the variable's value passed in, so a test need not
@@ -71,7 +71,7 @@ fn seed_enabled_from(value: Option<&str>) -> bool {
 /// so a test that forgets the file fails instead of wedging the daemon. A
 /// no-op unless set.
 pub(crate) fn hold_the_seeded_reconcile_for_tests() {
-    let Some(path) = std::env::var_os(HOLD_RECONCILE_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let Some(path) = crate::knobs::os_non_empty(&crate::knobs::SEED_HOLD_RECONCILE_FILE) else { return };
     let path = PathBuf::from(path);
     crate::log_role!(
         "holding the seeded reconcile until {} is removed ({HOLD_RECONCILE_FILE_ENV})",
@@ -85,7 +85,7 @@ pub(crate) fn hold_the_seeded_reconcile_for_tests() {
 
 /// Path whose deletion releases a seeded reconcile held by
 /// [`hold_the_seeded_reconcile_for_tests`].
-pub const HOLD_RECONCILE_FILE_ENV: &str = "G_MESH_SEED_HOLD_RECONCILE_FILE";
+pub const HOLD_RECONCILE_FILE_ENV: &str = crate::knobs::SEED_HOLD_RECONCILE_FILE.name;
 
 /// Held by whoever runs a seeded index's first-start reconcile; while it is
 /// held the phase stays `Walking`, so tool calls wait on `Need::Structural`.

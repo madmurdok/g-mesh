@@ -120,7 +120,7 @@ pub(crate) const PAGE_SIZE: i64 = 256;
 /// test needs no real ONNX weights on disk. A no-op unless set, which is
 /// every real run - same poll-until-deleted shape as
 /// `daemon::bulk_index::WALK_HOLD_FILE_ENV`.
-pub const HOLD_FILE_ENV: &str = "G_MESH_EMBED_PASS_HOLD_FILE";
+pub const HOLD_FILE_ENV: &str = crate::knobs::EMBED_PASS_HOLD_FILE.name;
 
 /// While this env var is set to a non-empty value, [`run`] panics before its
 /// first batch - test-only, for GM-395 slice 2b's guard that a panic in this
@@ -133,7 +133,7 @@ pub const HOLD_FILE_ENV: &str = "G_MESH_EMBED_PASS_HOLD_FILE";
 /// hold above, before the availability check, for the same reason the hold
 /// itself runs early: a test needs this to fire whether or not the machine
 /// running it has ever fetched real weights.
-pub const PANIC_ENV: &str = "G_MESH_EMBED_PASS_PANIC";
+pub const PANIC_ENV: &str = crate::knobs::EMBED_PASS_PANIC.name;
 
 /// What one call to [`run`] actually did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -355,7 +355,7 @@ fn candidate_tier(candidate: &Candidate) -> EmbedTier {
 /// wait, bounded so a test that forgets to release it fails as a timeout
 /// rather than wedging the daemon forever).
 fn hold_before_first_batch_for_tests() {
-    let Some(path) = std::env::var_os(HOLD_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let Some(path) = crate::knobs::os_non_empty(&crate::knobs::EMBED_PASS_HOLD_FILE) else { return };
     let path = std::path::PathBuf::from(path);
     crate::log_role!(
         "holding the embedding backfill pass until {} is removed ({HOLD_FILE_ENV})",
@@ -373,7 +373,7 @@ fn hold_before_first_batch_for_tests() {
 /// project's structural tools into a tool error needs this pass to actually
 /// panic, not merely pause.
 fn panic_before_first_batch_for_tests() {
-    if std::env::var_os(PANIC_ENV).filter(|p| !p.is_empty()).is_some() {
+    if crate::knobs::flag(&crate::knobs::EMBED_PASS_PANIC) {
         panic!(
             "{}G_MESH_EMBED_PASS_PANIC test knob fired - this panic is expected",
             crate::log::role_prefix()

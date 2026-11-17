@@ -104,20 +104,20 @@ pub(crate) use similarity::floor as shipped_similarity_floor;
 /// g-mesh daemon: prepare: cancelled tool=get_file_outline request=3 waited_ms=900 progress_sent=4
 /// ```
 fn trace_call(what: std::fmt::Arguments<'_>) {
-    if std::env::var_os(TRACE_CALLS_ENV).is_some_and(|v| !v.is_empty()) {
+    if crate::knobs::flag(&crate::knobs::TRACE_CALLS) {
         crate::log_role!("{what}");
     }
 }
 
 /// Turns on [`trace_call`]. Any non-empty value.
-pub const TRACE_CALLS_ENV: &str = "G_MESH_TRACE_CALLS";
+pub const TRACE_CALLS_ENV: &str = crate::knobs::TRACE_CALLS.name;
 
 /// How often a tool call that is waiting for the index sends a progress
 /// notification, in milliseconds - only ever to a request that carried a
 /// `progressToken` (D6 in `docs/architecture/lazy-indexing.md`). `0` sends
 /// none at all, which is M1's "progress off" arm. Unset or unparsable means
 /// [`DEFAULT_PROGRESS_INTERVAL`].
-pub const PROGRESS_INTERVAL_ENV: &str = "G_MESH_PROGRESS_INTERVAL_MS";
+pub const PROGRESS_INTERVAL_ENV: &str = crate::knobs::PROGRESS_INTERVAL_MS.name;
 
 /// D6's heartbeat: often enough to keep an idle timer measured in tens of
 /// seconds or more alive, rarely enough to be no load at all.
@@ -126,7 +126,7 @@ pub const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 /// The longest a tool call waits for the index before it gives up with an
 /// explicit "still indexing, call again" tool error, in milliseconds (D7).
 /// `0` removes the cap. Unset or unparsable means [`DEFAULT_INDEX_WAIT_CAP`].
-pub const INDEX_WAIT_CAP_ENV: &str = "G_MESH_INDEX_WAIT_CAP_MS";
+pub const INDEX_WAIT_CAP_ENV: &str = crate::knobs::INDEX_WAIT_CAP_MS.name;
 
 /// D7's default: under Claude Code's 30 min stdio idle window, so even a call
 /// that carries no progress token ends with an answer the agent can act on
@@ -139,7 +139,7 @@ pub const DEFAULT_INDEX_WAIT_CAP: Duration = Duration::from_secs(25 * 60);
 /// call: once one call has waited it out, later calls during the same pass
 /// answer at once. `0` does not wait. Unset or unparsable means
 /// [`SEARCH_EMBEDDING_WAIT`].
-pub const SEARCH_EMBEDDING_WAIT_ENV: &str = "G_MESH_SEARCH_EMBEDDING_WAIT_MS";
+pub const SEARCH_EMBEDDING_WAIT_ENV: &str = crate::knobs::SEARCH_EMBEDDING_WAIT_MS.name;
 
 /// Under Claude Code's 120 s move-to-background threshold; long enough for a
 /// small project's whole backfill or one file-change batch
@@ -157,17 +157,6 @@ pub const SEARCH_EMBEDDING_WAIT: Duration = Duration::from_secs(20);
 /// headroom is kept smaller than the smallest tool's own entry, so a wording
 /// fix fits but a new tool or a batch of new parameters does not.
 pub const TOOLS_LIST_BYTE_CEILING: usize = 13_600;
-
-/// Reads a millisecond-valued env var, falling back to `default` when it is
-/// unset, empty or not a number. Read per call, so a test can change it
-/// without starting a new daemon.
-fn env_millis(name: &str, default: Duration) -> Duration {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(default)
-}
 
 /// A wait duration for a person: `"950ms"`, `"42s"`, `"18m 5s"`.
 fn human_duration(elapsed: Duration) -> String {
@@ -454,7 +443,7 @@ impl GMeshMcpServer {
         need: Need,
     ) -> Result<Option<CallToolResult>, ErrorData> {
         let started = Instant::now();
-        let cap = env_millis(INDEX_WAIT_CAP_ENV, DEFAULT_INDEX_WAIT_CAP);
+        let cap = crate::knobs::millis_lenient(&crate::knobs::INDEX_WAIT_CAP_MS, DEFAULT_INDEX_WAIT_CAP);
         // `0` is "no cap": `checked_add` failing (a cap too large to be a
         // real instant) means the same.
         let deadline = if cap.is_zero() { None } else { started.checked_add(cap) };
@@ -545,8 +534,9 @@ impl GMeshMcpServer {
         let bound = if spent {
             Duration::ZERO
         } else {
-            self.search_embedding_wait
-                .unwrap_or_else(|| env_millis(SEARCH_EMBEDDING_WAIT_ENV, SEARCH_EMBEDDING_WAIT))
+            self.search_embedding_wait.unwrap_or_else(|| {
+                crate::knobs::millis_lenient(&crate::knobs::SEARCH_EMBEDDING_WAIT_MS, SEARCH_EMBEDDING_WAIT)
+            })
         };
         let deadline = started.checked_add(bound);
         let outcome =

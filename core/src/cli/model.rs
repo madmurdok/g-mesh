@@ -125,15 +125,9 @@ impl Source {
     }
 }
 
-/// Points `model fetch` somewhere else. Prepended to the built-in list rather
-/// than replacing it, so an unreachable mirror degrades to a slower download
-/// instead of a failed one - and the output names both, so nobody who set this
-/// to keep traffic inside their network finds out silently that it did not.
-const BASE_URL_ENV: &str = "G_MESH_MODEL_BASE_URL";
-
 /// The sources to try, in order.
 fn sources() -> Vec<Source> {
-    let override_base = std::env::var_os(BASE_URL_ENV).filter(|value| !value.is_empty());
+    let override_base = crate::knobs::os_non_empty(&crate::knobs::MODEL_BASE_URL);
     sources_from(override_base.as_ref().map(|value| value.to_string_lossy()).as_deref())
 }
 
@@ -1016,9 +1010,10 @@ mod tests {
     /// command, and the two have to be kept in step by something.
     #[test]
     fn the_shell_script_reads_the_same_override_variable() {
+        let base_url_env = crate::knobs::MODEL_BASE_URL.name;
         assert!(
-            FETCH_SCRIPT.contains(BASE_URL_ENV),
-            "the script does not honour {BASE_URL_ENV}, so the two ways of fetching \
+            FETCH_SCRIPT.contains(base_url_env),
+            "the script does not honour {base_url_env}, so the two ways of fetching \
              the weights would disagree about where they come from"
         );
     }

@@ -16,8 +16,8 @@ use anyhow::Result;
 
 use super::{read_global_config, EmbeddingConfig, GlobalConfig};
 use crate::embedding::cache::{self, CACHE_ENV};
-use crate::embedding::model::{default_model_dir_from, InferenceOptions, MODEL_DIR_ENV};
-use crate::embedding::rerank::{rerank_model_dir_from, RERANK_ENV, RERANK_MODEL_DIR_ENV};
+use crate::embedding::model::{default_model_dir_from, InferenceOptions};
+use crate::embedding::rerank::{rerank_model_dir_from, RERANK_ENV};
 use crate::embedding::{CacheSettings, EmbeddingSettings, ModelSettings, RerankSettings};
 
 /// Everything `EmbeddingPipeline::load` needs for a project configured with
@@ -73,22 +73,21 @@ pub fn resolve_model_dir(explicit: Option<&Path>, model_name: &str) -> Result<Pa
 /// The cross-encoder's directory: `$G_MESH_RERANK_MODEL_DIR` when set and
 /// not empty, else its default beside the embedding model.
 pub fn rerank_model_dir() -> Result<PathBuf> {
-    let dir_override =
-        std::env::var_os(RERANK_MODEL_DIR_ENV).filter(|dir| !dir.is_empty()).map(PathBuf::from);
+    let dir_override = crate::knobs::os_non_empty(&crate::knobs::RERANK_MODEL_DIR).map(PathBuf::from);
     rerank_model_dir_from(dir_override.as_deref())
 }
 
 /// The `G_MESH_EMBED_*` inference options of the process environment.
 pub fn inference_options() -> InferenceOptions {
-    InferenceOptions::from_env_with(|name| std::env::var(name).ok())
+    InferenceOptions::from_env_with(crate::knobs::lookup)
 }
 
 fn model_dir_override() -> Option<PathBuf> {
-    std::env::var_os(MODEL_DIR_ENV).map(PathBuf::from)
+    crate::knobs::os_raw(&crate::knobs::MODEL_DIR).map(PathBuf::from)
 }
 
 fn env_lookup(name: &str) -> Option<OsString> {
-    std::env::var_os(name)
+    crate::knobs::lookup_os(name)
 }
 
 /// Which parts the environment and the global config leave switched on.
@@ -136,7 +135,7 @@ pub(crate) fn resolve(
 }
 
 fn switched_off(value: Option<OsString>) -> bool {
-    value.is_some_and(|value| value.eq_ignore_ascii_case("off"))
+    crate::knobs::is_off(value.as_deref())
 }
 
 #[cfg(test)]

@@ -98,7 +98,7 @@ fn the_installed_root_sits_beside_the_executable_and_outranks_the_checkout_root(
 fn the_override_env_var_replaces_the_entire_default_roots_list() {
     let override_dir = tempfile::tempdir().unwrap();
 
-    let roots = roots_with_override(Some(override_dir.path().to_str().unwrap().to_string()));
+    let roots = roots_with_override(Some(override_dir.path().to_path_buf()));
 
     assert_eq!(roots, vec![override_dir.path().to_path_buf()]);
 }

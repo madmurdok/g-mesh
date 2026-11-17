@@ -216,7 +216,10 @@ fn a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_with
 
 #[test]
 fn an_unset_timeout_reads_as_its_documented_default() {
-    assert_eq!(parse_timeout(None, DEFAULT_PLUGIN_IDLE, "X"), Some(DEFAULT_PLUGIN_IDLE));
+    assert_eq!(
+        crate::knobs::millis_from(None, "X", crate::knobs::ZeroIs::Off, DEFAULT_PLUGIN_IDLE),
+        Some(DEFAULT_PLUGIN_IDLE)
+    );
 }
 
 /// A project with no config.toml (`ProjectConfig::default()`) must
@@ -272,18 +275,24 @@ fn the_env_override_still_wins_over_a_configured_value() {
 
 #[test]
 fn a_zero_timeout_turns_the_timer_off() {
-    assert_eq!(parse_timeout(Some("0"), DEFAULT_CORE_IDLE, "X"), None);
+    assert_eq!(crate::knobs::millis_from(Some("0"), "X", crate::knobs::ZeroIs::Off, DEFAULT_CORE_IDLE), None);
 }
 
 #[test]
 fn a_number_is_read_as_milliseconds() {
-    assert_eq!(parse_timeout(Some(" 250 "), DEFAULT_CORE_IDLE, "X"), Some(Duration::from_millis(250)));
+    assert_eq!(
+        crate::knobs::millis_from(Some(" 250 "), "X", crate::knobs::ZeroIs::Off, DEFAULT_CORE_IDLE),
+        Some(Duration::from_millis(250))
+    );
 }
 
 /// A typo must not silently disable a timer, and must not stop the daemon.
 #[test]
 fn an_unparseable_timeout_falls_back_to_the_default() {
-    assert_eq!(parse_timeout(Some("10 minutes"), DEFAULT_PLUGIN_IDLE, "X"), Some(DEFAULT_PLUGIN_IDLE));
+    assert_eq!(
+        crate::knobs::millis_from(Some("10 minutes"), "X", crate::knobs::ZeroIs::Off, DEFAULT_PLUGIN_IDLE),
+        Some(DEFAULT_PLUGIN_IDLE)
+    );
 }
 
 #[test]

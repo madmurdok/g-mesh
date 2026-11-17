@@ -44,10 +44,10 @@ pub const FRONT_CORE_IDLE: Duration = Duration::from_secs(60);
 
 /// Overrides [`FRONT_CORE_IDLE`] for the test suite, in milliseconds; `0`
 /// turns the timer off. Same parsing as `lifecycle::CORE_IDLE_ENV`.
-pub const FRONT_IDLE_ENV: &str = "G_MESH_FRONT_IDLE_MS";
+pub const FRONT_IDLE_ENV: &str = crate::knobs::FRONT_IDLE_MS.name;
 
 fn front_core_idle() -> Option<Duration> {
-    lifecycle::parse_timeout(std::env::var(FRONT_IDLE_ENV).ok().as_deref(), FRONT_CORE_IDLE, FRONT_IDLE_ENV)
+    crate::knobs::millis(&crate::knobs::FRONT_IDLE_MS, crate::knobs::ZeroIs::Off, FRONT_CORE_IDLE)
 }
 
 /// Serves `root` as a front until it idles out or is orphaned. Called by

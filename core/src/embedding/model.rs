@@ -218,7 +218,7 @@ pub const DEFAULT_MODEL_NAME: &str = "jina-embeddings-v2-base-code";
 /// Overrides where [`default_model_dir_from`] looks. Exists so tests and
 /// development checkouts can point at a model directory outside the user's
 /// home without a config file; ordinary runs never set it.
-pub const MODEL_DIR_ENV: &str = "G_MESH_MODEL_DIR";
+pub const MODEL_DIR_ENV: &str = crate::knobs::MODEL_DIR.name;
 
 /// How the encoder's hidden states become one vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,13 +264,13 @@ impl EncoderSpec {
 /// Environment variables that tune the ONNX session and the batching of
 /// [`EmbeddingModel::embed_batch`]. Absent or empty means the default; an
 /// invalid value logs one line and falls back to the default.
-pub const INTRA_THREADS_ENV: &str = "G_MESH_EMBED_INTRA_THREADS";
-pub const INTER_THREADS_ENV: &str = "G_MESH_EMBED_INTER_THREADS";
-pub const OPT_LEVEL_ENV: &str = "G_MESH_EMBED_OPT_LEVEL";
-pub const SPIN_ENV: &str = "G_MESH_EMBED_SPIN";
-pub const BATCH_ENV: &str = "G_MESH_EMBED_BATCH";
-pub const TOKEN_BUDGET_ENV: &str = "G_MESH_EMBED_TOKEN_BUDGET";
-pub const BUCKET_ENV: &str = "G_MESH_EMBED_BUCKET";
+pub const INTRA_THREADS_ENV: &str = crate::knobs::EMBED_INTRA_THREADS.name;
+pub const INTER_THREADS_ENV: &str = crate::knobs::EMBED_INTER_THREADS.name;
+pub const OPT_LEVEL_ENV: &str = crate::knobs::EMBED_OPT_LEVEL.name;
+pub const SPIN_ENV: &str = crate::knobs::EMBED_SPIN.name;
+pub const BATCH_ENV: &str = crate::knobs::EMBED_BATCH.name;
+pub const TOKEN_BUDGET_ENV: &str = crate::knobs::EMBED_TOKEN_BUDGET.name;
+pub const BUCKET_ENV: &str = crate::knobs::EMBED_BUCKET.name;
 
 /// Default cap on padded tokens (`texts x longest text`) per batched call:
 /// eight texts at [`DEFAULT_MAX_SEQUENCE_LENGTH`].

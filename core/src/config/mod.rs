@@ -105,8 +105,8 @@ impl Default for PluginConfig {
 }
 
 /// `[daemon]`: how long the daemon core is allowed to sit idle (zero MCP
-/// requests) before it exits cleanly. Not wired to the real daemon lifecycle
-/// yet.
+/// requests) before it exits cleanly. Read by
+/// `daemon::lifecycle::IdleTimeouts::from_config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct DaemonConfig {

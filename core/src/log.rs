@@ -89,7 +89,7 @@ macro_rules! log_role {
 /// The variable that turns on [`log_timing!`](crate::log_timing) lines (GM-435):
 /// any non-empty value. Plugins inherit the daemon's environment, so one
 /// variable turns on both sides.
-pub const TIMING_ENV: &str = "G_MESH_EDIT_TIMING";
+pub const TIMING_ENV: &str = crate::knobs::EDIT_TIMING.name;
 
 /// The fixed start of every timing line, before its `t=` stamp.
 pub const TIMING_PREFIX: &str = "g-mesh timing: ";
@@ -98,13 +98,13 @@ pub const TIMING_PREFIX: &str = "g-mesh timing: ";
 /// bool, so an unset variable costs one load per call site and nothing else.
 pub fn timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| timing_enabled_from(std::env::var_os(TIMING_ENV).as_deref()))
+    *ENABLED.get_or_init(|| crate::knobs::flag(&crate::knobs::EDIT_TIMING))
 }
 
 /// [`timing_enabled`]'s rule over a given value of [`TIMING_ENV`]: set and
 /// non-empty.
 pub fn timing_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| !value.is_empty())
+    crate::knobs::flag_from(value)
 }
 
 /// One timing line without its newline:

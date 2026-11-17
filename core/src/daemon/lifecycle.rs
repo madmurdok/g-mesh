@@ -51,10 +51,10 @@ pub const DEFAULT_CORE_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Overrides the plugin's idle timeout, in milliseconds, for the test suite;
 /// real installs never set it. `0` disables the timer (the plugin never sleeps).
-pub const PLUGIN_IDLE_ENV: &str = "G_MESH_PLUGIN_IDLE_MS";
+pub const PLUGIN_IDLE_ENV: &str = crate::knobs::PLUGIN_IDLE_MS.name;
 
 /// The core's equivalent of [`PLUGIN_IDLE_ENV`]; `0` means never exit on idleness.
-pub const CORE_IDLE_ENV: &str = "G_MESH_CORE_IDLE_MS";
+pub const CORE_IDLE_ENV: &str = crate::knobs::CORE_IDLE_MS.name;
 
 /// Test-only: the pid of a process this daemon must not outlive. The
 /// integration tests set it to their own pid on every `g-mesh` they start
@@ -63,7 +63,7 @@ pub const CORE_IDLE_ENV: &str = "G_MESH_CORE_IDLE_MS";
 /// its daemon running: [`supervise`] shuts down within one tick once that pid
 /// is gone. Unset in production, where it changes nothing; a value that does
 /// not parse as a pid is ignored.
-pub const LIFELINE_PID_ENV: &str = "G_MESH_LIFELINE_PID";
+pub const LIFELINE_PID_ENV: &str = crate::knobs::LIFELINE_PID.name;
 
 /// Lower bound on the tick, so a very short timeout never becomes a spin loop.
 const MIN_TICK: Duration = Duration::from_millis(50);
@@ -93,8 +93,8 @@ impl IdleTimeouts {
     pub fn from_config(config: &ProjectConfig) -> Self {
         Self::from_config_and_overrides(
             config,
-            std::env::var(PLUGIN_IDLE_ENV).ok().as_deref(),
-            std::env::var(CORE_IDLE_ENV).ok().as_deref(),
+            crate::knobs::string_raw(&crate::knobs::PLUGIN_IDLE_MS).as_deref(),
+            crate::knobs::string_raw(&crate::knobs::CORE_IDLE_MS).as_deref(),
         )
     }
 
@@ -110,8 +110,13 @@ impl IdleTimeouts {
         let plugin_default = Duration::from_secs(config.plugin.idle_timeout_minutes.saturating_mul(60));
         let core_default = Duration::from_secs(config.daemon.core_idle_timeout_hours.saturating_mul(60 * 60));
         Self {
-            plugin: parse_timeout(plugin_env, plugin_default, PLUGIN_IDLE_ENV),
-            core: parse_timeout(core_env, core_default, CORE_IDLE_ENV),
+            plugin: crate::knobs::millis_from(
+                plugin_env,
+                PLUGIN_IDLE_ENV,
+                crate::knobs::ZeroIs::Off,
+                plugin_default,
+            ),
+            core: crate::knobs::millis_from(core_env, CORE_IDLE_ENV, crate::knobs::ZeroIs::Off, core_default),
         }
     }
 
@@ -122,23 +127,6 @@ impl IdleTimeouts {
             Some(shortest) => (shortest / 4).clamp(MIN_TICK, MAX_TICK),
             // Nothing to time, but the loop still has to notice a stopped accept loop.
             None => MAX_TICK,
-        }
-    }
-}
-
-/// `None` for a configured zero (timer off); the default for anything unparseable,
-/// so a typo neither silently turns a timer off nor stops the daemon starting.
-pub(crate) fn parse_timeout(raw: Option<&str>, default: Duration, name: &str) -> Option<Duration> {
-    let Some(raw) = raw else { return Some(default) };
-    match raw.trim().parse::<u64>() {
-        Ok(0) => None,
-        Ok(millis) => Some(Duration::from_millis(millis)),
-        Err(_) => {
-            crate::log_role!(
-                "ignoring {name}={raw:?} - not a whole number of milliseconds; \
-                 using the default {default:?}"
-            );
-            Some(default)
         }
     }
 }
@@ -822,12 +810,12 @@ pub fn orphan_check(
 /// [`LIFELINE_PID_ENV`] as a pid: `None` when unset (production) or when the
 /// value does not parse, so a malformed variable never ends the process.
 fn lifeline_pid() -> Option<u32> {
-    lifeline_pid_from(std::env::var(LIFELINE_PID_ENV).ok().as_deref())
+    lifeline_pid_from(crate::knobs::string_raw(&crate::knobs::LIFELINE_PID).as_deref())
 }
 
 /// [`lifeline_pid`] over the variable's raw value, given rather than read.
 fn lifeline_pid_from(raw: Option<&str>) -> Option<u32> {
-    raw?.trim().parse().ok()
+    crate::knobs::parsed_from(raw)
 }
 
 /// `true` only for a path the filesystem positively reports as absent
