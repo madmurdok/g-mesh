@@ -3,7 +3,8 @@ package main
 // The project walk: which .go files this plugin ever produces a node for.
 // Gitignore layering plus the hard-excluded-dirs set (ignore.go) and the
 // symlink guard (symlinks.go), with the same link policy as the SDK's walk
-// (plugins/sdk/src/walk.rs).
+// (walk/src/lib.rs). testdata/walk.json, read by walk_corpus_test.go,
+// holds this walk to the SDK walker's answers.
 
 import (
 	"os"
