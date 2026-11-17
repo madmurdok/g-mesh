@@ -31,14 +31,13 @@
 # static `CGO_ENABLED=0` binary cross-compiled for the target in
 # `plugins/go/`, and since GM-288 the Rust plugin, a plain cargo binary built
 # in the same workspace as core for the same target, in `plugins/rust/` - see
-# `scripts/bundle-rust-plugin.sh` for why that needs no extra toolchain setup
+# `scripts/bundle-cargo-plugin.sh` for why that needs no extra toolchain setup
 # here (it is built by the Rust toolchain this file already installs for
 # core). Since GM-298 the same is true of the Python plugin, in `plugins/python/` -
 # it is a tree-sitter structural extractor written in Rust, not a program run
 # by a Python interpreter, so it needs no Python on this runner and no Python
 # on the machine that later runs it either; see
-# `scripts/bundle-python-plugin.sh` for the same reasoning
-# `scripts/bundle-rust-plugin.sh` already gives. Every plugin directory lives
+# `scripts/bundle-cargo-plugin.sh`, which serves both. Every plugin directory lives
 # where `daemon::manifest::bundled_roots` looks beside the executable.
 # `scripts/install.sh` (#66) fetches exactly these assets, by the URLs the
 # section below fixes, and verifies the `.sha256` beside each archive before
@@ -186,12 +185,12 @@ on:
       - "scripts/build-targets.sh"
       - "scripts/bundle-plugin.sh"
       - "scripts/bundle-go-plugin.sh"
-      - "scripts/bundle-rust-plugin.sh"
-      - "scripts/bundle-python-plugin.sh"
+      - "scripts/bundle-cargo-plugin.sh"
       - "scripts/prepare-release-assets.sh"
       # GM-613: the shared "can this run here" helpers every build script
       # sources, and the script that decides whether `tests` runs.
       - "scripts/lib/runnable.sh"
+      - "scripts/lib/bundle-tail.sh"
       - "scripts/ci-green-for-commit.sh"
       # GM-333: a change to any of these should get the same "watch all
       # four jobs" PR run as a change to the build/package scripts above -

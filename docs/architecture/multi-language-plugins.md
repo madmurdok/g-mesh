@@ -2072,7 +2072,7 @@ adds a second CI job that runs it with `go` off `PATH`. Two decisions:
     same as "works", and what the plugin does about it.
 - **Distribution:** a cargo binary in the same workspace as core, built by the
   existing native release matrix. See "Implementation notes (GM-288)" below
-  for how that turned into `scripts/bundle-rust-plugin.sh`, and why it is not
+  for how that turned into `scripts/bundle-cargo-plugin.sh`, and why it is not
   a GM-283-style cross-compile even though this crate's own dependency list
   would allow one.
 
@@ -2085,7 +2085,7 @@ branch) does not have to re-derive them:
 1. **The staged manifest is generated, not the checked-in one, and for the
    same reason as both other bundled plugins**: `plugins/rust/plugin.toml`'s
    `command` is a dev-checkout path into the workspace's own `target/`, which
-   does not exist in an installed layout. `scripts/bundle-rust-plugin.sh`
+   does not exist in an installed layout. `scripts/bundle-cargo-plugin.sh`
    derives the installed manifest from it by rewriting only the
    `[plugin.spawn] command` line - the same one-substitution pattern
    `scripts/bundle-go-plugin.sh` uses for the Go plugin, chosen over
@@ -2108,7 +2108,7 @@ branch) does not have to re-derive them:
    `.github/workflows/release.yml`'s "WHY A MATRIX ON NATIVE RUNNERS"
    section). Building this crate the same way, in the same job, is reusing
    that mechanism rather than adding a second one for a single plugin -
-   `scripts/bundle-rust-plugin.sh` builds with exactly the same two commands
+   `scripts/bundle-cargo-plugin.sh` builds with exactly the same two commands
    core's own build step uses, just scoped to `plugins/rust` instead of
    `core`. No CI toolchain setup was added for it, unlike Go's `setup-go`:
    the Rust toolchain the job already installs for core is all this needs.
@@ -2116,7 +2116,7 @@ branch) does not have to re-derive them:
    crates with no `[[bin]]` a release would install; they are statically
    linked into `g-mesh-plugin-rust` (and, for `wire`, into core's own binary
    too) at build time, the same way any Rust dependency is. There is nothing
-   for `scripts/bundle-rust-plugin.sh` to stage for either beyond what
+   for `scripts/bundle-cargo-plugin.sh` to stage for either beyond what
    already exists inside the one binary it copies.
 
 #### Implementation notes (GM-286)

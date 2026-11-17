@@ -326,20 +326,19 @@ if [ "${FAKE_STAGE_TS_BINARY:-}" = 1 ]; then
 fi
 "#,
     );
-    for (script, language) in [
-        ("bundle-go-plugin.sh", "go"),
-        ("bundle-rust-plugin.sh", "rust"),
-        ("bundle-python-plugin.sh", "python"),
-    ] {
-        write_executable(
-            &path.join("scripts").join(script),
-            &format!(
-                "#!/bin/sh\nmkdir -p \"$2/{language}\"\n\
-                 printf 'language = \"{language}\"\\ncommand = \"./g-mesh-plugin-{language}\"\\n' >\"$2/{language}/plugin.toml\"\n\
-                 echo {language} >\"$2/{language}/g-mesh-plugin-{language}\"\n"
-            ),
-        );
-    }
+    write_executable(
+        &path.join("scripts/bundle-go-plugin.sh"),
+        "#!/bin/sh\nmkdir -p \"$2/go\"\n\
+         printf 'language = \"go\"\\ncommand = \"./g-mesh-plugin-go\"\\n' >\"$2/go/plugin.toml\"\n\
+         echo go >\"$2/go/g-mesh-plugin-go\"\n",
+    );
+    // bundle-cargo-plugin.sh takes the language first: <language> <target> <dest>.
+    write_executable(
+        &path.join("scripts/bundle-cargo-plugin.sh"),
+        "#!/bin/sh\nlanguage=\"$1\"\nmkdir -p \"$3/$language\"\n\
+         printf 'language = \"%s\"\\ncommand = \"./g-mesh-plugin-%s\"\\n' \"$language\" \"$language\" >\"$3/$language/plugin.toml\"\n\
+         echo \"$language\" >\"$3/$language/g-mesh-plugin-$language\"\n",
+    );
     for file in ["LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "README.md"] {
         fs::write(path.join(file), "").unwrap();
     }

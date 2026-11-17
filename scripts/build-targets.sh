@@ -59,13 +59,13 @@
 #                                    the same workspace as core, for the same
 #                                    target, and the plugin.toml core
 #                                    discovers it through (built by
-#                                    scripts/bundle-rust-plugin.sh; see that
+#                                    scripts/bundle-cargo-plugin.sh; see that
 #                                    script's own header for GM-288)
 #   plugins/python/                  the Python plugin: a cargo binary built
 #                                    in the same workspace as core, for the
 #                                    same target, and the plugin.toml core
 #                                    discovers it through (built by
-#                                    scripts/bundle-python-plugin.sh; see that
+#                                    scripts/bundle-cargo-plugin.sh; see that
 #                                    script's own header for GM-298). No
 #                                    Python interpreter is required for the
 #                                    structural tier this ships today - a
@@ -102,7 +102,7 @@
 # Rust and Python plugins are built the same way core itself is (`rustup
 # target add` + `cargo build --target`, on that target's own runner) rather
 # than through a second, plugin-specific cross-build path - see
-# scripts/bundle-rust-plugin.sh's own header for why that is deliberate.
+# scripts/bundle-cargo-plugin.sh's own header for why that is deliberate.
 #
 # `G_MESH_SKIP_PLUGIN_BUNDLE=1` exists for the one case that is still useful
 # without either plugin: exercising the Rust *core* cross-build path (macOS
@@ -206,8 +206,7 @@ bundle_script_for() {
 	case "$1" in
 	typescript) echo "bundle-plugin.sh" ;;
 	go) echo "bundle-go-plugin.sh" ;;
-	rust) echo "bundle-rust-plugin.sh" ;;
-	python) echo "bundle-python-plugin.sh" ;;
+	rust | python) echo "bundle-cargo-plugin.sh" ;;
 	*) die "no bundle script for plugin language '$1'" ;;
 	esac
 }
@@ -313,7 +312,10 @@ build_one() {
 		local lang
 		for lang in "${BUNDLED_PLUGINS[@]}"; do
 			log "bundling the $lang plugin for $target"
-			CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/$(bundle_script_for "$lang")" "$target" "$stage_dir/plugins"
+			# bundle-cargo-plugin.sh serves several languages and takes the language first.
+			local lang_arg=()
+			case "$lang" in rust | python) lang_arg=("$lang") ;; esac
+			CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/$(bundle_script_for "$lang")" ${lang_arg[@]+"${lang_arg[@]}"} "$target" "$stage_dir/plugins"
 		done
 		# From the stage just bundled and before the main archive, so both
 		# carry the same bytes.
