@@ -88,25 +88,23 @@ pub(crate) fn run(
     };
     match outcome {
         Outcome::Unchanged => {
-            crate::log_line!(
-                "g-mesh daemon: {changed_file} changed nothing {language} resolution reads - \
+            crate::log_role!(
+                "{changed_file} changed nothing {language} resolution reads - \
                  nothing re-extracted ({} ms)",
                 started.elapsed().as_millis()
             );
             Ok(())
         }
         Outcome::Reextracted(count) => {
-            crate::log_line!(
-                "g-mesh daemon: {changed_file} changed {language} resolution - re-extracted {count} \
+            crate::log_role!(
+                "{changed_file} changed {language} resolution - re-extracted {count} \
                  file(s) ({} ms)",
                 started.elapsed().as_millis()
             );
             Ok(())
         }
         Outcome::Fallback(why) => {
-            crate::log_line!(
-                "g-mesh daemon: reindexing all of {language} after {changed_file} changed: {why}"
-            );
+            crate::log_role!("reindexing all of {language} after {changed_file} changed: {why}");
             workspace_reindex::run(registry, supervisor, store, changed_file)
         }
     }
@@ -202,8 +200,8 @@ fn reextract(
     }
     if semantic_pass && !selected.is_empty() {
         if let Err(err) = process.scoped_semantic_pass(store, selected.clone(), embedding) {
-            crate::log_line!(
-                "g-mesh daemon: the semantic pass over {language}'s re-extracted files failed ({err:#}) - \
+            crate::log_role!(
+                "the semantic pass over {language}'s re-extracted files failed ({err:#}) - \
                  their edges keep whatever the structural pass resolved"
             );
         }
@@ -248,26 +246,26 @@ pub(crate) fn resume_owed_reextracts(registry: &PluginRegistry, store: &IndexSto
     let owed = match store.with(schema::owed_reextracts) {
         Ok(owed) => owed,
         Err(err) => {
-            crate::log_line!("g-mesh daemon: could not read the interrupted re-extracts ({err:#})");
+            crate::log_role!("could not read the interrupted re-extracts ({err:#})");
             return;
         }
     };
     for (language, trigger, files) in owed {
         if !registry.has_manifest(&language) {
             if let Err(err) = store.with(|conn| schema::clear_owed_reextracts(conn, &language)) {
-                crate::log_line!("g-mesh daemon: could not drop {language}'s owed re-extracts ({err:#})");
+                crate::log_role!("could not drop {language}'s owed re-extracts ({err:#})");
             }
             continue;
         }
-        crate::log_line!(
-            "g-mesh daemon: re-extracting {} {language} file(s) an interrupted run owed after {trigger} changed",
+        crate::log_role!(
+            "re-extracting {} {language} file(s) an interrupted run owed after {trigger} changed",
             files.len()
         );
         let supervisor = match registry.get_or_spawn(&language) {
             Ok(supervisor) => supervisor,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not start the {language} plugin to finish its owed re-extracts \
+                crate::log_role!(
+                    "could not start the {language} plugin to finish its owed re-extracts \
                      ({err:#}) - they are retried at the next start"
                 );
                 continue;
@@ -285,8 +283,8 @@ pub(crate) fn resume_owed_reextracts(registry: &PluginRegistry, store: &IndexSto
             }
             if semantic_pass && !live.is_empty() {
                 if let Err(err) = process.scoped_semantic_pass(store, live, embedding) {
-                    crate::log_line!(
-                        "g-mesh daemon: the semantic pass over {language}'s owed re-extracts failed ({err:#}) - \
+                    crate::log_role!(
+                        "the semantic pass over {language}'s owed re-extracts failed ({err:#}) - \
                          their edges keep whatever the structural pass resolved"
                     );
                 }
@@ -294,12 +292,10 @@ pub(crate) fn resume_owed_reextracts(registry: &PluginRegistry, store: &IndexSto
             store.with(|conn| schema::settle_owed_reextracts(conn, &language, &files))
         });
         if let Err(err) = finished.and_then(|finished| finished) {
-            crate::log_line!(
-                "g-mesh daemon: reindexing all of {language}: its owed re-extracts did not finish ({err:#})"
-            );
+            crate::log_role!("reindexing all of {language}: its owed re-extracts did not finish ({err:#})");
             if let Err(err) = workspace_reindex::run(registry, &supervisor, store, &trigger) {
-                crate::log_line!(
-                    "g-mesh daemon: failed to reindex {language} for its owed re-extracts ({err:#}) - \
+                crate::log_role!(
+                    "failed to reindex {language} for its owed re-extracts ({err:#}) - \
                      they are retried at the next start"
                 );
             }

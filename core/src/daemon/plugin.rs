@@ -190,14 +190,14 @@ pub const SEMANTIC_PASS_PER_FILE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Test-only override for [`RoundTripTimeouts::file_changed`] - real installs
 /// never set it. See [`RoundTripTimeouts`]'s doc comment.
-pub const FILE_CHANGED_TIMEOUT_ENV: &str = "G_MESH_FILE_CHANGED_TIMEOUT_MS";
+pub const FILE_CHANGED_TIMEOUT_ENV: &str = crate::knobs::FILE_CHANGED_TIMEOUT_MS.name;
 /// Test-only override for [`RoundTripTimeouts::semantic_pass_file`].
-pub const SEMANTIC_PASS_FILE_TIMEOUT_ENV: &str = "G_MESH_SEMANTIC_PASS_FILE_TIMEOUT_MS";
+pub const SEMANTIC_PASS_FILE_TIMEOUT_ENV: &str = crate::knobs::SEMANTIC_PASS_FILE_TIMEOUT_MS.name;
 /// Test-only override for [`RoundTripTimeouts::semantic_pass_project`] - the
 /// floor, not the scaled timeout (there is no override for the per-file
 /// budget; tests that need a short whole-project timeout pass a small
 /// `file_count` too, since the floor is what dominates at small counts).
-pub const SEMANTIC_PASS_PROJECT_TIMEOUT_ENV: &str = "G_MESH_SEMANTIC_PASS_PROJECT_TIMEOUT_MS";
+pub const SEMANTIC_PASS_PROJECT_TIMEOUT_ENV: &str = crate::knobs::SEMANTIC_PASS_PROJECT_TIMEOUT_MS.name;
 
 impl Default for RoundTripTimeouts {
     fn default() -> Self {
@@ -215,21 +215,24 @@ impl RoundTripTimeouts {
     pub fn from_env() -> Self {
         let default = Self::default();
         Self {
-            file_changed: parse_round_trip_timeout(
-                std::env::var(FILE_CHANGED_TIMEOUT_ENV).ok().as_deref(),
+            file_changed: crate::knobs::millis(
+                &crate::knobs::FILE_CHANGED_TIMEOUT_MS,
+                crate::knobs::ZeroIs::Default,
                 default.file_changed,
-                FILE_CHANGED_TIMEOUT_ENV,
-            ),
-            semantic_pass_file: parse_round_trip_timeout(
-                std::env::var(SEMANTIC_PASS_FILE_TIMEOUT_ENV).ok().as_deref(),
+            )
+            .unwrap_or(default.file_changed),
+            semantic_pass_file: crate::knobs::millis(
+                &crate::knobs::SEMANTIC_PASS_FILE_TIMEOUT_MS,
+                crate::knobs::ZeroIs::Default,
                 default.semantic_pass_file,
-                SEMANTIC_PASS_FILE_TIMEOUT_ENV,
-            ),
-            semantic_pass_project: parse_round_trip_timeout(
-                std::env::var(SEMANTIC_PASS_PROJECT_TIMEOUT_ENV).ok().as_deref(),
+            )
+            .unwrap_or(default.semantic_pass_file),
+            semantic_pass_project: crate::knobs::millis(
+                &crate::knobs::SEMANTIC_PASS_PROJECT_TIMEOUT_MS,
+                crate::knobs::ZeroIs::Default,
                 default.semantic_pass_project,
-                SEMANTIC_PASS_PROJECT_TIMEOUT_ENV,
-            ),
+            )
+            .unwrap_or(default.semantic_pass_project),
         }
     }
 
@@ -248,26 +251,6 @@ impl RoundTripTimeouts {
         let file_count = u32::try_from(file_count).unwrap_or(u32::MAX);
         let scaled = SEMANTIC_PASS_PER_FILE_BUDGET.saturating_mul(file_count);
         self.semantic_pass_project.max(scaled)
-    }
-}
-
-/// `default` for an absent or unparseable override, and - unlike
-/// `daemon::lifecycle::parse_timeout`'s idle timers - also for an explicit
-/// `0`: an idle timer can mean "never" at zero, but a round-trip timeout of
-/// zero would fail every request, which is not a meaningful "off" state for
-/// this type to offer.
-fn parse_round_trip_timeout(raw: Option<&str>, default: Duration, name: &str) -> Duration {
-    let Some(raw) = raw else { return default };
-    match raw.trim().parse::<u64>() {
-        Ok(0) => default,
-        Ok(millis) => Duration::from_millis(millis),
-        Err(_) => {
-            crate::log_line!(
-                "g-mesh daemon: ignoring {name}={raw:?} - not a whole number of milliseconds; \
-                 using the default {default:?}"
-            );
-            default
-        }
     }
 }
 
@@ -963,8 +946,8 @@ impl PluginProcess {
                         "its change to {file_path} could not be applied ({err:#}), so its cached copy of \
                      that file is ahead of the index - a fresh process re-extracts it in full"
                     )) {
-                        crate::log_line!(
-                            "g-mesh daemon: could not relaunch the {} plugin after a failed apply \
+                        crate::log_role!(
+                            "could not relaunch the {} plugin after a failed apply \
                          ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
                             self.manifest.language
                         );
@@ -1006,8 +989,8 @@ impl PluginProcess {
             return;
         }
         if let Err(err) = self.relaunch("it exited while re-extracting the files an edit moved") {
-            crate::log_line!(
-                "g-mesh daemon: failed to relaunch the {} plugin after a failed re-extract: {err:#}",
+            crate::log_role!(
+                "failed to relaunch the {} plugin after a failed re-extract: {err:#}",
                 self.manifest.language
             );
         }
@@ -1163,8 +1146,8 @@ impl PluginProcess {
                 "its query-time reindex of {file_path} could not be applied ({err:#}), so its cached \
                  copy of that file is ahead of the index - a fresh process re-extracts it in full"
             )) {
-                crate::log_line!(
-                    "g-mesh daemon: could not relaunch the {} plugin after a failed query-time \
+                crate::log_role!(
+                    "could not relaunch the {} plugin after a failed query-time \
                      reindex ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
                     self.manifest.language
                 );
@@ -1370,8 +1353,8 @@ impl PluginProcess {
             return;
         }
         if let Err(relaunch_err) = self.relaunch(&format!("the process exited unexpectedly ({err:#})")) {
-            crate::log_line!(
-                "g-mesh daemon: failed to relaunch the {} plugin after a control-plane timeout: {relaunch_err:#}",
+            crate::log_role!(
+                "failed to relaunch the {} plugin after a control-plane timeout: {relaunch_err:#}",
                 self.manifest.language
             );
         }
@@ -1552,8 +1535,8 @@ impl PluginProcess {
     /// `Mutex`.
     fn kill_on_timeout<'a>(&'a self, child: &'a mut Child) -> impl FnMut() + 'a {
         move || {
-            crate::log_line!(
-                "g-mesh daemon: the {} plugin did not answer a control-plane request in time - \
+            crate::log_role!(
+                "the {} plugin did not answer a control-plane request in time - \
                  killing it so a fresh process can take over",
                 self.manifest.language
             );
@@ -1609,7 +1592,7 @@ impl PluginProcess {
     /// was killed, and what keeps a relaunched *live* plugin from leaving its
     /// tsserver running or its pid a zombie.
     fn relaunch(&self, why: &str) -> Result<()> {
-        crate::log_line!("g-mesh daemon: relaunching the {} plugin: {why}", self.manifest.language);
+        crate::log_role!("relaunching the {} plugin: {why}", self.manifest.language);
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
         let replaced = std::mem::replace(&mut *self.state(), fresh);
@@ -1617,8 +1600,8 @@ impl PluginProcess {
         // Outside the state lock: the fresh process is already serving, and
         // waiting out the old one's grace period must not hold up a request.
         if let Err(err) = replaced.end(RELAUNCH_GRACE) {
-            crate::log_line!(
-                "g-mesh daemon: the replaced {} plugin process did not shut down cleanly: {err:#}",
+            crate::log_role!(
+                "the replaced {} plugin process did not shut down cleanly: {err:#}",
                 self.manifest.language
             );
         }

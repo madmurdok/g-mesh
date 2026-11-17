@@ -62,13 +62,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::config::EmbeddingConfig;
 use crate::embedding::cache::{self, EmbeddingCache, Hash, OpenError};
 use crate::embedding::model::{
-    check_default_weights, default_model_dir, embedding_version, EmbeddingModel, EncoderSpec,
-    InferenceOptions, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
+    check_default_weights, default_model_dir_from, embedding_version, EmbeddingModel, EncoderSpec,
+    InferenceOptions, DEFAULT_MODEL_NAME, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
-use crate::embedding::rerank::Reranker;
+use crate::embedding::rerank::{RerankSettings, Reranker};
 use crate::embedding::text::{node_text, EmbedInput, TextRule};
 use crate::model::Diff;
 use crate::storage::embed_row;
@@ -110,46 +109,51 @@ impl CacheSettings {
     pub fn new(path: PathBuf, max_size_mb: u64) -> Self {
         Self { path, max_bytes: max_size_mb.saturating_mul(1024 * 1024) }
     }
+}
 
-    /// What the global config and [`cache::CACHE_ENV`] ask for: `None` when
-    /// the cache is switched off by either.
-    fn from_global_config() -> Option<Self> {
-        if env_disables_cache(std::env::var_os(cache::CACHE_ENV).as_deref()) {
-            return None;
-        }
-        let config = crate::config::read_global_config().map(|config| config.embedding_cache).unwrap_or_else(|err| {
-            crate::log_line!("g-mesh: failed to read the global config ({err:#}) - using the embedding cache's defaults");
-            Default::default()
-        });
-        if !config.enabled {
-            return None;
-        }
-        match cache::default_path() {
-            Ok(path) => Some(Self::new(path, config.max_size_mb)),
-            Err(err) => {
-                crate::log_line!(
-                    "g-mesh: the embedding cache has no location ({err:#}) - embedding without it"
-                );
-                None
-            }
-        }
+/// Which embedding model a pipeline uses, where its weights are and how it
+/// runs inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSettings {
+    /// The configured model name (`[embedding] model`).
+    pub name: String,
+    /// The directory to load from instead of `~/.g-mesh/models/<name>`.
+    pub dir_override: Option<PathBuf>,
+    pub inference: InferenceOptions,
+}
+
+impl ModelSettings {
+    /// `name` in its default directory, with default inference options.
+    pub fn new(name: &str) -> Self {
+        Self { name: name.to_string(), dir_override: None, inference: InferenceOptions::default() }
     }
 }
 
-fn env_disables_cache(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| value.eq_ignore_ascii_case("off"))
+/// Everything [`EmbeddingPipeline::load`] needs, resolved by its caller.
+#[derive(Debug)]
+pub struct EmbeddingSettings {
+    pub model: ModelSettings,
+    /// The machine-wide cache; `None` when it is switched off.
+    pub cache: Option<CacheSettings>,
+    pub rerank: RerankSettings,
 }
 
 /// The cache as one process sees it. Opened on the first `compute` that has
 /// something to embed, never by [`EmbeddingPipeline::load`].
 enum CacheSlot {
-    /// Not opened yet: the settings to open with, `None` to read them from
-    /// the global config at that moment.
-    Unopened(Option<CacheSettings>),
+    /// Not opened yet: the settings to open with.
+    Unopened(CacheSettings),
     Active(ActiveCache),
     /// Switched off, no model files to fingerprint, or unusable even after
     /// being recreated: every text is embedded, as without a cache.
     Off,
+}
+
+fn cache_slot(cache: Option<CacheSettings>) -> CacheSlot {
+    match cache {
+        Some(settings) => CacheSlot::Unopened(settings),
+        None => CacheSlot::Off,
+    }
 }
 
 struct ActiveCache {
@@ -180,7 +184,7 @@ pub struct EmbedStats {
 /// A lazily-resolved embedding model plus the version string stored rows are
 /// tagged with, held for as long as the daemon runs.
 ///
-/// `version` is [`embedding_version`] of `config.embedding.model` - the
+/// `version` is [`embedding_version`] of `[embedding] model` - the
 /// project's *configured* choice, plus which pinned weights of it for the
 /// default model (ADR 0011). [`apply`](Self::apply) keeps
 /// `meta.embedding_model` mirroring this same value on every call (see `storage::schema::set_embedding_model`), so a
@@ -191,15 +195,16 @@ pub struct EmbedStats {
 /// or one batch insert, never across inference or the model's hashing and
 /// never while taking another lock.
 pub struct EmbeddingPipeline {
-    config: EmbeddingConfig,
-    /// [`embedding_version`] of `config.model`, computed once.
+    /// The configured model name.
+    model_name: String,
+    /// [`embedding_version`] of `model_name`, computed once.
     version: String,
     /// Whether the directory must hold the default model's pinned weights
     /// ([`check_default_weights`]) before it counts as available or loads:
     /// true for the default model, false for any other and for a test's own
     /// loader.
     pinned_weights: bool,
-    /// `None`: `default_model_dir(config.model)`.
+    /// Passed to [`default_model_dir_from`] with `model_name`.
     model_dir: Option<PathBuf>,
     loader: Loader,
     model: OnceLock<Option<Box<dyn Embedder>>>,
@@ -210,54 +215,32 @@ pub struct EmbeddingPipeline {
 }
 
 impl EmbeddingPipeline {
-    /// Stores `config` for a later load - see the module doc's "Where the
+    /// Stores `settings` for a later load - see the module doc's "Where the
     /// model lives" section for why this does no I/O and returns instantly.
-    /// The embedding cache follows the global config (`[embeddingCache]`,
-    /// `G_MESH_EMBEDDING_CACHE`), read when it is first needed.
-    pub fn load(config: &EmbeddingConfig) -> Self {
-        Self::build(config, None, CacheSlot::Unopened(None))
+    /// The cache is opened at `settings.cache` when it is first needed, or
+    /// never for `None`.
+    pub fn load(settings: EmbeddingSettings) -> Self {
+        Self::build(settings.model, cache_slot(settings.cache), Reranker::new(settings.rerank))
     }
 
-    /// [`load`](Self::load) with the cache given explicitly: at `cache`, or
-    /// none at all for `None`, whatever the global config says.
-    pub fn load_with_cache(config: &EmbeddingConfig, cache: Option<CacheSettings>) -> Self {
-        let slot = match cache {
-            Some(settings) => CacheSlot::Unopened(Some(settings)),
-            None => CacheSlot::Off,
-        };
-        Self::build(config, None, slot)
-    }
-
-    /// [`load`](Self::load) with the model directory given rather than
-    /// resolved by `default_model_dir`, so a test can name a directory
-    /// without writing `G_MESH_MODEL_DIR` for every other thread in the
-    /// process.
-    #[cfg(test)]
-    pub(crate) fn load_at(config: &EmbeddingConfig, model_dir: &Path) -> Self {
-        Self::build(config, Some(model_dir.to_path_buf()), CacheSlot::Unopened(None))
-    }
-
-    fn build(config: &EmbeddingConfig, model_dir: Option<PathBuf>, cache: CacheSlot) -> Self {
-        let pinned_weights = config.model == EmbeddingConfig::default().model;
+    fn build(model: ModelSettings, cache: CacheSlot, reranker: Reranker) -> Self {
+        let pinned_weights = model.name == DEFAULT_MODEL_NAME;
+        let inference = model.inference;
         Self {
-            config: config.clone(),
-            version: embedding_version(&config.model),
+            version: embedding_version(&model.name),
+            model_name: model.name,
             pinned_weights,
-            model_dir,
+            model_dir: model.dir_override,
             loader: Box::new(move |dir| {
                 if pinned_weights {
                     check_default_weights(dir)?;
                 }
-                let model = EmbeddingModel::load_with_options(
-                    dir,
-                    EncoderSpec::production(),
-                    &InferenceOptions::from_env(),
-                )?;
+                let model = EmbeddingModel::load_with_options(dir, EncoderSpec::production(), &inference)?;
                 Ok(Box::new(model) as Box<dyn Embedder>)
             }),
             model: OnceLock::new(),
             cache: Mutex::new(cache),
-            reranker: Reranker::from_environment(),
+            reranker,
         }
     }
 
@@ -268,9 +251,9 @@ impl EmbeddingPipeline {
     /// [`apply`](Self::apply) is actually called, and this pre-fills that
     /// result with "no model" so a disabled pipeline never tries.
     pub fn disabled() -> Self {
-        let mut pipeline = Self::build(&EmbeddingConfig::default(), None, CacheSlot::Off);
+        let mut pipeline =
+            Self::build(ModelSettings::new(DEFAULT_MODEL_NAME), CacheSlot::Off, Reranker::off());
         pipeline.model = OnceLock::from(None);
-        pipeline.reranker = Reranker::off();
         pipeline
     }
 
@@ -283,14 +266,13 @@ impl EmbeddingPipeline {
         loader: impl Fn(&Path) -> Result<Box<dyn Embedder>> + Send + Sync + 'static,
         cache: Option<CacheSettings>,
     ) -> Self {
-        let slot = match cache {
-            Some(settings) => CacheSlot::Unopened(Some(settings)),
-            None => CacheSlot::Off,
+        let model = ModelSettings {
+            dir_override: Some(model_dir.to_path_buf()),
+            ..ModelSettings::new(DEFAULT_MODEL_NAME)
         };
-        let mut pipeline = Self::build(&EmbeddingConfig::default(), Some(model_dir.to_path_buf()), slot);
+        let mut pipeline = Self::build(model, cache_slot(cache), Reranker::off());
         pipeline.loader = Box::new(loader);
         pipeline.pinned_weights = false;
-        pipeline.reranker = Reranker::off();
         pipeline
     }
 
@@ -307,10 +289,7 @@ impl EmbeddingPipeline {
     }
 
     fn model_dir(&self) -> Result<PathBuf> {
-        match &self.model_dir {
-            Some(dir) => Ok(dir.clone()),
-            None => default_model_dir(&self.config.model),
-        }
+        default_model_dir_from(self.model_dir.as_deref(), &self.model_name)
     }
 
     /// The loaded model, resolving `config`'s model directory and loading it
@@ -323,10 +302,10 @@ impl EmbeddingPipeline {
             .get_or_init(|| match self.model_dir().and_then(|dir| (self.loader)(&dir)) {
                 Ok(model) => Some(model),
                 Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: embedding model {:?} is not available ({err:#}) - \
+                    crate::log_role!(
+                        "embedding model {:?} is not available ({err:#}) - \
                          indexing will continue without semantic search",
-                        self.config.model
+                        self.model_name
                     );
                     None
                 }
@@ -362,7 +341,7 @@ impl EmbeddingPipeline {
     /// [`model`](Self::model) has decided, that decision is the one source of
     /// truth, and a `disabled` pipeline in particular must read as
     /// unavailable regardless of what happens to exist under
-    /// `default_model_dir` (a test's real weights, say) - it was
+    /// `default_model_dir_from` (a test's real weights, say) - it was
     /// constructed to never try. Otherwise - the common cold-start case,
     /// nothing has asked to embed yet - this falls back to the one fact that
     /// can be checked without loading anything: do `model.onnx` and
@@ -412,7 +391,7 @@ impl EmbeddingPipeline {
         match model.embed(text) {
             Ok(embedding) => Some(embedding),
             Err(err) => {
-                crate::log_line!("g-mesh daemon: failed to embed search query ({err:#})");
+                crate::log_role!("failed to embed search query ({err:#})");
                 None
             }
         }
@@ -495,8 +474,8 @@ impl EmbeddingPipeline {
                 let texts: Vec<&str> = misses.iter().map(|&index| pending[index].1.as_str()).collect();
                 let embedded = model.embed_batch(&texts);
                 if embedded.len() != misses.len() {
-                    crate::log_line!(
-                        "g-mesh daemon: the model returned {} vectors for {} texts - the rest are left unembedded",
+                    crate::log_role!(
+                        "the model returned {} vectors for {} texts - the rest are left unembedded",
                         embedded.len(),
                         misses.len()
                     );
@@ -523,9 +502,7 @@ impl EmbeddingPipeline {
                     computed.push(ComputedEmbedding { node_id: node_id.to_string(), embedding, text });
                 }
                 Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to embed node {node_id} ({err:#}) - it is left unembedded"
-                    )
+                    crate::log_role!("failed to embed node {node_id} ({err:#}) - it is left unembedded")
                 }
             }
         }
@@ -616,13 +593,10 @@ impl EmbeddingPipeline {
             CacheSlot::Unopened(settings) => settings.clone(),
             _ => return,
         };
-        let opened = match settings.or_else(CacheSettings::from_global_config) {
-            None => CacheSlot::Off,
-            Some(settings) => match self.open_cache(&settings) {
-                Ok(Some(active)) => CacheSlot::Active(active),
-                Ok(None) => CacheSlot::Off,
-                Err(()) => CacheSlot::Unopened(Some(settings)),
-            },
+        let opened = match self.open_cache(&settings) {
+            Ok(Some(active)) => CacheSlot::Active(active),
+            Ok(None) => CacheSlot::Off,
+            Err(()) => CacheSlot::Unopened(settings),
         };
         let mut slot = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         if matches!(*slot, CacheSlot::Unopened(_)) {
@@ -725,23 +699,21 @@ impl EmbeddingPipeline {
                 None => vectors::delete(conn, node_id),
             });
             if let Err(err) = deleted {
-                crate::log_line!(
-                    "g-mesh daemon: failed to delete the vector of filtered node {node_id} ({err:#})"
-                );
+                crate::log_role!("failed to delete the vector of filtered node {node_id} ({err:#})");
             }
         }
         if computed.embeddings.is_empty() {
             return;
         }
         if let Err(err) = crate::storage::schema::set_embedding_model(conn, &self.version) {
-            crate::log_line!("g-mesh daemon: failed to record the active embedding model ({err:#})");
+            crate::log_role!("failed to record the active embedding model ({err:#})");
         }
         for entry in &computed.embeddings {
             match current_embeddable_text(conn, &entry.node_id) {
                 Ok(Some(current_text)) if current_text == entry.text => {
                     if let Err(err) = vectors::insert(conn, &entry.node_id, &entry.embedding, &self.version) {
-                        crate::log_line!(
-                            "g-mesh daemon: failed to store the embedding for node {} ({err:#}) - it is \
+                        crate::log_role!(
+                            "failed to store the embedding for node {} ({err:#}) - it is \
                              left unembedded",
                             entry.node_id
                         );
@@ -753,8 +725,8 @@ impl EmbeddingPipeline {
                 // newer content owns re-embedding it; this vector would only
                 // ever be stale.
                 Ok(_) => {}
-                Err(err) => crate::log_line!(
-                    "g-mesh daemon: failed to verify node {} before storing its embedding ({err:#}) - it is \
+                Err(err) => crate::log_role!(
+                    "failed to verify node {} before storing its embedding ({err:#}) - it is \
                      left unembedded",
                     entry.node_id
                 ),
@@ -776,8 +748,8 @@ fn model_files_exist(dir: &Path) -> bool {
 }
 
 fn log_stats(label: &str, stats: &EmbedStats, elapsed: Duration) {
-    crate::log_line!(
-        "g-mesh daemon: embeddings [{label}]: {} texts, {} cache hits, {} embedded, {} cache errors, {:.1}s",
+    crate::log_role!(
+        "embeddings [{label}]: {} texts, {} cache hits, {} embedded, {} cache errors, {:.1}s",
         stats.texts,
         stats.hits,
         stats.embedded,
@@ -1054,6 +1026,11 @@ mod tests {
     use crate::embedding::text::text_to_embed;
     use crate::model::NodeRecord;
 
+    /// `name`'s settings with its weights in `dir`.
+    fn model_at(name: &str, dir: &Path) -> ModelSettings {
+        ModelSettings { dir_override: Some(dir.to_path_buf()), ..ModelSettings::new(name) }
+    }
+
     /// A model directory whose `model.onnx` is a sparse file of `onnx_size`
     /// bytes: the weight check reads a length, never the bytes.
     fn sized_model_dir(onnx_size: u64) -> tempfile::TempDir {
@@ -1075,7 +1052,7 @@ mod tests {
     /// or drop `TEXT_FORM_TAG` from it, and this fails.
     #[test]
     fn the_embedding_version_names_the_weights_and_the_text_form() {
-        let model = EmbeddingConfig::default().model;
+        let model = DEFAULT_MODEL_NAME;
         let pipeline = EmbeddingPipeline::disabled();
         assert_eq!(pipeline.embedding_version(), format!("{model}+int8+structured"));
         assert_ne!(pipeline.embedding_version(), model, "fp32 vectors were tagged with the bare name");
@@ -1085,8 +1062,9 @@ mod tests {
             "untrimmed-text vectors carry this"
         );
 
-        let other = EmbeddingConfig { model: "some-other-model".to_string() };
-        assert_eq!(EmbeddingPipeline::load(&other).embedding_version(), "some-other-model+structured");
+        let other =
+            EmbeddingPipeline::build(ModelSettings::new("some-other-model"), CacheSlot::Off, Reranker::off());
+        assert_eq!(other.embedding_version(), "some-other-model+structured");
     }
 
     /// An fp32 `model.onnx` is neither available nor loaded for the default
@@ -1102,9 +1080,9 @@ mod tests {
     fn fp32_weights_are_not_loaded_for_the_default_model() {
         let fp32 = sized_model_dir(641_517_466);
         let pipeline = EmbeddingPipeline::build(
-            &EmbeddingConfig::default(),
-            Some(fp32.path().to_path_buf()),
+            model_at(DEFAULT_MODEL_NAME, fp32.path()),
             CacheSlot::Off,
+            Reranker::off(),
         );
         assert!(!pipeline.is_available(), "the fp32 file must not count as the default model");
         let err = match (pipeline.loader)(fp32.path()) {
@@ -1116,15 +1094,18 @@ mod tests {
 
         let int8 = sized_model_dir(crate::embedding::model::DEFAULT_ONNX_SIZE);
         let pipeline = EmbeddingPipeline::build(
-            &EmbeddingConfig::default(),
-            Some(int8.path().to_path_buf()),
+            model_at(DEFAULT_MODEL_NAME, int8.path()),
             CacheSlot::Off,
+            Reranker::off(),
         );
         assert!(pipeline.is_available(), "the pinned size is the default model");
 
         // Another model's weights are not g-mesh's to pin.
-        let other = EmbeddingConfig { model: "some-other-model".to_string() };
-        let pipeline = EmbeddingPipeline::build(&other, Some(fp32.path().to_path_buf()), CacheSlot::Off);
+        let pipeline = EmbeddingPipeline::build(
+            model_at("some-other-model", fp32.path()),
+            CacheSlot::Off,
+            Reranker::off(),
+        );
         assert!(pipeline.is_available());
     }
 
@@ -1445,9 +1426,9 @@ mod tests {
         assert_eq!(counters.embeds(), 3, "the cache is warm for these weights");
 
         let pinned = EmbeddingPipeline::build(
-            &EmbeddingConfig::default(),
-            Some(model_dir.clone()),
-            CacheSlot::Unopened(Some(cache_at(dir.path()))),
+            model_at(DEFAULT_MODEL_NAME, &model_dir),
+            CacheSlot::Unopened(cache_at(dir.path())),
+            Reranker::off(),
         );
         let conn = index_with(&diff);
         let mut stats = EmbedStats::default();
@@ -1457,6 +1438,25 @@ mod tests {
         assert_eq!(computed.len(), 0, "cached vectors of refused weights must not be served");
         assert_eq!((stats.texts, stats.hits), (0, 0));
         assert_eq!(vector_count(&conn), 0, "nothing is stored under {}", pinned.embedding_version());
+    }
+
+    /// `load` opens the cache its settings name at the first `compute`, and
+    /// creates no cache file for `None`. The weights are stand-ins, so the
+    /// model itself never loads; the cache is opened before that is tried.
+    #[test]
+    fn load_creates_a_cache_file_only_when_its_settings_name_one() {
+        for wants_cache in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let model_dir = fake_model_dir(&dir.path().join("model"), "weights v1");
+            let settings = cache_at(dir.path());
+            let pipeline = EmbeddingPipeline::load(EmbeddingSettings {
+                model: model_at("a-custom-model", &model_dir),
+                cache: wants_cache.then(|| settings.clone()),
+                rerank: RerankSettings { enabled: false, model_dir: Ok(dir.path().join("rerank")) },
+            });
+            pipeline.compute(&diff_of(1), &mut EmbedStats::default());
+            assert_eq!(settings.path.exists(), wants_cache, "cache file with settings.cache = {wants_cache}");
+        }
     }
 
     /// Same texts under a second fingerprint: nothing is shared.
@@ -1496,20 +1496,6 @@ mod tests {
         assert_eq!(counters.embeds(), 6);
         assert_eq!((stats.texts, stats.hits, stats.embedded), (6, 0, 6));
         assert!(!dir.path().join("embedding-cache").exists(), "no cache means no cache file");
-    }
-
-    /// `G_MESH_EMBEDDING_CACHE=off` is the kill switch.
-    ///
-    /// Control: make `env_disables_cache` return false and the `off` rows
-    /// fail.
-    #[test]
-    fn the_environment_switch_turns_the_cache_off() {
-        use std::ffi::OsStr;
-        assert!(env_disables_cache(Some(OsStr::new("off"))));
-        assert!(env_disables_cache(Some(OsStr::new("OFF"))));
-        assert!(!env_disables_cache(None));
-        assert!(!env_disables_cache(Some(OsStr::new(""))));
-        assert!(!env_disables_cache(Some(OsStr::new("on"))));
     }
 
     fn index_with(diff: &Diff) -> Connection {

@@ -215,7 +215,8 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             );
             let project_config = config::read_project_config(project_root)
                 .context("failed to read the project's config.toml")?;
-            let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
+            let embedding_pipeline =
+                EmbeddingPipeline::load(config::embedding::embedding_settings(&project_config.embedding));
             // Per language now: `run_once` asks every currently-owed
             // language and records `language_state.semanticPassAt` (and the
             // roll-up) itself - see that function's own doc comment.
@@ -246,7 +247,8 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         // configured, exactly like `daemon::run`'s own cold start.
         let project_config =
             config::read_project_config(project_root).context("failed to read the project's config.toml")?;
-        let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
+        let embedding_pipeline =
+            EmbeddingPipeline::load(config::embedding::embedding_settings(&project_config.embedding));
         // Discovery's result, resolved above, handed straight in - see
         // `daemon::bulk_index::run`'s doc comment for why it takes that
         // directly rather than a `PluginRegistry`. The walk is

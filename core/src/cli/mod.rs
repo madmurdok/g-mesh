@@ -381,7 +381,10 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Clean(args) => clean::run(&args),
         Command::Stop => stop::run(),
         Command::McpShim => shim::run(),
-        Command::Daemon { project_root } => daemon::run(&project_root),
+        Command::Daemon { project_root } => {
+            crate::log::set_role(crate::log::Role::Daemon);
+            daemon::run(&project_root)
+        }
         Command::DebugCandidates { dir, json } => debug_candidates::run(dir, json),
         #[cfg(feature = "embed-eval")]
         Command::DebugEmbedEval { command } => embed_eval::run(command),

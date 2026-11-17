@@ -99,7 +99,7 @@ use crate::storage::schema;
 /// never does so is not failed for it; `checks` reports it "not instrumented"
 /// instead, because the absence of a marker is no evidence the engine was
 /// lazy.
-pub const MARKER_DIR_ENV: &str = "G_MESH_PLUGIN_CHECK_MARKER_DIR";
+pub const MARKER_DIR_ENV: &str = crate::knobs::PLUGIN_CHECK_MARKER_DIR.name;
 
 /// See [`MARKER_DIR_ENV`].
 pub const SEMANTIC_ENGINE_MARKER: &str = "semantic-engine-started";

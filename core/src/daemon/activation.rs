@@ -134,7 +134,7 @@ fn run(mut ctx: ActivationCtx, triggered: Receiver<()>) {
                 format!("the index build panicked: {what}")
             }
         };
-        crate::log_line!("g-mesh daemon: {failure} - the next tool call retries");
+        crate::log_role!("{failure} - the next tool call retries");
         ctx.indexing.activation_failed(failure);
     }
 }
@@ -156,9 +156,7 @@ impl ActivationCtx {
             // instead, before the watcher's consumer (below) can start any
             // incremental pass of its own - see the ordering comment in
             // `walk` - and at most once per daemon start.
-            crate::log_line!(
-                "g-mesh daemon: the project was walked but its semantic pass never completed - retrying it"
-            );
+            crate::log_role!("the project was walked but its semantic pass never completed - retrying it");
             semantic::run_with_registry_and_progress(&self.registry, &self.conn, Some(&self.indexing))
                 .log("the previously-interrupted index");
             self.needs_semantic_pass_retry = false;
@@ -230,8 +228,8 @@ impl ActivationCtx {
             crate::embedding::backfill::run(&self.conn, &self.embedding, &self.indexing)
         }));
         match backfill {
-            Ok(summary) if summary.owed_a_vector() > 0 => crate::log_line!(
-                "g-mesh daemon: embedding backfill - {} of {} nodes owed a vector got one, {} from the embedding \
+            Ok(summary) if summary.owed_a_vector() > 0 => crate::log_role!(
+                "embedding backfill - {} of {} nodes owed a vector got one, {} from the embedding \
                  cache, {} embedded",
                 summary.cache_hits + summary.embedded,
                 summary.owed_a_vector(),
@@ -239,8 +237,8 @@ impl ActivationCtx {
                 summary.embedded
             ),
             Ok(_) => {}
-            Err(_) => crate::log_line!(
-                "g-mesh daemon: the embedding backfill pass panicked - structural tools are unaffected, \
+            Err(_) => crate::log_role!(
+                "the embedding backfill pass panicked - structural tools are unaffected, \
                  search_code covers only the nodes embedded so far"
             ),
         }
@@ -259,16 +257,12 @@ impl ActivationCtx {
             let retry = match self.conn.with(|conn| schema::begin_language_retry(conn, &language)) {
                 Ok(retry) => retry,
                 Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: could not count a retry of {language} - not retried: {err:#}"
-                    );
+                    crate::log_role!("could not count a retry of {language} - not retried: {err:#}");
                     continue;
                 }
             };
             let of = schema::MAX_LANGUAGE_RETRIES;
-            crate::log_line!(
-                "g-mesh daemon: retrying {language}, which failed the last walk - retry {retry} of {of}"
-            );
+            crate::log_role!("retrying {language}, which failed the last walk - retry {retry} of {of}");
             // Before the plugin is spawned: the baselines rest on it.
             let walk_started = std::time::SystemTime::now();
             let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -277,9 +271,7 @@ impl ActivationCtx {
             }));
             let err = match attempt {
                 Ok(Ok(())) => {
-                    crate::log_line!(
-                        "g-mesh daemon: {language} retry {retry} of {of} succeeded - it is indexed"
-                    );
+                    crate::log_role!("{language} retry {retry} of {of} succeeded - it is indexed");
                     continue;
                 }
                 Ok(Err(err)) => err,
@@ -289,16 +281,14 @@ impl ActivationCtx {
             if let Err(record) =
                 self.conn.with(|conn| schema::record_language_retry_failed(conn, &language, &error))
             {
-                crate::log_line!(
-                    "g-mesh daemon: could not record the failed retry of {language}: {record:#}"
-                );
+                crate::log_role!("could not record the failed retry of {language}: {record:#}");
             }
             let next = if retry < of {
                 "the next start retries it"
             } else {
                 "no retry left - fix the plugin, then run `g-mesh reindex`"
             };
-            crate::log_line!("g-mesh daemon: {language} retry {retry} of {of} failed ({err:#}) - {next}");
+            crate::log_role!("{language} retry {retry} of {of} failed ({err:#}) - {next}");
         }
     }
 
@@ -336,14 +326,14 @@ impl ActivationCtx {
         }));
         for (language, outcome) in &summary.outcomes {
             match outcome {
-                LanguageOutcome::Failed { error } => crate::log_line!(
-                    "g-mesh daemon: {language} failed to index and is left out of the index - the next \
+                LanguageOutcome::Failed { error } => crate::log_role!(
+                    "{language} failed to index and is left out of the index - the next \
                      {} daemon starts retry it, or run `g-mesh reindex`: {}",
                     schema::MAX_LANGUAGE_RETRIES,
                     crate::storage::language_outcome::error_on_one_line(error)
                 ),
-                LanguageOutcome::PluginAbsent { files } => crate::log_line!(
-                    "g-mesh daemon: {language} has no plugin installed - {} not indexed",
+                LanguageOutcome::PluginAbsent { files } => crate::log_role!(
+                    "{language} has no plugin installed - {} not indexed",
                     files.map_or_else(|| "its files are".to_string(), |n| format!("{n} file(s)"))
                 ),
                 LanguageOutcome::Indexed { .. } => {}
@@ -362,13 +352,15 @@ impl ActivationCtx {
         // same reasoning `last_used::touch` applies to a GC scan, applied to
         // the core's own idle timer.
         self.core_activity.request();
-        crate::log_line!(
-            "g-mesh daemon: initial index built - {} nodes, {} edges ({} imports linked to their target file)",
-            summary.nodes, summary.edges, summary.linked_imports
+        crate::log_role!(
+            "initial index built - {} nodes, {} edges ({} imports linked to their target file)",
+            summary.nodes,
+            summary.edges,
+            summary.linked_imports
         );
         if summary.skipped_lines > 0 {
-            crate::log_line!(
-                "g-mesh daemon: {} unreadable lines were skipped - the index may be incomplete",
+            crate::log_role!(
+                "{} unreadable lines were skipped - the index may be incomplete",
                 summary.skipped_lines
             );
         }

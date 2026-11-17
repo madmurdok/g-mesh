@@ -21,7 +21,7 @@
 #   core/scripts/fetch-embedding-model.sh [target-dir]
 #
 # Default target dir is ~/.g-mesh/models/jina-embeddings-v2-base-code, which is
-# where embedding::model::default_model_dir looks. Existing files of the
+# where config::embedding::model_dir looks. Existing files of the
 # pinned size are left alone (any other size is replaced), so re-running after
 # an interrupted download is cheap for the file that already finished but does
 # NOT resume a partial one.
@@ -37,7 +37,7 @@ MODEL_NAME="jina-embeddings-v2-base-code"
 REPO="jinaai/${MODEL_NAME}"
 REVISION="516f4baf13dec4ddddda8631e019b5737c8bc250"
 
-# Same resolution order as embedding::model::default_model_dir, so the script
+# Same resolution order as config::embedding::model_dir, so the script
 # and the loader can never disagree about where the weights belong: an explicit
 # argument, else $G_MESH_MODEL_DIR, else the per-user model directory.
 TARGET_DIR="${1:-${G_MESH_MODEL_DIR:-${HOME}/.g-mesh/models/${MODEL_NAME}}}"

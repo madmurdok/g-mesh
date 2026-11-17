@@ -214,11 +214,6 @@ fn a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_with
     responsive.sleep_now("test cleanup");
 }
 
-#[test]
-fn an_unset_timeout_reads_as_its_documented_default() {
-    assert_eq!(parse_timeout(None, DEFAULT_PLUGIN_IDLE, "X"), Some(DEFAULT_PLUGIN_IDLE));
-}
-
 /// A project with no config.toml (`ProjectConfig::default()`) must
 /// resolve to exactly the pre-config defaults - task #38's behavior,
 /// unchanged now that config is wired in.
@@ -270,20 +265,32 @@ fn the_env_override_still_wins_over_a_configured_value() {
     assert_eq!(resolved.plugin, Some(Duration::from_millis(250)));
 }
 
+/// Both idle timers read `0` as "never idle out", not as their default.
 #[test]
-fn a_zero_timeout_turns_the_timer_off() {
-    assert_eq!(parse_timeout(Some("0"), DEFAULT_CORE_IDLE, "X"), None);
+fn a_zero_override_turns_both_idle_timers_off() {
+    let resolved = IdleTimeouts::from_config_and_overrides(&ProjectConfig::default(), Some("0"), Some("0"));
+    assert_eq!(resolved, IdleTimeouts { plugin: None, core: None });
 }
 
 #[test]
-fn a_number_is_read_as_milliseconds() {
-    assert_eq!(parse_timeout(Some(" 250 "), DEFAULT_CORE_IDLE, "X"), Some(Duration::from_millis(250)));
+fn an_override_is_read_as_milliseconds() {
+    let resolved =
+        IdleTimeouts::from_config_and_overrides(&ProjectConfig::default(), Some(" 250 "), Some("40"));
+    assert_eq!(resolved.plugin, Some(Duration::from_millis(250)));
+    assert_eq!(resolved.core, Some(Duration::from_millis(40)));
 }
 
 /// A typo must not silently disable a timer, and must not stop the daemon.
 #[test]
-fn an_unparseable_timeout_falls_back_to_the_default() {
-    assert_eq!(parse_timeout(Some("10 minutes"), DEFAULT_PLUGIN_IDLE, "X"), Some(DEFAULT_PLUGIN_IDLE));
+fn an_unparseable_override_falls_back_to_the_configured_value() {
+    let config = ProjectConfig {
+        plugin: crate::config::PluginConfig { idle_timeout_minutes: 5, memory_limit_mb: None },
+        daemon: crate::config::DaemonConfig { core_idle_timeout_hours: 2 },
+        ..ProjectConfig::default()
+    };
+    let resolved = IdleTimeouts::from_config_and_overrides(&config, Some("10 minutes"), Some("abc"));
+    assert_eq!(resolved.plugin, Some(Duration::from_secs(5 * 60)));
+    assert_eq!(resolved.core, Some(Duration::from_secs(2 * 60 * 60)));
 }
 
 #[test]
