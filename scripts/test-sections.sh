@@ -105,8 +105,8 @@ section_filter() {
 	core-mcp) echo 'package(g-mesh) & kind(lib) & test(/^mcp::/)' ;;
 	core-daemon) echo 'package(g-mesh) & kind(lib) & test(/^daemon::/)' ;;
 	core-cli) echo 'package(g-mesh) & kind(lib) & test(/^cli::/)' ;;
-	core-graph) echo 'package(g-mesh) & kind(lib) & test(/^graph::/)' ;;
-	core-rest) echo 'package(g-mesh) & (kind(bin) | (kind(lib) & !test(/^(mcp|daemon|cli|graph)::/)))' ;;
+	core-graph) echo 'package(g-mesh) & kind(lib) & test(/^(graph|link)::/)' ;;
+	core-rest) echo 'package(g-mesh) & (kind(bin) | (kind(lib) & !test(/^(mcp|daemon|cli|graph|link)::/)))' ;;
 	sdk) echo 'package(g-mesh-plugin-sdk)' ;;
 	plugin-typescript) echo 'package(g-mesh-plugin-typescript)' ;;
 	plugin-rust) echo 'package(g-mesh-plugin-rust)' ;;
@@ -247,7 +247,7 @@ cmd_run() {
 		# this section's.
 		rm -f "$junit_dir/junit.xml"
 		start="$(date +%s)"
-		cargo nextest run --workspace --profile "$profile" --no-tests=fail -E "$filter" || status=$?
+		cargo nextest run --workspace --features g-mesh/embed-eval --profile "$profile" --no-tests=fail -E "$filter" || status=$?
 		secs=$(($(date +%s) - start))
 		result=PASS
 		[ "$status" -eq 0 ] || result=FAIL
@@ -282,10 +282,10 @@ cmd_check() {
 	local dir="$CHECK_DIR"
 	local -a args=("$dir/all.json")
 	echo "== listing the whole suite"
-	cargo nextest list --workspace --run-ignored all --message-format json >"$dir/all.json"
+	cargo nextest list --workspace --features g-mesh/embed-eval --run-ignored all --message-format json >"$dir/all.json"
 	for name in "${SECTIONS[@]}"; do
 		echo "== listing $name"
-		cargo nextest list --workspace --run-ignored all --message-format json \
+		cargo nextest list --workspace --features g-mesh/embed-eval --run-ignored all --message-format json \
 			-E "$(section_filter "$name")" >"$dir/$name.json"
 		args+=("$name=$dir/$name.json")
 	done

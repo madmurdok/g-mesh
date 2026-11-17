@@ -377,8 +377,8 @@ const SCRIPTS_CLOSURE_PATHS: [&str; 10] = [
     "core/src/languages/tests.rs",
     "core/src/plugin_manifest.rs",
     "core/src/plugin_manifest/tests.rs",
-    "core/src/graph/symbol_links.rs",
-    "core/src/graph/symbol_links/x.rs",
+    "core/src/link/symbol_links.rs",
+    "core/src/link/symbol_links/x.rs",
     "core/src/protocol/types.rs",
     "core/src/protocol/mod.rs",
 ];

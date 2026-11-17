@@ -27,10 +27,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use g_mesh::daemon;
 use g_mesh::daemon::bulk_index::WALK_HOLD_FILE_ENV;
 use g_mesh::ipc;
 use g_mesh::mcp::{INDEX_WAIT_CAP_ENV, PROGRESS_INTERVAL_ENV, TRACE_CALLS_ENV};
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{
@@ -120,8 +120,8 @@ impl Project {
     /// Blocks until the structural index is built, without triggering
     /// anything: the activation this is waiting on is already running.
     fn wait_until_structural(&self) {
-        let path =
-            daemon::phase_path_in(&project_dir(self.root()).expect("failed to resolve the state directory"));
+        let path = StateDir::at(project_dir(self.root()).expect("failed to resolve the state directory"))
+            .phase_file();
         common::wait_for("the walk to finish", common::startup_timeout(), || {
             std::fs::read_to_string(&path)
                 .map(|phase| matches!(phase.trim(), "structural" | "embedding" | "ready"))
@@ -168,12 +168,16 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(self.hold());
-        for path in
-            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())].into_iter().flatten()
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ]
+        .into_iter()
+        .flatten()
         {
             common::kill_pid_file(&path);
         }
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
         if let Ok(state) = project_dir(self.root()) {
@@ -320,7 +324,9 @@ async fn a_waiting_call_without_a_token_gets_no_notifications_and_the_full_answe
     let project = Project::new();
     let bootstrap = project.connect((), &[]).await;
 
-    let endpoint = daemon::endpoint(project.root()).expect("the daemon must have an endpoint");
+    let endpoint = StateDir::of(project.root())
+        .and_then(|sd| g_mesh::control::lock::endpoint(&sd))
+        .expect("the daemon must have an endpoint");
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = done_tx.send(raw_outline_call_without_token(&endpoint));

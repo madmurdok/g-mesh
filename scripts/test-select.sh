@@ -172,7 +172,7 @@ classify() {
 	core/src/lib.rs | core/src/log.rs | core/src/languages.rs | core/src/languages/* | \
 		core/src/plugin_manifest.rs | core/src/plugin_manifest/* | core/src/project_walk.rs | \
 		core/src/storage/language_outcome.rs | \
-		core/src/graph/symbol_links.rs | core/src/graph/symbol_links/* | core/src/protocol/*)
+		core/src/link/symbol_links.rs | core/src/link/symbol_links/* | core/src/protocol/*)
 		add "${CORE[@]}"
 		;;
 	core/src/*) if [ -n "$narrow" ]; then add core-it "${CORE_LIB[@]}"; else add "${CORE[@]}"; fi ;;

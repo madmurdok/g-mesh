@@ -6,8 +6,7 @@
 //! anchor calls). Both are single-hop by design; the transitive walk lives in
 //! `get_dependencies`, not here.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 
 use anyhow::Context;
 use rmcp::model::CallToolResult;
@@ -15,17 +14,16 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::registry::PathCoverage;
-use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, Direction};
+use crate::graph::pagination;
 use crate::graph::queries;
-use crate::plugin_manifest::{Capabilities, MemberOverrides};
-use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
+use crate::graph::Direction;
+use crate::mcp::response_bound;
+use crate::model::NodeRecord;
+use crate::plugin_manifest::MemberOverrides;
 
+use super::context::QueryCtx;
 use super::not_indexed::{self, NotIndexed};
 use super::overrides::{self, OverriddenMember, Overrides};
-use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
 use super::unlinked::{self, UnlinkedUsages};
@@ -44,7 +42,7 @@ struct CallSite {
     /// The edge's position in `paginate_edges`' order. Carried through so
     /// `handle_callers`/`handle_callees` can rebuild a resumable cursor if
     /// the enriched page needs further truncation to fit
-    /// `pagination::MAX_RESPONSE_BYTES`.
+    /// `response_bound::MAX_RESPONSE_BYTES`.
     rank: pagination::EdgeRank,
 }
 
@@ -192,7 +190,7 @@ struct CallerPage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     files: Option<&'a [pagination::FileTally]>,
     /// Present only when `files` leaves files out, cut by its entry or byte
-    /// cap (`pagination::tally_edge_files_bounded`); absent, not `false`,
+    /// cap (`response_bound::tally_edge_files_bounded`); absent, not `false`,
     /// otherwise.
     #[serde(skip_serializing_if = "answer::is_false")]
     files_truncated: bool,
@@ -273,8 +271,8 @@ struct CallerPage<'a> {
 /// full coverage"* - and the answer it then wrote was a file list.
 ///
 /// So `files` carries the names, at ~40 bytes an entry against a reference
-/// row's ~260, capped by `pagination::MAX_EXCLUDED_FILE_TALLY` entries and
-/// `pagination::EXCLUDED_TALLY_MAX_BYTES` bytes. `count` stays
+/// row's ~260, capped by `response_bound::MAX_EXCLUDED_FILE_TALLY` entries and
+/// `response_bound::EXCLUDED_TALLY_MAX_BYTES` bytes. `count` stays
 /// exact and uncapped even when the tally is cut, since understating the gap
 /// is the one thing this field must never do; `files_truncated` says so
 /// explicitly rather than leaving the caller to notice that the tally sums to
@@ -289,8 +287,8 @@ struct ExcludedReferences {
     count: usize,
     /// The files holding one of the excluded usages that the rest of the
     /// response does not already name, highest count first, capped at
-    /// `pagination::MAX_EXCLUDED_FILE_TALLY` before that filtering and at
-    /// `pagination::EXCLUDED_TALLY_MAX_BYTES` after it. Every file holding an
+    /// `response_bound::MAX_EXCLUDED_FILE_TALLY` before that filtering and at
+    /// `response_bound::EXCLUDED_TALLY_MAX_BYTES` after it. Every file holding an
     /// excluded usage is named once somewhere in the response, up to those
     /// caps. Absent when empty, and always on `answer: "count"`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -348,21 +346,21 @@ fn excluded_references(
         direction,
         &["REFERENCES"],
         file_paths,
-        pagination::MAX_EXCLUDED_FILE_TALLY,
+        response_bound::MAX_EXCLUDED_FILE_TALLY,
     )
     .unwrap_or_default();
-    let files_truncated = files.len() >= pagination::MAX_EXCLUDED_FILE_TALLY;
+    let files_truncated = files.len() >= response_bound::MAX_EXCLUDED_FILE_TALLY;
     Some(ExcludedReferences { count, files, files_truncated, hint: EXCLUDED_REFERENCES_HINT })
 }
 
 impl ExcludedReferences {
     /// This disclosure for a response that already names `named`: those
     /// files dropped from `files`, and the rest capped at
-    /// `pagination::EXCLUDED_TALLY_MAX_BYTES`.
+    /// `response_bound::EXCLUDED_TALLY_MAX_BYTES`.
     fn naming_only_new(&self, named: &HashSet<&str>) -> ExcludedReferences {
         let mut files: Vec<pagination::FileTally> =
             self.files.iter().filter(|tally| !named.contains(tally.path.as_str())).cloned().collect();
-        let cut = pagination::truncate_to_bytes(&mut files, pagination::EXCLUDED_TALLY_MAX_BYTES);
+        let cut = response_bound::truncate_to_bytes(&mut files, response_bound::EXCLUDED_TALLY_MAX_BYTES);
         ExcludedReferences { files, files_truncated: self.files_truncated || cut, ..self.clone() }
     }
 }
@@ -443,19 +441,6 @@ fn excluded_paths(excluded: &Option<ExcludedReferences>) -> impl Iterator<Item =
     excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str()))
 }
 
-pub(crate) fn handle_callers(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
-    find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_callers_in(store, semantic, capabilities, hints, params.clone())
-    })
-}
-
 /// Everything a caller page carries besides its rows, fetched once so that
 /// candidate pages can be measured whole before one is sent.
 struct CallerParts<'a> {
@@ -483,7 +468,7 @@ impl CallerParts<'_> {
         total: Option<usize>,
         send: bool,
     ) -> CallerPage<'p> {
-        let files = pagination::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
+        let files = response_bound::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
             .then_some(self.tally.as_slice());
         let named: HashSet<&str> = page
             .results
@@ -545,28 +530,16 @@ impl CallerParts<'_> {
     }
 }
 
-/// One pass of [`handle_callers`] - see [`find_definition::SemanticRung`].
-pub(crate) fn handle_callers_in(
-    store: &Arc<IndexStore>,
+/// One pass of `find_callers` - see [`find_definition::SemanticRung`];
+/// [`QueryCtx::resolve_lazily`] runs both. `ctx.uncovered` (the `file_paths`
+/// entries whose language is not indexed) is named in `notIndexed`
+/// (`not_indexed::group`).
+pub(crate) fn handle_callers(
+    ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    handle_callers_in_covered(store, semantic, capabilities, hints, &[], params)
-}
-
-/// [`handle_callers_in`], with `uncovered` the `file_paths` entries whose language is
-/// not indexed (`GMeshMcpServer::filter_coverage`): the answer names them in
-/// `notIndexed` (`not_indexed::group`).
-pub(crate) fn handle_callers_in_covered(
-    store: &Arc<IndexStore>,
-    semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    uncovered: &[(String, PathCoverage)],
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
+    let QueryCtx { store, capabilities, hints, uncovered, .. } = ctx;
     let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, semantic, &params)? {
@@ -636,9 +609,14 @@ pub(crate) fn handle_callers_in_covered(
         params.cursor.as_deref(),
     )
     .map_err(|e| internal_error("failed to find callers", e))?;
-    let (tally, tally_truncated) =
-        pagination::tally_edge_files_bounded(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
-            .map_err(|e| internal_error("failed to tally calling files", e))?;
+    let (tally, tally_truncated) = response_bound::tally_edge_files_bounded(
+        &conn,
+        &anchor.id,
+        Direction::Incoming,
+        &["CALLS"],
+        &file_paths,
+    )
+    .map_err(|e| internal_error("failed to tally calling files", e))?;
     let parts = CallerParts {
         conn: &conn,
         anchor: &anchor,
@@ -663,9 +641,14 @@ pub(crate) fn handle_callers_in_covered(
             pagination::EdgeRow { item: CallerSite::from(site), rank }
         })
         .collect();
-    let bounded = pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
-        pagination::wire_len(&parts.response(candidate, pagination::widest_total(candidate.has_more), false))
-    });
+    let bounded =
+        response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
+            response_bound::wire_len(&parts.response(
+                candidate,
+                response_bound::widest_total(candidate.has_more),
+                false,
+            ))
+        });
     let total = bounded
         .has_more
         .then(|| pagination::count_edges(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths))
@@ -673,20 +656,6 @@ pub(crate) fn handle_callers_in_covered(
         .map_err(|e| internal_error("failed to count callers", e))?;
 
     success(&parts.response(&bounded, total, true))
-}
-
-#[cfg(test)]
-pub(crate) fn handle_callees(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    capabilities: &HashMap<String, Capabilities>,
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
-    let hints = SessionHints::default();
-    find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_callees_in(store, semantic, capabilities, &hints, params.clone())
-    })
 }
 
 /// Everything a callee page carries besides its rows; see [`CallerParts`].
@@ -747,30 +716,14 @@ impl CalleeParts<'_> {
     }
 }
 
-/// One pass of [`handle_callees`] - see [`find_definition::SemanticRung`].
-/// Tests only: the server calls [`handle_callees_in_covered`].
-#[cfg(test)]
-pub(crate) fn handle_callees_in(
-    store: &Arc<IndexStore>,
+/// One pass of `find_callees`, as [`handle_callers`]: the same context, so
+/// the same session's hints.
+pub(crate) fn handle_callees(
+    ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    handle_callees_in_covered(store, semantic, capabilities, hints, &[], params)
-}
-
-/// `handle_callees_in`, with `uncovered` the `file_paths` entries whose language is
-/// not indexed (`GMeshMcpServer::filter_coverage`): the answer names them in
-/// `notIndexed` (`not_indexed::group`).
-pub(crate) fn handle_callees_in_covered(
-    store: &Arc<IndexStore>,
-    semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    uncovered: &[(String, PathCoverage)],
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
+    let QueryCtx { store, capabilities, hints, uncovered, .. } = ctx;
     let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, semantic, &params)? {
@@ -837,9 +790,14 @@ pub(crate) fn handle_callees_in_covered(
             pagination::EdgeRow { item: CalleeSite::from(site), rank }
         })
         .collect();
-    let bounded = pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
-        pagination::wire_len(&parts.response(candidate, pagination::widest_total(candidate.has_more), false))
-    });
+    let bounded =
+        response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
+            response_bound::wire_len(&parts.response(
+                candidate,
+                response_bound::widest_total(candidate.has_more),
+                false,
+            ))
+        });
     let total = bounded
         .has_more
         .then(|| pagination::count_edges(&conn, &anchor.id, Direction::Outgoing, &["CALLS"], &file_paths))
@@ -852,9 +810,14 @@ pub(crate) fn handle_callees_in_covered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::queries::{upsert_edge, upsert_node};
+    use crate::mcp::PathCoverage;
+    use crate::model::EdgeRecord;
+    use crate::plugin_manifest::Capabilities;
+    use crate::storage::index_store::IndexStore;
     use crate::storage::schema;
-    use crate::storage::write::EdgeRecord;
+    use crate::storage::write::{upsert_edge, upsert_node};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// The capability map every test in this module passes: empty, so
     /// `provenance::resolve` reads "no plugin here declares a semantic
@@ -916,14 +879,11 @@ mod tests {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
 
-        let result = handle_callers(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &rust_with_a_semantic_tier(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: rust_with_a_semantic_tier(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callers, params)
         .unwrap();
 
         let body = json_body(&result);
@@ -950,14 +910,11 @@ mod tests {
         schema::record_language_semantic_pass(&conn, "rust").unwrap();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
 
-        let result = handle_callers(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &rust_with_a_semantic_tier(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: rust_with_a_semantic_tier(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callers, params)
         .unwrap();
 
         let body = json_body(&result);
@@ -978,13 +935,11 @@ mod tests {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
 
-        let result = handle_callees(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &rust_with_a_semantic_tier(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: rust_with_a_semantic_tier(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callees, params)
         .unwrap();
 
         assert_eq!(
@@ -1017,14 +972,11 @@ mod tests {
     fn find_callers_of_b_returns_exactly_a_not_c_not_itself() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
-        let result = handle_callers(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callers, params)
         .unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
@@ -1036,13 +988,11 @@ mod tests {
     fn find_callees_of_b_returns_exactly_c_not_a() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() };
-        let result = handle_callees(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callees, params)
         .unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
@@ -1079,15 +1029,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callers,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
@@ -1126,14 +1073,11 @@ mod tests {
     fn callers_of_a_root_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("a".to_string()), ..Default::default() };
-        let result = handle_callers(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callers, params)
         .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -1162,14 +1106,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle_callers, params)
             .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
@@ -1197,14 +1138,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle_callers, params)
             .unwrap(),
         );
 
@@ -1240,7 +1178,7 @@ mod tests {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
             .unwrap();
-        let over = pagination::MAX_EXCLUDED_FILE_TALLY + 3;
+        let over = response_bound::MAX_EXCLUDED_FILE_TALLY + 3;
         for i in 0..over {
             let id = format!("spec{i}");
             let path = format!("spec{i}.test.rs");
@@ -1254,21 +1192,18 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle_callers, params)
             .unwrap(),
         );
 
         assert_eq!(body["excludedReferences"]["count"], over, "the count stays whole");
         assert_eq!(
             body["excludedReferences"]["files"].as_array().unwrap().len(),
-            pagination::MAX_EXCLUDED_FILE_TALLY,
+            response_bound::MAX_EXCLUDED_FILE_TALLY,
             "the tally, and only the tally, is what the cap cuts",
         );
         assert_eq!(body["excludedReferences"]["filesTruncated"], true);
@@ -1293,13 +1228,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callees(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle_callees, params)
             .unwrap(),
         );
 
@@ -1320,14 +1253,11 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result = handle_callers(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callers, params)
         .unwrap();
         let raw = json_body(&result).to_string();
         let body = json_body(&result);
@@ -1360,14 +1290,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle_callers, params)
             .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
@@ -1381,13 +1308,11 @@ mod tests {
     fn callees_of_a_leaf_is_an_empty_page_not_an_error() {
         let conn = setup_chain();
         let params = SymbolQueryParams { symbol_id: Some("c".to_string()), ..Default::default() };
-        let result = handle_callees(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callees, params)
         .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -1402,15 +1327,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(setup_chain()));
 
         let callers = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callers,
+                    SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert_eq!(callers["anchor"]["id"], "b");
         assert_eq!(callers["anchor"]["qualifiedName"], "pkg::b");
@@ -1418,14 +1340,12 @@ mod tests {
         assert_eq!(callers["anchor"]["filePath"], "b.rs");
 
         let callees = json_body(
-            &handle_callees(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callees,
+                    SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert_eq!(callees["anchor"]["id"], "b");
         assert_eq!(callees["anchor"]["qualifiedName"], "pkg::b");
@@ -1438,28 +1358,23 @@ mod tests {
         let conn = Arc::new(IndexStore::new(setup_chain()));
 
         let callers = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callers,
+                    SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert_eq!(callers["results"].as_array().unwrap().len(), 1);
         assert_eq!(callers["results"][0]["callerSymbolId"], "a");
 
         let callees = json_body(
-            &handle_callees(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callees,
+                    SymbolQueryParams { symbol_name: Some("b".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert_eq!(callees["results"].as_array().unwrap().len(), 1);
         assert_eq!(callees["results"][0]["calleeSymbolId"], "c");
@@ -1489,15 +1404,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let ambiguous = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callers,
+                    SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert_eq!(
             ambiguous["ambiguous"], true,
@@ -1521,15 +1433,9 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle_callers, params)
+                .unwrap(),
         );
         assert!(body.get("ambiguous").is_none(), "an id is never ambiguous");
         let results = body["results"].as_array().unwrap();
@@ -1556,15 +1462,9 @@ mod tests {
 
         let by_name = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
         let ambiguous = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                by_name,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle_callers, by_name)
+                .unwrap(),
         );
         assert_eq!(ambiguous["ambiguous"], true);
 
@@ -1572,15 +1472,9 @@ mod tests {
         let requalified = SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() };
         assert_eq!(
             json_body(
-                &handle_callers(
-                    &conn,
-                    &EmbeddingPipeline::disabled(),
-                    QueryShapes::shipped(),
-                    &no_capabilities(),
-                    &SessionHints::default(),
-                    requalified
-                )
-                .unwrap()
+                &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                    .resolve_lazily(handle_callers, requalified)
+                    .unwrap()
             )["ambiguous"],
             true
         );
@@ -1596,15 +1490,9 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("run_b".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle_callers, params)
+                .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap()[0]["callerSymbolId"], "caller_b");
     }
@@ -1614,14 +1502,11 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle_callers(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callers, params)
         .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -1631,13 +1516,11 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle_callees(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle_callees, params)
         .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -1732,15 +1615,9 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle_callers, params)
+                .unwrap(),
         );
         let mut file_paths: Vec<&str> =
             body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
@@ -1761,30 +1638,24 @@ mod tests {
         let conn = Arc::new(IndexStore::new(setup_chain()));
 
         let omitted = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callers,
+                    SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let explicit_empty = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams {
-                    symbol_id: Some("b".to_string()),
-                    file_paths: Some(Vec::new()),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callers,
+                    SymbolQueryParams {
+                        symbol_id: Some("b".to_string()),
+                        file_paths: Some(Vec::new()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
         );
         assert_eq!(
             omitted, explicit_empty,
@@ -1822,15 +1693,9 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle_callers, params)
+                .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
@@ -1864,15 +1729,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let callers = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callers,
+                    SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let callers_hint =
             callers["hint"].as_str().expect("a File-anchored find_callers call must carry a hint");
@@ -1882,14 +1744,12 @@ mod tests {
         assert_eq!(callers["allUnresolved"], false);
 
         let callees = json_body(
-            &handle_callees(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callees,
+                    SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let callees_hint =
             callees["hint"].as_str().expect("a File-anchored find_callees call must carry a hint");
@@ -1906,27 +1766,22 @@ mod tests {
         let conn = Arc::new(IndexStore::new(setup_chain()));
 
         let callers = json_body(
-            &handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callers,
+                    SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert!(callers.get("hint").is_none(), "hint must be entirely absent, not null: {callers}");
 
         let callees = json_body(
-            &handle_callees(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle_callees,
+                    SymbolQueryParams { symbol_id: Some("b".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert!(callees.get("hint").is_none(), "hint must be entirely absent, not null: {callees}");
     }
@@ -1958,14 +1813,9 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle_callees(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                params,
-            )
-            .unwrap();
+            let result = QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle_callees, params)
+                .unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["calleeSymbolId"].as_str().unwrap().to_string()));
@@ -2006,15 +1856,9 @@ mod tests {
     fn hint_for(store: &Arc<IndexStore>, hints: &SessionHints) -> String {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callers(
-                store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                hints,
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), hints: hints.clone(), ..QueryCtx::for_test(store) }
+                .resolve_lazily(handle_callers, params)
+                .unwrap(),
         );
         body["hint"].as_str().unwrap_or_default().to_string()
     }
@@ -2077,14 +1921,9 @@ mod tests {
     fn callee_hint(store: &Arc<IndexStore>) -> String {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle_callees(
-                store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(store) }
+                .resolve_lazily(handle_callees, params)
+                .unwrap(),
         );
         body["hint"].as_str().unwrap_or_default().to_string()
     }
@@ -2117,12 +1956,13 @@ mod tests {
 
     fn callers_of_b(uncovered: &[(String, PathCoverage)], params: SymbolQueryParams) -> serde_json::Value {
         json_body(
-            &handle_callers_in_covered(
-                &Arc::new(IndexStore::new(setup_chain())),
+            &handle_callers(
+                &QueryCtx {
+                    capabilities: no_capabilities(),
+                    uncovered: uncovered.to_vec(),
+                    ..QueryCtx::for_test(&Arc::new(IndexStore::new(setup_chain())))
+                },
                 &find_definition::SemanticRung::off(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                uncovered,
                 params,
             )
             .unwrap(),
@@ -2131,12 +1971,13 @@ mod tests {
 
     fn callees_of_b(uncovered: &[(String, PathCoverage)], params: SymbolQueryParams) -> serde_json::Value {
         json_body(
-            &handle_callees_in_covered(
-                &Arc::new(IndexStore::new(setup_chain())),
+            &handle_callees(
+                &QueryCtx {
+                    capabilities: no_capabilities(),
+                    uncovered: uncovered.to_vec(),
+                    ..QueryCtx::for_test(&Arc::new(IndexStore::new(setup_chain())))
+                },
                 &find_definition::SemanticRung::off(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                uncovered,
                 params,
             )
             .unwrap(),
@@ -2216,12 +2057,13 @@ mod tests {
         let conn = setup_chain();
         record_failed(&conn, "python");
         let body = json_body(
-            &handle_callers_in_covered(
-                &Arc::new(IndexStore::new(conn)),
+            &handle_callers(
+                &QueryCtx {
+                    capabilities: no_capabilities(),
+                    uncovered: vec![("x.py".to_string(), python_failed())],
+                    ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+                },
                 &find_definition::SemanticRung::off(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                &[("x.py".to_string(), python_failed())],
                 scoped(&["a.rs", "x.py"], None),
             )
             .unwrap(),
@@ -2282,14 +2124,12 @@ mod tests {
     ) -> serde_json::Value {
         let params = SymbolQueryParams { symbol_id: Some(id.to_string()), answer, ..Default::default() };
         json_body(
-            &handle_callers(
-                store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                capabilities,
-                hints,
-                params,
-            )
+            &QueryCtx {
+                capabilities: capabilities.clone(),
+                hints: hints.clone(),
+                ..QueryCtx::for_test(store)
+            }
+            .resolve_lazily(handle_callers, params)
             .unwrap(),
         )
     }

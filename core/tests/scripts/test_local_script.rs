@@ -302,7 +302,10 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
     let lib_filter = lists[0].value_of("-E");
     let tests = calls_of(&calls, &["test"]);
     assert_eq!(tests.len(), 1);
-    assert_eq!(tests[0].args, ["test", "-p", "g-mesh", "--lib", "--", "--exact", "cli::a", "cli::b"]);
+    assert_eq!(
+        tests[0].args,
+        ["test", "-p", "g-mesh", "--features", "embed-eval", "--lib", "--", "--exact", "cli::a", "cli::b"]
+    );
     assert_eq!(tests[0].seeds.as_deref(), Some("2"));
 
     // The lib filter is the core-mcp section's lib tests; nextest runs the
@@ -338,7 +341,18 @@ fn each_crate_runs_its_own_names_in_its_own_process() {
     assert_eq!(
         tests,
         [
-            vec!["test", "-p", "g-mesh", "--lib", "--", "--exact", "cli::a", "cli::b"],
+            vec![
+                "test",
+                "-p",
+                "g-mesh",
+                "--features",
+                "embed-eval",
+                "--lib",
+                "--",
+                "--exact",
+                "cli::a",
+                "cli::b"
+            ],
             vec!["test", "-p", "g-mesh-plugin-sdk", "--lib", "--", "--exact", "cli::a"],
         ]
     );
@@ -603,8 +617,8 @@ const HEAVY_JUNIT: &str = r#"<testsuites><testsuite name="g-mesh">
 <testcase classname="g-mesh" name="unlisted::slow" time="15.0"/>
 <testcase classname="g-mesh" name="unlisted::at_threshold" time="10.0"/>
 <testcase classname="g-mesh" name="unlisted::fast" time="9.9"/>
-<testcase classname="g-mesh" name="graph::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence" time="300.0"/>
-<testcase classname="g-mesh" name="graph::containers::tests::bulk_batch_boundaries_do_not_change_the_result" time="60.0"/>
+<testcase classname="g-mesh" name="storage::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence" time="300.0"/>
+<testcase classname="g-mesh" name="storage::containers::tests::bulk_batch_boundaries_do_not_change_the_result" time="60.0"/>
 </testsuite></testsuites>
 "#;
 

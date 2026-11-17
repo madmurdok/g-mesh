@@ -495,7 +495,7 @@
 //!   declaration at all - `stream-order` requires both endpoints to be nodes
 //!   of the edge's own file - so it travels as a placeholder, and a
 //!   placeholder edge the linker repoints is set `resolved = 1` by
-//!   `graph::symbol_links` whatever the plugin said. Measured: flipping all
+//!   `link::symbol_links` whatever the plugin said. Measured: flipping all
 //!   ten edges the Go plugin's `go/types` tier answers with changes nothing
 //!   in the index, because every one of them lands on a placeholder core
 //!   then resolves.
@@ -514,7 +514,7 @@
 //!
 //! `find_callers`/`find_references` attach `files` exactly when it says
 //! something `results` does not: the page is incomplete, or its rows repeat
-//! a file (`pagination::tally_is_worth_sending`). Decision 4 has already
+//! a file (`response_bound::tally_is_worth_sending`). Decision 4 has already
 //! ruled the first half out here, so within this kit the field is present
 //! precisely when the rows repeat a file - which makes both of its states
 //! worth pinning:
@@ -584,7 +584,7 @@
 //!
 //! `count` is asserted beside `files` rather than derived from it because
 //! the wire keeps them apart for a reason: the count is exact and uncapped,
-//! the tally is cut at `pagination::MAX_EXCLUDED_FILE_TALLY`, and
+//! the tally is cut at `response_bound::MAX_EXCLUDED_FILE_TALLY`, and
 //! understating the gap is the one thing this disclosure must never do. A
 //! response that sets `filesTruncated` fails the entry rather than being
 //! compared against a capped list - decision 4's rule once more, and no
@@ -614,9 +614,8 @@
 //! plugin whose manifest declares `files_created` but whose expectations
 //! file has no such table gets that check as `Skip`, not `Fail`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -625,16 +624,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
-use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, Direction};
-use crate::mcp::query_shapes::QueryShapes;
+use crate::graph::pagination;
+use crate::graph::Direction;
+use crate::mcp::context::QueryCtx;
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{
     find_callers_callees, find_definition, find_implementations, find_references, get_dependencies,
     FindDefinitionParams, FindImplementationsParams, GetDependenciesParams, SymbolQueryParams,
 };
-use crate::plugin_manifest::Capabilities;
-use crate::storage::index_store::IndexStore;
 
 /// The whole `--expect` file. Every list defaults to empty, so a fixture
 /// that only cares about, say, `[[callers]]` never has to spell out the
@@ -926,29 +923,25 @@ pub(crate) fn parse(path: &Path) -> Result<ExpectFile> {
     toml::from_str(&text).with_context(|| format!("failed to parse the expectations file {}", path.display()))
 }
 
-/// Everything [`evaluate`] needs to drive the five handlers - one connection
-/// (decision 1), the disabled embedding pipeline every other step of this
-/// kit already uses (semantic-neighbour candidates never enter the picture,
-/// which keeps ambiguity handling to the two rungs decision 3 documents),
-/// the fixture's scratch root (`find_definition::handle`'s `project_root`,
-/// unused here since every call passes `include_source: false`, but still a
-/// required argument of the real handler), and the manifest's own declared
-/// entry points (`get_dependencies`' miss-path fallback).
-pub(crate) struct EvalContext<'a> {
-    pub(crate) conn: &'a Arc<IndexStore>,
-    pub(crate) embedding: &'a EmbeddingPipeline,
-    pub(crate) project_root: &'a Path,
-    pub(crate) entry_points: &'a [String],
-    /// The manifest's own `[plugin.capabilities]`, keyed by language -
-    /// what the four edge-walking handlers need to decide whether this
-    /// plugin declares a semantic tier at all (`mcp::provenance::resolve`).
-    /// A one-entry map, because a check run is always about exactly one
-    /// plugin; built from `manifest.capabilities` rather than from a
-    /// registry, since the kit discovers no registry.
-    pub(crate) capabilities: &'a HashMap<String, Capabilities>,
-    /// The manifest's own `[plugin.non_symbol_queries]`, keyed by language,
-    /// for the same reason as `capabilities`.
-    pub(crate) shapes: &'a QueryShapes,
+/// Everything [`evaluate`] needs to drive the five handlers: one tool-call
+/// context over one connection (decision 1), with the disabled embedding
+/// pipeline (semantic-neighbour candidates never enter the picture, which
+/// keeps ambiguity handling to the two rungs decision 3 documents), the
+/// fixture's scratch root as `project_root`, and the manifest's own entry
+/// points, `[plugin.capabilities]` and `[plugin.non_symbol_queries]`, each
+/// keyed by its one language (a check run is about exactly one plugin, and
+/// the kit discovers no registry).
+pub(crate) struct EvalContext {
+    pub(crate) query: QueryCtx,
+}
+
+impl EvalContext {
+    /// The context of one handler call: every call sees a fresh session's
+    /// hints, so an expectation's JSON never depends on which calls ran
+    /// before it.
+    fn query_ctx(&self) -> QueryCtx {
+        QueryCtx { hints: SessionHints::default(), ..self.query.clone() }
+    }
 }
 
 /// Runs every expectation in `expect`, in file order, and returns one
@@ -1052,30 +1045,15 @@ impl SymbolTool {
     /// is not a second, weaker path into that module.
     fn call(&self, ctx: &EvalContext, params: SymbolQueryParams) -> Result<ToolOutcome, String> {
         let result = match self {
-            SymbolTool::Callers => find_callers_callees::handle_callers(
-                ctx.conn,
-                ctx.embedding,
-                ctx.shapes,
-                ctx.capabilities,
-                &SessionHints::default(),
-                params,
-            ),
-            SymbolTool::References => find_references::handle(
-                ctx.conn,
-                ctx.embedding,
-                ctx.shapes,
-                ctx.capabilities,
-                &SessionHints::default(),
-                params,
-            ),
+            SymbolTool::Callers => {
+                ctx.query_ctx().resolve_lazily(find_callers_callees::handle_callers, params)
+            }
+            SymbolTool::References => ctx.query_ctx().resolve_lazily(find_references::handle, params),
             SymbolTool::Implementations => {
                 let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: _ } =
                     params;
-                find_implementations::dispatch(
-                    ctx.conn,
-                    ctx.embedding,
-                    ctx.shapes,
-                    ctx.capabilities,
+                ctx.query_ctx().resolve_lazily(
+                    find_implementations::dispatch,
                     FindImplementationsParams {
                         symbol_id,
                         symbol_name,
@@ -1098,7 +1076,7 @@ impl SymbolTool {
 /// through the same parameters.
 fn call_definition(ctx: &EvalContext, symbol_name: String) -> Result<ToolOutcome, String> {
     let params = FindDefinitionParams { symbol_name: Some(symbol_name), ..definition_params() };
-    tool_outcome(find_definition::handle(ctx.conn, ctx.project_root, ctx.embedding, ctx.shapes, params))
+    tool_outcome(ctx.query_ctx().resolve_lazily(find_definition::handle, params))
 }
 
 /// Every `find_definition` call here addresses one symbol and wants no source.
@@ -1261,12 +1239,7 @@ fn dependency_walk(ctx: &EvalContext, file: &str, direction: Direction) -> Resul
         max_fanout: Some(pagination::MAX_PAGE_SIZE as u32),
         resume_token: None,
     };
-    tool_json(tool_outcome(get_dependencies::handle(
-        ctx.conn,
-        ctx.entry_points,
-        &SessionHints::default(),
-        params,
-    )))
+    tool_json(tool_outcome(get_dependencies::handle(&ctx.query_ctx(), params)))
 }
 
 /// The set comparison both walk categories share, with decision 8's
@@ -1389,7 +1362,7 @@ fn files_finding(value: &Value, expected: Option<&[String]>) -> Option<String> {
         )),
         (Some(expected), None) => Some(format!(
             "files = {{{}}}, but the response carries no files tally at all: it is claiming its \
-             rows already sit one per file (pagination::tally_is_worth_sending), which is the \
+             rows already sit one per file (response_bound::tally_is_worth_sending), which is the \
              opposite of what this entry says (decision 12)",
             format_set(&expected.iter().cloned().collect())
         )),
@@ -1430,7 +1403,7 @@ fn excluded_references_finding(value: &Value, expected: Option<&ExcludedExpectat
             if block.get("filesTruncated").and_then(Value::as_bool) == Some(true) {
                 return Some(
                     "the response set excludedReferences.filesTruncated - its tally was cut at \
-                     pagination::MAX_EXCLUDED_FILE_TALLY, so decision 13 will not compare it \
+                     response_bound::MAX_EXCLUDED_FILE_TALLY, so decision 13 will not compare it \
                      against a fixture's whole list; narrow the fixture"
                         .to_string(),
                 );
@@ -1547,14 +1520,8 @@ fn resolve_definition(ctx: &EvalContext, symbol: &str, narrowing: Narrowing) -> 
         candidate.get("id").and_then(Value::as_str).unwrap_or_default().to_string()
     };
     let retry = FindDefinitionParams { symbol_id: Some(candidate_id), ..definition_params() };
-    let retried = tool_json(tool_outcome(find_definition::handle(
-        ctx.conn,
-        ctx.project_root,
-        ctx.embedding,
-        ctx.shapes,
-        retry,
-    )))
-    .map_err(|e| vec![e])?;
+    let retried = tool_json(tool_outcome(ctx.query_ctx().resolve_lazily(find_definition::handle, retry)))
+        .map_err(|e| vec![e])?;
     if is_candidate_page(&retried) {
         return Err(vec![
             "re-querying find_definition by the disambiguated candidate's own id still returned a candidate \

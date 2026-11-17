@@ -4,7 +4,7 @@
 //! blocked, the daemon still serves other calls and other lock takers, and the
 //! answers are the ones the ladder gave before.
 
-use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::context::QueryCtx;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -17,19 +17,19 @@ use serde_json::{json, Value};
 
 use super::search_code_worker_tests::{call, connect, Gate, GatedEmbedder};
 use super::{find_definition, FindDefinitionParams, GMeshMcpServer};
-use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::registry::PluginRegistry;
 use crate::embedding::model::EMBEDDING_DIM;
 use crate::embedding::pipeline::Embedder;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::queries::upsert_node;
 use crate::indexing_status::{IndexingStatus, Phase};
+use crate::mcp::host_fake::FakeHost;
+use crate::mcp::McpHost;
+use crate::model::NodeRecord;
 use crate::plugin_manifest::{DiscoveredPlugins, NonSymbolShapes, PluginManifest};
 use crate::protocol::types::QualifiedPath;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::vectors::{insert, register_extension};
-use crate::storage::write::NodeRecord;
+use crate::storage::write::upsert_node;
 
 /// A name nothing declares, no file carries and nothing imports: only the
 /// semantic rung can answer it.
@@ -81,20 +81,11 @@ fn server_with(
     discovered: DiscoveredPlugins,
 ) -> GMeshMcpServer {
     let root = dir.join("project");
-    let state = dir.join("state");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
     let indexing = IndexingStatus::structural();
     indexing.set_phase(Phase::Ready);
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        discovered,
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
-    GMeshMcpServer::new(store, registry, CoreActivity::new(), indexing, embedding)
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::over(&root, discovered));
+    GMeshMcpServer::new(store, host, indexing, embedding)
 }
 
 fn body(result: &CallToolResult) -> Value {
@@ -109,7 +100,7 @@ fn body(result: &CallToolResult) -> Value {
 /// inference is off the worker.
 ///
 /// Control: in `GMeshMcpServer::find_definition`, call
-/// `find_definition::resolve_lazily` (the synchronous driver, which embeds
+/// `QueryCtx::resolve_lazily` (the synchronous driver, which embeds
 /// on the calling thread) instead of `resolve_lazily_off_worker` - both calls
 /// stall behind the inference until the watchdog opens the gate, and the
 /// first assertion fails.
@@ -232,8 +223,13 @@ async fn the_ladder_answers_as_before_on_exact_suffix_and_semantic_rungs() {
             include_source: Some(false),
         };
         let direct = body(
-            &find_definition::handle(&store, Path::new("."), &embedding, QueryShapes::shipped(), params)
-                .unwrap(),
+            &QueryCtx {
+                embedding: Arc::clone(&embedding),
+                project_root: Path::new(".").to_path_buf(),
+                ..QueryCtx::for_test(&store)
+            }
+            .resolve_lazily(find_definition::handle, params)
+            .unwrap(),
         );
 
         assert_eq!(served["resolvedBy"], rung, "{query}: {served}");

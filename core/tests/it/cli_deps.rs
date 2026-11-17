@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
 
 use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -86,7 +87,7 @@ impl Project {
     }
 
     fn daemon_pid(&self) -> Option<u32> {
-        daemon::read_pid_file(&daemon::pid_path(self.root()).unwrap())
+        daemon::read_pid_file(&StateDir::of(self.root()).map(|sd| sd.pid_file()).unwrap())
     }
 
     fn live_daemon_pid(&self) -> u32 {
@@ -99,12 +100,16 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(self.hold());
-        for path in
-            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())].into_iter().flatten()
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ]
+        .into_iter()
+        .flatten()
         {
             common::kill_pid_file(&path);
         }
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
         if let Ok(state) = project_dir(self.root()) {
@@ -247,7 +252,10 @@ fn help_exits_0_and_deps_without_json_is_a_usage_error() {
     assert_exit(&bare, 2);
     assert!(bare.stdout.is_empty(), "a usage error prints no document");
     assert!(stderr(&bare).contains("--json"), "the error names the missing flag: {}", stderr(&bare));
-    assert!(daemon::read_pid_file(&daemon::pid_path(dir.path()).unwrap()).is_none(), "no daemon was started");
+    assert!(
+        daemon::read_pid_file(&StateDir::of(dir.path()).map(|sd| sd.pid_file()).unwrap()).is_none(),
+        "no daemon was started"
+    );
 }
 
 #[test]
@@ -257,8 +265,11 @@ fn a_folder_of_projects_or_a_missing_directory_exits_3_and_starts_no_daemon() {
     assert_exit(&output, 3);
     assert!(output.stdout.is_empty());
     assert!(stderr(&output).contains("is a folder of"), "{}", stderr(&output));
-    assert!(!daemon::pid_path(folder.path()).unwrap().exists(), "no daemon may be started for a folder");
-    assert!(!daemon::pid_path(&folder.path().canonicalize().unwrap()).unwrap().exists());
+    assert!(
+        !StateDir::of(folder.path()).map(|sd| sd.pid_file()).unwrap().exists(),
+        "no daemon may be started for a folder"
+    );
+    assert!(!StateDir::of(&folder.path().canonicalize().unwrap()).map(|sd| sd.pid_file()).unwrap().exists());
 
     let missing = folder.path().join("does-not-exist");
     let output = run(folder.path(), &["deps", "--json", "--project", missing.to_str().unwrap()], &[]);
@@ -505,7 +516,7 @@ fn a_short_timeout_on_a_cold_project_exits_5_after_starting_the_walk() {
     assert!(output.stdout.is_empty(), "no document on a timeout");
     assert!(stderr(&output).contains("The daemon keeps indexing"), "{}", stderr(&output));
 
-    let phase = daemon::phase_path_in(&project_dir(project.root()).unwrap());
+    let phase = StateDir::at(project_dir(project.root()).unwrap()).phase_file();
     common::wait_for("the index phase to leave `unindexed`", common::startup_timeout(), || {
         std::fs::read_to_string(&phase)
             .is_ok_and(|phase| !phase.trim().is_empty() && phase.trim() != "unindexed")

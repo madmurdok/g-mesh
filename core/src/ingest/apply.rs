@@ -24,16 +24,16 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
+use crate::graph::queries;
+use crate::ingest::convert::{to_storage_diff, PathWarnings};
+use crate::model::Diff;
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
-    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, LinkedEdge, PathError,
-    PlaceholderTarget, QualifiedPath, RequestId, ResolutionDelta, SourceTier, TargetKey, TargetScope,
-    Visibility, WireEdge, WireNode, JSONRPC_VERSION,
+    ControlEnvelope, ControlMessage, FileChangeResponse, RequestId, ResolutionDelta, JSONRPC_VERSION,
 };
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
-use crate::storage::schema;
-use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
+use crate::storage::{schema, vectors, write};
 
 /// Sends a `FileChanged` request (tagged with `request_id`) for `file_path`
 /// over `writer`, reads the plugin's `FileChangeResponse` off `reader`,
@@ -47,7 +47,7 @@ use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, Pla
 /// reparses a file gets it for free: the watcher (via
 /// `daemon::lifecycle::PluginSupervisor::file_changed`), the wake-up replay
 /// of everything queued while the plugin slept, and the query-time
-/// staleness catch-up in `watcher::staleness::ensure_fresh` - which is a
+/// staleness catch-up in `ingest::staleness::ensure_fresh` - which is a
 /// reparse settling as much as any other, and whose edges deserve the
 /// upgrade just as much.
 ///
@@ -382,7 +382,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 
 /// Selects the indexed files of `language` that an edit of `file_path`
 /// answered `affected` for, plus `gone_importers` (GM-509's threshold over
-/// both, [`config_reindex::select_with`], the importers of a moved container
+/// both, [`select::select_with`], the importers of a moved container
 /// key included), records them as owed a re-extract, and re-extracts each
 /// one still on disk; one gone from disk is left to its own deletion's
 /// change, and its owed row is settled. Returns the re-extracted paths,
@@ -401,7 +401,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 /// failed, or a re-extract that failed (the loop stops there; the reindex's
 /// swap clears the rows).
 ///
-/// [`config_reindex::select_with`]: crate::daemon::config_reindex::select_with
+/// [`select::select_with`]: crate::ingest::select::select_with
 #[allow(clippy::too_many_arguments)]
 fn reextract_affected<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -419,7 +419,7 @@ fn reextract_affected<R: BufRead + Send, W: Write>(
     own_waiting: &[String],
     on_timeout: &mut dyn FnMut(),
 ) -> std::result::Result<Vec<String>, String> {
-    use crate::daemon::config_reindex::{select_with, Selection};
+    use crate::ingest::select::{select_with, Selection};
 
     let selected = match store.step(|conn| {
         select_with(conn, language, files, imports, Some(file_path), gone_importers, own_waiting)
@@ -503,7 +503,7 @@ fn settle_reextracts(store: &mut Writer<'_>, language: &str, file_paths: &[Strin
 /// it remembers emitting in its own process.
 ///
 /// After a complete whole-project pass, `sweep_language`'s semantic edges
-/// the pass did not send are deleted ([`sweep_semantic_edges`]): they are
+/// the pass did not send are deleted ([`write::sweep_semantic_edges`]): they are
 /// what an earlier process emitted and this one no longer does, and so are
 /// the placeholders the language's last workspace reindex kept that nothing
 /// has re-sent since (`IndexStore::sweep_unclaimed_nodes`). `None` (a
@@ -665,7 +665,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     // Read inside the same unit that committed the reparse (or after the
     // whole-project link), so these are the links of exactly the text the
     // plugin is about to answer for.
-    let linked = store.step(|conn| linked_edges(conn, language, &sent))?;
+    let linked = store.step(|conn| queries::linked_edges(conn, language, &sent))?;
     if whole_project {
         crate::log_line!(
             "g-mesh: {language}'s whole-project semantic pass carries {} linked edge(s)",
@@ -800,7 +800,8 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
             None => {}
         }
     } else if let Some(language) = sweep_language {
-        let swept = store.step(|conn| sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
+        let swept =
+            store.step(|conn| write::sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
         if swept > 0 {
             crate::log_line!(
                 "g-mesh: {language}'s whole-project semantic pass no longer stands behind {swept} \
@@ -816,69 +817,6 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
         }
     }
     Ok(SemanticPassOutcome::Complete)
-}
-
-/// The structural edges of `language` that linking moved onto a declaration,
-/// each with the target it moved it to - what a `semanticPass` request
-/// carries as `linkedEdges`. `file_paths` scopes them by the file the edge
-/// starts in; empty means every file, as for the pass itself. A semantic
-/// edge is left out even when linked: the tier compares its answers with
-/// what the structural pass and linking settled, not with its own.
-pub(crate) fn linked_edges(
-    conn: &rusqlite::Connection,
-    language: &str,
-    file_paths: &[String],
-) -> Result<Vec<LinkedEdge>> {
-    let mut sql = String::from(
-        "SELECT e.id, e.toId FROM edges e JOIN nodes f ON f.id = e.fromId
-         WHERE e.linkedFrom IS NOT NULL AND e.source = 'syntactic' AND f.language = ?1",
-    );
-    if !file_paths.is_empty() {
-        let slots: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + 2)).collect();
-        sql.push_str(&format!(" AND f.filePath IN ({})", slots.join(", ")));
-    }
-    sql.push_str(" ORDER BY e.id");
-    let params = std::iter::once(&language as &dyn rusqlite::ToSql)
-        .chain(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
-    conn.prepare(&sql)
-        .and_then(|mut statement| {
-            statement
-                .query_map(rusqlite::params_from_iter(params), |row| {
-                    Ok(LinkedEdge { edge_id: row.get(0)?, to_id: row.get(1)? })
-                })?
-                .collect()
-        })
-        .context("failed to read the linked edges of a semantic pass")
-}
-
-/// Deletes every edge with `source = 'semantic'` whose `fromId` is a node of
-/// `language` and whose id is not in `kept`, in one transaction, and returns
-/// how many went. Placeholder nodes the deleted edges pointed at stay, as
-/// every linked-away placeholder does (`graph::symbol_links`, "Why the
-/// placeholder is kept").
-pub(crate) fn sweep_semantic_edges(
-    conn: &mut rusqlite::Connection,
-    language: &str,
-    kept: &std::collections::HashSet<String>,
-) -> Result<usize> {
-    let tx = conn.transaction().context("failed to start the semantic-edge sweep")?;
-    let candidates: Vec<String> = tx
-        .prepare(
-            "SELECT e.id FROM edges e JOIN nodes n ON n.id = e.fromId
-             WHERE e.source = 'semantic' AND n.language = ?1",
-        )
-        .and_then(|mut statement| {
-            statement.query_map(rusqlite::params![language], |row| row.get(0))?.collect()
-        })
-        .context("failed to read the semantic edges to sweep")?;
-    let mut swept = 0;
-    for id in candidates.iter().filter(|id| !kept.contains(*id)) {
-        swept += tx
-            .execute("DELETE FROM edges WHERE id = ?1", rusqlite::params![id])
-            .context("failed to delete a semantic edge the pass no longer sends")?;
-    }
-    tx.commit().context("failed to commit the semantic-edge sweep")?;
-    Ok(swept)
 }
 
 /// What one round trip reported about itself, beyond the diff it already
@@ -1087,7 +1025,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
 
     // Best-effort, like a failed semantic pass: a diff that is already
     // committed and linked is not undone by an optional layer on top of it.
-    store.store_vectors(embedding, &computed);
+    store.store_vectors(&embedding.vector_write(&computed));
     crate::log_timing!("rt_vectors id={}", timing_id(&request_id));
     Ok(RoundTrip {
         incomplete: response.incomplete,
@@ -1101,22 +1039,16 @@ fn round_trip<R: BufRead + Send, W: Write>(
 }
 
 /// The upserted nodes of `diff` that already have a vector. A failed lookup
-/// counts as none, which embeds them all, as before GM-486.
+/// counts as none, which embeds them all.
 fn nodes_with_vectors(conn: &rusqlite::Connection, diff: &Diff) -> HashSet<String> {
-    let lookup = || -> rusqlite::Result<HashSet<String>> {
-        let mut stmt = conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM vectors WHERE nodeId = ?1)")?;
-        let mut found = HashSet::new();
-        for node in &diff.upsert_nodes {
-            if stmt.query_row([&node.id], |row| row.get::<_, bool>(0))? {
-                found.insert(node.id.clone());
-            }
-        }
-        Ok(found)
-    };
-    lookup().unwrap_or_else(|err| {
-        crate::log_line!("g-mesh daemon: failed to check a semantic answer's nodes for vectors ({err:#})");
-        HashSet::new()
-    })
+    vectors::nodes_with_vectors(conn, diff.upsert_nodes.iter().map(|node| node.id.as_str())).unwrap_or_else(
+        |err| {
+            crate::log_line!(
+                "g-mesh daemon: failed to check a semantic answer's nodes for vectors ({err:#})"
+            );
+            HashSet::new()
+        },
+    )
 }
 
 /// What a `fileChanged` answer says about its file as a whole: gone when it
@@ -1176,242 +1108,6 @@ fn method_name(message: &ControlMessage) -> &'static str {
         ControlMessage::PrepareSemanticPass => "prepareSemanticPass",
         ControlMessage::FilesCreated { .. } => "filesCreated",
         ControlMessage::ResolutionChanged { .. } => "resolutionChanged",
-    }
-}
-
-/// Converts the wire-level diff (nested `range: {start, end}`) into the
-/// storage layer's flat `start_line`/`start_col`/`end_line`/`end_col`
-/// fields. `delete_node_ids`/`delete_edge_ids` pass through unchanged since
-/// both sides already agree on `Vec<String>`.
-fn to_storage_diff(wire: FileChangeDiff, warnings: &mut PathWarnings) -> Diff {
-    Diff {
-        upsert_nodes: wire.upsert_nodes.into_iter().map(|node| to_node_record(node, warnings)).collect(),
-        delete_node_ids: wire.delete_node_ids,
-        upsert_edges: wire.upsert_edges.into_iter().map(to_edge_record).collect(),
-        delete_edge_ids: wire.delete_edge_ids,
-    }
-}
-
-/// Warns about a plugin's invalid paths at most once per (language, file),
-/// so a plugin that gets every path in a file wrong logs one line for it.
-#[derive(Debug, Default)]
-pub(crate) struct PathWarnings {
-    warned: HashSet<(String, String)>,
-    /// Every line written, for tests.
-    pub(crate) emitted: Vec<String>,
-}
-
-impl PathWarnings {
-    fn warn(&mut self, node: &WireNode, what: &str, error: &PathError) {
-        if !self.warned.insert((node.language.clone(), node.file_path.clone())) {
-            return;
-        }
-        let line = format!(
-            "g-mesh daemon: the {} plugin sent an invalid {what} for {:?} in {}: {error}; \
-             dropped it and kept the node (later invalid paths in this file are dropped without a warning)",
-            node.language, node.qualified_name, node.file_path
-        );
-        crate::log_line!("{line}");
-        self.emitted.push(line);
-    }
-}
-
-/// The node's paths that pass their rules. A `qualifiedPath` that fails
-/// drops with all its aliases; an alias that fails, including one sent
-/// without a `qualifiedPath`, drops alone. The node itself is always kept.
-fn checked_paths(
-    node: &WireNode,
-    warnings: &mut PathWarnings,
-) -> (Option<QualifiedPath>, Vec<QualifiedPath>) {
-    if let Err(error) = node.check_qualified_path() {
-        warnings.warn(node, "qualifiedPath", &error);
-        return (None, Vec::new());
-    }
-    let aliases = node
-        .alias_paths
-        .iter()
-        .filter(|alias| match node.check_alias_path(alias) {
-            Ok(()) => true,
-            Err(error) => {
-                warnings.warn(node, "aliasPaths entry", &error);
-                false
-            }
-        })
-        .cloned()
-        .collect();
-    (node.qualified_path.clone(), aliases)
-}
-
-/// Wire node -> storage record. Shared with the cold-start bulk index
-/// (`daemon::bulk_index`), which ingests the very same `WireNode` shape off
-/// an NDJSON stream instead of out of a diff response - the two paths must
-/// never disagree about how a wire node becomes a row.
-pub(crate) fn to_node_record(node: WireNode, warnings: &mut PathWarnings) -> NodeRecord {
-    let (visibility, visibility_container) = to_storage_visibility(&node.visibility);
-    let (qualified_path, alias_paths) = checked_paths(&node, warnings);
-    let key_path = node.target.as_ref().and_then(|target| match target.check_key_path() {
-        Ok(()) => target.key_path.clone(),
-        Err(error) => {
-            warnings.warn(&node, "keyPath", &error);
-            None
-        }
-    });
-    NodeRecord {
-        id: node.id,
-        kind: format!("{:?}", node.kind),
-        name: node.name,
-        qualified_name: node.qualified_name,
-        file_path: node.file_path.clone(),
-        start_line: node.range.start.line as i64,
-        start_col: node.range.start.col as i64,
-        end_line: node.range.end.line as i64,
-        end_col: node.range.end.col as i64,
-        signature: node.signature,
-        // The read-side mirror of the database's `GENERATED ALWAYS exported`
-        // column - see `NodeRecord.exported`'s own doc comment for why this
-        // still has to be set correctly here even though `apply_diff` never
-        // writes it: `graph::symbol_links::link_diff` filters this very
-        // `Diff` in memory, before anything is read back from storage.
-        exported: matches!(node.visibility, Visibility::Public),
-        visibility,
-        visibility_container,
-        container: node.container,
-        // Carried through to `apply_diff`, where `graph::containers` stores it
-        // on the container's `containers.parentKey` - it describes the
-        // container, not this member, so it has no `nodes` column of its own.
-        container_parent: node.container_parent,
-        target: node.target.as_ref().map(|target| to_placeholder_target_record(target, key_path)),
-        doc_comment: node.doc_comment,
-        language: node.language,
-        native_kind: node.native_kind,
-        has_syntax_errors: node.has_syntax_errors,
-        generated: node.generated,
-        // Absent means "one declaration", which is no rows in the child table
-        // - the same thing an empty list means to `apply_diff`, which replaces
-        // whatever was stored either way.
-        declarations: node
-            .declarations
-            .unwrap_or_default()
-            .into_iter()
-            .map(|declaration| DeclarationRecord {
-                ordinal: declaration.ordinal as i64,
-                start_line: declaration.start_line as i64,
-                start_col: declaration.start_col as i64,
-                end_line: declaration.end_line as i64,
-                end_col: declaration.end_col as i64,
-                signature: declaration.signature,
-                has_body: declaration.has_body,
-            })
-            .collect(),
-        qualified_path,
-        alias_paths,
-        untyped_calls: node.untyped_calls,
-    }
-}
-
-/// `protocol::types::Visibility` -> `(nodes.visibility, nodes.
-/// visibilityContainer)`. See `storage::schema`'s DDL comment on those two
-/// columns for why the container's key gets its own nullable column rather
-/// than being packed into `visibility` itself.
-fn to_storage_visibility(visibility: &Visibility) -> (String, Option<String>) {
-    match visibility {
-        Visibility::Public => ("public".to_string(), None),
-        Visibility::File => ("file".to_string(), None),
-        Visibility::Container(key) => ("container".to_string(), Some(key.clone())),
-    }
-}
-
-/// `protocol::types::PlaceholderTarget` -> `storage::write::
-/// PlaceholderTargetRecord`. Notably does *not* set a `from_file` - the wire
-/// type has no such field, because it is already available for free as the
-/// placeholder node's own `filePath` (the existing "a placeholder's filePath
-/// is the importing file" convention - `graph::symbol_links`'s module doc),
-/// so `storage::write::apply_diff` fills `placeholder_targets.fromFile` from
-/// `NodeRecord.file_path` directly rather than threading it through this
-/// record - see that table's own DDL comment.
-/// `key_path` is the target's own, already checked by the caller.
-fn to_placeholder_target_record(
-    target: &PlaceholderTarget,
-    key_path: Option<QualifiedPath>,
-) -> PlaceholderTargetRecord {
-    let (scope_kind, scope) = match &target.scope {
-        TargetScope::File(path) => ("file".to_string(), path.clone()),
-        TargetScope::Container(key) => ("container".to_string(), key.clone()),
-    };
-    let (key_kind, key) = match &target.key {
-        TargetKey::Name(name) => ("name".to_string(), name.clone()),
-        TargetKey::QualifiedName(qualified_name) => ("qualifiedName".to_string(), qualified_name.clone()),
-    };
-    PlaceholderTargetRecord {
-        scope_kind,
-        scope,
-        key_kind,
-        key,
-        from_container: target.from_container.clone(),
-        key_path,
-        // Extra waiting scopes are file paths: kept only on a file-scoped
-        // target (the conformance rule), never read as container keys.
-        also_scopes: if matches!(target.scope, TargetScope::File(_)) {
-            target.also_scopes.clone()
-        } else {
-            Vec::new()
-        },
-    }
-}
-
-/// Wire edge -> storage record; see [`to_node_record`] on why this is shared.
-pub(crate) fn to_edge_record(edge: WireEdge) -> EdgeRecord {
-    let mut record = EdgeRecord::new(
-        edge.id,
-        edge.from_id,
-        edge.to_id,
-        edge_kind_wire_value(&edge.kind),
-        edge_source_tier_wire_value(&edge.source),
-        edge.resolved,
-    );
-    // `EdgeRecord::new`'s legacy-string inference (`storage::write::
-    // normalize_legacy_source`) sets `.engine` to a copy of the tier string
-    // passed above, which is only ever right for a v1 caller with no real
-    // engine to report. A `WireEdge` always has a real one - the protocol's legacy
-    // normalization already synthesizes `"tree-sitter"`/`"ts-compiler"` for a
-    // v1 sender, so `edge.engine` is populated regardless of which protocol
-    // version produced this edge - so it overwrites the guess here, the same
-    // way `to_declaration` below is set post-construction rather than
-    // threaded through `new`.
-    record.engine = edge.engine;
-    record.to_declaration = edge.to_declaration.map(|ordinal| ordinal as i64);
-    record.specifier = edge.specifier;
-    record
-}
-
-/// `nodes.kind` in the schema is a plain string matching `NodeKind`'s Rust
-/// variant name (see `WireNode`'s doc comment in `protocol::types`); no
-/// custom serde attributes are attached to `NodeKind`, so `{:?}` already
-/// gives the exact variant name (e.g. "Function").
-///
-/// `edges.kind`, by contrast, has a custom serde rename
-/// (`SCREAMING_SNAKE_CASE`) - reuse that exact wire string by round-tripping
-/// through serde_json rather than re-deriving the mapping by hand, so the
-/// storage string always matches what the wire format (and therefore what
-/// the plugin actually sent) says, and any future rename attribute change on
-/// this enum doesn't silently desync this file.
-fn edge_kind_wire_value(kind: &crate::protocol::types::EdgeKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("{kind:?}"))
-}
-
-/// `SourceTier` -> `edges.source`'s own two values (`storage::schema`'s DDL:
-/// `CHECK (source IN ('syntactic', 'semantic'))`). A direct 1:1 mapping, not
-/// the legacy engine-conflating one `storage::write::normalize_legacy_source`
-/// still carries for callers that only have a v1 string - a `WireEdge`
-/// always has a real, separate `engine` (see [`to_edge_record`]'s own
-/// comment), so the tier alone is all this needs to produce.
-fn edge_source_tier_wire_value(source: &SourceTier) -> String {
-    match source {
-        SourceTier::Syntactic => "syntactic".to_string(),
-        SourceTier::Semantic => "semantic".to_string(),
     }
 }
 

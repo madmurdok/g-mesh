@@ -676,8 +676,8 @@ fn the_local_profile_skips_exactly_its_heavy_list() {
     let skipped: std::collections::BTreeSet<_> = default.difference(&local).cloned().collect();
     assert_eq!(skipped, unique, "default minus local is not the heavy list");
     for name in [
-        "graph::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence",
-        "graph::containers::tests::bulk_batch_boundaries_do_not_change_the_result",
+        "storage::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence",
+        "storage::containers::tests::bulk_batch_boundaries_do_not_change_the_result",
     ] {
         let key = ("g-mesh".to_owned(), name.to_owned());
         assert!(default.contains(&key), "{name} is not in the suite");

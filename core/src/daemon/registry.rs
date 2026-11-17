@@ -76,7 +76,7 @@
 //! languages can never step on each other's record, on a crash relaunch any
 //! more than on an ordinary sleep. `cli::status`/`cli::stop`/`cli::clean`
 //! read every `plugin-<language>.pid` file present
-//! ([`discovered_pid_files`]) rather than assuming exactly one.
+//! ([`StateDir::plugin_pid_files`]) rather than assuming exactly one.
 //!
 //! # The index's generation string (task 163)
 //!
@@ -100,6 +100,9 @@ use sha2::{Digest, Sha256};
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
+use crate::ingest::staleness::{self, StalenessOutcome};
+use crate::mcp::PathCoverage;
+use crate::model::Diff;
 use crate::paths::state_dir::StateDir;
 use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::project_walk::{extension_of, under_excluded_dir};
@@ -107,20 +110,6 @@ use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{self, IndexStore, Unit};
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
-use crate::storage::write::Diff;
-use crate::watcher::staleness::{self, StalenessOutcome};
-
-/// Every `plugin-<language>.pid` file currently present in `state_dir`, paired
-/// with its language. Compat wrapper over `StateDir::plugin_pid_files`.
-pub fn discovered_pid_files(state_dir: &Path) -> Vec<(String, PathBuf)> {
-    StateDir::at(state_dir).plugin_pid_files()
-}
-
-/// Every `plugin-<language>.suspended` marker in `state_dir`, with its reason.
-/// Compat wrapper over `StateDir::suspended_markers`.
-pub fn discovered_suspended_markers(state_dir: &Path) -> Vec<(String, String)> {
-    StateDir::at(state_dir).suspended_markers()
-}
 
 /// The generation string an index is stamped with, and the thing
 /// `storage::schema::ensure_current` compares: core's hand-maintained pipeline
@@ -129,7 +118,7 @@ pub fn discovered_suspended_markers(state_dir: &Path) -> Vec<(String, String)> {
 ///
 /// Both halves have to be in it. The constant alone misses every plugin-side
 /// change (the failure task 116 fixes); the plugin half alone would miss every
-/// change in `graph::imports` / `graph::symbol_links`, which run in core and
+/// change in `link::imports` / `link::symbol_links`, which run in core and
 /// leave every plugin's bytes untouched.
 ///
 /// # Why every discovered plugin, and not just the one that was spawned
@@ -166,10 +155,7 @@ pub fn discovered_suspended_markers(state_dir: &Path) -> Vec<(String, String)> {
 /// version check needs only discovery's output and has to run before anything
 /// trusts the index at all), and `cli::init`/`cli::reindex` never build a
 /// registry in the first place. Taking `&DiscoveredPlugins` directly removes
-/// that ordering problem rather than working around it - the same shape, and
-/// for the same reason, as [`discovered_pid_files`] above: a fact about
-/// plugins that callers with no live registry still have to be able to ask
-/// for.
+/// that ordering problem rather than working around it.
 pub fn indexer_version(discovered: &DiscoveredPlugins) -> String {
     format!("{CURRENT_INDEXER_VERSION}+{}", plugins_digest(discovered))
 }
@@ -235,22 +221,15 @@ fn indexed_files_under(
     conn: &rusqlite::Connection,
     subtrees: &[String],
 ) -> Result<BTreeMap<String, HashSet<String>>> {
-    let mut statement = conn
-        .prepare("SELECT language, filePath FROM nodes WHERE kind = 'File'")
-        .context("failed to query indexed files")?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-        .context("failed to read indexed files")?;
     let mut files: BTreeMap<String, HashSet<String>> = BTreeMap::new();
-    for row in rows {
-        let (language, file_path) = row.context("failed to read indexed files")?;
+    crate::graph::files::for_each_file_node(conn, |language, file_path| {
         let under = subtrees.iter().any(|dir| {
             dir.is_empty() || file_path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/'))
         });
         if under {
             files.entry(language).or_default().insert(file_path);
         }
-    }
+    })?;
     Ok(files)
 }
 
@@ -277,17 +256,6 @@ pub(crate) enum ReconcileScope<'a> {
     /// The subtrees whose events the OS dropped (GM-616): project-relative
     /// directories, forward-slash separated, `""` being the root.
     Rescan(&'a [String]),
-}
-
-/// Every file the index holds anything for: an `indexed_files` baseline or a
-/// `File` node. The live side of [`PluginRegistry::reconcile_since_index`].
-fn live_file_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>> {
-    let mut statement = conn
-        .prepare("SELECT filePath FROM indexed_files UNION SELECT filePath FROM nodes WHERE kind = 'File'")
-        .context("failed to query indexed files")?;
-    let rows =
-        statement.query_map([], |row| row.get::<_, String>(0)).context("failed to read indexed files")?;
-    rows.collect::<rusqlite::Result<HashSet<String>>>().context("failed to read indexed files")
 }
 
 /// [`indexer_version`] for a discovery that found nothing - the generation
@@ -458,18 +426,6 @@ impl Drop for SpawnReservation<'_> {
             self.language
         )));
     }
-}
-
-/// Why a path-anchored answer about one file can be empty while the file
-/// exists: [`PluginRegistry::path_coverage`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PathCoverage {
-    /// No discovered plugin claims the file; the catalogue entry of the
-    /// plugin that would index it.
-    Absent(&'static crate::languages::CatalogueEntry),
-    /// The discovered plugin for this language failed its bulk walk, so
-    /// nothing of the language is in the index (ADR 0021, section 2).
-    Failed(String),
 }
 
 /// The daemon's plugins: what was discovered, and which of them are running.
@@ -842,10 +798,10 @@ impl PluginRegistry {
         crate::languages::missing(&self.discovered).into_iter().map(|entry| entry.language).collect()
     }
 
-    /// Every discovered language's `[plugin.non_symbol_queries]`, for the
-    /// semantic rung. Fixed for the daemon's lifetime, as discovery is.
-    pub(crate) fn query_shapes(&self) -> crate::mcp::query_shapes::QueryShapes {
-        crate::mcp::query_shapes::QueryShapes::from_manifests(self.discovered.manifests.values())
+    /// Every discovered plugin's manifest, for the MCP server's query shapes.
+    /// Fixed for the daemon's lifetime, as discovery is.
+    pub(crate) fn manifests(&self) -> impl Iterator<Item = &plugin_manifest::PluginManifest> {
+        self.discovered.manifests.values()
     }
 
     /// Whether `language`'s manifest declares both `semantic_pass` and
@@ -1358,7 +1314,7 @@ impl PluginRegistry {
             }
         }
         let started = std::time::Instant::now();
-        let mut live = match conn.with(live_file_paths) {
+        let mut live = match conn.with(crate::graph::files::known_file_paths) {
             Ok(live) => live,
             Err(err) => {
                 crate::log_line!(
@@ -1568,12 +1524,12 @@ impl PluginRegistry {
     /// pass still owes ([`schema::owed_semantic_pending_files`]: the seeded
     /// reconcile's reparsed files, including those of an earlier start that
     /// died before their pass), plus the language's owed files. The rows
-    /// clear only when that pass completes ([`watcher::apply`]'s per-file
+    /// clear only when that pass completes ([`ingest::apply`]'s per-file
     /// settling); an unfinished or failed pass leaves them for the next
     /// start. Best-effort: a failure is logged and the files keep their
     /// structural edges.
     ///
-    /// [`watcher::apply`]: crate::watcher::apply
+    /// [`ingest::apply`]: crate::ingest::apply
     pub(crate) fn owed_semantic_file_passes(&self, conn: &IndexStore) {
         let owed = match conn.with(schema::owed_semantic_pending_files) {
             Ok(owed) => owed,

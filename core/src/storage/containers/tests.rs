@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
 use super::*;
+use crate::graph::containers::parent_chain;
+use crate::model::EdgeRecord;
 use crate::storage::schema;
-use crate::storage::write::{apply_diff, EdgeRecord};
+use crate::storage::write::apply_diff;
 use g_mesh_wire::native_kind::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
 use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 
@@ -374,7 +376,7 @@ fn deleting_the_last_member_deletes_the_container_and_every_edge_into_it() {
 
 /// A placeholder is an address, not a declaration: counting one would
 /// keep a linked-away `resolved_module` alive forever (its `DEFINES`
-/// edge is an incident edge `graph::imports` waits to see gone).
+/// edge is an incident edge `link::imports` waits to see gone).
 ///
 /// `external_module` is in this list too (GM-376) even though no shipped
 /// plugin ever sends one with a non-empty `container` - the case is only
@@ -383,7 +385,7 @@ fn deleting_the_last_member_deletes_the_container_and_every_edge_into_it() {
 /// is the arm that fails without GM-376's change to [`membership`]: on
 /// the four-kind copy `membership` used to spell, an `external_module`
 /// row here was still counted, so `containers.memberCount` would disagree
-/// with `graph::symbol_links::requesters_below_new_containers`'s own
+/// with `link::symbol_links::requesters_below_new_containers`'s own
 /// count for it - the coupling that function's own comment names. The
 /// other four kinds fail without any filter at all, so they are not the
 /// control for this change; see
@@ -563,7 +565,7 @@ fn parent_chain_ends_at_a_cycle() {
 }
 
 /// The daemon's own write path: a real `FileChangeDiff`-shaped wire node
-/// goes through `watcher::apply::to_node_record`, which must carry
+/// goes through `ingest::convert::to_node_record`, which must carry
 /// `containerParent` through rather than drop it as it did before GM-265.
 #[test]
 fn the_wire_conversion_carries_container_parent_through_to_the_row() {
@@ -593,7 +595,7 @@ fn the_wire_conversion_carries_container_parent_through_to_the_row() {
     let mut conn = setup(false);
     apply_diff(
         &mut conn,
-        &upsert(vec![crate::watcher::apply::to_node_record(wire, &mut Default::default())]),
+        &upsert(vec![crate::ingest::convert::to_node_record(wire, &mut Default::default())]),
     )
     .unwrap();
     assert_eq!(

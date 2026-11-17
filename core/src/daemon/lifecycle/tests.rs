@@ -1,7 +1,7 @@
 use super::*;
 
-use crate::daemon::test_plugin;
 use crate::plugin_manifest::read_manifest;
+use crate::test_plugin;
 
 /// The reason [`PluginSupervisor::manifest`] is a field and not an
 /// argument: a supervisor spawns *its own* plugin at every one of its
@@ -55,7 +55,7 @@ fn a_supervisor_wakes_the_plugin_its_own_manifest_names() {
 }
 
 /// GM-271's acceptance test. Today, before this task's fix, a request the
-/// plugin never answers blocks `watcher::apply::round_trip`'s read
+/// plugin never answers blocks `ingest::apply::round_trip`'s read
 /// forever - `file_changed` below would simply never return, and this
 /// test would hang rather than fail. With the fix: the request times out
 /// (a short, test-only budget given to the supervisor - see
@@ -705,7 +705,7 @@ fn a_plugin_over_its_memory_limit_is_put_to_sleep_and_its_language_suspended() {
     // ...but no semanticPass rode along with it, even though this
     // fixture's manifest declares `capabilities.semantic_pass = true` and
     // would otherwise always send one on the same round trip
-    // (`watcher::apply::apply_file_change`'s own doc comment) - the
+    // (`ingest::apply::apply_file_change`'s own doc comment) - the
     // discriminating assertion this task is judged on.
     let requests = test_plugin::requests(&plugin_dir);
     assert!(
@@ -1018,8 +1018,8 @@ fn supervise_exit_leaves_no_state_file_behind(orphan: bool) {
     );
     let core = CoreActivity::new();
     let indexing = IndexingStatus::structural();
-    indexing.attach_phase_file(crate::daemon::phase_path_in(state_dir));
-    indexing.attach_progress_file_every(crate::daemon::progress_path_in(state_dir), Duration::ZERO);
+    indexing.attach_phase_file(StateDir::at(state_dir).phase_file());
+    indexing.attach_progress_file_every(StateDir::at(state_dir).progress_file(), Duration::ZERO);
 
     let stop = Arc::new(AtomicBool::new(false));
     let writer = {

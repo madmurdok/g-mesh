@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 
 use crate::common;
@@ -50,21 +51,27 @@ impl Project {
     /// platforms.
     #[cfg(unix)]
     fn socket(&self) -> PathBuf {
-        daemon::socket_path(self.root()).expect("failed to resolve the daemon socket path")
+        StateDir::of(self.root())
+            .map(|sd| sd.socket_file())
+            .expect("failed to resolve the daemon socket path")
     }
 
     /// Whether anything is answering on the project's endpoint - the
     /// platform-independent form of "the socket is (not) held".
     fn is_listening(&self) -> bool {
-        daemon::is_listening(self.root()).expect("failed to probe the daemon endpoint")
+        StateDir::of(self.root())
+            .and_then(|sd| g_mesh::control::lock::is_listening(&sd))
+            .expect("failed to probe the daemon endpoint")
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     fn plugin_pid_file(&self) -> PathBuf {
-        daemon::plugin_pid_path(self.root()).expect("failed to resolve the plugin pid file path")
+        StateDir::of(self.root())
+            .map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE))
+            .expect("failed to resolve the plugin pid file path")
     }
 
     /// Bootstraps a detached daemon through the shim and returns its core
@@ -285,13 +292,19 @@ impl Drop for Folder {
     fn drop(&mut self) {
         for dir in [self.root().to_path_buf(), self.sub("a"), self.sub("b")] {
             let Ok(state) = project_dir(&dir) else { continue };
-            for path in [daemon::pid_path(&dir), daemon::plugin_pid_path(&dir)].into_iter().flatten() {
+            for path in [
+                StateDir::of(&dir).map(|sd| sd.pid_file()),
+                StateDir::of(&dir).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 common::kill_pid_file(&path);
             }
-            for (_, plugin_pid) in daemon::registry::discovered_pid_files(&state) {
+            for (_, plugin_pid) in StateDir::at(&state).plugin_pid_files() {
                 common::kill_pid_file(&plugin_pid);
             }
-            if let Ok(endpoint) = daemon::endpoint(&dir) {
+            if let Ok(endpoint) = StateDir::of(&dir).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
                 endpoint.clear_stale();
             }
             let _ = std::fs::remove_dir_all(state);
@@ -331,7 +344,7 @@ async fn select(client: &rmcp::service::RunningService<rmcp::service::RoleClient
 /// file just after binding its endpoint, so a reachable daemon may not have
 /// written it yet.
 fn daemon_pid(root: &Path) -> u32 {
-    let path = daemon::pid_path(root).expect("failed to resolve the pid file path");
+    let path = StateDir::of(root).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path");
     wait_for("the daemon to write its pid file", || daemon::read_pid_file(&path).is_some());
     read_pid(&path)
 }
@@ -380,14 +393,20 @@ async fn stop_reaps_a_daemon_whose_folder_shim_is_still_running() {
     let stopper = a.clone();
     tokio::task::spawn_blocking(move || stop_in(&stopper)).await.expect("the stop task panicked");
     assert!(!daemon::is_process_alive(first), "a's daemon (pid {first}) must be gone, not a zombie");
-    assert!(!daemon::is_listening(&a).unwrap_or(true), "a's endpoint must be released");
+    assert!(
+        !StateDir::of(&a).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap_or(true),
+        "a's endpoint must be released"
+    );
 
     // The shim that bootstrapped the stopped daemon is still serving, and
     // bootstraps (and reaps) a fresh one for `a`.
     select(&client, "a").await;
     let second = daemon_pid(&a);
     assert_ne!(second, first, "reselecting a must bootstrap a new daemon");
-    assert!(daemon::is_listening(&a).unwrap_or(false), "a's new daemon must be reachable");
+    assert!(
+        StateDir::of(&a).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap_or(false),
+        "a's new daemon must be reachable"
+    );
 
     let stopper = a.clone();
     tokio::task::spawn_blocking(move || stop_in(&stopper)).await.expect("the stop task panicked");

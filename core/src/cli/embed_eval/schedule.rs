@@ -289,16 +289,7 @@ pub fn run(args: &ScheduleArgs) -> Result<()> {
                 .iter()
                 .map(|&c| {
                     let n = &nodes[candidates[c]];
-                    let input = EmbedInput {
-                        kind: &n.kind,
-                        name: &n.name,
-                        qualified_name: &n.qualified_name,
-                        file_path: &n.file_path,
-                        doc: n.doc.as_deref(),
-                        signature: n.signature.as_deref(),
-                        generated: false,
-                    };
-                    embed_tier(&input, &n.visibility)
+                    embed_tier(&EmbedInput::from_row(&n.embed_row()), &n.visibility)
                 })
                 .collect(),
             cost_ms: kept.iter().map(|&c| costs[c]).collect(),

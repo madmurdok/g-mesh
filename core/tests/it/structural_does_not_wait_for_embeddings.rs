@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use g_mesh::daemon;
 use g_mesh::embedding::backfill::HOLD_FILE_ENV;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -62,13 +63,16 @@ impl Project {
     /// identical `Project::stop` for why this waits rather than merely
     /// signaling.
     fn stop(&self) {
-        for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ] {
             let Ok(path) = path else { continue };
             if let Some(pid) = daemon::read_pid_file(&path) {
                 common::kill_and_wait(pid);
             }
         }
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
     }

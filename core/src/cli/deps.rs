@@ -22,21 +22,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::cli::{
-    language_outcome_lines, status, DepsArgs, ExitStatus, INDEX_UNAVAILABLE_EXIT_CODE,
-    NOT_A_PROJECT_EXIT_CODE, TIMEOUT_EXIT_CODE,
+    language_outcome_lines, DepsArgs, ExitStatus, INDEX_UNAVAILABLE_EXIT_CODE, NOT_A_PROJECT_EXIT_CODE,
+    TIMEOUT_EXIT_CODE,
 };
 use crate::daemon::{self, client};
-use crate::graph::containers;
+use crate::graph::{containers, importers};
 use crate::indexing_status::group_thousands;
 use crate::paths::state_dir::{project_dir, StateDir};
 use crate::plugin_manifest;
 use crate::process;
 use crate::project_detect::{self as candidates, Limits, Mode};
 use crate::shim;
+use crate::storage::connection::open_existing;
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema;
 use g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND;
@@ -82,7 +83,6 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_NAME: &str = "g-mesh-deps";
 
 const FILE_KIND: &str = "File";
-const IMPORTS_KIND: &str = "IMPORTS";
 
 pub fn run(args: &DepsArgs) -> Result<()> {
     // The daemon a cold run spawns must not hold this process's stdout: the
@@ -352,10 +352,10 @@ fn readiness_loop(
     }
 }
 
-/// [`status::open_index`] (never creates a database) plus `query_only`, so
+/// [`open_existing`] (never creates a database) plus `query_only`, so
 /// nothing this command does can write.
 fn open_read_only(db_path: &Path) -> Result<Connection> {
-    let conn = status::open_index(db_path)?;
+    let conn = open_existing(db_path)?;
     conn.pragma_update(None, "query_only", true).context("failed to make the index connection read-only")?;
     conn.busy_timeout(BUSY_TIMEOUT).context("failed to set the index busy timeout")?;
     Ok(conn)
@@ -441,7 +441,7 @@ pub fn export(
 ) -> Result<(DepsReport, BTreeMap<String, LanguageOutcome>)> {
     let tx = conn.unchecked_transaction().context("failed to begin the index read")?;
     let outcomes: BTreeMap<String, LanguageOutcome> = schema::language_outcomes(&tx)?.into_iter().collect();
-    let container_keys = container_keys(&tx)?;
+    let container_keys = containers::container_keys(&tx)?;
     let defining = containers::defining_files(&tx)?;
     let mut fallback: HashMap<String, Vec<(String, &'static str)>> = HashMap::new();
 
@@ -450,32 +450,7 @@ pub fn export(
     // pick does not depend on row order.
     let mut edges: BTreeMap<(String, String), (&'static str, String, Option<String>)> = BTreeMap::new();
 
-    let mut stmt = tx
-        .prepare(
-            "SELECT f.filePath, f.language, t.id, t.kind, t.filePath, t.nativeKind, \
-                    COALESCE(e.specifier, t.qualifiedName) \
-             FROM edges e \
-             JOIN nodes f ON f.id = e.fromId AND f.kind = ?1 \
-             JOIN nodes t ON t.id = e.toId \
-             WHERE e.kind = ?2",
-        )
-        .context("failed to prepare the import edge query")?;
-    let rows = stmt
-        .query_map(params![FILE_KIND, IMPORTS_KIND], |row| {
-            Ok(ImportRow {
-                from: row.get(0)?,
-                language: row.get(1)?,
-                target_id: row.get(2)?,
-                target_kind: row.get(3)?,
-                target_path: row.get(4)?,
-                native_kind: row.get(5)?,
-                specifier: row.get(6)?,
-            })
-        })
-        .context("failed to query the import edges")?;
-
-    for row in rows {
-        let row = row.context("failed to read an import edge")?;
+    importers::for_each_file_import(&tx, |row| {
         let tally = tallies.entry(row.language.clone()).or_default();
         let (targets, module) = if row.target_kind == FILE_KIND {
             (vec![(row.target_path.clone(), "file")], None)
@@ -494,15 +469,15 @@ pub fn export(
             (targets, Some(key.clone()))
         } else if row.native_kind.as_deref() == Some(EXTERNAL_MODULE_NATIVE_KIND) {
             tally.external.insert((row.from, row.specifier));
-            continue;
+            return Ok(());
         } else {
             tally.unresolved.insert((row.from, row.specifier));
-            continue;
+            return Ok(());
         };
 
         if targets.is_empty() {
             tally.unresolved.insert((row.from, row.specifier));
-            continue;
+            return Ok(());
         }
         for (to, kind) in targets {
             // An import of the importer itself, or of the package directory
@@ -524,8 +499,8 @@ pub fn export(
                 })
                 .or_insert(value);
         }
-    }
-    drop(stmt);
+        Ok(())
+    })?;
     tx.finish().context("failed to end the index read")?;
 
     let mut edge_counts: HashMap<&str, u64> = HashMap::new();
@@ -592,26 +567,6 @@ pub fn export(
         edges,
     };
     Ok((report, outcomes))
-}
-
-struct ImportRow {
-    from: String,
-    language: String,
-    target_id: String,
-    target_kind: String,
-    target_path: String,
-    native_kind: Option<String>,
-    specifier: String,
-}
-
-/// Container node id -> container key.
-fn container_keys(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut stmt = conn
-        .prepare("SELECT nodeId, key FROM containers")
-        .context("failed to prepare the container listing")?;
-    let rows =
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).context("failed to list the containers")?;
-    rows.collect::<rusqlite::Result<_>>().context("failed to read the containers")
 }
 
 /// What a resolved target's files become: one file -> that file; several in

@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "4.31.0"
+version = "4.32.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -13,10 +13,15 @@ name = "g-mesh"
 path = "src/main.rs"
 
 [features]
+# Compiles the embedding search-quality eval (`g-mesh debug-embed-eval`, hidden
+# subcommand). Off by default: the shipped binary carries no eval code. Tests
+# and clippy in CI build with it so the eval stays checked.
+embed-eval = []
 # Links ONNX Runtime's CoreML execution provider (and CoreML.framework) so
-# `debug-embed-eval run --ep coreml` can time it. Off by default: release and
-# CI builds stay CPU-only and the daemon never reads the switch.
-ep-coreml = ["ort/coreml", "dep:tracing-subscriber"]
+# `debug-embed-eval run --ep coreml` can time it, hence it implies `embed-eval`.
+# Off by default: release and CI builds stay CPU-only and the daemon never
+# reads the switch.
+ep-coreml = ["embed-eval", "ort/coreml", "dep:tracing-subscriber"]
 
 [dependencies]
 anyhow = "1"
@@ -201,4 +206,5 @@ tempfile = "3"
 # The `ep-coreml` ONNX Runtime log test asks the installed subscriber which
 # targets and levels it lets through.
 tracing = "0.1"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+# `test-util`: the heartbeat tests run on tokio's paused clock.
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "test-util"] }

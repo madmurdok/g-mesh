@@ -7,22 +7,22 @@
 //! result is the caller's business.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::registry::PathCoverage;
 use crate::graph::containers::{self, DefiningContainer};
-use crate::graph::pagination::{self, Direction};
+use crate::graph::pagination;
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
-use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
+use crate::graph::Direction;
+use crate::mcp::response_bound;
+use crate::model::NodeRecord;
 
+use super::context::QueryCtx;
 use super::not_indexed;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{error, internal_error, success};
@@ -89,7 +89,7 @@ struct DependencyNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     qualified_name: Option<String>,
     /// The file this dependency *is*, and null when it is not one. An import
-    /// `graph::imports` could not link - a package, or a relative path with
+    /// `link::imports` could not link - a package, or a relative path with
     /// nothing indexed behind it - stays a `Module` placeholder whose stored
     /// `filePath` is the *importing* file, because that is where the
     /// specifier is written. Echoing that column here would name the wrong
@@ -234,7 +234,7 @@ fn wire_name(cause: TruncatedBy) -> &'static str {
 /// bounds the *total size* of a whole level, only depth (how many levels) or
 /// fanout (one node's own children) individually - a node can be depth- and
 /// fanout-bounded and still, summed across every node reached at a given
-/// depth, produce a response too large for `pagination::MAX_RESPONSE_BYTES`.
+/// depth, produce a response too large for `response_bound::MAX_RESPONSE_BYTES`.
 ///
 /// Reuses the exact resume-token mechanism `traversal::traverse`'s own
 /// exploration-budget cut already relies on (`graph::resume_token`), just
@@ -289,7 +289,7 @@ fn bound_walk(
         }
     }
 
-    let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES) else {
+    let Some(cut) = response_bound::longest_prefix_fitting(&dtos, response_bound::MAX_RESPONSE_BYTES) else {
         return DependencyWalk {
             results: dtos,
             truncated: result.truncated,
@@ -674,7 +674,7 @@ fn is_entry_point(file_path: &str, entry_points: &[String]) -> bool {
 /// as a suggestion and nothing more - a name matching a directory does not
 /// establish that the package lives there.
 ///
-/// The specifier itself cannot help: `graph::imports` keeps a placeholder
+/// The specifier itself cannot help: `link::imports` keeps a placeholder
 /// `Module` node per import specifier, but only for the ones that never
 /// resolved (`react` survives, `@excalidraw/math` became an edge to a file and
 /// its placeholder is gone). So there is nothing to look the package name up
@@ -777,36 +777,17 @@ fn continued(conn: &Connection, token: &str, hints: &SessionHints) -> Result<Cal
     success(&walk)
 }
 
-/// `entry_points` is the union of every discovered plugin's
-/// `[plugin.workspace] entry_points` - see `daemon::registry::PluginRegistry::entry_points`
-/// and `graph::queries::entry_point_rank_expr` for where it comes from and
-/// how it is used. The caller (`mcp::GMeshMcpServer::get_dependencies`) reads
-/// it off its own `PluginRegistry` once per call, since discovery never
-/// changes while a daemon runs (see `plugin_manifest::discover`'s own
-/// contract) - there is nothing this function would gain by asking twice.
-pub(crate) fn handle(
-    store: &Arc<IndexStore>,
-    entry_points: &[String],
-    hints: &SessionHints,
-    params: GetDependenciesParams,
-) -> Result<CallToolResult, ErrorData> {
-    handle_covered(store, entry_points, hints, None, params)
-}
-
-/// [`handle`], told whether `params.file_path`'s language is indexed at all
-/// (`PluginRegistry::path_coverage`). A `file_path` in an absent or failed
-/// language that names no indexed file is refused with the reason
-/// ([`not_indexed::miss`]) before the container-key and entry-point
-/// fallbacks: a path with a known language extension is a file path, not a
-/// key, and substituting an entry point for it would answer a different
-/// question.
-pub(crate) fn handle_covered(
-    store: &Arc<IndexStore>,
-    entry_points: &[String],
-    hints: &SessionHints,
-    coverage: Option<&PathCoverage>,
-    params: GetDependenciesParams,
-) -> Result<CallToolResult, ErrorData> {
+/// `ctx.entry_points` is the union of every discovered plugin's
+/// `[plugin.workspace] entry_points`; `graph::queries::entry_point_rank_expr`
+/// says how it ranks fallback anchors. `ctx.coverage` says whether
+/// `params.file_path`'s language is indexed at all (`McpHost::path_coverage`):
+/// a `file_path` in an absent or failed language that names no indexed file
+/// is refused with the reason ([`not_indexed::miss`]) before the
+/// container-key and entry-point fallbacks, since a path with a known
+/// language extension is a file path, not a key.
+pub(crate) fn handle(ctx: &QueryCtx, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
+    let QueryCtx { store, entry_points, hints, .. } = ctx;
+    let coverage = ctx.coverage.as_ref();
     let conn = store.read();
     let GetDependenciesParams { file_path, module_id, direction, max_depth, max_fanout, resume_token } =
         params;

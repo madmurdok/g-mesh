@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use globset::Glob;
 use serde::Deserialize;
 
-use crate::graph::symbol_links::LinkRules;
+use crate::link::symbol_links::LinkRules;
 use crate::project_walk::{extension_of, under_excluded_dir};
 use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
 
@@ -168,7 +168,7 @@ pub struct Capabilities {
     /// edge this plugin stands behind, and every placeholder node such an edge
     /// lands on, and says `incomplete` whenever it did not. `true`: after such
     /// a pass core deletes this language's semantic edges the pass did not
-    /// re-send (`watcher::apply::sweep_semantic_edges`), and the swap of a
+    /// re-send (`ingest::apply::sweep_semantic_edges`), and the swap of a
     /// workspace reindex keeps the language's pending-symbol placeholders the
     /// walk no longer emits until that pass, which deletes those it did not
     /// re-send (`IndexStore::sweep_unclaimed_nodes`). `false` (the default):
@@ -304,7 +304,7 @@ impl SymbolQueryPrefixes {
 
 /// `[plugin.reexports]`: how this plugin's language resolves a name that one
 /// scope both re-exports by name and through a glob. Core's linker applies it
-/// to that language's scopes only (`graph::symbol_links::LinkRules`); an
+/// to that language's scopes only (`link::symbol_links::LinkRules`); an
 /// absent table declares nothing, so neither kind of row wins. Decision:
 /// `docs/adr/0020-named-reexport-shadows-glob.md`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::storage::vectors;
 
@@ -20,7 +20,7 @@ pub use crate::paths::state_dir::{ensure_project_dir, project_dir, projects_root
 /// Cross-file edges are lazy by design: when a symbol another file points at
 /// is deleted or renamed, an edge into it that no placeholder carried is left
 /// dangling until its file is reindexed, and an import linked to a deleted
-/// file until core re-extracts the importer (see `graph::imports::link_diff`
+/// file until core re-extracts the importer (see `link::imports::link_diff`
 /// and `storage::write::apply_diff`). And the TS
 /// plugin reports any change to a symbol as a delete plus an upsert of the
 /// same id, without re-sending the unchanged edges into it - so under
@@ -39,7 +39,7 @@ pub use crate::paths::state_dir::{ensure_project_dir, project_dir, projects_root
 ///
 /// Because nothing cascades, a delete from `nodes` owes its dependents an
 /// explicit delete of their own - `storage::write::apply_diff`,
-/// `graph::containers`' empty-container delete, `graph::imports`' placeholder
+/// `graph::containers`' empty-container delete, `link::imports`' placeholder
 /// drop and `storage::language_swap::swap` all do this.
 /// `ON DELETE CASCADE` in the DDL is still honoured where a connection turns
 /// enforcement on (many unit tests do, to catch an edge pointed at a node that
@@ -47,10 +47,9 @@ pub use crate::paths::state_dir::{ensure_project_dir, project_dir, projects_root
 /// production relies on.
 ///
 /// Every connection that *writes* a project's index comes through here: the
-/// daemon (`daemon::run`), `g-mesh init` and `g-mesh reindex`. The two that
-/// open an existing file without `CREATE` - `cli::status::index_status` and
-/// `gc::last_used::read_from_project_dir` - deliberately leave the pragma
-/// alone: they only read, and foreign-key enforcement only ever affects
+/// daemon (`daemon::run`), `g-mesh init` and `g-mesh reindex`. The readers
+/// that open an existing file without `CREATE` ([`open_existing`]) leave the
+/// pragma alone: they only read, and foreign-key enforcement only ever affects
 /// writes. The one other index core builds, `g-mesh plugins check`'s
 /// in-memory one (`cli::plugin_check::session::open_index`), switches it off
 /// itself, because it exists to commit diffs exactly as the daemon would.
@@ -68,6 +67,15 @@ pub fn open(root: &Path) -> Result<Connection> {
     // file temp storage each step's statement journal spills to a temp file.
     conn.pragma_update(None, "temp_store", "MEMORY").context("failed to keep temp storage in memory")?;
     Ok(conn)
+}
+
+/// Opens the existing index at `db_path` for reading: read-write without
+/// `CREATE`. Recovering a WAL an abandoned daemon left behind needs write
+/// access, and a missing database must never be conjured into existence by a
+/// reader. Its callers only read.
+pub fn open_existing(db_path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
+        .with_context(|| format!("failed to open the project index at {}", db_path.display()))
 }
 
 /// Opens (creating) a throwaway index at `path` with the graph schema - the

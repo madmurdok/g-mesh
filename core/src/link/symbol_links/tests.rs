@@ -1,6 +1,7 @@
 use super::*;
+use crate::model::{EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 use crate::storage::schema;
-use crate::storage::write::{apply_diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
+use crate::storage::write::apply_diff;
 
 /// The rules the bundled plugins declare, read from the checked-in
 /// manifests as the daemon reads them (`plugins/rust/plugin.toml` and
@@ -1010,7 +1011,7 @@ fn adding_a_barrel_links_the_usages_that_were_waiting_on_it() {
 }
 
 /// An import placeholder is a different handshake with a different owner
-/// (`graph::imports`); this pass must not touch one.
+/// (`link::imports`); this pass must not touch one.
 #[test]
 fn a_module_import_placeholder_is_left_exactly_as_it_was() {
     let mut conn = setup();
@@ -3569,6 +3570,7 @@ fn gm491_an_unchanged_answer_writes_nothing() {
 fn gm491_a_language_swap_keeps_the_provenance() {
     use std::collections::HashSet;
 
+    use crate::embedding::text::TextRule;
     use crate::storage::connection::open_staging;
     use crate::storage::language_swap::{plan, swap, SwapBookkeeping};
 
@@ -3603,7 +3605,9 @@ fn gm491_a_language_swap_keeps_the_provenance() {
     apply_diff(&mut staging, &diff).unwrap();
     link_all(&mut staging).unwrap();
     assert_eq!(gm491_linked_from(&staging, &edge), Some(placeholder.clone()));
-    let planned = plan(&mut staging, live_path.to_str().unwrap(), "typescript", "model", true).unwrap();
+    let planned =
+        plan(&mut staging, live_path.to_str().unwrap(), "typescript", &TextRule { version: "model" }, true)
+            .unwrap();
     assert_eq!(planned.counts.upsert_edges, 1, "{:?}", planned.counts);
     drop(staging);
     let capable = HashSet::new();

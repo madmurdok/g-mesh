@@ -590,7 +590,7 @@ pub enum ControlMessage {
     Status,
     /// Asks the plugin's semantic layer to re-answer what the structural
     /// (tree-sitter) pass could only guess at, and reply with the edges it
-    /// can now upgrade - see `watcher::apply::apply_semantic_pass`.
+    /// can now upgrade - see `ingest::apply::apply_semantic_pass`.
     ///
     /// Plural `file_paths`, unlike every other variant, because the two
     /// moments core sends this are different in kind: after an incremental
@@ -908,7 +908,7 @@ pub struct FileChangeResponse {
     ///
     /// Core applies the diff either way and, for a whole-project pass, leaves
     /// `language_state.semanticPassAt` unset so the next daemon start asks
-    /// again (`daemon::semantic`, `watcher::apply::apply_semantic_pass`). That
+    /// again (`daemon::semantic`, `ingest::apply::apply_semantic_pass`). That
     /// is the whole reason this is a field beside `result` rather than a
     /// JSON-RPC `error`: an error answer carries no diff, so reporting "the
     /// last hundred sites are missing" would throw away the nine thousand this

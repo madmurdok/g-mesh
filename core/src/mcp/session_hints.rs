@@ -200,29 +200,18 @@ mod tests {
     /// clone it per request: clones must share one set, new servers must not.
     #[test]
     fn each_server_starts_its_own_session_and_its_clones_share_it() {
-        use crate::daemon::lifecycle::CoreActivity;
-        use crate::daemon::registry::PluginRegistry;
         use crate::embedding::EmbeddingPipeline;
         use crate::indexing_status::IndexingStatus;
-        use crate::plugin_manifest::DiscoveredPlugins;
+        use crate::mcp::host_fake::FakeHost;
         use crate::storage::index_store::IndexStore;
 
         let dir = tempfile::tempdir().unwrap();
         let server = || {
             let embedding = Arc::new(EmbeddingPipeline::disabled());
-            let registry = PluginRegistry::new(
-                dir.path(),
-                dir.path().to_path_buf(),
-                DiscoveredPlugins::default(),
-                None,
-                None,
-                Arc::clone(&embedding),
-            );
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             super::super::GMeshMcpServer::new(
                 Arc::new(IndexStore::new(conn)),
-                Arc::new(registry),
-                CoreActivity::new(),
+                Arc::new(FakeHost::new(dir.path())),
                 IndexingStatus::unindexed(),
                 embedding,
             )

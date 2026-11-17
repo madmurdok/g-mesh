@@ -97,13 +97,14 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{Connection, Result as SqlResult};
+use rusqlite::Connection;
 
 use crate::embedding::text::{embed_tier, is_noise, EmbedInput, EmbedTier, NOISE_RULE_VERSION};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::indexing_status::IndexingStatus;
+use crate::model::{Diff, NodeRecord};
+use crate::storage::embed_row::{self, count_candidates, fetch_candidate_page, EmbedCandidate as Candidate};
 use crate::storage::index_store::{IndexStore, Unit};
-use crate::storage::write::{Diff, NodeRecord};
 use crate::storage::{schema, vectors};
 
 /// Keyset page size. Small enough that one page's inference plus its commit
@@ -245,7 +246,7 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
                 // Inference runs between the unit's steps.
                 let computed = embedding.compute(&diff, &mut stats);
                 filtered += computed.dropped_len();
-                store.store_vectors(embedding, &computed);
+                store.store_vectors(&embedding.vector_write(&computed));
                 progress.add_embed_done(nodes_len as u64);
             }
             crate::log_line!(
@@ -315,53 +316,17 @@ fn purge_noise_page(
     after_id: &str,
     limit: i64,
 ) -> anyhow::Result<(usize, Option<String>)> {
-    type Row = (String, String, String, String, String, Option<String>, Option<String>);
-    let rows: Vec<Row> = {
-        let mut stmt = conn.prepare(
-            "SELECT n.id, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
-             FROM vectors v JOIN nodes n ON n.id = v.nodeId \
-             WHERE v.nodeId > ?1 ORDER BY v.nodeId LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![after_id, limit], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
-        })?;
-        rows.collect::<SqlResult<_>>()?
-    };
+    let rows = embed_row::embedded_rows_after(conn, after_id, limit)?;
     let Some(last_id) = rows.last().map(|row| row.0.clone()) else { return Ok((0, None)) };
     let mut deleted = 0;
-    for (id, kind, name, qualified_name, file_path, doc, signature) in &rows {
-        let input = EmbedInput {
-            kind,
-            name,
-            qualified_name,
-            file_path,
-            doc: doc.as_deref(),
-            signature: signature.as_deref(),
-            // A generated node never gets a vector (`EmbeddingPipeline::compute`
-            // drops it, schema 15 rebuilt every older index), so this purge
-            // has none to find; it stays the noise rule's alone.
-            generated: false,
-        };
+    for (id, row) in &rows {
+        let input = EmbedInput::from_row(row);
         if is_noise(&input) {
             vectors::delete(conn, id)?;
             deleted += 1;
         }
     }
     Ok((deleted, Some(last_id)))
-}
-
-/// One candidate row: a node's id plus the columns
-/// [`EmbeddingPipeline::compute`] actually reads, and the `visibility`
-/// [`candidate_tier`] reads.
-struct Candidate {
-    id: String,
-    visibility: String,
-    kind: String,
-    name: String,
-    qualified_name: String,
-    file_path: String,
-    doc_comment: Option<String>,
-    signature: Option<String>,
 }
 
 /// Builds a [`NodeRecord`] carrying only what
@@ -373,76 +338,12 @@ struct Candidate {
 /// row before writing anything, so a filler language here can never leak
 /// into a stored answer.
 fn to_node_record(candidate: Candidate) -> NodeRecord {
-    let Candidate { id, visibility: _, kind, name, qualified_name, file_path, doc_comment, signature } =
-        candidate;
-    let mut node = NodeRecord::new(id, kind, name, qualified_name, file_path, "");
-    node.doc_comment = doc_comment;
-    node.signature = signature;
-    node
+    candidate.row.into_node_record(candidate.id)
 }
 
 /// The embedding tier `candidate` belongs to.
 fn candidate_tier(candidate: &Candidate) -> EmbedTier {
-    let input = EmbedInput {
-        kind: &candidate.kind,
-        name: &candidate.name,
-        qualified_name: &candidate.qualified_name,
-        file_path: &candidate.file_path,
-        doc: candidate.doc_comment.as_deref(),
-        signature: candidate.signature.as_deref(),
-        generated: false,
-    };
-    embed_tier(&input, &candidate.visibility)
-}
-
-/// Total rows this pass owes the project right now: every node with
-/// embeddable text (a doc comment or a signature) and no `vectors` row yet,
-/// or one made under an `embeddingVersion` other than `version`.
-/// Mirrors [`fetch_candidate_page`]'s own `WHERE` clause exactly - this is
-/// the unpaged count of the same set that query pages through.
-fn count_candidates(conn: &Connection, version: &str) -> SqlResult<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
-         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?1) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0",
-        [version],
-        |row| row.get(0),
-    )
-}
-
-/// One keyset page of candidates strictly after `after_id` (or from the
-/// start, if `None`), ordered by `id` so paging never revisits or skips a
-/// row regardless of how many pages have already run - see this module's own
-/// "Termination" doc section.
-fn fetch_candidate_page(
-    conn: &Connection,
-    version: &str,
-    after_id: Option<&str>,
-    limit: i64,
-) -> SqlResult<Vec<Candidate>> {
-    let mut stmt = conn.prepare(
-        "SELECT n.id, n.visibility, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
-         FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
-         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0 \
-         AND n.id > ?1 ORDER BY n.id LIMIT ?2",
-    )?;
-    // Every real node id is a non-empty string, so `id > ''` is true for all
-    // of them - the same query serves both "from the very start" (`after_id`
-    // is `None`) and "strictly after the last page's id" with one statement.
-    let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit, version], |row| {
-        Ok(Candidate {
-            id: row.get(0)?,
-            visibility: row.get(1)?,
-            kind: row.get(2)?,
-            name: row.get(3)?,
-            qualified_name: row.get(4)?,
-            file_path: row.get(5)?,
-            doc_comment: row.get(6)?,
-            signature: row.get(7)?,
-        })
-    })?;
-    rows.collect()
+    embed_tier(&EmbedInput::from_row(&candidate.row), &candidate.visibility)
 }
 
 /// Honors [`HOLD_FILE_ENV`]. A no-op unless it is set, which is every real
@@ -478,6 +379,8 @@ fn panic_before_first_batch_for_tests() {
 mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    use rusqlite::Result as SqlResult;
 
     use super::*;
     use crate::storage::schema;
@@ -1029,7 +932,8 @@ mod tests {
         let diff =
             Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
         let computed = reference_pipeline.compute(&diff, &mut EmbedStats::default());
-        id_order.unit(Unit::Backfill, |store| store.store_vectors(&reference_pipeline, &computed));
+        id_order
+            .unit(Unit::Backfill, |store| store.store_vectors(&reference_pipeline.vector_write(&computed)));
 
         let rows = vector_rows(&tiered_store);
         assert_eq!(rows.len(), 30, "{:?}", rows.iter().map(|r| &r.0).collect::<Vec<_>>());

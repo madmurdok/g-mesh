@@ -38,6 +38,11 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::embedding::EmbeddingPipeline;
+use crate::ingest::apply::{
+    apply_file_change as apply_file_change_diff, apply_residual_semantic_pass, apply_scoped_semantic_pass,
+    apply_semantic_pass, reextract_file, FileChangeOutcome, SemanticPassOutcome,
+};
+use crate::ingest::staleness::{self, StalenessOutcome};
 use crate::plugin_manifest::PluginManifest;
 use crate::protocol::handshake;
 use crate::protocol::jsonrpc::{is_timeout, read_message_with_timeout, write_message};
@@ -46,11 +51,6 @@ use crate::protocol::types::{
     JSONRPC_VERSION,
 };
 use crate::storage::index_store::{self, IndexStore};
-use crate::watcher::apply::{
-    apply_file_change as apply_file_change_diff, apply_residual_semantic_pass, apply_scoped_semantic_pass,
-    apply_semantic_pass, reextract_file, FileChangeOutcome, SemanticPassOutcome,
-};
-use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// How often [`PluginProcess::shutdown`] checks whether the plugin has taken
 /// the hint and exited.
@@ -65,7 +65,7 @@ const RELAUNCH_GRACE: Duration = Duration::from_secs(2);
 
 /// Per-method budgets for one control-plane round trip - see
 /// `docs/architecture/multi-language-plugins.md`'s "Semantic engine hangs or
-/// is slow" failure mode, and `watcher::apply::round_trip`/
+/// is slow" failure mode, and `ingest::apply::round_trip`/
 /// `protocol::jsonrpc::read_message_with_timeout` for the mechanism that
 /// enforces them. Three separate fields, not one shared timeout, because each
 /// covers a different amount of plugin work - and, as of this task's review
@@ -84,7 +84,7 @@ const RELAUNCH_GRACE: Duration = Duration::from_secs(2);
 ///   and a loaded CI box before calling the plugin wedged rather than merely
 ///   slow. Treat this as a guess with a wide margin, not a validated budget.
 /// - **`semantic_pass_file`**: the per-file semantic upgrade that rides on
-///   the very same reparse (`watcher::apply::apply_file_change`'s own doc
+///   the very same reparse (`ingest::apply::apply_file_change`'s own doc
 ///   comment). **Not measured either** - same gap: the bench indexes this
 ///   task's `semantic_pass_project` numbers came from only record the
 ///   *whole-project* pass's timestamps (`meta.bulkIndexedAt` /
@@ -290,7 +290,7 @@ pub const FINGERPRINT_UNAVAILABLE: &str = "unavailable";
 const BASELINE_FINGERPRINT_IGNORE: &[&str] =
     &[".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"];
 
-/// The language whose pid file `daemon::plugin_pid_path` resolves: the
+/// The language whose pid file `StateDir::plugin_pid_file` is asked for: the
 /// bundled TypeScript plugin's manifest `language`, which is also its
 /// directory name under a plugin root.
 ///
@@ -1065,14 +1065,14 @@ impl PluginProcess {
     }
 
     /// Synchronous per-file staleness check plus reindex-if-needed, per
-    /// `watcher::staleness::ensure_fresh` - see
+    /// `ingest::staleness::ensure_fresh` - see
     /// `daemon::lifecycle::PluginSupervisor::ensure_fresh`'s doc for why this
     /// exists and what gap it closes.
     ///
-    /// The mtime/hash comparison (`watcher::staleness::is_stale`) runs
+    /// The mtime/hash comparison (`ingest::staleness::is_stale`) runs
     /// without this process's `state` lock at all - the overwhelmingly common
     /// case (nothing changed) must not queue behind a live reparse it has
-    /// nothing to do with, matching the whole point of `watcher::staleness`'s
+    /// nothing to do with, matching the whole point of `ingest::staleness`'s
     /// two-tier design. Only a real mismatch takes the lock, for exactly the
     /// one round trip a live watcher event would also pay for.
     ///
@@ -1099,7 +1099,7 @@ impl PluginProcess {
     /// query's retry would get an empty diff back, succeed, and record the
     /// new content hash as this file's baseline over a graph that never took
     /// the edit: stale data marked fresh, surviving a restart. The baseline
-    /// is not written for the failed attempt (`watcher::staleness::
+    /// is not written for the failed attempt (`ingest::staleness::
     /// ensure_fresh` records it only after a successful reindex); the
     /// relaunch is what makes the retry a full extraction instead of that
     /// empty diff. The error is still returned, for the MCP layer to log.
@@ -1175,7 +1175,7 @@ impl PluginProcess {
 
     /// Asks the plugin's semantic layer to upgrade what the structural pass
     /// could only guess at, and commits its answer - see
-    /// `watcher::apply::apply_semantic_pass`.
+    /// `ingest::apply::apply_semantic_pass`.
     ///
     /// This is the *whole-project* entry point, used once the cold-start
     /// bulk walk is done (`daemon::run`); the per-file pass that follows an
@@ -1207,7 +1207,7 @@ impl PluginProcess {
     /// `file_paths` empty asks the whole project. Non-empty, it is a residual
     /// language's owed files (GM-521, `storage::schema::
     /// semantic_residual_files`) and the pass is
-    /// `watcher::apply::apply_residual_semantic_pass`; `file_count` is then
+    /// `ingest::apply::apply_residual_semantic_pass`; `file_count` is then
     /// their number. The returned [`SemanticPassOutcome`] says what the
     /// caller records.
     pub fn semantic_pass(

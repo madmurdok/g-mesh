@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
+use super::context::QueryCtx;
 use super::query_shapes::QueryShapes;
 use super::search_code::handle;
-use super::session_hints::SessionHints;
 use super::SearchCodeParams;
 use crate::embedding::pipeline::test_support::{fake_model_dir, fake_pipeline, fake_vector, Counters};
 use crate::embedding::rerank::{self, RerankSettings, Reranker, Scorer};
@@ -86,15 +86,21 @@ fn descending(count: usize, top: f64, step: f64) -> Vec<Row> {
         .collect()
 }
 
+/// A context over `store` answering through `embedding`; an empty project
+/// root, so no snippet bodies.
+fn ctx_for(store: &Arc<IndexStore>, embedding: &Arc<EmbeddingPipeline>) -> QueryCtx {
+    QueryCtx { embedding: Arc::clone(embedding), ..QueryCtx::for_test(store) }
+}
+
 pub(super) fn call(
     store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
+    embedding: &Arc<EmbeddingPipeline>,
     query: &str,
     limit: Option<u32>,
     cursor: Option<String>,
 ) -> CallToolResult {
     let params = SearchCodeParams { query: query.to_string(), cursor, limit };
-    handle(store, embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None).unwrap()
+    handle(&ctx_for(store, embedding), params, None).unwrap()
 }
 
 /// The JSON body of a one-block result.
@@ -107,7 +113,7 @@ pub(super) fn body(result: &CallToolResult) -> serde_json::Value {
 
 /// Every call the golden file records, as (label, result), through
 /// `embedding`.
-fn golden_calls(embedding: &EmbeddingPipeline) -> Vec<(String, serde_json::Value)> {
+fn golden_calls(embedding: &Arc<EmbeddingPipeline>) -> Vec<(String, serde_json::Value)> {
     let mut out = Vec::new();
     for query in ["parseConfig", "parses the config file"] {
         let high = store_for(query, &descending(64, 0.9, 0.01));
@@ -152,7 +158,7 @@ const SCORE_TOLERANCE: f64 = 1e-6;
 /// Compares `embedding`'s golden calls with [`GOLDEN`] structurally:
 /// everything exactly except scores, which may differ by
 /// [`SCORE_TOLERANCE`], including the ones cursors carry.
-pub(super) fn assert_matches_golden(embedding: &EmbeddingPipeline) {
+pub(super) fn assert_matches_golden(embedding: &Arc<EmbeddingPipeline>) {
     let calls = golden_calls(embedding);
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
     if std::env::var_os(WRITE_GOLDEN_ENV).is_some() {
@@ -319,7 +325,7 @@ fn reversing(row: usize) -> f32 {
 fn with_the_switch_off_the_output_equals_todays() {
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
-    assert_matches_golden(&fake(dir.path()).with_reranker(stub_reranker(false, reversing, &lines)));
+    assert_matches_golden(&Arc::new(fake(dir.path()).with_reranker(stub_reranker(false, reversing, &lines))));
     assert_eq!(lines.count(), 0);
 }
 
@@ -329,7 +335,7 @@ fn with_the_switch_off_the_output_equals_todays() {
 fn with_the_switch_on_the_stub_changes_the_first_page() {
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
-    let embedding = fake(dir.path()).with_reranker(stub_reranker(true, reversing, &lines));
+    let embedding = Arc::new(fake(dir.path()).with_reranker(stub_reranker(true, reversing, &lines)));
     let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
     let page = body(&call(&store, &embedding, "parseConfig", Some(5), None));
     assert_eq!(page["results"][0]["symbolId"], "n29", "{page}");
@@ -346,7 +352,7 @@ fn a_missing_model_keeps_todays_output_and_logs_once() {
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
     let missing = dir.path().join("no-rerank-model-here");
-    let embedding = fake(dir.path()).with_reranker(Reranker::real_at(&missing, lines.sink()));
+    let embedding = Arc::new(fake(dir.path()).with_reranker(Reranker::real_at(&missing, lines.sink())));
     // The once-per-daemon missing-model hint is the only output change; spent
     // here so the golden pins the ranking alone.
     assert!(embedding.reranker().take_unavailable_hint().is_some());
@@ -364,9 +370,9 @@ fn a_failing_call_keeps_the_embedding_order_for_that_call() {
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
     let failing = stub_reranker(true, |_| f32::NAN, &lines);
-    let embedding = fake(dir.path()).with_reranker(failing);
+    let embedding = Arc::new(fake(dir.path()).with_reranker(failing));
     let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
-    let plain = fake(dir.path());
+    let plain = Arc::new(fake(dir.path()));
     for _ in 0..2 {
         assert_eq!(
             serde_json::to_value(call(&store, &embedding, "parseConfig", Some(5), None)).unwrap(),
@@ -419,8 +425,8 @@ fn the_verdict_is_the_same_with_the_rerank_on_and_off() {
 
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
-    let off = fake(dir.path());
-    let on = fake(dir.path()).with_reranker(stub_reranker(true, pull_25_push_0, &lines));
+    let off = Arc::new(fake(dir.path()));
+    let on = Arc::new(fake(dir.path()).with_reranker(stub_reranker(true, pull_25_push_0, &lines)));
     for (rows, judged_below) in [(&only_row_0_clears, false), (&only_row_25_clears, true)] {
         for query in ["parseConfig", "parses the config file"] {
             let store = store_for(query, rows);
@@ -461,7 +467,7 @@ fn expected_walk() -> Vec<String> {
 /// `between` runs after the first page.
 fn walk(
     store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
+    embedding: &Arc<EmbeddingPipeline>,
     limit: u32,
     between: impl FnOnce(&Arc<IndexStore>),
 ) -> Vec<String> {
@@ -495,7 +501,7 @@ fn walk(
 fn every_page_size_walks_the_reranked_window_then_the_rest_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
-    let embedding = fake(dir.path()).with_reranker(stub_reranker(true, permuting, &lines));
+    let embedding = Arc::new(fake(dir.path()).with_reranker(stub_reranker(true, permuting, &lines)));
     let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
     for limit in [1, 5, 20, 29, 30, 50] {
         assert_eq!(walk(&store, &embedding, limit, |_| {}), expected_walk(), "limit {limit}");
@@ -508,7 +514,7 @@ fn every_page_size_walks_the_reranked_window_then_the_rest_exactly_once() {
 fn a_row_deleted_between_pages_is_skipped() {
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
-    let embedding = fake(dir.path()).with_reranker(stub_reranker(true, permuting, &lines));
+    let embedding = Arc::new(fake(dir.path()).with_reranker(stub_reranker(true, permuting, &lines)));
     let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
     let expected = expected_walk();
     let deleted = expected[7].clone();
@@ -533,8 +539,8 @@ fn a_partial_page_is_not_reranked() {
 
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
-    let on = fake(dir.path()).with_reranker(stub_reranker(true, reversing, &lines));
-    let off = fake(dir.path());
+    let on = Arc::new(fake(dir.path()).with_reranker(stub_reranker(true, reversing, &lines)));
+    let off = Arc::new(fake(dir.path()));
     let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
     let coverage = super::search_code::Coverage::partial(
         &Phase::Embedding,
@@ -543,21 +549,9 @@ fn a_partial_page_is_not_reranked() {
         Some(std::time::Duration::ZERO),
         dir.path(),
     );
-    let partial = |embedding: &EmbeddingPipeline| {
+    let partial = |embedding: &Arc<EmbeddingPipeline>| {
         let params = SearchCodeParams { query: "parseConfig".to_string(), cursor: None, limit: Some(5) };
-        serde_json::to_value(
-            handle(
-                &store,
-                embedding,
-                QueryShapes::shipped(),
-                &SessionHints::default(),
-                params,
-                coverage.as_ref(),
-                None,
-            )
-            .unwrap(),
-        )
-        .unwrap()
+        serde_json::to_value(handle(&ctx_for(&store, embedding), params, coverage.as_ref()).unwrap()).unwrap()
     };
     assert_eq!(partial(&on), partial(&off));
     let complete = body(&call(&store, &on, "parseConfig", Some(5), None));
@@ -699,21 +693,13 @@ fn the_handler_scores_the_texts_the_reference_scored() {
             move |_| Ok(Box::new(scorer.clone()) as Box<dyn Scorer>),
             lines.sink(),
         );
-        let embedding = fake(dir.path()).with_reranker(reranker);
+        let embedding = Arc::new(fake(dir.path()).with_reranker(reranker));
         let root = tempfile::tempdir().unwrap();
         let store = store_for_parity(case, root.path());
         let window = case.rows.len() as u32;
         let params = SearchCodeParams { query: case.query.clone(), cursor: None, limit: Some(window) };
-        let result = handle(
-            &store,
-            &embedding,
-            QueryShapes::shipped(),
-            &SessionHints::default(),
-            params,
-            None,
-            Some(root.path()),
-        )
-        .unwrap();
+        let ctx = QueryCtx { project_root: root.path().to_path_buf(), ..ctx_for(&store, &embedding) };
+        let result = handle(&ctx, params, None).unwrap();
         let page = body(&result);
 
         let calls = capture.0.lock().unwrap().clone();
@@ -752,18 +738,13 @@ fn scored_texts(store: &Arc<IndexStore>, query: &str, project_root: Option<&Path
         lines.sink(),
     );
     let dir = tempfile::tempdir().unwrap();
-    let embedding = fake(dir.path()).with_reranker(reranker);
+    let embedding = Arc::new(fake(dir.path()).with_reranker(reranker));
     let params = SearchCodeParams { query: query.to_string(), cursor: None, limit: Some(10) };
-    let result = handle(
-        store,
-        &embedding,
-        QueryShapes::shipped(),
-        &SessionHints::default(),
-        params,
-        None,
-        project_root,
-    )
-    .unwrap_or_else(|err| panic!("the call failed: {err:?}"));
+    let ctx = QueryCtx {
+        project_root: project_root.map(Path::to_path_buf).unwrap_or_default(),
+        ..ctx_for(store, &embedding)
+    };
+    let result = handle(&ctx, params, None).unwrap_or_else(|err| panic!("the call failed: {err:?}"));
     assert_ne!(result.is_error, Some(true), "{result:?}");
     assert_eq!(lines.count(), 0, "the rerank fell back: {:?}", lines.0.lock().unwrap());
     let page = body(&result);
@@ -845,17 +826,14 @@ fn an_unreadable_file_or_span_gives_a_text_and_no_root_gives_no_body() {
 async fn the_tool_reads_the_body_under_the_project_root() {
     use super::search_code_worker_tests::{call, connect};
     use super::GMeshMcpServer;
-    use crate::daemon::lifecycle::CoreActivity;
-    use crate::daemon::registry::PluginRegistry;
     use crate::indexing_status::{IndexingStatus, Phase};
-    use crate::plugin_manifest::DiscoveredPlugins;
+    use crate::mcp::host_fake::FakeHost;
+    use crate::mcp::McpHost;
 
     let query = "parseConfig";
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
-    let state = dir.path().join("state");
     std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
     std::fs::write(root.join("src/config.rs"), "fn n00() {\n    read_the_file();\n}\n").unwrap();
     std::fs::write(root.join("src/other.rs"), "fn n01() {\n    parse_it();\n}\n").unwrap();
 
@@ -885,15 +863,8 @@ async fn the_tool_reads_the_body_under_the_project_root() {
     let embedding = Arc::new(fake(&dir.path().join("model")).with_reranker(reranker));
     let indexing = IndexingStatus::structural();
     indexing.set_phase(Phase::Ready);
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        DiscoveredPlugins::default(),
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
-    let server = GMeshMcpServer::new(store, registry, CoreActivity::new(), indexing, embedding);
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::new(&root));
+    let server = GMeshMcpServer::new(store, host, indexing, embedding);
 
     let client = connect(server).await;
     let result = call(&client, "search_code", serde_json::json!({ "query": query })).await;
@@ -934,10 +905,14 @@ fn search_code_embeds_a_prefixed_query_as_typed() {
 
     let run = |shapes: &QueryShapes| {
         let counters = Counters::default();
-        let embedding = fake_pipeline(&fake_model_dir(dir.path(), "weights"), None, &counters);
+        let embedding = Arc::new(fake_pipeline(&fake_model_dir(dir.path(), "weights"), None, &counters));
         let params = SearchCodeParams { query: "@Component".to_string(), cursor: None, limit: None };
-        let result =
-            handle(&store, &embedding, shapes, &SessionHints::default(), params, None, None).unwrap();
+        let result = handle(
+            &QueryCtx { shapes: Arc::new(shapes.clone()), ..ctx_for(&store, &embedding) },
+            params,
+            None,
+        )
+        .unwrap();
         (body(&result), counters.received())
     };
     let (with_strip, embedded) = run(stripping);
@@ -974,7 +949,7 @@ fn failing_reranker(model_dir: Option<std::path::PathBuf>) -> Reranker {
 }
 
 /// A first complete page under `embedding`, as a fresh session asks it.
-fn first_page(embedding: &EmbeddingPipeline) -> serde_json::Value {
+fn first_page(embedding: &Arc<EmbeddingPipeline>) -> serde_json::Value {
     let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
     body(&call(&store, embedding, "parseConfig", Some(5), None))
 }
@@ -988,7 +963,7 @@ fn first_page(embedding: &EmbeddingPipeline) -> serde_json::Value {
 fn an_absent_model_is_named_once_on_the_first_full_page() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("no-rerank-model-here");
-    let embedding = fake(dir.path()).with_reranker(Reranker::real_at(&missing, |_| {}));
+    let embedding = Arc::new(fake(dir.path()).with_reranker(Reranker::real_at(&missing, |_| {})));
 
     let page = first_page(&embedding);
     let hint = hint_of(&page);
@@ -1019,7 +994,7 @@ fn a_model_that_fails_to_load_gets_the_failed_wording() {
     std::fs::write(model.path().join("model.onnx"), "weights").unwrap();
     std::fs::write(model.path().join("tokenizer.json"), "{}").unwrap();
     for reranker in [failing_reranker(Some(model.path().to_path_buf())), failing_reranker(None)] {
-        let page = first_page(&fake(dir.path()).with_reranker(reranker));
+        let page = first_page(&Arc::new(fake(dir.path()).with_reranker(reranker)));
         let hint = hint_of(&page);
         assert!(hint.contains(super::session_hints::RERANK_MODEL_FAILED), "{page}");
         assert!(!hint.contains(super::session_hints::RERANK_MODEL_MISSING), "{page}");
@@ -1035,9 +1010,9 @@ fn a_switched_off_or_loaded_rerank_gets_no_hint() {
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
     for embedding in [
-        fake(dir.path()),
-        fake(dir.path()).with_reranker(stub_reranker(false, reversing, &lines)),
-        fake(dir.path()).with_reranker(stub_reranker(true, reversing, &lines)),
+        Arc::new(fake(dir.path())),
+        Arc::new(fake(dir.path()).with_reranker(stub_reranker(false, reversing, &lines))),
+        Arc::new(fake(dir.path()).with_reranker(stub_reranker(true, reversing, &lines))),
     ] {
         for _ in 0..2 {
             let page = first_page(&embedding);
@@ -1054,7 +1029,7 @@ fn a_switched_off_or_loaded_rerank_gets_no_hint() {
 #[test]
 fn a_page_of_fewer_than_two_rows_does_not_spend_the_hint() {
     let dir = tempfile::tempdir().unwrap();
-    let embedding = fake(dir.path()).with_reranker(failing_reranker(None));
+    let embedding = Arc::new(fake(dir.path()).with_reranker(failing_reranker(None)));
     let empty = store_for("parseConfig", &[]);
     let page = body(&call(&empty, &embedding, "parseConfig", Some(5), None));
     assert!(!mentions_the_rerank_model(&page), "{page}");
@@ -1075,13 +1050,13 @@ fn a_page_of_fewer_than_two_rows_does_not_spend_the_hint() {
 fn a_continuation_page_does_not_spend_the_hint() {
     let dir = tempfile::tempdir().unwrap();
     let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
-    let plain = fake(dir.path());
+    let plain = Arc::new(fake(dir.path()));
     let cursor = body(&call(&store, &plain, "parseConfig", Some(5), None))["nextCursor"]
         .as_str()
         .map(str::to_string)
         .expect("a 64-row store has a second page");
 
-    let embedding = fake(dir.path()).with_reranker(failing_reranker(None));
+    let embedding = Arc::new(fake(dir.path()).with_reranker(failing_reranker(None)));
     let next = body(&call(&store, &embedding, "parseConfig", Some(5), Some(cursor)));
     assert!(next["results"].as_array().is_some_and(|rows| rows.len() >= 2), "{next}");
     assert!(!mentions_the_rerank_model(&next), "{next}");
@@ -1100,7 +1075,7 @@ fn a_partial_page_does_not_spend_the_hint() {
     use crate::indexing_status::Phase;
 
     let dir = tempfile::tempdir().unwrap();
-    let embedding = fake(dir.path()).with_reranker(failing_reranker(None));
+    let embedding = Arc::new(fake(dir.path()).with_reranker(failing_reranker(None)));
     let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
     let coverage = super::search_code::Coverage::partial(
         &Phase::Embedding,
@@ -1111,16 +1086,7 @@ fn a_partial_page_does_not_spend_the_hint() {
     );
     assert!(coverage.is_some(), "the fixture must be a partial page");
     let params = SearchCodeParams { query: "parseConfig".to_string(), cursor: None, limit: Some(5) };
-    let result = handle(
-        &store,
-        &embedding,
-        QueryShapes::shipped(),
-        &SessionHints::default(),
-        params,
-        coverage.as_ref(),
-        None,
-    )
-    .unwrap();
+    let result = handle(&ctx_for(&store, &embedding), params, coverage.as_ref()).unwrap();
     // A partial result may lead with a plain-text note; the page is the JSON block.
     let partial = result
         .content
@@ -1145,8 +1111,8 @@ fn a_partial_page_does_not_spend_the_hint() {
 fn an_unavailable_model_changes_nothing_but_the_hint() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("no-rerank-model-here");
-    let absent = fake(dir.path()).with_reranker(Reranker::real_at(&missing, |_| {}));
-    let plain = fake(dir.path());
+    let absent = Arc::new(fake(dir.path()).with_reranker(Reranker::real_at(&missing, |_| {})));
+    let plain = Arc::new(fake(dir.path()));
     let mut with_hint = first_page(&absent);
     assert!(mentions_the_rerank_model(&with_hint), "{with_hint}");
     let mut without = first_page(&plain);
@@ -1188,7 +1154,7 @@ fn window_named_parse_config() -> Vec<Row> {
 #[test]
 fn an_exact_name_first_row_skips_the_scorer_and_gives_the_plain_page() {
     let dir = tempfile::tempdir().unwrap();
-    let plain = fake(dir.path());
+    let plain = Arc::new(fake(dir.path()));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = Arc::clone(&calls);
     let reranker = Reranker::with_parts(
@@ -1196,7 +1162,7 @@ fn an_exact_name_first_row_skips_the_scorer_and_gives_the_plain_page() {
         move |_| Ok(Box::new(Counting(Arc::clone(&counted))) as Box<dyn Scorer>),
         |_| {},
     );
-    let reranking = fake(dir.path()).with_reranker(reranker);
+    let reranking = Arc::new(fake(dir.path()).with_reranker(reranker));
 
     let exact = store_for("parseConfig", &window_named_parse_config());
     let skipped = call(&exact, &reranking, "parseConfig", Some(5), None);
@@ -1226,8 +1192,8 @@ fn a_directory_with_the_old_fp32_file_fails_once_and_keeps_the_embedding_order()
     std::fs::File::create(model.path().join("model.onnx")).unwrap().set_len(91_011_230).unwrap();
     std::fs::write(model.path().join("tokenizer.json"), "{}").unwrap();
     let lines = Lines::default();
-    let embedding = fake(dir.path()).with_reranker(Reranker::real_at(model.path(), lines.sink()));
-    let plain = fake(dir.path());
+    let embedding = Arc::new(fake(dir.path()).with_reranker(Reranker::real_at(model.path(), lines.sink())));
+    let plain = Arc::new(fake(dir.path()));
 
     let first = first_page(&embedding);
     assert!(hint_of(&first).contains(super::session_hints::RERANK_MODEL_FAILED), "{first}");
