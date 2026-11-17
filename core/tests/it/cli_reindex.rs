@@ -19,6 +19,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::service::{RoleClient, RunningService};
@@ -74,11 +75,13 @@ impl Project {
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     fn plugin_pid_file(&self) -> PathBuf {
-        daemon::plugin_pid_path(self.root()).expect("failed to resolve the plugin pid file path")
+        StateDir::of(self.root())
+            .map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE))
+            .expect("failed to resolve the plugin pid file path")
     }
 
     /// Bootstraps a detached daemon through the shim and returns once it has
@@ -330,11 +333,11 @@ impl HeldForRebuild {
             .create(true)
             .write(true)
             .truncate(false)
-            .open(daemon::daemon_lock_path_in(&state))
+            .open(StateDir::at(&state).daemon_lock_file())
             .unwrap();
         // The kernel releases a killed daemon's lock shortly after it dies.
         wait_for("the daemon lock to be free", || lock.try_lock().is_ok());
-        let marker = daemon::rebuild_marker_path_in(&state);
+        let marker = StateDir::at(&state).rebuild_marker_file();
         let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         std::fs::write(&marker, format!("{}\n{started}\nreindex\n", std::process::id())).unwrap();
         Self { marker, _lock: lock }
@@ -514,7 +517,7 @@ fn a_shim_started_while_the_project_is_held_for_a_rebuild_exits_naming_it() {
 fn a_crashed_rebuilds_marker_naming_a_live_pid_does_not_turn_shims_away_once_a_daemon_serves() {
     let project = Project::new();
     let state = g_mesh::storage::connection::ensure_project_dir(project.root()).unwrap();
-    let marker = daemon::rebuild_marker_path_in(&state);
+    let marker = StateDir::at(&state).rebuild_marker_file();
     let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     std::fs::write(&marker, format!("{}\n{started}\nreindex\n", std::process::id())).unwrap();
 

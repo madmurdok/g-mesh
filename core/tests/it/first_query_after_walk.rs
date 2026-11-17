@@ -32,9 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use g_mesh::daemon;
 use g_mesh::ingest::apply::HOLD_COMPUTE_FILE_ENV;
 use g_mesh::mcp::{PROGRESS_INTERVAL_ENV, TRACE_CALLS_ENV};
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, RunningService};
@@ -173,12 +173,16 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(self.hold());
-        for path in
-            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())].into_iter().flatten()
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ]
+        .into_iter()
+        .flatten()
         {
             common::kill_pid_file(&path);
         }
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
         if let Ok(state) = project_dir(self.root()) {

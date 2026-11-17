@@ -36,7 +36,7 @@ const SUN_PATH_CAPACITY: usize =
 const _: () = assert!(SUN_PATH_CAPACITY == 104 || SUN_PATH_CAPACITY == 108);
 
 impl Endpoint {
-    /// The socket file for a project, as `daemon::endpoint` derives it.
+    /// The socket file for a project, as `control::lock::endpoint` derives it.
     pub fn at_path(path: PathBuf) -> Self {
         Self(path)
     }

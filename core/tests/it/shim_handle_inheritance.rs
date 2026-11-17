@@ -29,6 +29,7 @@ use std::thread;
 use std::time::Duration;
 
 use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 
 use crate::common;
@@ -76,7 +77,8 @@ fn a_daemon_the_shim_leaves_behind_does_not_hold_the_client_s_pipe() {
         .spawn()
         .expect("failed to spawn the shim");
 
-    let pid_file: PathBuf = daemon::pid_path(project.path()).expect("failed to resolve the pid file");
+    let pid_file: PathBuf =
+        StateDir::of(project.path()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file");
     wait_for("the shim to bootstrap a daemon", || pid_file.exists());
     let daemon_pid = daemon::read_pid_file(&pid_file).expect("the daemon must have recorded its pid");
 

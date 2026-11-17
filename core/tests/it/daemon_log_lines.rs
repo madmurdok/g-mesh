@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use g_mesh::daemon;
 use g_mesh::mcp::TRACE_CALLS_ENV;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
@@ -120,8 +121,12 @@ impl Harness {
 
     /// Stops the daemon and its plugin, so nothing writes to the log after.
     fn stop_daemon(&self) {
-        for path in
-            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())].into_iter().flatten()
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ]
+        .into_iter()
+        .flatten()
         {
             common::kill_pid_file(&path);
         }
@@ -131,7 +136,7 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         self.stop_daemon();
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
         if let Ok(state) = project_dir(self.root()) {

@@ -32,7 +32,8 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use g_mesh::daemon::{self, identity::project_hash};
+use g_mesh::daemon::identity::project_hash;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::paths::HOME_ENV;
 
 use crate::common;
@@ -82,11 +83,11 @@ impl<'a> Project<'a> {
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path_in(&self.state_dir())
+        StateDir::at(self.state_dir()).pid_file()
     }
 
     fn plugin_pid_file(&self) -> PathBuf {
-        daemon::plugin_pid_path_in(&self.state_dir())
+        StateDir::at(self.state_dir()).plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)
     }
 
     fn command(&self, args: &[&str]) -> Output {

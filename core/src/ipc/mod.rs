@@ -158,7 +158,7 @@ mod tests {
 
     /// Nothing is listening, so connecting fails rather than hanging - the
     /// judgement `shim::incumbent` turns into `Incumbent::Absent` and
-    /// `daemon::is_listening` into `false`.
+    /// `control::lock::is_listening` into `false`.
     #[test]
     fn connecting_to_an_unbound_endpoint_fails_promptly() {
         let (_dir, endpoint) = unique_endpoint();

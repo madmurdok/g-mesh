@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::ipc;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::protocol::types::CURRENT_PROTOCOL_VERSION;
 use g_mesh::storage::connection::project_dir;
@@ -182,7 +183,9 @@ pub fn trigger_activation(root: &Path) {
 /// the disconnect, and rmcp does not abort a request handler whose session
 /// ended, so the handler still reaches `prepare`'s `request_activation`.
 fn try_trigger_activation(root: &Path) -> Result<(), String> {
-    let endpoint = daemon::endpoint(root).map_err(|err| format!("no endpoint: {err:#}"))?;
+    let endpoint = StateDir::of(root)
+        .and_then(|sd| g_mesh::control::lock::endpoint(&sd))
+        .map_err(|err| format!("no endpoint: {err:#}"))?;
     let stream = ipc::Stream::connect(&endpoint).map_err(|err| format!("connecting to {endpoint}: {err}"))?;
     let mut writer = stream.try_clone().map_err(|err| format!("cloning the connection: {err}"))?;
     let mut reader = BufReader::new(stream);
@@ -328,7 +331,7 @@ pub fn wait_until_indexed_within(root: &Path, timeout: Duration) {
 /// gives `Connection::open` failing on `index.db`.
 pub fn wait_until_phase(root: &Path, phase: &str) {
     trigger_activation(root);
-    let path = daemon::phase_path_in(&project_dir(root).expect("failed to resolve the state directory"));
+    let path = StateDir::at(project_dir(root).expect("failed to resolve the state directory")).phase_file();
     wait_for(&format!("{}'s index.phase to read {phase:?}", root.display()), indexed_timeout(), || {
         std::fs::read_to_string(&path).map(|contents| contents.trim() == phase).unwrap_or(false)
     });
