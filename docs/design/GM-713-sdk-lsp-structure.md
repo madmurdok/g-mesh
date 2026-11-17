@@ -428,3 +428,15 @@ Draft kept, with order and one model change:
 
 If S3 has to wait long for GM-711/GM-712, S2 can be merged and the task parked between S2 and
 S3; nothing in S2 depends on S3.
+
+## 5. Owner review (2026-11-17)
+
+- D8: "Новая секция sdk-lsp" — the alternative is taken: a new `sdk-lsp` test section
+  (SECTIONS entry and filter in `test-sections.sh`, a `ci.yml` step, the section array in
+  `test_sections_scripts.rs`, `LIB_SECTIONS` in `test-local.sh`); `plugins/sdk-lsp/*` selects
+  `sdk-lsp` + the plugin sections. Rebase onto GM-712 first (D9 already orders it after).
+- D4: "Сейчас, вместе с R-28" — `ServerProfile` is designed and built in this task, with the
+  crate move, not later. Its shape is settled in a design addendum (S3) before the R-28 code
+  slice.
+- D5: "Реестр fn() в sdk (Recommended)" — as written.
+- D9 / note: "Утвердить (Recommended)" — approved with this order.
