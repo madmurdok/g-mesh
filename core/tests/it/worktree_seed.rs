@@ -19,6 +19,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::service::RunningService;
@@ -258,10 +259,10 @@ impl Drop for Harness {
     fn drop(&mut self) {
         for root in [&self.worktree, &self.main] {
             if let Ok(state) = project_dir(root) {
-                for (_, path) in daemon::registry::discovered_pid_files(&state) {
+                for (_, path) in StateDir::at(&state).plugin_pid_files() {
                     common::kill_pid_file(&path);
                 }
-                common::kill_pid_file(&daemon::pid_path_in(&state));
+                common::kill_pid_file(&StateDir::at(&state).pid_file());
                 let _ = fs::remove_dir_all(&state);
             }
         }

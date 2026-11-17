@@ -23,9 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use g_mesh::daemon;
 use g_mesh::ingest::apply::HOLD_COMPUTE_FILE_ENV;
 use g_mesh::ipc;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use rusqlite::Connection;
@@ -324,9 +324,12 @@ fn a_caller_is_listed_once_while_the_first_edit_of_a_file_holds_both_its_call_ed
 
     let hold_file = project.root().join(".g-mesh-hold-compute");
     spawn_daemon(&mut project, &hold_file);
-    let pid_file = daemon::pid_path(project.root()).expect("failed to resolve the pid file path");
+    let pid_file =
+        StateDir::of(project.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path");
     common::wait_for("the daemon to start listening", common::startup_timeout(), || pid_file.exists());
-    let endpoint = daemon::endpoint(project.root()).expect("failed to resolve the daemon's endpoint");
+    let endpoint = StateDir::of(project.root())
+        .and_then(|sd| g_mesh::control::lock::endpoint(&sd))
+        .expect("failed to resolve the daemon's endpoint");
     common::wait_until_indexed(project.root());
 
     // Before the hold: the settled answer, which also activates the daemon.

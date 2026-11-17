@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rusqlite::Connection;
 
@@ -140,7 +140,7 @@ fn file_change_is_routed_through_the_real_js_ts_plugin_and_applied_to_storage() 
     // handshake didn't check out, the daemon would have already exited with
     // an error and this pid file would never appear, so waiting on it also
     // proves the plugin came up cleanly.
-    let pid_file = daemon::pid_path(project.root()).unwrap();
+    let pid_file = StateDir::of(project.root()).map(|sd| sd.pid_file()).unwrap();
     wait_for("the daemon (and its JS/TS plugin) to start", || pid_file.exists());
     // GM-395 slice 2: the daemon walks - and registers its watcher - only once a tool call asks.
     common::trigger_activation(project.root());
@@ -190,7 +190,7 @@ fn an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass() {
     let project = Project::new();
     let mut daemon = spawn_daemon(project.root());
 
-    let pid_file = daemon::pid_path(project.root()).unwrap();
+    let pid_file = StateDir::of(project.root()).map(|sd| sd.pid_file()).unwrap();
     wait_for("the daemon (and its JS/TS plugin) to start", || pid_file.exists());
     // GM-395 slice 2: the daemon walks - and registers its watcher - only once a tool call asks.
     common::trigger_activation(project.root());

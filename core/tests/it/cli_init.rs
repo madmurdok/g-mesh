@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 
 use crate::common;
@@ -102,7 +102,12 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        for path in [daemon::pid_path(self.root()).unwrap(), daemon::plugin_pid_path(self.root()).unwrap()] {
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()).unwrap(),
+            StateDir::of(self.root())
+                .map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE))
+                .unwrap(),
+        ] {
             common::kill_pid_file(&path);
         }
         let _ = std::fs::remove_dir_all(self.state_dir());
@@ -249,7 +254,7 @@ fn init_refuses_a_project_whose_daemon_lock_is_held() {
         .create(true)
         .write(true)
         .truncate(false)
-        .open(daemon::daemon_lock_path_in(&state))
+        .open(StateDir::at(&state).daemon_lock_file())
         .unwrap();
     lock.try_lock().expect("nothing else holds this fixture's daemon lock");
 
@@ -258,6 +263,6 @@ fn init_refuses_a_project_whose_daemon_lock_is_held() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "init must refuse a held project; stderr:\n{stderr}");
     assert_contains(&stderr, "still holds the daemon lock");
-    assert!(!daemon::rebuild_marker_path_in(&state).exists(), "a refused init leaves no marker");
+    assert!(!StateDir::at(&state).rebuild_marker_file().exists(), "a refused init leaves no marker");
     assert!(!project.index_path().exists(), "a refused init writes no index");
 }

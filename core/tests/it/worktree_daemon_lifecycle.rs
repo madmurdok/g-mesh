@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon;
 use g_mesh::daemon::identity::{project_hash, record_project_root};
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, PLUGIN_IDLE_ENV};
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
@@ -94,7 +95,7 @@ impl Project {
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path_in(&self.state_dir)
+        StateDir::at(&self.state_dir).pid_file()
     }
 
     /// Bootstraps a detached daemon through a shim, then lets the shim go:
@@ -132,7 +133,7 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        for (_, path) in daemon::registry::discovered_pid_files(&self.state_dir) {
+        for (_, path) in StateDir::at(&self.state_dir).plugin_pid_files() {
             common::kill_pid_file(&path);
         }
         common::kill_pid_file(&self.pid_file());
@@ -352,10 +353,10 @@ struct Cleanup(Vec<PathBuf>);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         for state in &self.0 {
-            for (_, path) in daemon::registry::discovered_pid_files(state) {
+            for (_, path) in StateDir::at(state).plugin_pid_files() {
                 common::kill_pid_file(&path);
             }
-            common::kill_pid_file(&daemon::pid_path_in(state));
+            common::kill_pid_file(&StateDir::at(state).pid_file());
             let _ = fs::remove_dir_all(state);
         }
     }
@@ -375,7 +376,7 @@ async fn a_killed_daemon_is_restarted_and_the_next_answer_says_so() {
     fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
     let state = project_dir(&root).unwrap();
     let _cleanup = Cleanup(vec![state.clone()]);
-    let pid_file = daemon::pid_path_in(&state);
+    let pid_file = StateDir::at(&state).pid_file();
 
     let client = shim_in(&root, &[]).await;
     call(&client, "get_file_outline", json!({ "file_path": "a.ts" })).await;
@@ -434,7 +435,8 @@ async fn a_call_to_a_deleted_selection_says_it_no_longer_exists() {
     select(&client, "b").await;
     let outline = call(&client, "get_file_outline", json!({ "file_path": "b.ts" })).await;
     assert_ne!(outline.is_error, Some(true), "{:?}", texts_of(&outline));
-    let b_daemon = daemon::read_pid_file(&daemon::pid_path_in(&b_state)).expect("b's daemon records its pid");
+    let b_daemon =
+        daemon::read_pid_file(&StateDir::at(&b_state).pid_file()).expect("b's daemon records its pid");
 
     fs::remove_dir_all(&b).unwrap();
     tokio::task::block_in_place(|| {
@@ -511,10 +513,10 @@ impl Drop for Home {
     fn drop(&mut self) {
         if let Ok(entries) = fs::read_dir(self.0.join("projects")) {
             for entry in entries.flatten() {
-                for (_, path) in daemon::registry::discovered_pid_files(&entry.path()) {
+                for (_, path) in StateDir::at(entry.path()).plugin_pid_files() {
                     common::kill_pid_file(&path);
                 }
-                common::kill_pid_file(&daemon::pid_path_in(&entry.path()));
+                common::kill_pid_file(&StateDir::at(entry.path()).pid_file());
             }
         }
         let _ = fs::remove_dir_all(&self.0);

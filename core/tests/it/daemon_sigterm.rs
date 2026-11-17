@@ -55,6 +55,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::process;
 use g_mesh::storage::connection::project_dir;
 
@@ -97,11 +98,13 @@ impl Project {
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     fn plugin_pid_file(&self) -> PathBuf {
-        daemon::plugin_pid_path(self.root()).expect("failed to resolve the plugin pid file path")
+        StateDir::of(self.root())
+            .map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE))
+            .expect("failed to resolve the plugin pid file path")
     }
 
     /// Bootstraps a detached daemon through the shim and waits for its plugin

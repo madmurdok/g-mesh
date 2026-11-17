@@ -807,14 +807,14 @@ fn the_repair_advice_is_shown_only_when_no_live_daemon_is_working() {
 fn embedding_progress_shows_the_daemons_own_done_and_total_as_a_percentage() {
     let dir = tempfile::tempdir().unwrap();
     let indexing = crate::indexing_status::IndexingStatus::structural();
-    indexing.attach_progress_file_every(daemon::progress_path_in(dir.path()), Duration::ZERO);
+    indexing.attach_progress_file_every(StateDir::at(dir.path()).progress_file(), Duration::ZERO);
     indexing.set_phase(crate::indexing_status::Phase::Embedding);
     indexing.set_embed_total(1_200);
     indexing.add_embed_done(300);
 
     let mut report = phase_fixture(true, Some("embedding"));
     report.core = CoreState::Running { pid: std::process::id() };
-    report.progress = daemon::read_progress_in(dir.path());
+    report.progress = crate::indexing_status::read_progress(&StateDir::at(dir.path()));
     let rendered = render(&report);
 
     assert_eq!(indexing.embed_progress(), (300, 1_200));
@@ -1020,7 +1020,7 @@ fn a_daemon_holding_a_rebuilt_plugin_is_named_as_that_and_not_as_an_old_binary()
     let state = tempfile::tempdir().unwrap();
     let mut incumbent = build_stamp::of_running_process().unwrap();
     incumbent.plugin = format!("{}-before", incumbent.plugin);
-    build_stamp::write(&daemon::build_stamp_path_in(state.path()), &incumbent).unwrap();
+    build_stamp::write(&StateDir::at(state.path()).build_stamp_file(), &incumbent).unwrap();
 
     assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::PluginChanged);
     let described = describe_build(BuildState::PluginChanged).unwrap();
@@ -1031,7 +1031,7 @@ fn a_daemon_holding_a_rebuilt_plugin_is_named_as_that_and_not_as_an_old_binary()
 fn a_daemon_that_published_this_builds_stamp_reads_as_current() {
     let state = tempfile::tempdir().unwrap();
     let ours = build_stamp::of_running_process().unwrap();
-    build_stamp::write(&daemon::build_stamp_path_in(state.path()), &ours).unwrap();
+    build_stamp::write(&StateDir::at(state.path()).build_stamp_file(), &ours).unwrap();
 
     assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Current);
     // Still comparable for a daemon that is up but not answering on its
@@ -1044,7 +1044,7 @@ fn a_daemon_that_published_an_older_builds_stamp_reads_as_outdated() {
     let state = tempfile::tempdir().unwrap();
     let mut older = build_stamp::of_running_process().unwrap();
     older.exe_mtime_millis -= 24 * 60 * 60 * 1000;
-    build_stamp::write(&daemon::build_stamp_path_in(state.path()), &older).unwrap();
+    build_stamp::write(&StateDir::at(state.path()).build_stamp_file(), &older).unwrap();
 
     assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Outdated);
 }
@@ -1772,7 +1772,7 @@ fn rerank_line(status: RerankStatus) -> String {
 
 fn write_outcome(state_dir: &Path, pid: u32, outcome: &str) {
     std::fs::write(
-        daemon::rerank_outcome_path_in(state_dir),
+        StateDir::at(state_dir).rerank_outcome_file(),
         format!(r#"{{"pid":{pid},"outcome":"{outcome}","dir":"/models/rerank"}}"#),
     )
     .unwrap();
@@ -1815,7 +1815,7 @@ fn a_leftover_record_falls_back_to_the_on_disk_check() {
     write_outcome(state.path(), 4242, "loaded");
     assert!(alive(rerank_status(CoreState::Running { pid: 7 }, state.path())), "another pid's record");
     assert!(!alive(rerank_status(CoreState::NotRunning, state.path())), "no daemon");
-    std::fs::write(daemon::rerank_outcome_path_in(state.path()), "garbage").unwrap();
+    std::fs::write(StateDir::at(state.path()).rerank_outcome_file(), "garbage").unwrap();
     assert!(alive(rerank_status(CoreState::Running { pid: 4242 }, state.path())), "an unreadable record");
 }
 

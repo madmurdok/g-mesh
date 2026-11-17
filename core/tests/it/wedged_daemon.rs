@@ -52,6 +52,7 @@ use std::thread;
 
 use g_mesh::cli::status::{self, CoreState};
 use g_mesh::daemon::{self, DaemonLock};
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
@@ -118,11 +119,13 @@ impl Project {
     }
 
     fn socket(&self) -> PathBuf {
-        daemon::socket_path(self.root()).expect("failed to resolve the daemon socket path")
+        StateDir::of(self.root())
+            .map(|sd| sd.socket_file())
+            .expect("failed to resolve the daemon socket path")
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     /// Bootstraps a detached daemon through the shim - the same vehicle
@@ -158,7 +161,7 @@ impl Project {
         // them into.
         wait_for("the daemon to publish itself as serving", || {
             daemon::inspect_daemon_lock(self.root()).ok() == Some(DaemonLock::Serving)
-                && daemon::serving_owner_in(&self.state_dir()).is_some()
+                && StateDir::at(self.state_dir()).serving_owner().is_some()
         });
         let _ = shim.kill();
         let _ = shim.wait();
@@ -190,13 +193,17 @@ impl Project {
     fn wedge(&self) -> u32 {
         let pid = self.bootstrap_core();
 
-        for path in [self.socket(), self.pid_file(), daemon::build_stamp_path(self.root()).unwrap()] {
+        for path in [
+            self.socket(),
+            self.pid_file(),
+            StateDir::of(self.root()).map(|sd| sd.build_stamp_file()).unwrap(),
+        ] {
             let _ = std::fs::remove_file(&path);
         }
 
         assert!(daemon::is_process_alive(pid), "the wedged daemon must still be alive");
         assert!(
-            !daemon::is_listening(self.root()).unwrap(),
+            !StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap(),
             "the wedged daemon must be unreachable - that is what makes it a wedge"
         );
         assert_eq!(
@@ -410,7 +417,10 @@ fn a_shim_bootstrap_recovers_a_wedged_project_rather_than_timing_out() {
 
     let mut shim = project.spawn_shim();
     wait_for("the shim to bring a working daemon up", || {
-        project.pid_file().exists() && daemon::is_listening(project.root()).unwrap_or(false)
+        project.pid_file().exists()
+            && StateDir::of(project.root())
+                .and_then(|sd| g_mesh::control::lock::is_listening(&sd))
+                .unwrap_or(false)
     });
     let replacement = read_pid(&project.pid_file());
     let _ = shim.kill();
