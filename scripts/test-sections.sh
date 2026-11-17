@@ -247,7 +247,7 @@ cmd_run() {
 		# this section's.
 		rm -f "$junit_dir/junit.xml"
 		start="$(date +%s)"
-		cargo nextest run --workspace --profile "$profile" --no-tests=fail -E "$filter" || status=$?
+		cargo nextest run --workspace --features g-mesh/embed-eval --profile "$profile" --no-tests=fail -E "$filter" || status=$?
 		secs=$(($(date +%s) - start))
 		result=PASS
 		[ "$status" -eq 0 ] || result=FAIL
@@ -282,10 +282,10 @@ cmd_check() {
 	local dir="$CHECK_DIR"
 	local -a args=("$dir/all.json")
 	echo "== listing the whole suite"
-	cargo nextest list --workspace --run-ignored all --message-format json >"$dir/all.json"
+	cargo nextest list --workspace --features g-mesh/embed-eval --run-ignored all --message-format json >"$dir/all.json"
 	for name in "${SECTIONS[@]}"; do
 		echo "== listing $name"
-		cargo nextest list --workspace --run-ignored all --message-format json \
+		cargo nextest list --workspace --features g-mesh/embed-eval --run-ignored all --message-format json \
 			-E "$(section_filter "$name")" >"$dir/$name.json"
 		args+=("$name=$dir/$name.json")
 	done

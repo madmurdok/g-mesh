@@ -1,4 +1,4 @@
-use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::context::QueryCtx;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,10 +10,9 @@ use super::*;
 use crate::daemon::bulk_index;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::queries;
-use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
 use crate::model::{EdgeRecord, PlaceholderTargetRecord};
-use crate::plugin_manifest::{read_manifest, Capabilities, DiscoveredPlugins};
+use crate::plugin_manifest::{read_manifest, DiscoveredPlugins};
 use crate::protocol::types::QualifiedPath;
 use crate::storage::connection::{open, project_dir};
 use crate::storage::index_store::IndexStore;
@@ -89,29 +88,17 @@ impl Fixture {
 
     fn callers(&self, symbol: &str) -> serde_json::Value {
         json_body(
-            &find_callers_callees::handle_callers(
-                &self.store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &HashMap::<String, Capabilities>::new(),
-                &SessionHints::default(),
-                by_name(symbol),
-            )
-            .unwrap(),
+            &QueryCtx::for_test(&self.store)
+                .resolve_lazily(find_callers_callees::handle_callers, by_name(symbol))
+                .unwrap(),
         )
     }
 
     fn references(&self, symbol: &str) -> serde_json::Value {
         json_body(
-            &find_references::handle(
-                &self.store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &HashMap::<String, Capabilities>::new(),
-                &SessionHints::default(),
-                by_name(symbol),
-            )
-            .unwrap(),
+            &QueryCtx::for_test(&self.store)
+                .resolve_lazily(find_references::handle, by_name(symbol))
+                .unwrap(),
         )
     }
 }

@@ -4,20 +4,19 @@
 
 use std::cell::Cell;
 use std::path::Path;
-use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
+use crate::mcp::PathCoverage;
 use crate::model::NodeRecord;
-use crate::storage::index_store::IndexStore;
 
+use super::context::QueryCtx;
 use super::not_indexed;
 use super::query_shapes::QueryShapes;
 use super::similarity;
@@ -572,53 +571,6 @@ impl<'a> SemanticRung<'a> {
             Self::Embedded { .. } => None,
         }
     }
-}
-
-/// Runs `handler` with the semantic rung deferred, then - only if the ladder
-/// reached that rung - embeds the name with no lock held and runs it again
-/// with the vector (see [`SemanticRung`]). `handler` must take and release
-/// the store itself, so nothing is held between the passes. Synchronous: for
-/// callers already off the async workers (the CLI, tests).
-pub(crate) fn resolve_lazily(
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    handler: impl Fn(&SemanticRung<'_>) -> Result<CallToolResult, ErrorData>,
-) -> Result<CallToolResult, ErrorData> {
-    let first = SemanticRung::deferred(embedding, shapes);
-    let answer = handler(&first)?;
-    let Some(name) = first.reached() else { return Ok(answer) };
-    let query = embedding.embed_query(&name);
-    handler(&SemanticRung::Embedded { name: &name, query: query.as_deref(), shapes })
-}
-
-/// [`resolve_lazily`] for the server: the first pass, plain store reads, runs
-/// on the async worker as every structural tool does; the inference and the
-/// second pass run on the blocking pool, so the model's load and the vector
-/// scan never stall the other calls the daemon is serving. As with
-/// `search_code::handle_off_worker`, dropping the future does not stop the
-/// blocking work.
-pub(super) async fn resolve_lazily_off_worker<H>(
-    embedding: Arc<EmbeddingPipeline>,
-    shapes: Arc<QueryShapes>,
-    handler: H,
-) -> Result<CallToolResult, ErrorData>
-where
-    H: Fn(&SemanticRung<'_>) -> Result<CallToolResult, ErrorData> + Send + 'static,
-{
-    let name = {
-        let first = SemanticRung::deferred(&embedding, &shapes);
-        let answer = handler(&first)?;
-        match first.reached() {
-            Some(name) => name,
-            None => return Ok(answer),
-        }
-    };
-    tokio::task::spawn_blocking(move || {
-        let query = embedding.embed_query(&name);
-        handler(&SemanticRung::Embedded { name: &name, query: query.as_deref(), shapes: &shapes })
-    })
-    .await
-    .map_err(|e| internal_error("symbol resolution task failed", e.into()))?
 }
 
 /// Resolves a symbol name to the single node it names: an exact
@@ -1201,29 +1153,18 @@ fn by_symbol_id(
     }
 }
 
-pub(crate) fn handle(
-    store: &Arc<IndexStore>,
-    project_root: &Path,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    params: FindDefinitionParams,
-) -> Result<CallToolResult, ErrorData> {
-    resolve_lazily(embedding, shapes, |semantic| {
-        handle_in(store, project_root, semantic, None, params.clone())
-    })
-}
-
-/// One pass of [`handle`] - see [`SemanticRung`]. `coverage` is
-/// `params.file_path`'s (`PluginRegistry::path_coverage`), read only by the
+/// One pass of `find_definition` - see [`SemanticRung`];
+/// [`QueryCtx::resolve_lazily`] runs both. `ctx.coverage` is
+/// `params.file_path`'s (`McpHost::path_coverage`), read only by the
 /// `file_path` + `position` mode.
-pub(super) fn handle_in(
-    store: &Arc<IndexStore>,
-    project_root: &Path,
+pub(crate) fn handle(
+    ctx: &QueryCtx,
     semantic: &SemanticRung<'_>,
-    coverage: Option<&PathCoverage>,
     params: FindDefinitionParams,
 ) -> Result<CallToolResult, ErrorData> {
-    let conn = store.read();
+    let conn = ctx.store.read();
+    let project_root = ctx.project_root.as_path();
+    let coverage = ctx.coverage.as_ref();
     // Defaults to on. The snippet is the point of the field - a caller who
     // wants coordinates alone has to say so, rather than every caller having
     // to ask for the thing that saves them a round trip.

@@ -12,6 +12,7 @@ pub mod front;
 pub mod identity;
 pub use crate::indexing_status;
 pub mod lifecycle;
+pub(crate) mod mcp_host;
 pub use crate::plugin_manifest as manifest;
 pub mod memory;
 pub(crate) mod path_case;
@@ -160,23 +161,23 @@ fn serve_forever(
         let mut listener =
             listener.into_async().context("failed to register the daemon endpoint with the async runtime")?;
 
+        // One host for the daemon's lifetime, shared by every connection.
+        let host: Arc<dyn mcp::McpHost> =
+            Arc::new(mcp_host::DaemonHost::new(Arc::clone(&registry), Arc::clone(&core_activity)));
         loop {
             let stream = listener.accept().await.context("failed to accept a daemon connection")?;
             let conn = Arc::clone(&conn);
-            let registry = Arc::clone(&registry);
+            let host = Arc::clone(&host);
             let indexing = indexing.clone();
             let embedding = Arc::clone(&embedding);
             // Taken before the task spawns, so the count rises before the core can
             // be judged unattended.
             let attached = core_activity.connection_opened();
-            let core_activity = Arc::clone(&core_activity);
             tokio::spawn(async move {
                 // Dropped when this session ends, whichever way it ends, which
                 // is also what restarts the core's idle clock.
                 let _attached = attached;
-                if let Err(err) =
-                    mcp::serve_connection(stream, conn, registry, core_activity, indexing, embedding).await
-                {
+                if let Err(err) = mcp::serve_connection(stream, conn, host, indexing, embedding).await {
                     crate::log_line!("g-mesh daemon: connection ended: {err:#}");
                 }
             });

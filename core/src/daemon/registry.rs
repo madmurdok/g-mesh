@@ -101,6 +101,7 @@ use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
 use crate::ingest::staleness::{self, StalenessOutcome};
+use crate::mcp::PathCoverage;
 use crate::model::Diff;
 use crate::paths::state_dir::StateDir;
 use crate::plugin_manifest::{self, DiscoveredPlugins};
@@ -425,18 +426,6 @@ impl Drop for SpawnReservation<'_> {
             self.language
         )));
     }
-}
-
-/// Why a path-anchored answer about one file can be empty while the file
-/// exists: [`PluginRegistry::path_coverage`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PathCoverage {
-    /// No discovered plugin claims the file; the catalogue entry of the
-    /// plugin that would index it.
-    Absent(&'static crate::languages::CatalogueEntry),
-    /// The discovered plugin for this language failed its bulk walk, so
-    /// nothing of the language is in the index (ADR 0021, section 2).
-    Failed(String),
 }
 
 /// The daemon's plugins: what was discovered, and which of them are running.
@@ -809,10 +798,10 @@ impl PluginRegistry {
         crate::languages::missing(&self.discovered).into_iter().map(|entry| entry.language).collect()
     }
 
-    /// Every discovered language's `[plugin.non_symbol_queries]`, for the
-    /// semantic rung. Fixed for the daemon's lifetime, as discovery is.
-    pub(crate) fn query_shapes(&self) -> crate::mcp::query_shapes::QueryShapes {
-        crate::mcp::query_shapes::QueryShapes::from_manifests(self.discovered.manifests.values())
+    /// Every discovered plugin's manifest, for the MCP server's query shapes.
+    /// Fixed for the daemon's lifetime, as discovery is.
+    pub(crate) fn manifests(&self) -> impl Iterator<Item = &plugin_manifest::PluginManifest> {
+        self.discovered.manifests.values()
     }
 
     /// Whether `language`'s manifest declares both `semantic_pass` and

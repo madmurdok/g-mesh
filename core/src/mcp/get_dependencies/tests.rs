@@ -1,10 +1,13 @@
 use super::*;
+use crate::mcp::context::QueryCtx;
 use crate::mcp::response_bound;
+use crate::mcp::PathCoverage;
 use crate::model::{Diff, EdgeRecord, NodeRecord};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write;
 use crate::storage::write::{upsert_edge, upsert_node};
+use std::sync::Arc;
 
 /// What a real daemon feeds `handle`/`from_file`/`from_module`/
 /// `no_file_message` in the bundled, TS-only setup: the bundled plugin's
@@ -21,7 +24,7 @@ fn ts_entry_points() -> Vec<String> {
 /// (a fake Rust manifest, an empty one) calls `super::handle` directly
 /// instead of this wrapper.
 fn handle(conn: &Arc<IndexStore>, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
-    super::handle(conn, &ts_entry_points(), &SessionHints::default(), params)
+    super::handle(&QueryCtx { entry_points: ts_entry_points().to_vec(), ..QueryCtx::for_test(conn) }, params)
 }
 
 /// [`handle`]'s own shadow, for [`super::from_file`].
@@ -1311,7 +1314,17 @@ fn a_file_defining_two_sibling_modules_is_refused_with_both_named() {
 /// The `hint` a walk out of `a` over `conn`'s import chain answers with on
 /// `session`, `""` when absent.
 fn walk_hint_on(conn: &Arc<IndexStore>, params: GetDependenciesParams, session: &SessionHints) -> String {
-    let body = json_body(&super::handle(conn, &ts_entry_points(), session, params).unwrap());
+    let body = json_body(
+        &super::handle(
+            &QueryCtx {
+                entry_points: ts_entry_points().to_vec(),
+                hints: session.clone(),
+                ..QueryCtx::for_test(conn)
+            },
+            params,
+        )
+        .unwrap(),
+    );
     body["hint"].as_str().unwrap_or_default().to_string()
 }
 
@@ -1386,11 +1399,12 @@ fn covered(
     coverage: Option<&PathCoverage>,
     params: GetDependenciesParams,
 ) -> CallToolResult {
-    super::handle_covered(
-        &Arc::new(IndexStore::new(conn)),
-        &ts_entry_points(),
-        &SessionHints::default(),
-        coverage,
+    super::handle(
+        &QueryCtx {
+            entry_points: ts_entry_points().to_vec(),
+            coverage: coverage.cloned(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        },
         params,
     )
     .unwrap()
@@ -1400,7 +1414,7 @@ fn covered(
 /// install command.
 ///
 /// Control: drop the `Some(coverage) if uncovered_miss(..)` arm in
-/// `handle_covered` - `from_file`'s plain no-file message comes back.
+/// `handle` - `from_file`'s plain no-file message comes back.
 #[test]
 fn an_absent_languages_file_is_refused_with_the_install_command() {
     let result = covered(setup(), Some(&python_absent()), anchored_at("tools/gen.py", Direction::Outgoing));

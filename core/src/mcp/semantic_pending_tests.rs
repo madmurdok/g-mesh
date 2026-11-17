@@ -1,7 +1,7 @@
 //! The `pending` provenance block (ADR 0009) on the four edge-walking tools,
 //! through their real handlers.
 
-use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::context::QueryCtx;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -128,52 +128,30 @@ fn by_id(id: &str) -> SymbolQueryParams {
 }
 
 fn callers(store: &Arc<IndexStore>, params: SymbolQueryParams) -> serde_json::Value {
-    let result = find_callers_callees::handle_callers(
-        store,
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        &rust_with_a_semantic_tier(),
-        &SessionHints::default(),
-        params,
-    )
-    .unwrap();
+    let result = QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+        .resolve_lazily(find_callers_callees::handle_callers, params)
+        .unwrap();
     body(&result).0
 }
 
 fn callees(store: &Arc<IndexStore>, id: &str) -> serde_json::Value {
-    let result = find_callers_callees::handle_callees(
-        store,
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        &rust_with_a_semantic_tier(),
-        by_id(id),
-    )
-    .unwrap();
+    let result = QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+        .resolve_lazily(find_callers_callees::handle_callees, by_id(id))
+        .unwrap();
     body(&result).0
 }
 
 fn references(store: &Arc<IndexStore>, id: &str) -> serde_json::Value {
-    let result = find_references::handle(
-        store,
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        &rust_with_a_semantic_tier(),
-        &SessionHints::default(),
-        by_id(id),
-    )
-    .unwrap();
+    let result = QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+        .resolve_lazily(find_references::handle, by_id(id))
+        .unwrap();
     body(&result).0
 }
 
 fn implementations(store: &Arc<IndexStore>, params: FindImplementationsParams) -> (serde_json::Value, usize) {
-    let result = find_implementations::dispatch(
-        store,
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        &rust_with_a_semantic_tier(),
-        params,
-    )
-    .unwrap();
+    let result = QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+        .resolve_lazily(find_implementations::dispatch, params)
+        .unwrap();
     body(&result)
 }
 
@@ -296,7 +274,7 @@ fn many_implementors(count: usize, name_bytes: usize, file: impl Fn(usize) -> St
 /// other 5 counted, and the whole response inside `MAX_RESPONSE_BYTES`. One
 /// implementor per file; the pending ones sort first by path, so all thirty
 /// are on the page. Controls: measure candidate pages without their
-/// `provenance` block (single-hop `find_implementations::handle_in`) -> over
+/// `provenance` block (single-hop `find_implementations::handle`) -> over
 /// budget; drop the entry cap -> 30 listed.
 #[test]
 fn the_pending_list_is_capped_and_the_page_keeps_its_budget() {
@@ -410,7 +388,6 @@ fn a_resumed_transitive_page_never_says_absent() {
 // the answers as once-per-session hints.
 // ---------------------------------------------------------------------------
 
-use super::find_definition;
 use super::session_hints::{ALL_UNRESOLVED, PROVENANCE, UNRESOLVED_ROW};
 
 /// Rust nodes with a declared semantic tier that has never run (so every
@@ -463,28 +440,19 @@ enum Tool {
 const TOOLS: [Tool; 4] = [Tool::Callers, Tool::References, Tool::Callees, Tool::Implementations];
 
 fn ask(store: &Arc<IndexStore>, hints: &SessionHints, tool: Tool, id: &str) -> serde_json::Value {
-    let capabilities = rust_with_a_semantic_tier();
-    let embedding = EmbeddingPipeline::disabled();
-    let shapes = QueryShapes::shipped();
+    let ctx = QueryCtx {
+        capabilities: rust_with_a_semantic_tier(),
+        hints: hints.clone(),
+        ..QueryCtx::for_test(store)
+    };
     let result = match tool {
-        Tool::Callers => {
-            find_callers_callees::handle_callers(store, &embedding, shapes, &capabilities, hints, by_id(id))
-        }
-        Tool::References => {
-            find_references::handle(store, &embedding, shapes, &capabilities, hints, by_id(id))
-        }
-        Tool::Callees => find_definition::resolve_lazily(&embedding, shapes, |semantic| {
-            find_callers_callees::handle_callees_in(store, semantic, &capabilities, hints, by_id(id))
-        }),
-        Tool::Implementations => find_definition::resolve_lazily(&embedding, shapes, |semantic| {
-            find_implementations::dispatch_in(
-                store,
-                semantic,
-                &capabilities,
-                hints,
-                FindImplementationsParams { symbol_id: Some(id.to_string()), ..Default::default() },
-            )
-        }),
+        Tool::Callers => ctx.resolve_lazily(find_callers_callees::handle_callers, by_id(id)),
+        Tool::References => ctx.resolve_lazily(find_references::handle, by_id(id)),
+        Tool::Callees => ctx.resolve_lazily(find_callers_callees::handle_callees, by_id(id)),
+        Tool::Implementations => ctx.resolve_lazily(
+            find_implementations::dispatch,
+            FindImplementationsParams { symbol_id: Some(id.to_string()), ..Default::default() },
+        ),
     }
     .unwrap();
     body(&result).0
@@ -590,12 +558,12 @@ fn transitive(
     hints: &SessionHints,
     params: FindImplementationsParams,
 ) -> serde_json::Value {
-    let capabilities = rust_with_a_semantic_tier();
-    let embedding = EmbeddingPipeline::disabled();
-    let result = find_definition::resolve_lazily(&embedding, QueryShapes::shipped(), |semantic| {
-        find_implementations::dispatch_in(store, semantic, &capabilities, hints, params.clone())
-    })
-    .unwrap();
+    let ctx = QueryCtx {
+        capabilities: rust_with_a_semantic_tier(),
+        hints: hints.clone(),
+        ..QueryCtx::for_test(store)
+    };
+    let result = ctx.resolve_lazily(find_implementations::dispatch, params).unwrap();
     body(&result).0
 }
 
@@ -639,7 +607,7 @@ fn transitive_walks_send_the_provenance_sentence_once_per_session() {
 /// shorter than that field, a cut that ignored it would stop less than one
 /// row short of the ceiling, so adding the field would go over. With `provenance: absent` there is no pending
 /// list. Control: measure candidate pages with no `hint` (single-hop
-/// `find_implementations::handle_in`).
+/// `find_implementations::handle`).
 #[test]
 fn a_page_at_the_budget_edge_keeps_room_for_the_provenance_sentence() {
     let store = pending_index(&many_implementors(300, 4, |i| format!("m{i:03}.rs")), &[]);
@@ -676,31 +644,15 @@ fn a_page_at_the_budget_edge_keeps_room_for_the_provenance_sentence() {
 /// A server over `store` (no plugins discovered, index ready), so each call
 /// below goes through `GMeshMcpServer`'s tool handler over a real session.
 fn hint_server(dir: &std::path::Path, store: Arc<IndexStore>) -> super::GMeshMcpServer {
-    use crate::daemon::lifecycle::CoreActivity;
-    use crate::daemon::registry::PluginRegistry;
     use crate::indexing_status::{IndexingStatus, Phase};
-    use crate::plugin_manifest::DiscoveredPlugins;
+    use crate::mcp::host_fake::FakeHost;
+    use crate::mcp::McpHost;
     let root = dir.join("project");
-    let state = dir.join("state");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
     let indexing = IndexingStatus::structural();
     indexing.set_phase(Phase::Ready);
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        DiscoveredPlugins::default(),
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
-    super::GMeshMcpServer::new(
-        store,
-        registry,
-        CoreActivity::new(),
-        indexing,
-        Arc::new(EmbeddingPipeline::disabled()),
-    )
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::new(&root));
+    super::GMeshMcpServer::new(store, host, indexing, Arc::new(EmbeddingPipeline::disabled()))
 }
 
 /// One MCP call on `client`'s session, as its JSON body.

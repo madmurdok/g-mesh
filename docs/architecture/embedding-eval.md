@@ -144,7 +144,8 @@ node with no embeddable text (no model could ever find it).
 ### D4. Embedding each variant: g-mesh's own pipeline, offline
 
 A hidden CLI subcommand in g-mesh, `g-mesh debug-embed-eval` (precedent:
-the hidden `debug-candidates`), in `core/src/cli/embed_eval.rs`:
+the hidden `debug-candidates`), in `core/src/cli/embed_eval.rs`, compiled
+only with `--features embed-eval` (off by default):
 
 1. **Snapshot.** Each corpus is indexed once by the workspace build with the
    embedding model switched off (structural and semantic passes only); the

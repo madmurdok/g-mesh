@@ -12,13 +12,12 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 
 use super::GMeshMcpServer;
-use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::registry::PluginRegistry;
 use crate::embedding::model::EMBEDDING_DIM;
 use crate::embedding::pipeline::test_support::{fake_pipeline, Counters};
 use crate::embedding::EmbeddingPipeline;
 use crate::indexing_status::{IndexingStatus, Phase};
-use crate::plugin_manifest::DiscoveredPlugins;
+use crate::mcp::host_fake::FakeHost;
+use crate::mcp::McpHost;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::vectors::{insert, register_extension};
@@ -36,7 +35,7 @@ struct Fixture {
     _dir: tempfile::TempDir,
     store: Arc<IndexStore>,
     indexing: IndexingStatus,
-    registry: Arc<PluginRegistry>,
+    host: Arc<dyn McpHost>,
     embedding: Arc<EmbeddingPipeline>,
     client: RunningService<RoleClient, ()>,
 }
@@ -48,8 +47,7 @@ impl Fixture {
         serve(
             GMeshMcpServer::new(
                 Arc::clone(&self.store),
-                Arc::clone(&self.registry),
-                CoreActivity::new(),
+                Arc::clone(&self.host),
                 self.indexing.clone(),
                 Arc::clone(&self.embedding),
             )
@@ -92,9 +90,7 @@ fn add_embedded_node(conn: &Connection, id: &str, seed: usize) {
 async fn fixture(vectors: usize, embedded: u64, total: u64) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
-    let state = dir.path().join("state");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
 
     register_extension();
     let conn = Connection::open_in_memory().unwrap();
@@ -109,27 +105,14 @@ async fn fixture(vectors: usize, embedded: u64, total: u64) -> Fixture {
     indexing.set_embed_total(total);
     indexing.add_embed_done(embedded);
 
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        DiscoveredPlugins::default(),
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::new(&root));
     let embedding = Arc::new(fake_pipeline(&dir.path().join("model"), None, &Counters::default()));
     let client = serve(
-        GMeshMcpServer::new(
-            Arc::clone(&store),
-            Arc::clone(&registry),
-            CoreActivity::new(),
-            indexing.clone(),
-            Arc::clone(&embedding),
-        )
-        .with_search_embedding_wait(WAIT),
+        GMeshMcpServer::new(Arc::clone(&store), Arc::clone(&host), indexing.clone(), Arc::clone(&embedding))
+            .with_search_embedding_wait(WAIT),
     )
     .await;
-    Fixture { _dir: dir, store, indexing, registry, embedding, client }
+    Fixture { _dir: dir, store, indexing, host, embedding, client }
 }
 
 async fn search(client: &RunningService<RoleClient, ()>, arguments: Value) -> CallToolResult {

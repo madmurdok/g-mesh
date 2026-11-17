@@ -8,31 +8,28 @@
 //! protocol); the why goes in a `//` comment, cross-tool guidance in
 //! `get_info`'s instructions (`docs/adr/0003-mcp-instructions-rendering.md`).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    CallToolResult, Implementation, ProgressNotificationParam, ServerCapabilities, ServerInfo,
-};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::registry::{PathCoverage, PluginRegistry};
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
 use crate::graph::Direction;
 use crate::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::ipc::AsyncStream;
-use crate::plugin_manifest::Capabilities;
 use crate::protocol::types::Position;
 use crate::storage::index_store::IndexStore;
+
+use self::context::QueryCtx;
+use self::progress::{Beat, Cancel};
 
 mod anchor;
 mod answer;
@@ -40,6 +37,7 @@ mod answer;
 mod answer_tests;
 // `pub(crate)` so `cli::plugin_check::expectations` calls the same handler
 // functions as the tools below; every other submodule stays private.
+pub(crate) mod context;
 pub(crate) mod find_callers_callees;
 pub(crate) mod find_definition;
 pub(crate) mod find_implementations;
@@ -47,11 +45,19 @@ pub(crate) mod find_references;
 pub mod front;
 pub(crate) mod get_dependencies;
 mod get_file_outline;
+mod host;
+#[cfg(test)]
+mod host_fake;
+#[cfg(test)]
+mod host_tests;
 mod instructions;
 #[cfg(test)]
 mod member_name_collision_tests;
 mod not_indexed;
 mod overrides;
+mod progress;
+#[cfg(test)]
+mod progress_tests;
 mod provenance;
 pub(crate) mod query_shapes;
 pub(crate) mod response_bound;
@@ -77,9 +83,13 @@ mod tools_list_tests;
 mod unlinked;
 mod untyped;
 
+pub use self::host::{Activity, McpHost, PathCoverage};
+
 // The embedding eval (`cli::embed_eval`) scores against the same ranking and
 // the same shipped floors the tools use, not copies of them.
+#[cfg(feature = "embed-eval")]
 pub(crate) use search_code::top_k_for_eval;
+#[cfg(feature = "embed-eval")]
 pub(crate) use similarity::floor as shipped_similarity_floor;
 
 /// Logs a step of request handling when [`TRACE_CALLS_ENV`] is set. Every
@@ -187,12 +197,11 @@ fn walk_failed(message: &str) -> CallToolResult {
 pub async fn serve_connection(
     stream: AsyncStream,
     store: Arc<IndexStore>,
-    registry: Arc<PluginRegistry>,
-    core_activity: Arc<CoreActivity>,
+    host: Arc<dyn McpHost>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
 ) -> Result<()> {
-    let service = GMeshMcpServer::new(store, registry, core_activity, indexing, embedding)
+    let service = GMeshMcpServer::new(store, host, indexing, embedding)
         .serve(stream)
         .await
         .context("MCP initialization failed")?;
@@ -201,14 +210,13 @@ pub async fn serve_connection(
 }
 
 /// The structural query surface. Every handler answers out of `store` alone;
-/// `registry` is there to be woken, not queried: a tool call replays the files
-/// queued while a plugin slept before the index is read (see
-/// `daemon::lifecycle`), and it cannot know ahead which languages it touches.
+/// `host` is there to be woken, not queried: a tool call replays the files
+/// queued while a plugin slept before the index is read (the [`McpHost`] lock
+/// order), and it cannot know ahead which languages it touches.
 #[derive(Clone)]
 pub struct GMeshMcpServer {
     store: Arc<IndexStore>,
-    registry: Arc<PluginRegistry>,
-    core_activity: Arc<CoreActivity>,
+    host: Arc<dyn McpHost>,
     indexing: IndexingStatus,
     embedding: Arc<EmbeddingPipeline>,
     shapes: Arc<query_shapes::QueryShapes>,
@@ -223,16 +231,16 @@ pub struct GMeshMcpServer {
 impl GMeshMcpServer {
     pub fn new(
         store: Arc<IndexStore>,
-        registry: Arc<PluginRegistry>,
-        core_activity: Arc<CoreActivity>,
+        host: Arc<dyn McpHost>,
         indexing: IndexingStatus,
         embedding: Arc<EmbeddingPipeline>,
     ) -> Self {
-        let shapes = Arc::new(registry.query_shapes());
+        // Every discovered language's `[plugin.non_symbol_queries]`, for the
+        // semantic rung; fixed for the host's lifetime, as discovery is.
+        let shapes = Arc::new(query_shapes::QueryShapes::from_manifests(host.manifests()));
         Self {
             store,
-            registry,
-            core_activity,
+            host,
             indexing,
             embedding,
             shapes,
@@ -291,10 +299,10 @@ impl GMeshMcpServer {
     /// Replays whatever changed while a plugin was asleep; takes no lock when
     /// nothing did. On the blocking pool: waking a plugin spawns a process,
     /// and the accept loop's runtime has only two workers. Failures are logged
-    /// in `PluginRegistry::replay_pending`, never returned (the queue stays for
+    /// in `McpHost::replay_pending`, never returned (the queue stays for
     /// the next call to retry). Heartbeats like
     /// [`ensure_file_fresh`](Self::ensure_file_fresh), with a
-    /// [`PluginRegistry::pending_summary`] read once before the queue drains.
+    /// [`McpHost::pending_summary`] read once before the queue drains.
     /// Not cancellable.
     async fn replay_queued_changes(
         &self,
@@ -302,48 +310,23 @@ impl GMeshMcpServer {
         tool: &str,
         call_started: Instant,
     ) {
-        if !self.registry.has_pending() {
+        if !self.host.has_pending() {
             return;
         }
-        let summary = self.registry.pending_summary();
-        let registry = Arc::clone(&self.registry);
+        let summary = self.host.pending_summary();
+        let host = Arc::clone(&self.host);
         let store = Arc::clone(&self.store);
         let started = Instant::now();
-        let task = tokio::task::spawn_blocking(move || registry.replay_pending(&store));
-        tokio::pin!(task);
-
-        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
-        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
-            interval.max(Duration::from_millis(1)),
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut sent = 0u32;
-
-        let joined = loop {
-            tokio::select! {
-                biased;
-                joined = &mut task => break joined,
-                _ = ticker.tick(), if token.is_some() => {
-                    let token = token.clone().expect("the branch is only enabled with a token");
-                    let message = format!(
-                        "indexing {}: replaying queued changes for {summary} before answering ({} so far)",
-                        self.registry.project_root().display(),
-                        human_duration(started.elapsed())
-                    );
-                    let param = ProgressNotificationParam::new(token, call_started.elapsed().as_secs_f64())
-                        .with_message(message);
-                    match ctx.peer.notify_progress(param).await {
-                        Ok(()) => sent += 1,
-                        Err(err) => crate::log_line!(
-                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
-                            ctx.id
-                        ),
-                    }
-                }
-            }
-        };
+        let task = tokio::task::spawn_blocking(move || host.replay_pending(&store));
+        let (beat, sent) = progress::with_heartbeat(ctx, started, call_started, Cancel::Ignore, task, || {
+            format!(
+                "indexing {}: replaying queued changes for {summary} before answering ({} so far)",
+                self.host.project_root().display(),
+                human_duration(started.elapsed())
+            )
+        })
+        .await;
+        let Beat::Done(joined) = beat else { unreachable!("Cancel::Ignore never yields Cancelled") };
 
         let replayed = match joined {
             Ok(count) => count,
@@ -360,23 +343,35 @@ impl GMeshMcpServer {
         ));
     }
 
-    /// Every discovered plugin's declared `[plugin.capabilities]`, which the
-    /// four edge-walking tools hand to `provenance::resolve`. Read fresh per
-    /// call: it never changes while the daemon runs
-    /// (`plugin_manifest::discover`), so a cache would save nothing.
-    fn capabilities(&self) -> HashMap<String, Capabilities> {
-        self.registry.receiver_call_capabilities()
+    /// The context of one tool call: `file_paths` is a find tool's filter
+    /// (its unindexed entries become `uncovered`), `file` the anchoring file
+    /// of a path-anchored tool (its coverage becomes `coverage`). The host's
+    /// capabilities and entry points are read fresh per call: they never
+    /// change while the daemon runs (`plugin_manifest::discover`), so a cache
+    /// would save nothing.
+    fn query_ctx(&self, file_paths: Option<&[String]>, file: Option<&str>) -> QueryCtx {
+        QueryCtx {
+            store: Arc::clone(&self.store),
+            embedding: Arc::clone(&self.embedding),
+            shapes: Arc::clone(&self.shapes),
+            hints: self.hints.clone(),
+            project_root: self.host.project_root().to_path_buf(),
+            capabilities: self.host.receiver_call_capabilities(),
+            entry_points: self.host.entry_points(),
+            uncovered: self.filter_coverage(file_paths),
+            coverage: file.and_then(|path| self.host.path_coverage(path)),
+        }
     }
 
     /// The `file_paths` filter entries of a find tool whose language is not
     /// indexed here (plugin absent or failed), each with that coverage
-    /// (`PluginRegistry::path_coverage`, no I/O). Empty with no filter or a
+    /// (`McpHost::path_coverage`, no I/O). Empty with no filter or a
     /// fully covered one; the handlers group it into `notIndexed`.
     fn filter_coverage(&self, file_paths: Option<&[String]>) -> Vec<(String, PathCoverage)> {
         file_paths
             .unwrap_or_default()
             .iter()
-            .filter_map(|path| self.registry.path_coverage(path).map(|coverage| (path.clone(), coverage)))
+            .filter_map(|path| self.host.path_coverage(path).map(|coverage| (path.clone(), coverage)))
             .collect()
     }
 
@@ -399,49 +394,24 @@ impl GMeshMcpServer {
         call_started: Instant,
         file_path: &str,
     ) {
-        let registry = Arc::clone(&self.registry);
+        let host = Arc::clone(&self.host);
         let store = Arc::clone(&self.store);
         let owned_path = file_path.to_string();
         let task_path = owned_path.clone();
         let started = Instant::now();
-        let task = tokio::task::spawn_blocking(move || registry.ensure_fresh(&store, &task_path));
-        tokio::pin!(task);
-
-        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
-        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
-            interval.max(Duration::from_millis(1)),
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut sent = 0u32;
-
-        let joined = loop {
-            tokio::select! {
-                biased;
-                joined = &mut task => break joined,
-                _ = ticker.tick(), if token.is_some() => {
-                    let token = token.clone().expect("the branch is only enabled with a token");
-                    let message = format!(
-                        "indexing {}: bringing {owned_path} up to date before answering ({} so far)",
-                        self.registry.project_root().display(),
-                        human_duration(started.elapsed())
-                    );
-                    let param = ProgressNotificationParam::new(token, call_started.elapsed().as_secs_f64())
-                        .with_message(message);
-                    match ctx.peer.notify_progress(param).await {
-                        Ok(()) => sent += 1,
-                        Err(err) => crate::log_line!(
-                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
-                            ctx.id
-                        ),
-                    }
-                }
-            }
-        };
+        let task = tokio::task::spawn_blocking(move || host.ensure_fresh(&store, &task_path));
+        let (beat, sent) = progress::with_heartbeat(ctx, started, call_started, Cancel::Ignore, task, || {
+            format!(
+                "indexing {}: bringing {owned_path} up to date before answering ({} so far)",
+                self.host.project_root().display(),
+                human_duration(started.elapsed())
+            )
+        })
+        .await;
+        let Beat::Done(joined) = beat else { unreachable!("Cancel::Ignore never yields Cancelled") };
 
         let outcome = match &joined {
-            Ok(Ok(Some(outcome))) => format!("{outcome:?}"),
+            Ok(Ok(Some(outcome))) => outcome.clone(),
             Ok(Ok(None)) => "no_plugin".to_string(),
             Ok(Err(_)) => "failed".to_string(),
             Err(_) => "task_failed".to_string(),
@@ -499,7 +469,7 @@ impl GMeshMcpServer {
                 Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
                     "g-mesh: the index for {} is still being built ({}; this call waited {}). No answer was \
                  computed - call this tool again; the index keeps building in the background.",
-                    self.registry.project_root().display(),
+                    self.host.project_root().display(),
                     self.indexing.progress_detail(),
                     human_duration(started.elapsed())
                 ))]))
@@ -519,52 +489,28 @@ impl GMeshMcpServer {
         started: Instant,
         deadline: Option<Instant>,
     ) -> Result<WaitOutcome, ErrorData> {
-        let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
-        let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
-
-        // The ticker's first tick is one interval in, not immediately: a
-        // call that resolves on the fast path, or within one interval, sends
-        // nothing. `Delay` so a notification send that stalled does not come
-        // back to a burst of catch-up ticks.
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::from_std(started) + interval.max(Duration::from_millis(1)),
-            interval.max(Duration::from_millis(1)),
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut sent = 0u32;
-
-        let wait = self.indexing.wait_for(need, deadline);
-        tokio::pin!(wait);
-        let outcome = loop {
-            tokio::select! {
-                // Biased, wait first: an outcome that is ready wins over a
-                // tick or a cancellation that happens to be ready as well.
-                biased;
-                outcome = &mut wait => break outcome,
-                () = ctx.ct.cancelled() => {
-                    trace_call(format_args!(
-                        "prepare: cancelled tool={tool} request={} waited_ms={} progress_sent={sent}",
-                        ctx.id,
-                        started.elapsed().as_millis()
-                    ));
-                    return Err(ErrorData::internal_error(
-                        "g-mesh: the request was cancelled while it waited for the index; the index keeps \
-                         building in the background",
-                        None,
-                    ));
-                }
-                _ = ticker.tick(), if token.is_some() => {
-                    let token = token.clone().expect("the branch is only enabled with a token");
-                    let param = ProgressNotificationParam::new(token, started.elapsed().as_secs_f64())
-                        .with_message(self.indexing.progress_message(self.registry.project_root()));
-                    match ctx.peer.notify_progress(param).await {
-                        Ok(()) => sent += 1,
-                        Err(err) => crate::log_line!(
-                            "g-mesh daemon: could not send a progress notification for request {}: {err}",
-                            ctx.id
-                        ),
-                    }
-                }
+        let (beat, sent) = progress::with_heartbeat(
+            ctx,
+            started,
+            started,
+            Cancel::Honour,
+            self.indexing.wait_for(need, deadline),
+            || self.indexing.progress_message(self.host.project_root()),
+        )
+        .await;
+        let outcome = match beat {
+            Beat::Done(outcome) => outcome,
+            Beat::Cancelled => {
+                trace_call(format_args!(
+                    "prepare: cancelled tool={tool} request={} waited_ms={} progress_sent={sent}",
+                    ctx.id,
+                    started.elapsed().as_millis()
+                ));
+                return Err(ErrorData::internal_error(
+                    "g-mesh: the request was cancelled while it waited for the index; the index keeps \
+                     building in the background",
+                    None,
+                ));
             }
         };
 
@@ -621,7 +567,7 @@ impl GMeshMcpServer {
                     embedded,
                     total,
                     (!spent).then(|| started.elapsed()),
-                    self.registry.project_root(),
+                    self.host.project_root(),
                 )
                 .map_or(Ok(None), |coverage| Ok(Some(coverage)))
             }
@@ -630,13 +576,13 @@ impl GMeshMcpServer {
 
     /// Advances the project's durable `lastUsed` stamp (`gc::last_used`, read
     /// by a later GC scan) and this process's in-memory idle clock
-    /// (`daemon::lifecycle::CoreActivity`); neither can stand in for the
+    /// ([`Activity::request`]); neither can stand in for the
     /// other. Called per tool call, not per connection: a client holds one
     /// session for its whole lifetime. Best-effort: a failure is logged, never
     /// a tool error. The store is taken and released here, before the
     /// handler's own read guard.
     fn mark_used(&self) {
-        self.core_activity.request();
+        self.host.request();
         if let Err(err) = self.store.with(last_used::touch) {
             crate::log_line!("g-mesh daemon: failed to record lastUsed: {err:#}");
         }
@@ -654,8 +600,8 @@ impl GMeshMcpServer {
     /// store read. A failed read falls back to the no-I/O cold-start wording
     /// for the part it could not read.
     fn instructions(&self) -> String {
-        let capabilities = self.registry.receiver_call_capabilities();
-        let missing = || self.registry.missing_languages().into_iter().map(str::to_string).collect();
+        let capabilities = self.host.receiver_call_capabilities();
+        let missing = || self.host.missing_languages().into_iter().map(str::to_string).collect();
         let installed = || instructions::present_languages(capabilities.keys().cloned(), &capabilities);
 
         let phase = self.indexing.phase();
@@ -665,7 +611,7 @@ impl GMeshMcpServer {
                 uncovered: instructions::Uncovered::missing(missing()),
             };
             return instructions::cold_start(
-                self.registry.project_root(),
+                self.host.project_root(),
                 phase == Phase::Walking,
                 self.indexing.cold_cause(),
                 &coverage,
@@ -733,18 +679,10 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
-        let store = Arc::clone(&self.store);
-        let project_root = self.registry.project_root().to_path_buf();
         let params = params.0;
-        let coverage = params.file_path.as_deref().and_then(|path| self.registry.path_coverage(path));
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_definition::handle_in(&store, &project_root, semantic, coverage.as_ref(), params.clone())
-            },
-        )
-        .await
+        self.query_ctx(None, params.file_path.as_deref())
+            .resolve_lazily_off_worker(find_definition::handle, params)
+            .await
     }
 
     #[tool(
@@ -759,24 +697,10 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_references", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, hints, params) =
-            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
-        let uncovered = self.filter_coverage(params.file_paths.as_deref());
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_references::handle_in_covered(
-                    &store,
-                    semantic,
-                    &capabilities,
-                    &hints,
-                    &uncovered,
-                    params.clone(),
-                )
-            },
-        )
-        .await
+        let params = params.0;
+        self.query_ctx(params.file_paths.as_deref(), None)
+            .resolve_lazily_off_worker(find_references::handle, params)
+            .await
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -788,24 +712,10 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_callers", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, hints, params) =
-            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
-        let uncovered = self.filter_coverage(params.file_paths.as_deref());
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_callers_callees::handle_callers_in_covered(
-                    &store,
-                    semantic,
-                    &capabilities,
-                    &hints,
-                    &uncovered,
-                    params.clone(),
-                )
-            },
-        )
-        .await
+        let params = params.0;
+        self.query_ctx(params.file_paths.as_deref(), None)
+            .resolve_lazily_off_worker(find_callers_callees::handle_callers, params)
+            .await
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -817,24 +727,10 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_callees", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, hints, params) =
-            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
-        let uncovered = self.filter_coverage(params.file_paths.as_deref());
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_callers_callees::handle_callees_in_covered(
-                    &store,
-                    semantic,
-                    &capabilities,
-                    &hints,
-                    &uncovered,
-                    params.clone(),
-                )
-            },
-        )
-        .await
+        let params = params.0;
+        self.query_ctx(params.file_paths.as_deref(), None)
+            .resolve_lazily_off_worker(find_callers_callees::handle_callees, params)
+            .await
     }
 
     #[tool(
@@ -849,29 +745,12 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_implementations", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, hints, params) =
-            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        let params = params.0;
         // `transitive` ignores `file_paths`, so it names nothing about them.
-        let uncovered = if params.transitive.unwrap_or(false) {
-            Vec::new()
-        } else {
-            self.filter_coverage(params.file_paths.as_deref())
-        };
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_implementations::dispatch_in_covered(
-                    &store,
-                    semantic,
-                    &capabilities,
-                    &hints,
-                    &uncovered,
-                    params.clone(),
-                )
-            },
-        )
-        .await
+        let file_paths = if params.transitive.unwrap_or(false) { None } else { params.file_paths.as_deref() };
+        self.query_ctx(file_paths, None)
+            .resolve_lazily_off_worker(find_implementations::dispatch, params)
+            .await
     }
 
     #[tool(
@@ -888,8 +767,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
-        let coverage = self.registry.path_coverage(&params.0.file_path);
-        get_file_outline::handle_covered(&self.store, coverage.as_ref(), params.0)
+        get_file_outline::handle(&self.query_ctx(None, Some(&params.0.file_path)), params.0)
     }
 
     #[tool(
@@ -908,13 +786,7 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "get_dependencies", call_started, file_path).await;
         }
-        // The union of every plugin's declared entry points (see
-        // `PluginRegistry::entry_points` and
-        // `graph::queries::entry_point_rank_expr`). Read fresh per call: it
-        // never changes while the daemon runs.
-        let entry_points = self.registry.entry_points();
-        let coverage = params.0.file_path.as_deref().and_then(|path| self.registry.path_coverage(path));
-        get_dependencies::handle_covered(&self.store, &entry_points, &self.hints, coverage.as_ref(), params.0)
+        get_dependencies::handle(&self.query_ctx(None, params.0.file_path.as_deref()), params.0)
     }
 
     #[tool(
@@ -933,16 +805,7 @@ impl GMeshMcpServer {
             Ok(coverage) => coverage,
             Err(early) => return Ok(early),
         };
-        search_code::handle_off_worker(
-            Arc::clone(&self.store),
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            self.hints.clone(),
-            params.0,
-            coverage,
-            Some(self.registry.project_root().to_path_buf()),
-        )
-        .await
+        search_code::handle_off_worker(self.query_ctx(None, None), params.0, coverage).await
     }
 }
 

@@ -15,13 +15,12 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use super::GMeshMcpServer;
-use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::registry::PluginRegistry;
 use crate::embedding::model::EMBEDDING_DIM;
 use crate::embedding::pipeline::Embedder;
 use crate::embedding::EmbeddingPipeline;
 use crate::indexing_status::{IndexingStatus, Phase};
-use crate::plugin_manifest::DiscoveredPlugins;
+use crate::mcp::host_fake::FakeHost;
+use crate::mcp::McpHost;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::vectors::{insert, register_extension};
@@ -112,9 +111,7 @@ pub(super) async fn call(
 async fn another_call_is_served_while_a_search_code_inference_is_blocked() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
-    let state = dir.path().join("state");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
 
     register_extension();
     let conn = Connection::open_in_memory().unwrap();
@@ -131,14 +128,7 @@ async fn another_call_is_served_while_a_search_code_inference_is_blocked() {
     let indexing = IndexingStatus::structural();
     indexing.set_phase(Phase::Ready);
 
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        DiscoveredPlugins::default(),
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::new(&root));
     let gate = Arc::new(Gate::default());
     let loader_gate = Arc::clone(&gate);
     let embedding = Arc::new(EmbeddingPipeline::with_loader(
@@ -146,7 +136,7 @@ async fn another_call_is_served_while_a_search_code_inference_is_blocked() {
         move |_: &Path| Ok(Box::new(GatedEmbedder(Arc::clone(&loader_gate))) as Box<dyn Embedder>),
         None,
     ));
-    let server = GMeshMcpServer::new(store, registry, CoreActivity::new(), indexing, embedding);
+    let server = GMeshMcpServer::new(store, host, indexing, embedding);
 
     let searching = connect(server.clone()).await;
     let other = connect(server).await;

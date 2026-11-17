@@ -1,16 +1,14 @@
 //! `answer: rows|files|count` and `total` on `find_references`,
 //! `find_callers` and `find_callees`, through their real handlers.
 
-use std::collections::{HashMap, HashSet};
+use crate::mcp::context::QueryCtx;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
-use super::query_shapes::QueryShapes;
-use super::session_hints::SessionHints;
 use super::{find_callers_callees, find_references, Answer, SymbolQueryParams};
-use crate::embedding::EmbeddingPipeline;
 use crate::model::{EdgeRecord, NodeRecord};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -32,18 +30,11 @@ fn body(result: &CallToolResult) -> serde_json::Value {
 }
 
 fn call(tool: Tool, store: &Arc<IndexStore>, params: SymbolQueryParams) -> serde_json::Value {
-    let embedding = EmbeddingPipeline::disabled();
-    let shapes = QueryShapes::shipped();
-    let capabilities = HashMap::new();
-    let hints = SessionHints::default();
+    let ctx = QueryCtx::for_test(store);
     let result = match tool {
-        Tool::References => find_references::handle(store, &embedding, shapes, &capabilities, &hints, params),
-        Tool::Callers => {
-            find_callers_callees::handle_callers(store, &embedding, shapes, &capabilities, &hints, params)
-        }
-        Tool::Callees => {
-            find_callers_callees::handle_callees(store, &embedding, shapes, &capabilities, params)
-        }
+        Tool::References => ctx.resolve_lazily(find_references::handle, params),
+        Tool::Callers => ctx.resolve_lazily(find_callers_callees::handle_callers, params),
+        Tool::Callees => ctx.resolve_lazily(find_callers_callees::handle_callees, params),
     };
     body(&result.unwrap())
 }

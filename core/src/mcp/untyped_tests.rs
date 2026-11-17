@@ -2,6 +2,7 @@
 //! then both handlers. The end-to-end cases through the rust plugin sit
 //! beside `unlinkedUsages`' in `unlinked_tests.rs`, which owns that fixture.
 
+use crate::mcp::context::QueryCtx;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -9,11 +10,8 @@ use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
 use super::*;
-use crate::embedding::EmbeddingPipeline;
 use crate::graph::queries;
-use crate::mcp::query_shapes::QueryShapes;
 use crate::mcp::response_bound::MAX_RESPONSE_BYTES;
-use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
 use crate::model::{Diff, EdgeRecord};
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
@@ -336,29 +334,17 @@ fn by_id(id: &str, limit: Option<u32>) -> SymbolQueryParams {
 
 fn callers(store: &Arc<IndexStore>, params: SymbolQueryParams) -> (serde_json::Value, usize) {
     body(
-        &find_callers_callees::handle_callers(
-            store,
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &rust_with_a_semantic_tier(),
-            &SessionHints::default(),
-            params,
-        )
-        .unwrap(),
+        &QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+            .resolve_lazily(find_callers_callees::handle_callers, params)
+            .unwrap(),
     )
 }
 
 fn references(store: &Arc<IndexStore>, params: SymbolQueryParams) -> (serde_json::Value, usize) {
     body(
-        &find_references::handle(
-            store,
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &rust_with_a_semantic_tier(),
-            &SessionHints::default(),
-            params,
-        )
-        .unwrap(),
+        &QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+            .resolve_lazily(find_references::handle, params)
+            .unwrap(),
     )
 }
 

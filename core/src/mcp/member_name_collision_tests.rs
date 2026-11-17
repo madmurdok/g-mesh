@@ -8,7 +8,7 @@
 //! and lands the edge on the free declaration. Members keep exactly the
 //! usages that address them.
 
-use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::context::QueryCtx;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,10 +16,8 @@ use std::sync::Arc;
 use rmcp::model::CallToolResult;
 
 use crate::daemon::bulk_index;
-use crate::embedding::EmbeddingPipeline;
-use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
-use crate::plugin_manifest::{read_manifest, Capabilities, DiscoveredPlugins};
+use crate::plugin_manifest::{read_manifest, DiscoveredPlugins};
 use crate::storage::connection::{open, project_dir};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -82,17 +80,7 @@ impl Walked {
             limit: Some(200),
             ..Default::default()
         };
-        json_body(
-            &find_references::handle(
-                &self.store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &HashMap::<String, Capabilities>::new(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
-        )
+        json_body(&QueryCtx::for_test(&self.store).resolve_lazily(find_references::handle, params).unwrap())
     }
 
     /// What each `kind` edge from `from` points at, as `(qualifiedName,
@@ -138,15 +126,9 @@ impl Walked {
             ..Default::default()
         };
         let body = json_body(
-            &find_callers_callees::handle_callers(
-                &self.store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &HashMap::<String, Capabilities>::new(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx::for_test(&self.store)
+                .resolve_lazily(find_callers_callees::handle_callers, params)
+                .unwrap(),
         );
         assert_ne!(body["hasMore"], serde_json::json!(true), "{qualified_name}");
         body["results"]

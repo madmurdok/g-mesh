@@ -7,14 +7,12 @@
 //! result is the caller's business.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::registry::PathCoverage;
 use crate::graph::containers::{self, DefiningContainer};
 use crate::graph::pagination;
 use crate::graph::queries;
@@ -23,8 +21,8 @@ use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResu
 use crate::graph::Direction;
 use crate::mcp::response_bound;
 use crate::model::NodeRecord;
-use crate::storage::index_store::IndexStore;
 
+use super::context::QueryCtx;
 use super::not_indexed;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{error, internal_error, success};
@@ -779,36 +777,17 @@ fn continued(conn: &Connection, token: &str, hints: &SessionHints) -> Result<Cal
     success(&walk)
 }
 
-/// `entry_points` is the union of every discovered plugin's
-/// `[plugin.workspace] entry_points` - see `daemon::registry::PluginRegistry::entry_points`
-/// and `graph::queries::entry_point_rank_expr` for where it comes from and
-/// how it is used. The caller (`mcp::GMeshMcpServer::get_dependencies`) reads
-/// it off its own `PluginRegistry` once per call, since discovery never
-/// changes while a daemon runs (see `plugin_manifest::discover`'s own
-/// contract) - there is nothing this function would gain by asking twice.
-pub(crate) fn handle(
-    store: &Arc<IndexStore>,
-    entry_points: &[String],
-    hints: &SessionHints,
-    params: GetDependenciesParams,
-) -> Result<CallToolResult, ErrorData> {
-    handle_covered(store, entry_points, hints, None, params)
-}
-
-/// [`handle`], told whether `params.file_path`'s language is indexed at all
-/// (`PluginRegistry::path_coverage`). A `file_path` in an absent or failed
-/// language that names no indexed file is refused with the reason
-/// ([`not_indexed::miss`]) before the container-key and entry-point
-/// fallbacks: a path with a known language extension is a file path, not a
-/// key, and substituting an entry point for it would answer a different
-/// question.
-pub(crate) fn handle_covered(
-    store: &Arc<IndexStore>,
-    entry_points: &[String],
-    hints: &SessionHints,
-    coverage: Option<&PathCoverage>,
-    params: GetDependenciesParams,
-) -> Result<CallToolResult, ErrorData> {
+/// `ctx.entry_points` is the union of every discovered plugin's
+/// `[plugin.workspace] entry_points`; `graph::queries::entry_point_rank_expr`
+/// says how it ranks fallback anchors. `ctx.coverage` says whether
+/// `params.file_path`'s language is indexed at all (`McpHost::path_coverage`):
+/// a `file_path` in an absent or failed language that names no indexed file
+/// is refused with the reason ([`not_indexed::miss`]) before the
+/// container-key and entry-point fallbacks, since a path with a known
+/// language extension is a file path, not a key.
+pub(crate) fn handle(ctx: &QueryCtx, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
+    let QueryCtx { store, entry_points, hints, .. } = ctx;
+    let coverage = ctx.coverage.as_ref();
     let conn = store.read();
     let GetDependenciesParams { file_path, module_id, direction, max_depth, max_fanout, resume_token } =
         params;

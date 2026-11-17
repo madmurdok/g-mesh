@@ -7,8 +7,9 @@ use std::process::{Command, Output};
 
 /// The edges whose removal broke core's large module cycle and the
 /// `storage`/`graph`/`embedding` cycle: storage reaches graph and embedding
-/// only through the `model` leaf, the `link` module and the vector seams.
-const REMOVED_EDGES: [&str; 15] = [
+/// only through the `model` leaf, the `link` module and the vector seams;
+/// `mcp` reaches its host only through the `McpHost` trait it owns.
+const REMOVED_EDGES: [&str; 16] = [
     "project_walk->watcher",
     "protocol->graph",
     "shim->mcp",
@@ -24,6 +25,7 @@ const REMOVED_EDGES: [&str; 15] = [
     "model->storage",
     "model->graph",
     "plugin_manifest->graph",
+    "mcp->daemon",
 ];
 
 /// GM-707: `watcher` keeps only the event source and `ingest` sits below
