@@ -57,8 +57,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use g_mesh_wire::{
-    FileChangeDiff, Handshake, LinkedEdge, ResolutionChangedResult, ResolutionDelta,
-    CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION,
+    AckResponse, ControlDecodeError, ControlErrorResponse, ControlMessage, ControlRequest, FileChangeDiff,
+    FileChangeResponse, Handshake, RequestId, ResolutionChangedResponse, ResolutionChangedResult,
+    ResolutionDelta, ResolutionFactsTrailer, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION,
 };
 
 use crate::diff::diff_file;
@@ -207,17 +208,14 @@ fn bulk_index<E: Extractor>(extractor: &E, spec: &ResolvedSpec, root: &Path) -> 
     }
 
     // The facts the walk was built from, last: core stores them with the
-    // walk's rows, and a stream cut short never delivers them. `watchPaths`
-    // is written only when non-empty, so a plugin declaring none keeps
-    // working with an older core, which rejects the field.
+    // walk's rows, and a stream cut short never delivers them.
     if let Some(facts) = facts_caught(extractor, &project, &spec.language) {
         let watch_paths = watch_paths_caught(extractor, &project, &spec.language);
-        let line = if watch_paths.is_empty() {
-            serde_json::json!({ "resolutionFacts": facts })
-        } else {
-            serde_json::json!({ "resolutionFacts": facts, "watchPaths": watch_paths })
-        };
-        if let Err(err) = writeln!(out, "{line}") {
+        let trailer = ResolutionFactsTrailer { resolution_facts: facts, watch_paths };
+        let written = serde_json::to_string(&trailer)
+            .map_err(io::Error::other)
+            .and_then(|line| writeln!(out, "{line}"));
+        if let Err(err) = written {
             crate::log_line!("[{}] failed to write the bulk stream: {err}", spec.language);
             return 1;
         }
@@ -416,64 +414,68 @@ impl<E: Extractor> Session<'_, E> {
 
     /// Handles one frame and writes at most one response.
     fn handle<W: Write>(&mut self, body: &[u8], out: &mut W) -> anyhow::Result<()> {
-        // Parsed as a loose value rather than straight into `ControlEnvelope`:
-        // an envelope whose `method` this SDK does not know fails to
-        // deserialize as a whole, id and all, and a request left unanswered
-        // wedges core's stream until its timeout. This way an unknown method
-        // still gets an acknowledgement.
-        let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body) else {
+        // Decoded tolerantly rather than straight into `ControlEnvelope`: an
+        // envelope whose `method` this SDK does not know fails to deserialize
+        // as a whole, id and all, and a request left unanswered wedges core's
+        // stream until its timeout. This way an unknown method still gets an
+        // acknowledgement, and a malformed one an error answer.
+        let Ok(request) = ControlRequest::parse(body) else {
             crate::log_line!("[{}] ignoring a control message that is not JSON", self.spec.language);
             return Ok(());
         };
-        let id = envelope.get("id").filter(|id| !id.is_null()).cloned();
-        let method = envelope.get("method").and_then(|method| method.as_str()).unwrap_or_default();
-        let params = envelope.get("params");
+        let ControlRequest { id, method, message, dropped } = request;
+        if !dropped.is_empty() {
+            crate::log_line!("[{}] {method}: ignoring malformed {}", self.spec.language, dropped.join(", "));
+        }
+        let message = match message {
+            Ok(message) => message,
+            Err(ControlDecodeError::UnknownMethod) => {
+                if !method.is_empty() {
+                    crate::log_line!("[{}] ignoring unknown control method {method:?}", self.spec.language);
+                }
+                return self.acknowledge(out, id);
+            }
+            Err(ControlDecodeError::BadId) => {
+                crate::log_line!(
+                    "[{}] ignoring a {method:?} control message whose id is neither an integer nor a string",
+                    self.spec.language
+                );
+                return Ok(());
+            }
+            Err(ControlDecodeError::BadParams(reason)) => {
+                crate::log_line!("[{}] {method}: malformed params ({reason})", self.spec.language);
+                let Some(id) = id else { return Ok(()) };
+                write_message(out, &ControlErrorResponse::invalid_params(id, reason))?;
+                return Ok(());
+            }
+        };
 
-        match method {
-            "fileChanged" => {
-                let path = params
-                    .and_then(|params| params.get("filePath"))
-                    .and_then(|path| path.as_str())
-                    .unwrap_or_default();
-                let reextract = params
-                    .and_then(|params| params.get("reextract"))
-                    .and_then(|reextract| reextract.as_bool())
-                    .unwrap_or(false);
-                let diff = self.file_changed(&RelPath::new(path), reextract);
+        match message {
+            ControlMessage::FileChanged { file_path, reextract } => {
+                let diff = self.file_changed(&RelPath::new(&file_path), reextract);
                 self.respond(out, id, diff)
             }
-            "filesCreated" => {
+            ControlMessage::FilesCreated { file_paths } => {
                 // A notification: every listed file was created in one
                 // watcher batch, and each still gets its own `fileChanged`
                 // after this. Only presence is applied here, nothing is
-                // extracted, so there is no diff to answer with. A non-string
-                // entry costs itself, not the list.
-                let files: Vec<RelPath> = params
-                    .and_then(|params| params.get("filePaths"))
-                    .and_then(|paths| paths.as_array())
-                    .map(|paths| paths.iter().filter_map(|path| path.as_str()).map(RelPath::new).collect())
-                    .unwrap_or_default();
+                // extracted, so there is no diff to answer with.
+                let files: Vec<RelPath> = file_paths.iter().map(RelPath::new).collect();
                 self.files_created(&files);
                 self.acknowledge(out, id)
             }
-            "semanticPass" => {
+            ControlMessage::SemanticPass { file_paths, linked_edges, budget_ms } => {
                 // Core's timer for this request started when it was sent, so
                 // the deadline is reckoned from its arrival, before the hold
                 // point and the hydration below spend any of it (GM-521). An
                 // absent or unrepresentable budget leaves the engine's own.
                 let received = Instant::now();
-                let deadline = params
-                    .and_then(|params| params.get("budgetMs"))
-                    .and_then(|budget| budget.as_u64())
-                    .and_then(|millis| received.checked_add(Duration::from_millis(millis)));
+                let deadline =
+                    budget_ms.and_then(|millis| received.checked_add(Duration::from_millis(millis)));
                 // Test-only (GM-397): parks the pass before any engine
                 // starts, blocking this thread as a long pass would.
                 hold_point("semantic", &self.spec.language);
-                let files: Vec<RelPath> = params
-                    .and_then(|params| params.get("filePaths"))
-                    .and_then(|paths| paths.as_array())
-                    .map(|paths| paths.iter().filter_map(|path| path.as_str()).map(RelPath::new).collect())
-                    .unwrap_or_default();
+                let files: Vec<RelPath> = file_paths.iter().map(RelPath::new).collect();
                 // A per-file pass needs every file its answers can land in,
                 // not only its own (GM-487): an answer pointing into a file
                 // the index does not hold is dropped as "outside the index".
@@ -490,36 +492,20 @@ impl<E: Extractor> Session<'_, E> {
                 // lands where core already linked an edge is agreement. Always
                 // replaced: a pass without the field has nothing linked, and
                 // an earlier pass's links describe text that may have changed.
-                // An entry that does not parse costs itself, not the list.
-                let linked = params
-                    .and_then(|params| params.get("linkedEdges"))
-                    .and_then(|edges| edges.as_array())
-                    .map(|edges| {
-                        edges
-                            .iter()
-                            .filter_map(|edge| serde_json::from_value::<LinkedEdge>(edge.clone()).ok())
-                            .map(|edge| (edge.edge_id, edge.to_id))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                self.index.set_linked(linked);
+                self.index.set_linked(linked_edges.into_iter().map(|edge| (edge.edge_id, edge.to_id)));
                 let root = self.root.clone();
                 self.engine.set_pass_deadline(deadline);
                 let answer = self.engine.answer(&files, &self.index, &root);
                 self.respond_to_pass(out, id, files.is_empty(), answer)
             }
-            "workspaceChanged" => {
+            ControlMessage::WorkspaceChanged { file_path } => {
                 // A notification: core follows it with the per-language
                 // reindex that repopulates the graph, so there is no diff to
                 // answer with. What it means for the plugin is that every
                 // cached extraction was made against a project model that no
                 // longer applies.
-                let file = params
-                    .and_then(|params| params.get("filePath"))
-                    .and_then(|path| path.as_str())
-                    .unwrap_or_default();
                 crate::log_line!(
-                    "[{}] workspace changed ({file}) - reloading the project model",
+                    "[{}] workspace changed ({file_path}) - reloading the project model",
                     self.spec.language
                 );
                 self.index.clear();
@@ -530,24 +516,14 @@ impl<E: Extractor> Session<'_, E> {
                 self.engine.workspace_changed();
                 self.acknowledge(out, id)
             }
-            "resolutionChanged" => {
-                let file = params
-                    .and_then(|params| params.get("filePath"))
-                    .and_then(|path| path.as_str())
-                    .unwrap_or_default();
-                let previous = params
-                    .and_then(|params| params.get("previousFacts"))
-                    .and_then(|facts| facts.as_str())
-                    .map(str::to_string);
-                let result = self.resolution_changed(file, previous.as_deref());
+            ControlMessage::ResolutionChanged { file_path, previous_facts } => {
+                let result = self.resolution_changed(&file_path, previous_facts.as_deref());
                 let Some(id) = id else { return Ok(()) };
-                write_message(
-                    out,
-                    &serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": result }),
-                )?;
+                let response = ResolutionChangedResponse { jsonrpc: JSONRPC_VERSION.to_string(), id, result };
+                write_message(out, &response)?;
                 Ok(())
             }
-            "prepareSemanticPass" => {
+            ControlMessage::PrepareSemanticPass => {
                 // A notification: a whole-project pass is owed and will
                 // follow, so the engine may start now. Nothing is hydrated
                 // here - the pass does that against the files it is asked.
@@ -558,12 +534,7 @@ impl<E: Extractor> Session<'_, E> {
             // `reindex` is a no-op by design: a whole-project rebuild is an
             // unbounded stream, not one response frame, so core runs it as a
             // separate `--bulk-index` process. `status` is a liveness probe.
-            other => {
-                if !other.is_empty() && other != "reindex" && other != "status" {
-                    crate::log_line!("[{}] ignoring unknown control method {other:?}", self.spec.language);
-                }
-                self.acknowledge(out, id)
-            }
+            ControlMessage::Reindex { .. } | ControlMessage::Status => self.acknowledge(out, id),
         }
     }
 
@@ -857,7 +828,7 @@ impl<E: Extractor> Session<'_, E> {
     fn respond_to_pass<W: Write>(
         &self,
         out: &mut W,
-        id: Option<serde_json::Value>,
+        id: Option<RequestId>,
         whole_project: bool,
         answer: crate::semantic::SemanticAnswer,
     ) -> anyhow::Result<()> {
@@ -878,23 +849,28 @@ impl<E: Extractor> Session<'_, E> {
     fn respond<W: Write>(
         &self,
         out: &mut W,
-        id: Option<serde_json::Value>,
+        id: Option<RequestId>,
         diff: FileChangeDiff,
     ) -> anyhow::Result<()> {
         let Some(id) = id else { return Ok(()) };
-        write_message(out, &serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": diff }))?;
+        let response = FileChangeResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id,
+            result: diff,
+            incomplete: false,
+            incomplete_reason: None,
+            unfinished_files: None,
+        };
+        write_message(out, &response)?;
         Ok(())
     }
 
     /// The answer to a method that produces no diff. Never sent for
     /// `fileChanged`/`semanticPass`: core deserializes those responses as a
     /// `FileChangeResponse` and this shape is not one.
-    fn acknowledge<W: Write>(&self, out: &mut W, id: Option<serde_json::Value>) -> anyhow::Result<()> {
+    fn acknowledge<W: Write>(&self, out: &mut W, id: Option<RequestId>) -> anyhow::Result<()> {
         let Some(id) = id else { return Ok(()) };
-        write_message(
-            out,
-            &serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": { "acknowledged": true } }),
-        )?;
+        write_message(out, &AckResponse::new(id))?;
         Ok(())
     }
 }
@@ -907,28 +883,21 @@ impl<E: Extractor> Session<'_, E> {
 /// this JSON, and the difference between a pass that is recorded as done and
 /// one that is retried is one key in it.
 fn pass_response(
-    id: serde_json::Value,
+    id: RequestId,
     whole_project: bool,
     answer: crate::semantic::SemanticAnswer,
-) -> serde_json::Value {
+) -> FileChangeResponse {
     let incomplete = whole_project && !answer.complete;
-    let mut response = serde_json::json!({
-        "jsonrpc": JSONRPC_VERSION,
-        "id": id,
-        "result": answer.diff,
-        "incomplete": incomplete,
-    });
-    if let (true, Some(reason)) = (incomplete, answer.reason) {
-        response["incompleteReason"] = serde_json::Value::String(reason);
+    FileChangeResponse {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id,
+        result: answer.diff,
+        incomplete,
+        incomplete_reason: answer.reason.filter(|_| incomplete),
+        // Sent on per-file passes too, whatever `incomplete` says: core reads
+        // the list to settle exactly the files a pass finished.
+        unfinished_files: answer.unfinished.map(|files| files.iter().map(ToString::to_string).collect()),
     }
-    // Sent on per-file passes too, whatever `incomplete` says: core reads the
-    // list to settle exactly the files a pass finished.
-    if let Some(unfinished) = answer.unfinished {
-        response["unfinishedFiles"] = serde_json::Value::Array(
-            unfinished.iter().map(|file| serde_json::Value::String(file.to_string())).collect(),
-        );
-    }
-    response
 }
 
 // --- shared helpers ---------------------------------------------------------
@@ -1085,21 +1054,19 @@ mod tests {
     /// had its semantic pass - and the reason a per-file pass never carries it.
     #[test]
     fn only_a_whole_project_pass_reports_that_it_did_not_finish() {
-        let id = serde_json::json!(7);
+        let id = RequestId::Number(7);
         let incomplete = SemanticAnswer::incomplete(FileChangeDiff::default());
         let complete = SemanticAnswer::complete(FileChangeDiff::default());
 
         let response = pass_response(id.clone(), true, incomplete.clone());
-        assert_eq!(response["incomplete"], serde_json::json!(true));
-        assert!(response.get("result").is_some(), "an incomplete pass still carries its diff");
+        assert!(response.incomplete);
 
-        assert_eq!(pass_response(id.clone(), true, complete.clone())["incomplete"], serde_json::json!(false));
-        assert_eq!(
-            pass_response(id.clone(), false, incomplete)["incomplete"],
-            serde_json::json!(false),
+        assert!(!pass_response(id.clone(), true, complete.clone()).incomplete);
+        assert!(
+            !pass_response(id.clone(), false, incomplete).incomplete,
             "a per-file pass has no completion flag to protect"
         );
-        assert_eq!(pass_response(id, false, complete)["incomplete"], serde_json::json!(false));
+        assert!(!pass_response(id, false, complete).incomplete);
     }
 
     /// An incomplete whole-project pass carries the engine's reason for core
@@ -1107,14 +1074,14 @@ mod tests {
     /// flag.
     #[test]
     fn an_incomplete_whole_project_pass_says_why() {
-        let id = serde_json::json!(7);
+        let id = RequestId::Number(7);
         let answer = SemanticAnswer::incomplete_because(FileChangeDiff::default(), "the server exited");
 
         let response = pass_response(id.clone(), true, answer.clone());
-        assert_eq!(response["incompleteReason"], serde_json::json!("the server exited"));
-        assert!(pass_response(id.clone(), false, answer).get("incompleteReason").is_none());
+        assert_eq!(response.incomplete_reason.as_deref(), Some("the server exited"));
+        assert!(pass_response(id.clone(), false, answer).incomplete_reason.is_none());
         let complete = SemanticAnswer::complete(FileChangeDiff::default());
-        assert!(pass_response(id, true, complete).get("incompleteReason").is_none());
+        assert!(pass_response(id, true, complete).incomplete_reason.is_none());
     }
 
     /// `unfinishedFiles` is sent whenever the engine named its unfinished
@@ -1124,7 +1091,7 @@ mod tests {
     /// nothing sends no key at all.
     #[test]
     fn the_unfinished_files_are_sent_on_every_kind_of_pass() {
-        let id = serde_json::json!(7);
+        let id = RequestId::Number(7);
         let named: std::collections::BTreeSet<RelPath> =
             [RelPath::new("src/b.toy"), RelPath::new("src/a.toy")].into_iter().collect();
         let incomplete = SemanticAnswer::incomplete(FileChangeDiff::default()).with_unfinished(named.clone());
@@ -1133,8 +1100,8 @@ mod tests {
         for whole_project in [false, true] {
             for answer in [incomplete.clone(), complete.clone()] {
                 assert_eq!(
-                    pass_response(id.clone(), whole_project, answer)["unfinishedFiles"],
-                    serde_json::json!(["src/a.toy", "src/b.toy"]),
+                    pass_response(id.clone(), whole_project, answer).unfinished_files,
+                    Some(vec!["src/a.toy".to_string(), "src/b.toy".to_string()]),
                     "whole_project = {whole_project}"
                 );
             }
@@ -1142,10 +1109,10 @@ mod tests {
 
         let none_left = SemanticAnswer::complete(FileChangeDiff::default())
             .with_unfinished(std::collections::BTreeSet::new());
-        assert_eq!(pass_response(id.clone(), false, none_left)["unfinishedFiles"], serde_json::json!([]));
+        assert_eq!(pass_response(id.clone(), false, none_left).unfinished_files, Some(Vec::new()));
         for whole_project in [false, true] {
             let silent = SemanticAnswer::incomplete(FileChangeDiff::default());
-            assert!(pass_response(id.clone(), whole_project, silent).get("unfinishedFiles").is_none());
+            assert!(pass_response(id.clone(), whole_project, silent).unfinished_files.is_none());
         }
     }
 
@@ -1164,9 +1131,9 @@ mod tests {
         let graph = builder.finish();
 
         let diff = FileChangeDiff { upsert_nodes: graph.nodes, ..Default::default() };
-        let response = pass_response(serde_json::json!(1), true, SemanticAnswer::incomplete(diff));
-        assert_eq!(response["incomplete"], serde_json::json!(true));
-        assert_eq!(response["result"]["upsertNodes"].as_array().map(Vec::len), Some(1));
+        let response = pass_response(RequestId::Number(1), true, SemanticAnswer::incomplete(diff));
+        assert!(response.incomplete);
+        assert_eq!(response.result.upsert_nodes.len(), 1);
     }
 
     /// An extractor that panics on one file costs that file and nothing else -

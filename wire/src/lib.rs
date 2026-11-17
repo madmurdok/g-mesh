@@ -950,6 +950,245 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// The JSON-RPC 2.0 answer to a request that produces no diff: every control
+/// method other than `fileChanged`, `semanticPass` and `resolutionChanged`,
+/// and a method the plugin does not know.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AckResponse {
+    pub jsonrpc: String,
+    pub id: RequestId,
+    pub result: AckResult,
+}
+
+impl AckResponse {
+    pub fn new(id: RequestId) -> Self {
+        Self { jsonrpc: JSONRPC_VERSION.to_string(), id, result: AckResult { acknowledged: true } }
+    }
+}
+
+/// [`AckResponse`]'s `result`: `{"acknowledged": true}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AckResult {
+    pub acknowledged: bool,
+}
+
+/// JSON-RPC 2.0's "Invalid params" error code.
+pub const INVALID_PARAMS: i64 = -32602;
+
+/// The JSON-RPC 2.0 error answer to a request whose `params` do not decode.
+/// Core reads every answer typed, so this fails the one request it answers
+/// and leaves the stream in step, where no answer at all would hold the
+/// stream until core's round-trip timeout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlErrorResponse {
+    pub jsonrpc: String,
+    pub id: RequestId,
+    pub error: ControlError,
+}
+
+impl ControlErrorResponse {
+    pub fn invalid_params(id: RequestId, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id,
+            error: ControlError { code: INVALID_PARAMS, message: message.into() },
+        }
+    }
+}
+
+/// [`ControlErrorResponse`]'s `error` object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlError {
+    pub code: i64,
+    pub message: String,
+}
+
+/// The last line of a `resolution_delta` plugin's bulk-index stream: the
+/// resolution facts the walk was built from, and the files whose save changes
+/// that model. `watchPaths` is written only when non-empty, so a plugin that
+/// declares none keeps working with an older core, which rejects the field.
+/// `deny_unknown_fields` keeps a node or edge line from ever decoding as this.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolutionFactsTrailer {
+    pub resolution_facts: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_paths: Vec<String>,
+}
+
+/// A control-plane body that is not JSON at all: logged, never answered,
+/// since there is no id to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotJson;
+
+/// Why a control frame's message did not decode into a [`ControlMessage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlDecodeError {
+    /// A `method` this wire version does not define, or none at all. A plugin
+    /// acknowledges it, so a newer core's request does not wedge the stream.
+    UnknownMethod,
+    /// A known method whose `params` do not decode: a required field missing
+    /// or mistyped, or a non-empty list with no valid entry. Answered with a
+    /// [`ControlErrorResponse`] when the frame has an id.
+    BadParams(String),
+    /// An `id` that is neither an integer nor a string. Never answered: the
+    /// answer could not carry it back.
+    BadId,
+}
+
+impl std::fmt::Display for ControlDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownMethod => f.write_str("unknown control method"),
+            Self::BadParams(reason) => f.write_str(reason),
+            Self::BadId => f.write_str("the request id is neither an integer nor a string"),
+        }
+    }
+}
+
+impl std::error::Error for ControlDecodeError {}
+
+/// One control frame as a plugin receives it, decoded tolerantly.
+///
+/// Rules, in order of how much of the frame they cost:
+/// - a malformed entry of `filesCreated.filePaths`, `semanticPass.filePaths`
+///   or `semanticPass.linkedEdges` is dropped and named in [`Self::dropped`];
+///   a non-empty list whose every entry is dropped is
+///   [`ControlDecodeError::BadParams`], since an empty `semanticPass` list
+///   means the whole project;
+/// - a mistyped optional scalar (`reextract`, `budgetMs`, `previousFacts`)
+///   decodes as absent and is named in [`Self::dropped`];
+/// - a missing or mistyped required field is [`ControlDecodeError::BadParams`];
+/// - a method this wire version does not define is
+///   [`ControlDecodeError::UnknownMethod`];
+/// - an `id` that is not an integer or a string is
+///   [`ControlDecodeError::BadId`].
+///
+/// The tolerance lives here rather than in `#[serde]` attributes on
+/// [`ControlMessage`], so a strict decode of a [`ControlEnvelope`] stays
+/// strict.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlRequest {
+    /// `None` for a notification, and for a frame whose id is
+    /// [`ControlDecodeError::BadId`].
+    pub id: Option<RequestId>,
+    /// The method as sent, empty when there was none; kept for logging an
+    /// unknown method.
+    pub method: String,
+    pub message: Result<ControlMessage, ControlDecodeError>,
+    /// What was dropped to decode `message`: `filePaths[3]` for a list entry,
+    /// `budgetMs` for an optional scalar.
+    pub dropped: Vec<String>,
+}
+
+impl ControlRequest {
+    pub fn parse(body: &[u8]) -> Result<Self, NotJson> {
+        use serde_json::Value;
+
+        let value: Value = serde_json::from_slice(body).map_err(|_| NotJson)?;
+        let Value::Object(mut envelope) = value else {
+            return Ok(Self::failed(None, String::new(), ControlDecodeError::UnknownMethod));
+        };
+        let method = envelope.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
+        let id = match envelope.remove("id") {
+            None | Some(Value::Null) => None,
+            Some(id) => match serde_json::from_value::<RequestId>(id) {
+                Ok(id) => Some(id),
+                Err(_) => return Ok(Self::failed(None, method, ControlDecodeError::BadId)),
+            },
+        };
+
+        let mut params = match envelope.remove("params") {
+            None | Some(Value::Null) => serde_json::Map::new(),
+            Some(Value::Object(params)) => params,
+            Some(_) => {
+                let error = ControlDecodeError::BadParams("params is not an object".to_string());
+                return Ok(Self::failed(id, method, error));
+            }
+        };
+        let mut dropped = Vec::new();
+        let tolerated = match method.as_str() {
+            "reindex" | "workspaceChanged" => Ok(true),
+            "status" | "prepareSemanticPass" => Ok(false),
+            "fileChanged" => {
+                drop_mistyped::<bool>(&mut params, "reextract", &mut dropped);
+                Ok(true)
+            }
+            "filesCreated" => {
+                keep_valid_entries::<String>(&mut params, "filePaths", &mut dropped).map(|()| true)
+            }
+            "semanticPass" => {
+                drop_mistyped::<u64>(&mut params, "budgetMs", &mut dropped);
+                keep_valid_entries::<String>(&mut params, "filePaths", &mut dropped)
+                    .and_then(|()| keep_valid_entries::<LinkedEdge>(&mut params, "linkedEdges", &mut dropped))
+                    .map(|()| true)
+            }
+            "resolutionChanged" => {
+                drop_mistyped::<String>(&mut params, "previousFacts", &mut dropped);
+                Ok(true)
+            }
+            _ => Err(ControlDecodeError::UnknownMethod),
+        };
+        let message = tolerated.and_then(|has_params| {
+            let mut frame = serde_json::Map::new();
+            frame.insert("method".to_string(), Value::String(method.clone()));
+            if has_params {
+                frame.insert("params".to_string(), Value::Object(params));
+            }
+            serde_json::from_value::<ControlMessage>(Value::Object(frame))
+                .map_err(|err| ControlDecodeError::BadParams(err.to_string()))
+        });
+        Ok(Self { id, method, message, dropped })
+    }
+
+    fn failed(id: Option<RequestId>, method: String, error: ControlDecodeError) -> Self {
+        Self { id, method, message: Err(error), dropped: Vec::new() }
+    }
+}
+
+/// Drops every entry of the list at `key` that does not decode as `T`, naming
+/// each in `dropped`. A missing or non-list value is left for the typed
+/// decode to judge.
+fn keep_valid_entries<T: serde::de::DeserializeOwned>(
+    params: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    dropped: &mut Vec<String>,
+) -> Result<(), ControlDecodeError> {
+    let Some(serde_json::Value::Array(entries)) = params.get_mut(key) else { return Ok(()) };
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut kept = Vec::with_capacity(entries.len());
+    for (index, entry) in std::mem::take(entries).into_iter().enumerate() {
+        if T::deserialize(&entry).is_ok() {
+            kept.push(entry);
+        } else {
+            dropped.push(format!("{key}[{index}]"));
+        }
+    }
+    if kept.is_empty() {
+        return Err(ControlDecodeError::BadParams(format!("{key}: every entry is malformed")));
+    }
+    *entries = kept;
+    Ok(())
+}
+
+/// Removes the optional scalar at `key` when it is null or does not decode as
+/// `T`, so it reads as absent; a mistyped one is named in `dropped`.
+fn drop_mistyped<T: serde::de::DeserializeOwned>(
+    params: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    dropped: &mut Vec<String>,
+) {
+    let Some(value) = params.get(key) else { return };
+    if value.is_null() {
+        params.remove(key);
+    } else if T::deserialize(value).is_err() {
+        params.remove(key);
+        dropped.push(key.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
