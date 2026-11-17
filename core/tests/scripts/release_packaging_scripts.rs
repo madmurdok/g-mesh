@@ -301,6 +301,172 @@ fn a_repo_manifest_without_the_rewritten_command_line_stops_the_bundle() {
 }
 
 // ---------------------------------------------------------------------------
+// scripts/bundle-cargo-plugin.sh
+// ---------------------------------------------------------------------------
+
+/// The languages `bundle-cargo-plugin.sh` bundles.
+const CARGO_BUNDLED: [&str; 2] = ["rust", "python"];
+
+/// A scratch repo root holding `bundle-cargo-plugin.sh`, the libraries it
+/// sources and the real `plugins/<language>/plugin.toml` of every language it
+/// bundles. The stand-in plugin binary answers the handshake as `language`.
+struct CargoBundleRoot {
+    root: tempfile::TempDir,
+    language: &'static str,
+}
+
+impl CargoBundleRoot {
+    fn new(language: &'static str) -> Self {
+        let root = tempfile::tempdir().expect("failed to create a scratch repo root");
+        for script in
+            ["scripts/bundle-cargo-plugin.sh", "scripts/lib/runnable.sh", "scripts/lib/bundle-tail.sh"]
+        {
+            copy_from_repo(root.path(), script);
+        }
+        for bundled in CARGO_BUNDLED {
+            copy_from_repo(root.path(), &format!("plugins/{bundled}/plugin.toml"));
+        }
+        fake_toolchain(&root.path().join("fake-bin"));
+        write_executable(
+            &root.path().join("payload/plugin"),
+            &format!("#!/bin/sh\necho '{{\"language\":\"{language}\"}}'\n"),
+        );
+        CargoBundleRoot { root, language }
+    }
+
+    fn dest(&self) -> PathBuf {
+        self.root.path().join("dist/plugins")
+    }
+
+    fn stage(&self) -> PathBuf {
+        self.dest().join(self.language)
+    }
+
+    fn exe(&self, target: &str) -> String {
+        let ext = if target.contains("-windows-") { ".exe" } else { "" };
+        format!("g-mesh-plugin-{}{ext}", self.language)
+    }
+
+    /// Runs the script as `bundle-cargo-plugin.sh <language_arg> <target> <dest>`;
+    /// the stand-in cargo builds `self.exe(target)`.
+    fn run(&self, language_arg: &str, target: &str) -> Output {
+        Command::new("bash")
+            .arg(self.root.path().join("scripts/bundle-cargo-plugin.sh"))
+            .arg(language_arg)
+            .arg(target)
+            .arg(self.dest())
+            .env("PATH", path_with(&self.root.path().join("fake-bin")))
+            .env("CARGO_PROFILE", "release")
+            .env_remove("G_MESH_REQUIRE_SMOKE")
+            .env("FAKE_REPO_ROOT", self.root.path())
+            .env("FAKE_CARGO_PAYLOAD", self.root.path().join("payload/plugin"))
+            .env("FAKE_CARGO_OUTPUT", self.exe(target))
+            .output()
+            .expect("failed to run bash")
+    }
+}
+
+/// Asserts `stage/plugin.toml` is `plugins/<language>/plugin.toml`, byte for
+/// byte, below a header of comment lines, with only its dev spawn command
+/// rewritten to `./<exe>`.
+fn assert_staged_cargo_manifest(language: &str, stage: &Path, exe: &str) {
+    let dev_command = format!(r#"command = "${{G_MESH_BIN_DIR}}/g-mesh-plugin-{language}""#);
+    let source = fs::read_to_string(repo_root().join(format!("plugins/{language}/plugin.toml"))).unwrap();
+    assert_eq!(
+        source.matches(&dev_command).count(),
+        1,
+        "{language}: the repo manifest names the dev command once"
+    );
+    let expected = source.replace(&dev_command, &format!(r#"command = "./{exe}""#));
+    let staged = fs::read_to_string(stage.join("plugin.toml")).unwrap();
+    let header = staged.strip_suffix(expected.as_str()).unwrap_or_else(|| {
+        panic!("{language}: the staged manifest is not the repo's with only the command rewritten:\n{staged}")
+    });
+    assert!(
+        header.lines().all(|line| line.starts_with('#')),
+        "{language}: only comment lines may precede the copied manifest:\n{header}"
+    );
+}
+
+/// Each cargo-built plugin is staged on the host as its binary and its repo
+/// manifest with the command rewritten, after a handshake in its own language.
+///
+/// Control: drop `"$LANGUAGE"` from the script's marker - the rewrite then
+/// leaves the language name after `./g-mesh-plugin-<language>` and this fails.
+#[test]
+fn the_cargo_bundle_stages_each_language_with_its_manifest_rewritten() {
+    for language in CARGO_BUNDLED {
+        let bundle = CargoBundleRoot::new(language);
+        let output = bundle.run(language, HOST);
+        assert!(output.status.success(), "{language}\n{}", describe(&output));
+        assert!(stdout_of(&output).contains("handshake ok"), "{language}\n{}", describe(&output));
+        let exe = bundle.exe(HOST);
+        assert_eq!(entries_of(&bundle.stage()), BTreeSet::from(["plugin.toml".to_string(), exe.clone()]));
+        assert_staged_cargo_manifest(language, &bundle.stage(), &exe);
+    }
+}
+
+/// A handshake that names another language stops the bundle: the smoke test
+/// checks the language bundled, not any plugin's.
+///
+/// Control: replace `$language` with `rust` in the tail's handshake pattern -
+/// the python run passes and this fails.
+#[test]
+fn the_cargo_bundle_refuses_a_binary_answering_as_another_language() {
+    let bundle = CargoBundleRoot::new("python");
+    write_executable(
+        &bundle.root.path().join("payload/plugin"),
+        "#!/bin/sh\necho '{\"language\":\"rust\"}'\n",
+    );
+    let output = bundle.run("python", HOST);
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(
+        stderr_of(&output).contains("the staged Python plugin did not produce a handshake"),
+        "{}",
+        describe(&output)
+    );
+}
+
+/// For a Windows target the staged binary, and the command the manifest
+/// names, is `g-mesh-plugin-<language>.exe`.
+///
+/// Control: drop the `*-windows-*` branch of `exe_name_for` - the script looks
+/// for the binary without `.exe` and this fails.
+#[test]
+fn the_cargo_bundle_names_the_exe_for_a_windows_target() {
+    for language in CARGO_BUNDLED {
+        let bundle = CargoBundleRoot::new(language);
+        let output = bundle.run(language, WINDOWS);
+        assert!(output.status.success(), "{language}\n{}", describe(&output));
+        assert!(stdout_of(&output).contains("smoke test skipped"), "{language}\n{}", describe(&output));
+        let exe = format!("g-mesh-plugin-{language}.exe");
+        assert_eq!(entries_of(&bundle.stage()), BTreeSet::from(["plugin.toml".to_string(), exe.clone()]));
+        assert_staged_cargo_manifest(language, &bundle.stage(), &exe);
+    }
+}
+
+/// A language the script does not bundle, or none, is a usage error before
+/// anything is built or staged.
+///
+/// Control: add `typescript` to the script's language `case` - the stand-in
+/// cargo builds it and this fails.
+#[test]
+fn the_cargo_bundle_refuses_a_language_it_does_not_bundle() {
+    for language_arg in ["go", "typescript", "ruby", ""] {
+        let bundle = CargoBundleRoot::new("rust");
+        let output = bundle.run(language_arg, HOST);
+        assert_eq!(output.status.code(), Some(1), "{language_arg:?}\n{}", describe(&output));
+        assert!(
+            stderr_of(&output).contains("usage: bundle-cargo-plugin.sh <rust|python>"),
+            "{language_arg:?}\n{}",
+            describe(&output)
+        );
+        assert!(!bundle.dest().exists(), "{language_arg:?}: something was staged");
+        assert!(!bundle.root.path().join("target").exists(), "{language_arg:?}: cargo built something");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // scripts/build-targets.sh
 // ---------------------------------------------------------------------------
 
@@ -736,6 +902,51 @@ fn bundled_plugins_are_the_catalogue_languages() {
     let catalogue: BTreeSet<String> =
         g_mesh::languages::CATALOGUE.iter().map(|entry| entry.language.to_owned()).collect();
     assert_eq!(bundled_set, catalogue);
+}
+
+/// `--plugins cargo` and `--plugins go` split `--plugins` into its two build
+/// kinds, each in `--plugins` order: every cargo plugin is a crate under
+/// `plugins/<language>`, every go one a Go module there.
+///
+/// Control: make `plugins_of_kind` ignore its kind - `--plugins cargo` then
+/// prints every plugin and this fails.
+#[test]
+fn plugins_of_a_kind_split_the_plugin_list_by_how_each_is_built() {
+    let all = build_targets_query(&["--plugins"]);
+    let cargo = build_targets_query(&["--plugins", "cargo"]);
+    let go = build_targets_query(&["--plugins", "go"]);
+    assert!(!cargo.is_empty() && !go.is_empty(), "cargo {cargo:?}, go {go:?}");
+    let in_list_order =
+        |kind: &[String]| all.iter().filter(|lang| kind.contains(lang)).cloned().collect::<Vec<_>>();
+    assert_eq!(in_list_order(&cargo), cargo, "--plugins cargo is not in --plugins order");
+    assert_eq!(in_list_order(&go), go, "--plugins go is not in --plugins order");
+    let mut union: Vec<String> = cargo.iter().chain(&go).cloned().collect();
+    union.sort();
+    let mut sorted_all = all.clone();
+    sorted_all.sort();
+    assert_eq!(union, sorted_all, "cargo {cargo:?} and go {go:?} do not partition {all:?}");
+    for lang in &cargo {
+        assert!(repo_root().join(format!("plugins/{lang}/Cargo.toml")).is_file(), "cargo plugin {lang}");
+    }
+    for lang in &go {
+        assert!(repo_root().join(format!("plugins/{lang}/go.mod")).is_file(), "go plugin {lang}");
+    }
+}
+
+/// A kind that is neither `cargo` nor `go` is refused, printing no language.
+///
+/// Control: drop the kind `case` in `plugins_of_kind` - an unknown kind prints
+/// nothing and exits 0, and this fails.
+#[test]
+fn plugins_of_an_unknown_kind_are_refused() {
+    let output = Command::new("bash")
+        .arg(repo_root().join("scripts/build-targets.sh"))
+        .args(["--plugins", "node"])
+        .output()
+        .expect("failed to run bash");
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(stderr_of(&output).contains("unknown plugin kind 'node'"), "{}", describe(&output));
+    assert_eq!(stdout_of(&output), "", "{}", describe(&output));
 }
 
 /// Behaviour 12: `build_one` writes one asset per bundled language whose only
@@ -1335,4 +1546,42 @@ fn install_latest_runs_after_publish_and_asserts_latest_is_the_tag() {
         let throw = assert + position(&step[assert..], "throw \"releases/latest is $latest");
         assert!(read < assert && assert < throw, "{name} does not assert latest == the tag:\n{step}");
     }
+}
+
+/// The plugin languages a line names as list items: whole words, outside a
+/// `#` comment and outside double-quoted text (messages, which may name them
+/// in prose).
+fn plugin_languages_listed_on(line: &str, languages: &[String]) -> Vec<String> {
+    let code = line.split(" #").next().unwrap_or("");
+    if code.trim_start().starts_with('#') {
+        return Vec::new();
+    }
+    let unquoted: String = code.split('"').step_by(2).collect::<Vec<_>>().join(" ");
+    let words: BTreeSet<&str> =
+        unquoted.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')).collect();
+    languages.iter().filter(|lang| words.contains(lang.as_str())).cloned().collect()
+}
+
+/// release.yml reads the plugin list from `build-targets.sh --plugins`: no
+/// line of it lists two or more plugin languages itself.
+///
+/// Control: restore `foreach ($lang in @('typescript', 'go', 'rust', 'python'))`
+/// in the install-latest job - this fails.
+#[test]
+fn the_release_workflow_lists_no_plugin_languages_of_its_own() {
+    let languages = build_targets_query(&["--plugins"]);
+    let probe = "foreach ($lang in @('typescript', 'go', 'rust', 'python')) {";
+    assert_eq!(
+        plugin_languages_listed_on(probe, &languages).len(),
+        languages.len(),
+        "the probe must be seen"
+    );
+    let workflow = release_workflow();
+    let listing: Vec<String> = workflow
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| plugin_languages_listed_on(line, &languages).len() >= 2)
+        .map(|(i, line)| format!("{}: {line}", i + 1))
+        .collect();
+    assert!(listing.is_empty(), "release.yml lists plugin languages itself:\n{}", listing.join("\n"));
 }
