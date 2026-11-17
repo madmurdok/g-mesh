@@ -1,0 +1,610 @@
+{
+  "edges": [
+    {
+      "frame": {
+        "engine": "tree-sitter",
+        "fromId": "n1",
+        "id": "e1",
+        "kind": "CALLS",
+        "resolved": false,
+        "source": "syntactic",
+        "toId": "n2"
+      },
+      "name": "minimal"
+    },
+    {
+      "frame": {
+        "engine": "gopls",
+        "fromId": "n1",
+        "id": "e2",
+        "kind": "CALLS",
+        "resolved": true,
+        "source": "semantic",
+        "toDeclaration": 1,
+        "toId": "n2"
+      },
+      "name": "semantic with toDeclaration"
+    },
+    {
+      "frame": {
+        "engine": "tree-sitter",
+        "fromId": "n1",
+        "id": "e3",
+        "kind": "IMPORTS",
+        "resolved": false,
+        "source": "syntactic",
+        "specifier": "example.com/m/other",
+        "toId": "n2"
+      },
+      "name": "import with specifier"
+    }
+  ],
+  "errors": [
+    {
+      "frame": {
+        "error": {
+          "code": -32602,
+          "message": "missing field `filePath`"
+        },
+        "id": 9,
+        "jsonrpc": "2.0"
+      },
+      "name": "invalid params"
+    },
+    {
+      "frame": {
+        "error": {
+          "code": -32602,
+          "message": "empty list"
+        },
+        "id": "e-1",
+        "jsonrpc": "2.0"
+      },
+      "name": "invalid params string id"
+    }
+  ],
+  "nodes": [
+    {
+      "frame": {
+        "filePath": "pkg/a.go",
+        "hasSyntaxErrors": false,
+        "id": "n1",
+        "kind": "Function",
+        "language": "go",
+        "name": "Do",
+        "qualifiedName": "pkg.Do",
+        "range": {
+          "end": {
+            "col": 1,
+            "line": 5
+          },
+          "start": {
+            "col": 0,
+            "line": 3
+          }
+        },
+        "visibility": "file"
+      },
+      "name": "minimal"
+    },
+    {
+      "frame": {
+        "aliasPaths": [
+          [
+            {
+              "name": "alias"
+            },
+            {
+              "name": "Do",
+              "sep": "."
+            }
+          ]
+        ],
+        "container": "example.com/m/pkg",
+        "containerParent": "example.com/m",
+        "declarations": [
+          {
+            "endCol": 1,
+            "endLine": 2,
+            "hasBody": true,
+            "ordinal": 0,
+            "signature": "func Do()",
+            "startCol": 0,
+            "startLine": 1
+          },
+          {
+            "endCol": 9,
+            "endLine": 4,
+            "hasBody": false,
+            "ordinal": 1,
+            "startCol": 0,
+            "startLine": 4
+          }
+        ],
+        "docComment": "Do does it.",
+        "filePath": "pkg/a.go",
+        "generated": true,
+        "hasSyntaxErrors": true,
+        "id": "n1",
+        "kind": "Function",
+        "language": "go",
+        "name": "Do",
+        "nativeKind": "method",
+        "qualifiedName": "pkg.Do",
+        "qualifiedPath": [
+          {
+            "name": "pkg"
+          },
+          {
+            "name": "Do",
+            "sep": "."
+          }
+        ],
+        "range": {
+          "end": {
+            "col": 1,
+            "line": 5
+          },
+          "start": {
+            "col": 0,
+            "line": 3
+          }
+        },
+        "signature": "func Do(x int) error",
+        "target": {
+          "alsoScopes": [
+            "example.com/m/third"
+          ],
+          "fromContainer": "example.com/m/pkg",
+          "key": {
+            "qualifiedName": "other.Thing"
+          },
+          "keyPath": [
+            {
+              "name": "other"
+            },
+            {
+              "name": "Thing",
+              "sep": "."
+            }
+          ],
+          "scope": {
+            "container": "example.com/m/other"
+          }
+        },
+        "untypedCalls": [
+          "Helper"
+        ],
+        "visibility": {
+          "container": "example.com/m/pkg"
+        }
+      },
+      "name": "every optional field"
+    }
+  ],
+  "requests": [
+    {
+      "frame": {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "method": "reindex",
+        "params": {
+          "filePath": "a.go"
+        }
+      },
+      "name": "reindex"
+    },
+    {
+      "frame": {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "method": "fileChanged",
+        "params": {
+          "filePath": "a.go"
+        }
+      },
+      "name": "fileChanged"
+    },
+    {
+      "frame": {
+        "id": "r-3",
+        "jsonrpc": "2.0",
+        "method": "fileChanged",
+        "params": {
+          "filePath": "a.go",
+          "reextract": true
+        }
+      },
+      "name": "fileChanged reextract"
+    },
+    {
+      "frame": {
+        "jsonrpc": "2.0",
+        "method": "fileChanged",
+        "params": {
+          "filePath": "a.go"
+        }
+      },
+      "name": "fileChanged notification"
+    },
+    {
+      "frame": {
+        "id": 4,
+        "jsonrpc": "2.0",
+        "method": "status"
+      },
+      "name": "status"
+    },
+    {
+      "frame": {
+        "id": 5,
+        "jsonrpc": "2.0",
+        "method": "semanticPass",
+        "params": {
+          "filePaths": []
+        }
+      },
+      "name": "semanticPass whole project"
+    },
+    {
+      "frame": {
+        "id": 6,
+        "jsonrpc": "2.0",
+        "method": "semanticPass",
+        "params": {
+          "budgetMs": 30000,
+          "filePaths": [
+            "a.go",
+            "b/c.go"
+          ],
+          "linkedEdges": [
+            {
+              "edgeId": "e1",
+              "toId": "n9"
+            }
+          ]
+        }
+      },
+      "name": "semanticPass with every optional field"
+    },
+    {
+      "frame": {
+        "jsonrpc": "2.0",
+        "method": "workspaceChanged",
+        "params": {
+          "filePath": "go.mod"
+        }
+      },
+      "name": "workspaceChanged"
+    },
+    {
+      "frame": {
+        "jsonrpc": "2.0",
+        "method": "prepareSemanticPass"
+      },
+      "name": "prepareSemanticPass"
+    },
+    {
+      "frame": {
+        "jsonrpc": "2.0",
+        "method": "filesCreated",
+        "params": {
+          "filePaths": [
+            "a.go",
+            "b.go"
+          ]
+        }
+      },
+      "name": "filesCreated"
+    },
+    {
+      "frame": {
+        "id": 7,
+        "jsonrpc": "2.0",
+        "method": "resolutionChanged",
+        "params": {
+          "filePath": "go.mod"
+        }
+      },
+      "name": "resolutionChanged without facts"
+    },
+    {
+      "frame": {
+        "id": 8,
+        "jsonrpc": "2.0",
+        "method": "resolutionChanged",
+        "params": {
+          "filePath": "go.mod",
+          "previousFacts": "facts-blob"
+        }
+      },
+      "name": "resolutionChanged with facts"
+    }
+  ],
+  "responses": [
+    {
+      "frame": {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "deleteEdgeIds": [
+            "gone-edge"
+          ],
+          "deleteNodeIds": [
+            "gone"
+          ],
+          "upsertEdges": [
+            {
+              "engine": "tree-sitter",
+              "fromId": "n1",
+              "id": "e1",
+              "kind": "CALLS",
+              "resolved": false,
+              "source": "syntactic",
+              "toId": "n2"
+            }
+          ],
+          "upsertNodes": [
+            {
+              "filePath": "pkg/a.go",
+              "hasSyntaxErrors": false,
+              "id": "n1",
+              "kind": "Function",
+              "language": "go",
+              "name": "Do",
+              "qualifiedName": "pkg.Do",
+              "range": {
+                "end": {
+                  "col": 1,
+                  "line": 5
+                },
+                "start": {
+                  "col": 0,
+                  "line": 3
+                }
+              },
+              "visibility": "file"
+            }
+          ]
+        }
+      },
+      "name": "fileChanged diff"
+    },
+    {
+      "frame": {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "complete": true,
+          "deleteEdgeIds": [
+            "gone-edge"
+          ],
+          "deleteNodeIds": [
+            "gone"
+          ],
+          "upsertEdges": [
+            {
+              "engine": "tree-sitter",
+              "fromId": "n1",
+              "id": "e1",
+              "kind": "CALLS",
+              "resolved": false,
+              "source": "syntactic",
+              "toId": "n2"
+            }
+          ],
+          "upsertNodes": [
+            {
+              "filePath": "pkg/a.go",
+              "hasSyntaxErrors": false,
+              "id": "n1",
+              "kind": "Function",
+              "language": "go",
+              "name": "Do",
+              "qualifiedName": "pkg.Do",
+              "range": {
+                "end": {
+                  "col": 1,
+                  "line": 5
+                },
+                "start": {
+                  "col": 0,
+                  "line": 3
+                }
+              },
+              "visibility": "file"
+            }
+          ]
+        }
+      },
+      "name": "fileChanged complete"
+    },
+    {
+      "frame": {
+        "id": 5,
+        "incomplete": true,
+        "incompleteReason": "budget exhausted",
+        "jsonrpc": "2.0",
+        "result": {
+          "deleteEdgeIds": [],
+          "deleteNodeIds": [],
+          "upsertEdges": [],
+          "upsertNodes": []
+        },
+        "unfinishedFiles": [
+          "a.go"
+        ]
+      },
+      "name": "semanticPass incomplete"
+    },
+    {
+      "frame": {
+        "id": "p-1",
+        "jsonrpc": "2.0",
+        "result": {
+          "deleteEdgeIds": [],
+          "deleteNodeIds": [],
+          "upsertEdges": [],
+          "upsertNodes": []
+        },
+        "unfinishedFiles": []
+      },
+      "name": "semanticPass every file finished"
+    },
+    {
+      "frame": {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "affected": {
+            "kind": "unknown",
+            "reason": "mod item moved"
+          },
+          "deleteEdgeIds": [
+            "gone-edge"
+          ],
+          "deleteNodeIds": [
+            "gone"
+          ],
+          "upsertEdges": [
+            {
+              "engine": "tree-sitter",
+              "fromId": "n1",
+              "id": "e1",
+              "kind": "CALLS",
+              "resolved": false,
+              "source": "syntactic",
+              "toId": "n2"
+            }
+          ],
+          "upsertNodes": [
+            {
+              "filePath": "pkg/a.go",
+              "hasSyntaxErrors": false,
+              "id": "n1",
+              "kind": "Function",
+              "language": "go",
+              "name": "Do",
+              "qualifiedName": "pkg.Do",
+              "range": {
+                "end": {
+                  "col": 1,
+                  "line": 5
+                },
+                "start": {
+                  "col": 0,
+                  "line": 3
+                }
+              },
+              "visibility": "file"
+            }
+          ]
+        }
+      },
+      "name": "fileChanged affected"
+    },
+    {
+      "frame": {
+        "id": 7,
+        "jsonrpc": "2.0",
+        "result": {
+          "delta": {
+            "kind": "unchanged"
+          }
+        }
+      },
+      "name": "resolutionChanged unchanged"
+    },
+    {
+      "frame": {
+        "id": 7,
+        "jsonrpc": "2.0",
+        "result": {
+          "delta": {
+            "kind": "unknown",
+            "reason": "module renamed"
+          },
+          "facts": "facts-blob"
+        }
+      },
+      "name": "resolutionChanged unknown with facts"
+    },
+    {
+      "frame": {
+        "id": 8,
+        "jsonrpc": "2.0",
+        "result": {
+          "delta": {
+            "files": [
+              {
+                "notUnder": [
+                  "pkg/vendor"
+                ],
+                "under": "pkg"
+              }
+            ],
+            "imports": [
+              {
+                "by": {
+                  "specifier": {
+                    "under": {
+                      "prefix": "example.com/m",
+                      "separator": "/"
+                    }
+                  }
+                },
+                "importers": {
+                  "under": ""
+                }
+              }
+            ],
+            "kind": "affected"
+          },
+          "facts": "facts-blob",
+          "watchPaths": [
+            "go.work"
+          ]
+        }
+      },
+      "name": "resolutionChanged affected with watch paths"
+    },
+    {
+      "frame": {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "acknowledged": true
+        }
+      },
+      "name": "ack"
+    },
+    {
+      "frame": {
+        "id": "a-1",
+        "jsonrpc": "2.0",
+        "result": {
+          "acknowledged": true
+        }
+      },
+      "name": "ack string id"
+    }
+  ],
+  "trailers": [
+    {
+      "frame": {
+        "resolutionFacts": "facts-blob"
+      },
+      "name": "facts only"
+    },
+    {
+      "frame": {
+        "resolutionFacts": "facts-blob",
+        "watchPaths": [
+          "go.mod",
+          "go.work"
+        ]
+      },
+      "name": "facts and watch paths"
+    }
+  ]
+}
