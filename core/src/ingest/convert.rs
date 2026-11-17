@@ -37,9 +37,12 @@ impl PathWarnings {
             return;
         }
         let line = format!(
-            "g-mesh daemon: the {} plugin sent an invalid {what} for {:?} in {}: {error}; \
+            "{prefix}the {} plugin sent an invalid {what} for {:?} in {}: {error}; \
              dropped it and kept the node (later invalid paths in this file are dropped without a warning)",
-            node.language, node.qualified_name, node.file_path
+            node.language,
+            node.qualified_name,
+            node.file_path,
+            prefix = crate::log::role_prefix()
         );
         crate::log_line!("{line}");
         self.emitted.push(line);

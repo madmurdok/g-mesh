@@ -2,7 +2,7 @@ use std::io::BufRead;
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::protocol::types::{WireEdge, WireNode};
+use crate::protocol::types::{ResolutionFactsTrailer, WireEdge, WireNode};
 
 /// `Node` is boxed because protocol v2's `WireNode` (visibility, container,
 /// containerParent, target - GM-263) is now considerably larger than
@@ -22,14 +22,6 @@ pub enum BulkItem {
     },
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ResolutionFactsLine {
-    resolution_facts: String,
-    #[serde(default)]
-    watch_paths: Vec<String>,
-}
-
 impl BulkItem {
     /// WireNode and WireEdge have disjoint required fields (name/qualifiedName/
     /// filePath/... vs fromId/toId/...), so trying one then the other
@@ -40,10 +32,10 @@ impl BulkItem {
         }
         match serde_json::from_str::<WireEdge>(line) {
             Ok(edge) => Ok(BulkItem::Edge(edge)),
-            Err(err) => match serde_json::from_str::<ResolutionFactsLine>(line) {
-                Ok(line) => Ok(BulkItem::ResolutionFacts {
-                    facts: line.resolution_facts,
-                    watch_paths: line.watch_paths,
+            Err(err) => match serde_json::from_str::<ResolutionFactsTrailer>(line) {
+                Ok(trailer) => Ok(BulkItem::ResolutionFacts {
+                    facts: trailer.resolution_facts,
+                    watch_paths: trailer.watch_paths,
                 }),
                 Err(_) => Err(err).with_context(|| {
                     format!("malformed NDJSON line (neither a valid node nor edge): {line:?}")

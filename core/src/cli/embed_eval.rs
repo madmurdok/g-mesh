@@ -812,7 +812,7 @@ fn run_variant(args: &RunArgs) -> Result<()> {
             let base = variants.encoder_of(&variant)?;
             let dir = base.model_dir(eval_dir)?;
             let spec = base.encoder_spec()?;
-            let options = InferenceOptions::from_env();
+            let options = crate::config::embedding::inference_options();
             Some((
                 base.clone(),
                 dir.clone(),

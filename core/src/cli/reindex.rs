@@ -115,7 +115,8 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     // for a cold start - a reindex is that same walk, run early.
     let project_config = crate::config::read_project_config(project_root)
         .context("failed to read the project's config.toml")?;
-    let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
+    let embedding_pipeline =
+        EmbeddingPipeline::load(crate::config::embedding::embedding_settings(&project_config.embedding));
     // The walk is structural-only, matching `daemon::run`'s own cold
     // start; the pipeline above is used by the semantic pass and the
     // backfill pass below.

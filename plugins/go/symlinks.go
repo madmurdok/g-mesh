@@ -1,7 +1,7 @@
 package main
 
 // The symlink guard for this plugin's project walk. Links are followed, under
-// the same policy as the SDK's walk (plugins/sdk/src/walk.rs); why, and why
+// the same policy as the SDK's walk (walk/src/lib.rs); why, and why
 // these rules, is docs/adr/0025-project-walk-follows-symlinks.md.
 //
 // Invariants (walk.go's walkDir and walkProjectFiles hold the other half):
