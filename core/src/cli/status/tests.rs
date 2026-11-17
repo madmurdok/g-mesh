@@ -1,7 +1,15 @@
+use std::fs;
+
+use rusqlite::Connection;
+
 use super::*;
+use crate::fsutil::mtime_millis;
+use crate::index_health::discover_source_files;
 use crate::indexing_status::{EmbedProgress, SemanticProgress, WalkProgress};
 use crate::paths::state_dir::project_dir;
+use crate::plugin_manifest::DiscoveredPlugins;
 use crate::storage::schema;
+use crate::storage::schema::SemanticLeftover;
 
 /// The plugins this checkout ships - their real `plugin.toml`s, read from
 /// `plugins/` beside `core/` exactly as `plugin_manifest::bundled_roots` finds them in

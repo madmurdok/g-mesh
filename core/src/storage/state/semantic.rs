@@ -6,6 +6,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::languages::language_semantic_pass_done;
 use super::{in_savepoint, present_languages};
 
+/// The `semanticPassError` recorded for a language whose pass was not run
+/// because its plugin was asleep or memory-suspended: still owed, not failed.
+pub const NOT_RUN_REASON: &str = "not run - its plugin was asleep or memory-suspended; \
+     the next daemon start or `g-mesh reindex` asks again";
+
 /// Whether the whole-project semantic pass has ever finished for this index -
 /// independent of [`bulk_index_completed`], and deliberately so. `false` with
 /// `bulk_index_completed` also `false` just means the project has not been

@@ -24,16 +24,16 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
+use crate::graph::queries;
 use crate::ingest::convert::{to_storage_diff, PathWarnings};
 use crate::model::Diff;
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
-    ControlEnvelope, ControlMessage, FileChangeResponse, LinkedEdge, RequestId, ResolutionDelta,
-    JSONRPC_VERSION,
+    ControlEnvelope, ControlMessage, FileChangeResponse, RequestId, ResolutionDelta, JSONRPC_VERSION,
 };
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
-use crate::storage::schema;
+use crate::storage::{schema, vectors, write};
 
 /// Sends a `FileChanged` request (tagged with `request_id`) for `file_path`
 /// over `writer`, reads the plugin's `FileChangeResponse` off `reader`,
@@ -503,7 +503,7 @@ fn settle_reextracts(store: &mut Writer<'_>, language: &str, file_paths: &[Strin
 /// it remembers emitting in its own process.
 ///
 /// After a complete whole-project pass, `sweep_language`'s semantic edges
-/// the pass did not send are deleted ([`sweep_semantic_edges`]): they are
+/// the pass did not send are deleted ([`write::sweep_semantic_edges`]): they are
 /// what an earlier process emitted and this one no longer does, and so are
 /// the placeholders the language's last workspace reindex kept that nothing
 /// has re-sent since (`IndexStore::sweep_unclaimed_nodes`). `None` (a
@@ -665,7 +665,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     // Read inside the same unit that committed the reparse (or after the
     // whole-project link), so these are the links of exactly the text the
     // plugin is about to answer for.
-    let linked = store.step(|conn| linked_edges(conn, language, &sent))?;
+    let linked = store.step(|conn| queries::linked_edges(conn, language, &sent))?;
     if whole_project {
         crate::log_line!(
             "g-mesh: {language}'s whole-project semantic pass carries {} linked edge(s)",
@@ -800,7 +800,8 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
             None => {}
         }
     } else if let Some(language) = sweep_language {
-        let swept = store.step(|conn| sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
+        let swept =
+            store.step(|conn| write::sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
         if swept > 0 {
             crate::log_line!(
                 "g-mesh: {language}'s whole-project semantic pass no longer stands behind {swept} \
@@ -816,69 +817,6 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
         }
     }
     Ok(SemanticPassOutcome::Complete)
-}
-
-/// The structural edges of `language` that linking moved onto a declaration,
-/// each with the target it moved it to - what a `semanticPass` request
-/// carries as `linkedEdges`. `file_paths` scopes them by the file the edge
-/// starts in; empty means every file, as for the pass itself. A semantic
-/// edge is left out even when linked: the tier compares its answers with
-/// what the structural pass and linking settled, not with its own.
-pub(crate) fn linked_edges(
-    conn: &rusqlite::Connection,
-    language: &str,
-    file_paths: &[String],
-) -> Result<Vec<LinkedEdge>> {
-    let mut sql = String::from(
-        "SELECT e.id, e.toId FROM edges e JOIN nodes f ON f.id = e.fromId
-         WHERE e.linkedFrom IS NOT NULL AND e.source = 'syntactic' AND f.language = ?1",
-    );
-    if !file_paths.is_empty() {
-        let slots: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + 2)).collect();
-        sql.push_str(&format!(" AND f.filePath IN ({})", slots.join(", ")));
-    }
-    sql.push_str(" ORDER BY e.id");
-    let params = std::iter::once(&language as &dyn rusqlite::ToSql)
-        .chain(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
-    conn.prepare(&sql)
-        .and_then(|mut statement| {
-            statement
-                .query_map(rusqlite::params_from_iter(params), |row| {
-                    Ok(LinkedEdge { edge_id: row.get(0)?, to_id: row.get(1)? })
-                })?
-                .collect()
-        })
-        .context("failed to read the linked edges of a semantic pass")
-}
-
-/// Deletes every edge with `source = 'semantic'` whose `fromId` is a node of
-/// `language` and whose id is not in `kept`, in one transaction, and returns
-/// how many went. Placeholder nodes the deleted edges pointed at stay, as
-/// every linked-away placeholder does (`link::symbol_links`, "Why the
-/// placeholder is kept").
-pub(crate) fn sweep_semantic_edges(
-    conn: &mut rusqlite::Connection,
-    language: &str,
-    kept: &std::collections::HashSet<String>,
-) -> Result<usize> {
-    let tx = conn.transaction().context("failed to start the semantic-edge sweep")?;
-    let candidates: Vec<String> = tx
-        .prepare(
-            "SELECT e.id FROM edges e JOIN nodes n ON n.id = e.fromId
-             WHERE e.source = 'semantic' AND n.language = ?1",
-        )
-        .and_then(|mut statement| {
-            statement.query_map(rusqlite::params![language], |row| row.get(0))?.collect()
-        })
-        .context("failed to read the semantic edges to sweep")?;
-    let mut swept = 0;
-    for id in candidates.iter().filter(|id| !kept.contains(*id)) {
-        swept += tx
-            .execute("DELETE FROM edges WHERE id = ?1", rusqlite::params![id])
-            .context("failed to delete a semantic edge the pass no longer sends")?;
-    }
-    tx.commit().context("failed to commit the semantic-edge sweep")?;
-    Ok(swept)
 }
 
 /// What one round trip reported about itself, beyond the diff it already
@@ -1101,22 +1039,16 @@ fn round_trip<R: BufRead + Send, W: Write>(
 }
 
 /// The upserted nodes of `diff` that already have a vector. A failed lookup
-/// counts as none, which embeds them all, as before GM-486.
+/// counts as none, which embeds them all.
 fn nodes_with_vectors(conn: &rusqlite::Connection, diff: &Diff) -> HashSet<String> {
-    let lookup = || -> rusqlite::Result<HashSet<String>> {
-        let mut stmt = conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM vectors WHERE nodeId = ?1)")?;
-        let mut found = HashSet::new();
-        for node in &diff.upsert_nodes {
-            if stmt.query_row([&node.id], |row| row.get::<_, bool>(0))? {
-                found.insert(node.id.clone());
-            }
-        }
-        Ok(found)
-    };
-    lookup().unwrap_or_else(|err| {
-        crate::log_line!("g-mesh daemon: failed to check a semantic answer's nodes for vectors ({err:#})");
-        HashSet::new()
-    })
+    vectors::nodes_with_vectors(conn, diff.upsert_nodes.iter().map(|node| node.id.as_str())).unwrap_or_else(
+        |err| {
+            crate::log_line!(
+                "g-mesh daemon: failed to check a semantic answer's nodes for vectors ({err:#})"
+            );
+            HashSet::new()
+        },
+    )
 }
 
 /// What a `fileChanged` answer says about its file as a whole: gone when it

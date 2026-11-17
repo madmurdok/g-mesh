@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
-use rusqlite::{Connection, Row};
+use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::daemon::registry::PathCoverage;
@@ -408,39 +408,28 @@ fn rank_candidates(
     params: &[String],
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
-    let params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-    // The `nativeKind` filter is `graph::queries`' own, shared rather than
-    // restated (GM-367): the lookups that decide whether a candidate page is
-    // needed and the page itself have to agree about what counts as a
-    // declaration, and while they were two copies of one list they did not -
-    // the copy here was three kinds where that one is five.
-    let base_sql = format!(
-        "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
-         n.startLine AS startLine, n.endLine AS endLine, n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
-         CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
-         FROM nodes n WHERE {filter} AND {}",
-        queries::declaration_only("n.")
-    );
+    let page = queries::ranked_declarations(conn, filter, params, CANDIDATE_PAGE_SIZE, cursor)?;
+    Ok(pagination::Page {
+        results: page.results.into_iter().map(DefinitionCandidate::from).collect(),
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        all_unresolved: page.all_unresolved,
+    })
+}
 
-    fn map_row(row: &Row) -> rusqlite::Result<(DefinitionCandidate, f64, String)> {
-        let id: String = row.get("id")?;
-        let score: f64 = row.get("score")?;
-        let candidate = DefinitionCandidate {
-            id: id.clone(),
-            qualified_name: row.get("qualifiedName")?,
-            file_path: row.get("filePath")?,
-            start_line: Some(row.get("startLine")?),
-            end_line: Some(row.get("endLine")?),
-            kind: row.get("kind")?,
-            preview: row
-                .get::<_, Option<String>>("signature")?
-                .or(row.get::<_, Option<String>>("docComment")?),
+impl From<queries::RankedDeclaration> for DefinitionCandidate {
+    fn from(declaration: queries::RankedDeclaration) -> Self {
+        DefinitionCandidate {
+            id: declaration.id,
+            qualified_name: declaration.qualified_name,
+            file_path: declaration.file_path,
+            start_line: Some(declaration.start_line),
+            end_line: Some(declaration.end_line),
+            kind: declaration.kind,
+            preview: declaration.signature.or(declaration.doc_comment),
             source: None,
-        };
-        Ok((candidate, score, id))
+        }
     }
-
-    pagination::paginate_by_score(conn, &base_sql, &params, CANDIDATE_PAGE_SIZE, cursor, map_row)
 }
 
 /// Resolves `find_definition`'s file+position input - always unambiguous by

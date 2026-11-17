@@ -1,5 +1,6 @@
 pub mod embedding_meta;
 pub mod languages;
+pub mod last_used;
 pub mod reindex;
 pub mod resolution;
 pub mod retry;

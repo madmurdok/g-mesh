@@ -90,3 +90,19 @@ pub fn language_retries(conn: &Connection) -> Result<BTreeMap<String, u32>> {
     }
     Ok(retries)
 }
+
+/// [`language_retries`], empty for an index that has no `language_retry`
+/// table yet.
+pub fn language_retries_if_present(conn: &Connection) -> Result<BTreeMap<String, u32>> {
+    let has_table: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'language_retry')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to look for the language retry table")?;
+    if !has_table {
+        return Ok(BTreeMap::new());
+    }
+    language_retries(conn)
+}

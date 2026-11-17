@@ -14,6 +14,13 @@ pub fn mark_pending_reindex(conn: &Connection, language: &str, trigger: &str) ->
     Ok(())
 }
 
+/// Clears `language`'s pending-reindex mark.
+pub fn clear_pending_reindex(conn: &Connection, language: &str) -> Result<()> {
+    conn.execute("DELETE FROM pending_reindex WHERE language = ?1", params![language])
+        .with_context(|| format!("failed to clear {language}'s pending reindex"))?;
+    Ok(())
+}
+
 /// Every `(language, trigger)` whose workspace reindex was started and never
 /// swapped in, sorted by language. Empty for an index that predates the
 /// table.

@@ -42,7 +42,6 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::params;
 
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::path_case;
@@ -213,8 +212,7 @@ fn reextract(
         .with(|conn| -> Result<()> {
             let tx = conn.unchecked_transaction().context("failed to start the facts transaction")?;
             schema::set_resolution_facts(&tx, language, facts, watch_paths)?;
-            tx.execute("DELETE FROM pending_reindex WHERE language = ?1", params![language])
-                .with_context(|| format!("failed to clear {language}'s pending reindex"))?;
+            schema::clear_pending_reindex(&tx, language)?;
             tx.commit().context("failed to commit the facts transaction")
         })
         .with_context(|| format!("failed to store {language}'s resolution facts"))?;

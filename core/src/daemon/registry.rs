@@ -220,22 +220,15 @@ fn indexed_files_under(
     conn: &rusqlite::Connection,
     subtrees: &[String],
 ) -> Result<BTreeMap<String, HashSet<String>>> {
-    let mut statement = conn
-        .prepare("SELECT language, filePath FROM nodes WHERE kind = 'File'")
-        .context("failed to query indexed files")?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-        .context("failed to read indexed files")?;
     let mut files: BTreeMap<String, HashSet<String>> = BTreeMap::new();
-    for row in rows {
-        let (language, file_path) = row.context("failed to read indexed files")?;
+    crate::graph::files::for_each_file_node(conn, |language, file_path| {
         let under = subtrees.iter().any(|dir| {
             dir.is_empty() || file_path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/'))
         });
         if under {
             files.entry(language).or_default().insert(file_path);
         }
-    }
+    })?;
     Ok(files)
 }
 
@@ -262,17 +255,6 @@ pub(crate) enum ReconcileScope<'a> {
     /// The subtrees whose events the OS dropped (GM-616): project-relative
     /// directories, forward-slash separated, `""` being the root.
     Rescan(&'a [String]),
-}
-
-/// Every file the index holds anything for: an `indexed_files` baseline or a
-/// `File` node. The live side of [`PluginRegistry::reconcile_since_index`].
-fn live_file_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>> {
-    let mut statement = conn
-        .prepare("SELECT filePath FROM indexed_files UNION SELECT filePath FROM nodes WHERE kind = 'File'")
-        .context("failed to query indexed files")?;
-    let rows =
-        statement.query_map([], |row| row.get::<_, String>(0)).context("failed to read indexed files")?;
-    rows.collect::<rusqlite::Result<HashSet<String>>>().context("failed to read indexed files")
 }
 
 /// [`indexer_version`] for a discovery that found nothing - the generation
@@ -1343,7 +1325,7 @@ impl PluginRegistry {
             }
         }
         let started = std::time::Instant::now();
-        let mut live = match conn.with(live_file_paths) {
+        let mut live = match conn.with(crate::graph::files::known_file_paths) {
             Ok(live) => live,
             Err(err) => {
                 crate::log_line!(

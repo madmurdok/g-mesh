@@ -191,15 +191,8 @@ const PLUGIN_EXIT_GRACE: Duration = Duration::from_millis(500);
 /// `daemon::workspace_reindex` uses the same count to scale its
 /// single-language pass's timeout.
 pub(crate) fn indexed_file_count(conn: &IndexStore, language: &str) -> usize {
-    let result: rusqlite::Result<i64> = conn.with(|conn| {
-        conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE kind = 'File' AND language = ?1",
-            [language],
-            |row| row.get(0),
-        )
-    });
-    match result {
-        Ok(count) => count.max(0) as usize,
+    match conn.with(|conn| crate::graph::files::indexed_file_count(conn, language)) {
+        Ok(count) => count,
         Err(err) => {
             crate::log_line!(
                 "g-mesh daemon: failed to count {language}'s indexed files for the semantic-pass \
@@ -575,10 +568,7 @@ pub(crate) fn record_failure(conn: &IndexStore, language: &str, err: &anyhow::Er
     record_reason(conn, language, &format!("{err:#}"));
 }
 
-/// The reason recorded for a language whose pass was not run because its
-/// plugin was asleep or memory-suspended.
-pub(crate) const NOT_RUN_REASON: &str = "not run - its plugin was asleep or memory-suspended; \
-     the next daemon start or `g-mesh reindex` asks again";
+pub(crate) use crate::storage::state::semantic::NOT_RUN_REASON;
 
 /// Logs and records that `language`'s pass was not run because its plugin was
 /// asleep or memory-suspended. The language stays owed.
@@ -783,14 +773,14 @@ mod tests {
     fn status_lines(conn: &IndexStore, registry: &PluginRegistry) -> Vec<String> {
         let guard = conn.lock().unwrap();
         let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
-        let (owed, failures) = crate::cli::status::semantic_pass_state(&guard, &capable).unwrap();
+        let (owed, failures) = crate::index_health::semantic_pass_state(&guard, &capable).unwrap();
         let completed = schema::semantic_pass_completed(&guard).unwrap();
         let leftovers: Vec<_> = schema::semantic_leftovers(&guard)
             .unwrap()
             .into_iter()
             .filter(|leftover| capable.contains(&leftover.language))
             .collect();
-        crate::cli::status::semantic_pass_lines(completed, &owed, &failures, &leftovers, None)
+        crate::index_health::semantic_pass_lines(completed, &owed, &failures, &leftovers, None)
     }
 
     fn semantic_pass_at(conn: &Connection, language: &str) -> Option<String> {

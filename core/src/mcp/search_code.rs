@@ -18,16 +18,17 @@ use anyhow::Context;
 use base64::prelude::{Engine, BASE64_STANDARD};
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::embedding::ce_text::{ce_text, source_lines, CeNode};
 use crate::embedding::rerank::{self, RerankOutcome, Scorer};
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
+use crate::graph::search::{self, NodeTextColumns};
 use crate::indexing_status::Phase;
 use crate::storage::index_store::IndexStore;
-use crate::storage::vectors::pack;
+use crate::storage::vectors;
 
 use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
@@ -63,6 +64,21 @@ pub(super) struct SearchResult {
     /// repetition of a per-call fact that `super::provenance` argues against.
     #[serde(skip)]
     pub(super) language: String,
+}
+
+impl From<search::VectorHit> for SearchResult {
+    fn from(hit: search::VectorHit) -> Self {
+        SearchResult {
+            symbol_id: hit.id,
+            qualified_name: hit.qualified_name,
+            kind: hit.kind,
+            file_path: hit.file_path,
+            start_line: hit.start_line,
+            start_col: hit.start_col,
+            score: hit.score,
+            language: hit.language,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -219,15 +235,6 @@ fn split_partial_cursor(cursor: &str) -> Option<(u64, &str)> {
     Some((stored.parse().ok()?, inner))
 }
 
-/// How many vectors [`search`] ranks from.
-fn stored_vectors(conn: &Connection) -> anyhow::Result<u64> {
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM vectors v JOIN nodes n ON n.id = v.nodeId", [], |row| {
-            row.get(0)
-        })?;
-    Ok(u64::try_from(count).unwrap_or(0))
-}
-
 /// Ranks every embedded node against `query` and paginates the result.
 /// Split out from `handle` so tests can drive it with a small `page_size`
 /// without needing a page-size field on the public tool parameters - and,
@@ -240,36 +247,12 @@ pub(super) fn search(
     page_size: usize,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<SearchResult>> {
-    // `v.nodeId AS id` and the distance-to-similarity flip are the only
-    // things this base query owes `paginate_by_score`'s contract (a `score`
-    // and an `id` column); every other column just rides along for the
-    // caller. The inner join is what keeps unembedded nodes (no doc comment
-    // or signature, or filtered as noise - see `embedding::text::node_text`) out of the
-    // results without a separate filter.
-    let base_sql = "SELECT v.nodeId AS id, n.qualifiedName, n.kind, n.filePath, n.startLine, n.startCol, \
-                     n.language, \
-                     (1.0 - vec_distance_cosine(v.embedding, ?1)) AS score \
-                     FROM vectors v JOIN nodes n ON n.id = v.nodeId";
-    let packed = pack(query);
-    let params: Vec<&dyn rusqlite::ToSql> = vec![&packed];
-
-    pagination::paginate_by_score(conn, base_sql, &params, page_size, cursor, |row| {
-        let score: f64 = row.get("score")?;
-        let id: String = row.get("id")?;
-        Ok((
-            SearchResult {
-                symbol_id: id.clone(),
-                qualified_name: row.get("qualifiedName")?,
-                kind: row.get("kind")?,
-                file_path: row.get("filePath")?,
-                start_line: row.get("startLine")?,
-                start_col: row.get("startCol")?,
-                score,
-                language: row.get("language")?,
-            },
-            score,
-            id,
-        ))
+    let page = search::by_vector(conn, &vectors::pack(query), page_size, cursor)?;
+    Ok(pagination::Page {
+        results: page.results.into_iter().map(SearchResult::from).collect(),
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        all_unresolved: page.all_unresolved,
     })
 }
 
@@ -336,7 +319,8 @@ pub(super) fn handle(
     let conn = store.read();
     let partial_cursor_in = params.cursor.as_deref().and_then(split_partial_cursor);
     let stored = if coverage.is_some() || partial_cursor_in.is_some() {
-        stored_vectors(&conn).map_err(|e| internal_error("failed to count stored vectors", e))?
+        vectors::count_embedded_nodes(&conn)
+            .map_err(|e| internal_error("failed to count stored vectors", e))?
     } else {
         0
     };
@@ -539,15 +523,13 @@ fn window_texts(
     project_root: Option<&Path>,
     tok: &dyn Fn(&str) -> usize,
 ) -> anyhow::Result<Vec<String>> {
-    let mut statement = conn.prepare_cached(
-        "SELECT docComment, signature, kind, nativeKind, name, qualifiedName, filePath, startLine, endLine, \
-         language FROM nodes WHERE id = ?1",
-    )?;
+    let columns = search::node_text_columns(conn, rows.iter().map(|row| row.symbol_id.as_str()))?;
     let mut files: HashMap<String, Option<Vec<String>>> = HashMap::new();
-    rows.iter()
-        .map(|row| {
-            let Some(columns) = statement.query_row([&row.symbol_id], NodeColumns::read).optional()? else {
-                return Ok(String::new());
+    Ok(columns
+        .into_iter()
+        .map(|columns| {
+            let Some(columns) = columns else {
+                return String::new();
             };
             let lines = match (project_root, columns.file_path.as_deref()) {
                 (Some(root), Some(file_path)) => files
@@ -556,54 +538,24 @@ fn window_texts(
                     .as_deref(),
                 _ => None,
             };
-            Ok(ce_text(&columns.node(), lines, tok))
+            ce_text(&ce_node(&columns), lines, tok)
         })
-        .collect()
+        .collect())
 }
 
-/// The `nodes` columns [`ce_text`] reads.
-struct NodeColumns {
-    doc_comment: Option<String>,
-    signature: Option<String>,
-    kind: Option<String>,
-    native_kind: Option<String>,
-    name: Option<String>,
-    qualified_name: Option<String>,
-    file_path: Option<String>,
-    start_line: i64,
-    end_line: i64,
-    language: Option<String>,
-}
-
-impl NodeColumns {
-    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            doc_comment: r.get(0)?,
-            signature: r.get(1)?,
-            kind: r.get(2)?,
-            native_kind: r.get(3)?,
-            name: r.get(4)?,
-            qualified_name: r.get(5)?,
-            file_path: r.get(6)?,
-            start_line: r.get(7)?,
-            end_line: r.get(8)?,
-            language: r.get(9)?,
-        })
-    }
-
-    fn node(&self) -> CeNode<'_> {
-        CeNode {
-            kind: self.kind.as_deref(),
-            native_kind: self.native_kind.as_deref(),
-            name: self.name.as_deref(),
-            qualified_name: self.qualified_name.as_deref(),
-            file_path: self.file_path.as_deref(),
-            start_line: usize::try_from(self.start_line).unwrap_or(0),
-            end_line: usize::try_from(self.end_line).unwrap_or(0),
-            language: self.language.as_deref(),
-            signature: self.signature.as_deref(),
-            doc_comment: self.doc_comment.as_deref(),
-        }
+/// [`ce_text`]'s view of a node's columns.
+fn ce_node(columns: &NodeTextColumns) -> CeNode<'_> {
+    CeNode {
+        kind: columns.kind.as_deref(),
+        native_kind: columns.native_kind.as_deref(),
+        name: columns.name.as_deref(),
+        qualified_name: columns.qualified_name.as_deref(),
+        file_path: columns.file_path.as_deref(),
+        start_line: usize::try_from(columns.start_line).unwrap_or(0),
+        end_line: usize::try_from(columns.end_line).unwrap_or(0),
+        language: columns.language.as_deref(),
+        signature: columns.signature.as_deref(),
+        doc_comment: columns.doc_comment.as_deref(),
     }
 }
 
@@ -646,36 +598,8 @@ fn continue_rerank(
 /// The rows for `ids` that still have a vector, in `ids`' order, scored as
 /// [`search`] scores them.
 fn rows_by_id(conn: &Connection, query_vector: &[f32], ids: &[String]) -> anyhow::Result<Vec<SearchResult>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let sql =
-        "SELECT v.nodeId AS id, n.qualifiedName, n.kind, n.filePath, n.startLine, n.startCol, n.language, \
-               (1.0 - vec_distance_cosine(v.embedding, ?1)) AS score \
-               FROM vectors v JOIN nodes n ON n.id = v.nodeId \
-               WHERE v.nodeId IN (SELECT value FROM json_each(?2))";
-    let packed = pack(query_vector);
-    let ids_json = serde_json::to_string(ids)?;
-    let mut statement = conn.prepare(sql)?;
-    let mut found: std::collections::HashMap<String, SearchResult> = statement
-        .query_map(rusqlite::params![packed, ids_json], |row| {
-            let id: String = row.get("id")?;
-            Ok((
-                id.clone(),
-                SearchResult {
-                    symbol_id: id,
-                    qualified_name: row.get("qualifiedName")?,
-                    kind: row.get("kind")?,
-                    file_path: row.get("filePath")?,
-                    start_line: row.get("startLine")?,
-                    start_col: row.get("startCol")?,
-                    score: row.get("score")?,
-                    language: row.get("language")?,
-                },
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
+    let hits = search::hits_by_id(conn, &vectors::pack(query_vector), ids)?;
+    Ok(hits.into_iter().map(SearchResult::from).collect())
 }
 
 /// `judged` is true when the page carries `noMatch` or `lowSimilarity`: the

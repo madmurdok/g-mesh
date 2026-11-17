@@ -71,13 +71,14 @@ use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::embedding::EmbeddingPipeline;
 use crate::fsutil::mtime_millis;
 use crate::ingest::apply::{apply_file_change_in, FileChangeOutcome};
 use crate::protocol::types::RequestId;
+use crate::storage::file_rows::lookup_indexed_file;
 use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::write::upsert_indexed_file;
 
@@ -289,26 +290,11 @@ fn decide(conn: &Connection, project_root: &Path, file_path: &str) -> Result<Dec
     Ok(Decision::NeedsReindex { mtime: current_mtime, hash: current_hash, had_prior_record: prior.is_some() })
 }
 
-struct IndexedFileRecord {
-    mtime_millis: i64,
-    content_hash: String,
-}
-
 /// Whether the index holds an `indexed_files` baseline for `file_path`
 /// (project-relative), i.e. whether the file has been indexed and not deleted
 /// since.
 pub fn has_indexed_baseline(conn: &Connection, file_path: &str) -> Result<bool> {
     Ok(lookup_indexed_file(conn, file_path)?.is_some())
-}
-
-fn lookup_indexed_file(conn: &Connection, file_path: &str) -> Result<Option<IndexedFileRecord>> {
-    conn.query_row(
-        "SELECT mtimeMillis, contentHash FROM indexed_files WHERE filePath = ?1",
-        params![file_path],
-        |row| Ok(IndexedFileRecord { mtime_millis: row.get(0)?, content_hash: row.get(1)? }),
-    )
-    .optional()
-    .context("failed to query indexed_files")
 }
 
 /// How much older than the walk's start a file's mtime must be before
@@ -426,6 +412,8 @@ fn hash_file(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::{params, OptionalExtension};
+
     use super::*;
     use crate::protocol::jsonrpc::{read_message, write_message};
     use crate::protocol::types::{

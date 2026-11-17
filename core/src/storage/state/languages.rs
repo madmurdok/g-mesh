@@ -182,6 +182,17 @@ pub fn record_language_outcomes(
     })
 }
 
+/// Whether the index has a `language_outcome` table: an index built before
+/// per-language outcomes has none.
+pub fn has_outcome_table(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'language_outcome')",
+        [],
+        |row| row.get(0),
+    )
+    .context("failed to look for the language outcome table")
+}
+
 /// Every recorded outcome, sorted by language. `Indexed { files }` is the
 /// live `File`-node count. Empty before any walk has recorded outcomes.
 pub fn language_outcomes(conn: &Connection) -> Result<Vec<(String, LanguageOutcome)>> {

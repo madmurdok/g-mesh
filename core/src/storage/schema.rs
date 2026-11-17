@@ -849,6 +849,15 @@ pub fn stored_generation(conn: &Connection) -> Option<(String, String)> {
     Some((schema, indexer))
 }
 
+/// `meta.schema_version`, `None` when it cannot be read (no `meta` table, no
+/// row).
+pub fn stored_schema_version(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get::<_, String>(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
 /// Throws away everything a stale generation left behind and starts the index
 /// over empty. `bulkIndexedAt` going with it is the point, not a side effect:
 /// it is what makes the next daemon start walk the project again instead of

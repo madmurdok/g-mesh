@@ -1,9 +1,15 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use crate::graph::pagination;
 use crate::model::{EdgeRecord, NodeRecord};
+use crate::protocol::types::LinkedEdge;
 
-use g_mesh_wire::native_kind::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
+use g_mesh_wire::native_kind::{
+    EXTERNAL_MODULE_NATIVE_KIND, PENDING_SYMBOL_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND,
+};
 
 // Every "which symbol is this?" lookup below - by name, by qualifiedName, by
 // position, or by the stem of the file it sits in ([`find_in_file_named`]) -
@@ -684,6 +690,352 @@ pub fn get_edge(conn: &Connection, id: &str) -> Result<Option<EdgeRecord>> {
     conn.query_row("SELECT * FROM edges WHERE id = ?1", params![id], map_edge_row)
         .optional()
         .context("failed to look up edge by id")
+}
+
+/// The structural edges of `language` that linking moved onto a declaration,
+/// each with the target it moved it to - what a `semanticPass` request
+/// carries as `linkedEdges`. `file_paths` scopes them by the file the edge
+/// starts in; empty means every file, as for the pass itself. A semantic
+/// edge is left out even when linked: the tier compares its answers with
+/// what the structural pass and linking settled, not with its own.
+pub(crate) fn linked_edges(
+    conn: &Connection,
+    language: &str,
+    file_paths: &[String],
+) -> Result<Vec<LinkedEdge>> {
+    let mut sql = String::from(
+        "SELECT e.id, e.toId FROM edges e JOIN nodes f ON f.id = e.fromId
+         WHERE e.linkedFrom IS NOT NULL AND e.source = 'syntactic' AND f.language = ?1",
+    );
+    if !file_paths.is_empty() {
+        let slots: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + 2)).collect();
+        sql.push_str(&format!(" AND f.filePath IN ({})", slots.join(", ")));
+    }
+    sql.push_str(" ORDER BY e.id");
+    let params = std::iter::once(&language as &dyn rusqlite::ToSql)
+        .chain(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
+    conn.prepare(&sql)
+        .and_then(|mut statement| {
+            statement
+                .query_map(rusqlite::params_from_iter(params), |row| {
+                    Ok(LinkedEdge { edge_id: row.get(0)?, to_id: row.get(1)? })
+                })?
+                .collect()
+        })
+        .context("failed to read the linked edges of a semantic pass")
+}
+
+/// The `Type` declaration named `qualified_name` in `anchor`'s language and
+/// container, or in its file when it has no container; the lowest id wins.
+pub(crate) fn type_in_scope_of(
+    conn: &Connection,
+    qualified_name: &str,
+    anchor: &NodeRecord,
+) -> rusqlite::Result<Option<NodeRecord>> {
+    let declaration = declaration_only("");
+    let (scope, scope_value) = scope_of(anchor);
+    conn.query_row(
+        &format!(
+            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND language = ?2 AND kind = 'Type' \
+             AND {declaration} AND {scope} ORDER BY id LIMIT 1"
+        ),
+        rusqlite::params![qualified_name, anchor.language, scope_value],
+        map_node_row,
+    )
+    .optional()
+}
+
+/// The SQL condition (on parameter `?3`) and its value that keep a lookup in
+/// `node`'s container, or in its file when it has none: Go has a `T` in
+/// every package, TypeScript a `C` in every file.
+fn scope_of(node: &NodeRecord) -> (&'static str, &str) {
+    match &node.container {
+        Some(container) => ("container = ?3", container.as_str()),
+        None => ("container IS NULL AND filePath = ?3", node.file_path.as_str()),
+    }
+}
+
+/// `type_id`'s direct supertypes: resolved `SUPERTYPE_OF` edges onto a `Type`
+/// declaration, by `qualifiedName`. A placeholder base is left out.
+pub(crate) fn resolved_supertypes(conn: &Connection, type_id: &str) -> rusqlite::Result<Vec<NodeRecord>> {
+    let declaration = declaration_only("n.");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT n.* FROM edges e JOIN nodes n ON n.id = e.toId \
+             WHERE e.fromId = ?1 AND e.kind = 'SUPERTYPE_OF' AND e.resolved = 1 \
+               AND n.kind = 'Type' AND {declaration} \
+             ORDER BY n.qualifiedName, n.id"
+    ))?;
+    let rows = stmt.query_map([type_id], map_node_row)?;
+    rows.collect::<rusqlite::Result<_>>()
+}
+
+/// The `Function` declarations named `name` in `language` whose
+/// `qualifiedName` extends `owner`'s, in `owner`'s container or file, by
+/// `qualifiedName`. Direct and nested members alike: the caller tells them
+/// apart by `qualifiedPath`.
+pub(crate) fn functions_named_under(
+    conn: &Connection,
+    owner: &NodeRecord,
+    name: &str,
+    language: &str,
+) -> rusqlite::Result<Vec<NodeRecord>> {
+    let declaration = declaration_only("");
+    let (scope, scope_value) = scope_of(owner);
+    // Every member's qualifiedName starts with the owner's, so a range scan on
+    // `idx_nodes_qualifiedName` bounds the lookup; U+10FFFF is the highest
+    // character, so the upper bound sorts after every extension of the prefix.
+    let upper = format!("{}\u{10FFFF}", owner.qualified_name);
+    let mut stmt = conn.prepare(&format!(
+        "SELECT * FROM nodes WHERE qualifiedName > ?4 AND qualifiedName < ?5 \
+               AND name = ?1 AND language = ?2 AND kind = 'Function' AND {declaration} AND {scope} \
+             ORDER BY qualifiedName, id"
+    ))?;
+    let rows = stmt.query_map(
+        rusqlite::params![name, language, scope_value, owner.qualified_name, upper],
+        map_node_row,
+    )?;
+    rows.collect::<rusqlite::Result<_>>()
+}
+
+/// The members `node_id` states it implements: its outgoing resolved
+/// `SUPERTYPE_OF` edges onto a `Function` declaration, by `qualifiedName`.
+pub(crate) fn implemented_functions(conn: &Connection, node_id: &str) -> rusqlite::Result<Vec<NodeRecord>> {
+    let declaration = declaration_only("n.");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT n.* FROM edges e JOIN nodes n ON n.id = e.toId \
+             WHERE e.fromId = ?1 AND e.kind = 'SUPERTYPE_OF' AND e.resolved = 1 \
+               AND n.kind = 'Function' AND {declaration} \
+             ORDER BY n.qualifiedName, n.id"
+    ))?;
+    let rows = stmt.query_map([node_id], map_node_row)?;
+    rows.collect::<rusqlite::Result<_>>()
+}
+
+/// `(usage's file, placeholder keyPath)` for every `edge_kinds` edge into a
+/// `pending_symbol` placeholder of `language` named `name`, under the
+/// `file_paths` scope (every file when empty). An edge still on a placeholder
+/// is unlinked whatever its `resolved` bit says, so the query does not filter
+/// on it.
+pub(crate) fn placeholder_usages(
+    conn: &Connection,
+    name: &str,
+    language: &str,
+    edge_kinds: &[&str],
+    file_paths: &[&str],
+) -> rusqlite::Result<Vec<(String, Option<String>)>> {
+    let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&name, &language];
+    sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+    sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
+
+    let mut stmt = conn.prepare(&placeholder_usages_sql(edge_kinds.len(), file_paths.len()))?;
+    let rows = stmt.query_map(sql_params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
+/// `?1` is the name and `?2` the language, then `kinds` edge kinds, then
+/// `paths` scope paths. The placeholder kind is a literal so the planner can
+/// use the partial `idx_nodes_pending_name`; without it this is a scan of
+/// every node of the language on every call.
+pub(crate) fn placeholder_usages_sql(kinds: usize, paths: usize) -> String {
+    let kind_params: Vec<String> = (0..kinds).map(|i| format!("?{}", i + 3)).collect();
+    let scope_filter = if paths == 0 {
+        "1 = 1".to_string()
+    } else {
+        let params: Vec<String> = (0..paths).map(|i| format!("?{}", i + 3 + kinds)).collect();
+        format!("f.filePath IN ({})", params.join(", "))
+    };
+    format!(
+        "SELECT f.filePath, p.keyPath \
+         FROM nodes t \
+         JOIN placeholder_targets p ON p.nodeId = t.id \
+         JOIN edges e ON e.toId = t.id \
+         JOIN nodes f ON f.id = e.fromId \
+         WHERE t.name = ?1 AND t.language = ?2 AND t.nativeKind = '{PENDING_SYMBOL_NATIVE_KIND}' \
+           AND e.kind IN ({}) \
+           AND {scope_filter}",
+        kind_params.join(", ")
+    )
+}
+
+/// Whether `language` has a `Type` node whose `qualifiedName` is
+/// `qualified_name`. A failed read counts as no.
+pub(crate) fn has_type_named(conn: &Connection, qualified_name: &str, language: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM nodes WHERE qualifiedName = ?1 AND language = ?2 AND kind = 'Type' LIMIT 1",
+        rusqlite::params![qualified_name, language],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// `(caller's file, calling functions)` over the `untyped_calls` rows named
+/// `name` from `language`'s functions under the `file_paths` scope (every
+/// file when empty), leaving out a function with an `edge_kinds` edge to
+/// `anchor_id` or a semantic edge onto a node of that name.
+pub(crate) fn untyped_call_files(
+    conn: &Connection,
+    name: &str,
+    language: &str,
+    anchor_id: &str,
+    edge_kinds: &[&str],
+    file_paths: &[&str],
+) -> rusqlite::Result<Vec<(String, i64)>> {
+    let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&name, &language, &anchor_id];
+    sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+    sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
+
+    let mut stmt = conn.prepare(&untyped_calls_sql(edge_kinds.len(), file_paths.len()))?;
+    let rows =
+        stmt.query_map(sql_params.as_slice(), |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    rows.collect::<rusqlite::Result<_>>()
+}
+
+/// `?1` is the name, `?2` the language, `?3` the anchor id, then `kinds` edge
+/// kinds, then `paths` scope paths. Yields `(caller's file, calling
+/// functions)`; the table's primary key `(name, nodeId)` makes each row one
+/// calling function, and serves the `name = ?1` lookup.
+pub(crate) fn untyped_calls_sql(kinds: usize, paths: usize) -> String {
+    let kind_params: Vec<String> = (0..kinds).map(|i| format!("?{}", i + 4)).collect();
+    let scope_filter = if paths == 0 {
+        "1 = 1".to_string()
+    } else {
+        let params: Vec<String> = (0..paths).map(|i| format!("?{}", i + 4 + kinds)).collect();
+        format!("f.filePath IN ({})", params.join(", "))
+    };
+    format!(
+        "SELECT f.filePath, COUNT(*) \
+         FROM untyped_calls u \
+         JOIN nodes f ON f.id = u.nodeId \
+         WHERE u.name = ?1 AND f.language = ?2 \
+           AND {scope_filter} \
+           AND NOT EXISTS (SELECT 1 FROM edges e \
+                           WHERE e.fromId = u.nodeId AND e.toId = ?3 AND e.kind IN ({})) \
+           AND NOT EXISTS (SELECT 1 FROM edges e JOIN nodes t ON t.id = e.toId \
+                           WHERE e.fromId = u.nodeId AND e.source = 'semantic' AND t.name = u.name) \
+         GROUP BY f.filePath",
+        kind_params.join(", ")
+    )
+}
+
+/// One declaration of a ranked candidate page ([`ranked_declarations`]).
+pub(crate) struct RankedDeclaration {
+    pub(crate) id: String,
+    pub(crate) qualified_name: String,
+    pub(crate) file_path: String,
+    pub(crate) start_line: i64,
+    pub(crate) end_line: i64,
+    pub(crate) kind: String,
+    pub(crate) signature: Option<String>,
+    pub(crate) doc_comment: Option<String>,
+}
+
+/// Declarations satisfying `filter` (a condition on alias `n`, bound by
+/// `params` from `?1`), ranked by how many `REFERENCES`/`CALLS` edges point
+/// at each, then by id, one keyset page of `page_size` at a time.
+pub(crate) fn ranked_declarations(
+    conn: &Connection,
+    filter: &str,
+    params: &[String],
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<pagination::Page<RankedDeclaration>> {
+    let params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    // The `nativeKind` filter is [`declaration_only`], shared: the lookups
+    // that decide whether a candidate page is needed and the page itself
+    // agree about what counts as a declaration.
+    let base_sql = format!(
+        "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
+         n.startLine AS startLine, n.endLine AS endLine, n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
+         CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
+         FROM nodes n WHERE {filter} AND {}",
+        declaration_only("n.")
+    );
+
+    fn map_row(row: &Row) -> rusqlite::Result<(RankedDeclaration, f64, String)> {
+        let id: String = row.get("id")?;
+        let score: f64 = row.get("score")?;
+        let declaration = RankedDeclaration {
+            id: id.clone(),
+            qualified_name: row.get("qualifiedName")?,
+            file_path: row.get("filePath")?,
+            start_line: row.get("startLine")?,
+            end_line: row.get("endLine")?,
+            kind: row.get("kind")?,
+            signature: row.get("signature")?,
+            doc_comment: row.get("docComment")?,
+        };
+        Ok((declaration, score, id))
+    }
+
+    pagination::paginate_by_score(conn, &base_sql, &params, page_size, cursor, map_row)
+}
+
+/// The ids of the nodes whose `filePath` is `file`.
+pub(crate) fn node_ids_in_file(conn: &Connection, file: &str) -> Result<BTreeSet<String>> {
+    let mut statement = conn.prepare("SELECT id FROM nodes WHERE filePath = ?1")?;
+    let ids = statement.query_map([file], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
+/// A node's `(startLine, startCol, endLine, endCol)` as the index stores it.
+pub(crate) type StoredRange = (i64, i64, i64, i64);
+
+/// The nodes whose `filePath` is `file`, each with its stored range.
+pub(crate) fn node_ranges_in_file(conn: &Connection, file: &str) -> Result<BTreeMap<String, StoredRange>> {
+    let mut statement =
+        conn.prepare("SELECT id, startLine, startCol, endLine, endCol FROM nodes WHERE filePath = ?1")?;
+    let rows = statement
+        .query_map([file], |row| {
+            Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// One `IMPORTS` edge leaving a node of an importer, and where it lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportRow {
+    pub to_file: String,
+    pub to_kind: String,
+    pub to_name: String,
+    pub to_native_kind: Option<String>,
+    pub resolved: bool,
+    /// When the edge lands on a core-owned container (a Python module, a Go
+    /// package), the files of that container's members - empty otherwise.
+    pub container_member_files: Vec<String>,
+}
+
+/// Every `IMPORTS` edge whose `fromId` is a node of `importer`, with its
+/// landing node, sorted by the landing node's file and name - and, for a
+/// landing node that is a core-owned container, the files its members live
+/// in (the container's `DEFINES` edges).
+pub(crate) fn import_rows_of(conn: &Connection, importer: &str) -> Result<Vec<ImportRow>> {
+    let mut statement = conn.prepare(
+        "SELECT t.filePath, t.kind, t.name, t.nativeKind, e.resolved, \
+                (SELECT group_concat(DISTINCT m.filePath) FROM containers c \
+                   JOIN edges d ON d.fromId = c.nodeId AND d.kind = 'DEFINES' \
+                   JOIN nodes m ON m.id = d.toId \
+                 WHERE c.nodeId = t.id) \
+         FROM edges e JOIN nodes f ON f.id = e.fromId JOIN nodes t ON t.id = e.toId \
+         WHERE e.kind = 'IMPORTS' AND f.filePath = ?1 \
+         ORDER BY t.filePath, t.name",
+    )?;
+    let rows = statement
+        .query_map([importer], |row| {
+            let members: Option<String> = row.get(5)?;
+            Ok(ImportRow {
+                to_file: row.get(0)?,
+                to_kind: row.get(1)?,
+                to_name: row.get(2)?,
+                to_native_kind: row.get(3)?,
+                resolved: row.get::<_, i64>(4)? != 0,
+                container_member_files: members
+                    .map(|members| members.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 #[cfg(test)]

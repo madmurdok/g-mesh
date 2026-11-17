@@ -26,7 +26,7 @@
 //! another candidate or an unresolved placeholder. Each importer is owed that
 //! re-extract under its own language.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -166,4 +166,34 @@ pub(crate) fn delete_indexed_file(conn: &Connection, file_path: &str) -> Result<
     conn.execute("DELETE FROM indexed_files WHERE filePath = ?1", params![file_path])
         .context("failed to delete the file's indexed_files row")?;
     Ok(())
+}
+
+/// A file's `indexed_files` baseline: what the last index of it recorded.
+pub(crate) struct IndexedFileRecord {
+    pub(crate) mtime_millis: i64,
+    pub(crate) content_hash: String,
+}
+
+/// `file_path`'s `indexed_files` baseline, `None` when it has none.
+pub(crate) fn lookup_indexed_file(conn: &Connection, file_path: &str) -> Result<Option<IndexedFileRecord>> {
+    conn.query_row(
+        "SELECT mtimeMillis, contentHash FROM indexed_files WHERE filePath = ?1",
+        params![file_path],
+        |row| Ok(IndexedFileRecord { mtime_millis: row.get(0)?, content_hash: row.get(1)? }),
+    )
+    .optional()
+    .context("failed to query indexed_files")
+}
+
+/// Every `indexed_files` baseline's recorded mtime, by file path.
+pub(crate) fn recorded_mtimes(conn: &Connection) -> Result<HashMap<String, i64>> {
+    let mut statement = conn
+        .prepare("SELECT filePath, mtimeMillis FROM indexed_files")
+        .context("failed to query indexed_files baselines")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .context("failed to read indexed_files baselines")?
+        .collect::<rusqlite::Result<HashMap<String, i64>>>()
+        .context("failed to read indexed_files baselines")?;
+    Ok(rows)
 }

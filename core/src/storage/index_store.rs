@@ -832,11 +832,11 @@ mod tests {
             ])
             .unwrap();
         let never_answered = || -> Vec<(String, usize)> {
-            crate::cli::status::index_status(
+            crate::index_health::index_status(
                 project.path(),
                 &db_path,
                 &plugins,
-                crate::cli::status::Mode::Light,
+                crate::index_health::Mode::Light,
             )
             .unwrap()
             .semantic_leftovers

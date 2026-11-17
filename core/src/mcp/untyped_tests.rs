@@ -155,7 +155,7 @@ fn a_free_function_never_qualifies() {
     assert!(probe(&conn, &bare, &["CALLS"], &[]).is_none(), "a one-segment path");
 }
 
-// --- which rows count (`candidate_sql`) -------------------------------------
+// --- which rows count (`graph::queries::untyped_calls_sql`) -------------------------------------
 
 /// A row counts only under the anchor's own name and language. Controls:
 /// drop `u.name = ?1` (`other` counts); drop `f.language = ?2` (the python
@@ -258,7 +258,7 @@ fn count_is_calling_functions_summed_over_files() {
 fn the_candidate_lookup_seeks_the_name_key() {
     let conn = setup();
     let plan: Vec<String> = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {}", candidate_sql(3, 2)))
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", crate::graph::queries::untyped_calls_sql(3, 2)))
         .unwrap()
         .query_map(rusqlite::params_from_iter(["x"; 8]), |row| row.get(3))
         .unwrap()

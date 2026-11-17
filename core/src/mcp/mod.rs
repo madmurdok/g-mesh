@@ -672,14 +672,8 @@ impl GMeshMcpServer {
             );
         }
 
-        let (present, outcomes, retries) = {
-            let conn = self.store.read();
-            (
-                crate::storage::schema::present_languages_with_semantic_state(&conn),
-                crate::storage::schema::language_outcomes(&conn),
-                crate::storage::schema::language_retries(&conn),
-            )
-        };
+        let crate::index_health::LanguageOverview { present, outcomes, retries } =
+            crate::index_health::language_overview(&self.store.read());
         // A walk that failed every language is retried whole on the next
         // tool call, not by a daemon start's per-language retry.
         let retries = match retries {
