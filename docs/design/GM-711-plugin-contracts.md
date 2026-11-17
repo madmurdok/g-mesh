@@ -439,3 +439,11 @@ S3 review -> S4 tests -> S5 verify.
 
 Unsplit fallback: S2 R-14 opus; S3 R-21 sonnet; S4 R-24 opus (after GM-713); S5 R-26 sonnet;
 S6 review; S7 tests; S8 verify.
+
+## 6. Owner review (2026-11-17)
+
+- D2: "Новый крейт g-mesh-manifest (Recommended)".
+- D3: "Толерантно + ошибка -32602 (Recommended)".
+- D5: "Да, как в ноте (Recommended)" — acceptance says python and rust.
+- D6: "Split, новая в батч 4.33 (Recommended)" — GM-711 keeps R-21 + R-14; R-24 + R-26 move
+  to a new task in release 4.33.0, after GM-713 merges.
