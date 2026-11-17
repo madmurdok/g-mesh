@@ -1,5 +1,5 @@
 # SQL sites allowed outside storage/, graph/, link/ and model/: `path count  # reason`.
 # Checked by `python3 scripts/sql-sites.py --check scripts/sql-sites.allow`; a count may only
 # go down, and a lowered count must lower its line here.
-embedding/cache.rs 19  # its own database file and schema, not the index
+embedding/cache.rs 20  # its own database file and schema, not the index
 cli/embed_eval.rs 7  # reads snapshot copies whose schema may predate the current one

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """SQL statements written outside the index's own modules (core/src).
 
-A site is a string literal whose text starts with an SQL keyword (SELECT, INSERT, UPDATE, DELETE,
-CREATE, DROP, ALTER, PRAGMA, WITH, REPLACE, ATTACH, DETACH, BEGIN, SAVEPOINT, RELEASE), on a line
-that is neither test code nor a comment, in a file outside `storage/`, `graph/`, `link/` and
-`model/`. Test code is `module-cycles.py`'s rule: files under `tests/` or `testdata/`, files named
+A site is a string literal whose first non-whitespace text is an SQL keyword (SELECT, INSERT,
+UPDATE, DELETE, CREATE, DROP, ALTER, PRAGMA, WITH, REPLACE, ATTACH, DETACH, BEGIN, SAVEPOINT,
+RELEASE), whose opening quote is on a line that is neither test code nor a comment, in a file
+outside `storage/`, `graph/`, `link/` and
+`model/`. The keyword may follow a newline or a `\\` line continuation after the opening quote, and
+the site is attributed to the line of the opening quote. Keywords are uppercase only: lowercase
+would match prose such as "update the index". Test code is `module-cycles.py`'s rule: files under `tests/` or `testdata/`, files named
 `tests.rs`, `*_tests.rs`, `*_test.rs`, and `#[cfg(test)]` items in other files.
 
 Prints `count path` per file with a site, then the total. With `--check ALLOW` it also compares
@@ -21,21 +24,25 @@ import sys
 
 OWNERS = ("storage", "graph", "link", "model")
 SQL = re.compile(
-    r'"\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|PRAGMA|WITH|REPLACE|ATTACH|DETACH|BEGIN|SAVEPOINT|RELEASE)\b'
+    r'(?:\s|\\\r?\n)*(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|PRAGMA|WITH|REPLACE|ATTACH|DETACH|BEGIN|SAVEPOINT|RELEASE)\b'
 )
 
 
 def load_module_cycles():
     here = os.path.dirname(os.path.abspath(__file__))
     spec = importlib.util.spec_from_file_location("module_cycles", os.path.join(here, "module-cycles.py"))
+    if spec is None or spec.loader is None:
+        sys.exit("sql-sites: cannot load module-cycles.py next to this script")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def mask(src):
+def mask(src, literals=None):
     """Blank comments and the bodies of string and char literals, keeping every newline and the
-    quotes, so a masked line is code only and lines up with the original."""
+    quotes, so a masked line is code only and lines up with the original. When `literals` is a
+    list, each string literal's `(offset of its opening quote or prefix, body start, body end)` is
+    appended to it."""
     out = list(src)
     n = len(src)
 
@@ -72,6 +79,8 @@ def mask(src):
             j = src.find(end, i + raw.end())
             j = n if j < 0 else j + len(end)
             blank(i + raw.end(), j - len(end))
+            if literals is not None:
+                literals.append((i, i + raw.end(), max(j - len(end), i + raw.end())))
             i = j
             continue
         if c == '"':
@@ -79,6 +88,8 @@ def mask(src):
             while j < n and src[j] != '"':
                 j += 2 if src[j] == "\\" else 1
             blank(i + 1, j)
+            if literals is not None:
+                literals.append((i, i + 1, min(j, n)))
             i = min(j + 1, n)
             continue
         if c == "'":
@@ -106,11 +117,15 @@ def count_sites(src_root):
                 continue
             with open(path, encoding="utf-8") as f:
                 src = f.read()
-            live = cycles.strip_cfg_test(mask(src)).split("\n")
-            original = src.split("\n")
-            if len(live) != len(original):
+            literals = []
+            live = cycles.strip_cfg_test(mask(src, literals)).split("\n")
+            if len(live) != src.count("\n") + 1:
                 sys.exit(f"sql-sites: masking changed the line count of {rel}")
-            n = sum(len(SQL.findall(o)) for o, l in zip(original, live) if l.strip() and SQL.search(o))
+            n = 0
+            for start, body, end in literals:
+                line = src.count("\n", 0, start)
+                if live[line].strip() and SQL.match(src, body, end):
+                    n += 1
             if n:
                 counts[rel.replace(os.sep, "/")] = n
     return counts
