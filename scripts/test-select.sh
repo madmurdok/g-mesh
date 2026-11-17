@@ -234,7 +234,11 @@ else
 		case "$selected" in *" $s "*) ;; *) spawns_covered=0 ;; esac
 	done
 	if [ "$spawns_covered" -eq 0 ]; then
-		for s in core-spawns-typescript core-spawns-rust core-spawns-python core-spawns-go; do
+		# Cargo plugins, then go ones: the order the selectors are printed in.
+		spawn_plugins="$(bash scripts/build-targets.sh --plugins cargo && bash scripts/build-targets.sh --plugins go)" ||
+			die "could not read build-targets.sh --plugins"
+		for p in $spawn_plugins; do
+			s="core-spawns-$p"
 			case "$selected" in *" $s "*) out+=("$s") ;; esac
 		done
 	fi

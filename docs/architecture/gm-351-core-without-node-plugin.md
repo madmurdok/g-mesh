@@ -79,7 +79,7 @@ Proposed: `build_stamp`'s `plugin` field = `registry::plugins_digest` over
 `indexer_version` already computes. It covers each plugin's `manifest_dir`: in
 a checkout that is the plugin's sources (`plugins/typescript/{Cargo.toml,src,...}`);
 in an archive it is the staged `plugin.toml` plus binary
-(`bundle-rust-plugin.sh` layout).
+(`bundle-cargo-plugin.sh` layout).
 
 Why all plugins and not just TypeScript: TypeScript was singled out only
 because it was the one plugin built outside cargo. Now python/rust/typescript

@@ -15,9 +15,8 @@
 # `g-mesh plugins check plugins/python --fixture <dir>` run from the
 # repository root, after `cargo build -p g-mesh-plugin-python`, is what this
 # path is for today. A release archive does not reuse this file - see
-# `scripts/bundle-rust-plugin.sh`'s own header for why, and expect a
-# `scripts/bundle-python-plugin.sh` to do the same one-line `command`
-# rewrite when this plugin is distributed.
+# `scripts/bundle-cargo-plugin.sh`'s own header for why; it does the same
+# one-line `command` rewrite for this plugin.
 
 [plugin]
 language = "python"

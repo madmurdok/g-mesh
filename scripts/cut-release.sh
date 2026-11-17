@@ -290,16 +290,19 @@ check_workspace_versions() {
 	log "workspace versions agree: $core_version (core, ${OTHER_WORKSPACE_MANIFESTS[*]})"
 }
 
-# The cargo-workspace language plugins, by directory under plugins/. Each
-# carries its own version and is checked by `check_crate_backed_plugin_versions`
-# (see this script's header comment for the rule, and why Go is not here). A
-# new cargo-workspace plugin is a deliberate addition to this list, the same
-# fail-closed shape OTHER_WORKSPACE_MANIFESTS uses.
-CRATE_BACKED_PLUGINS=(
-	rust
-	python
-	typescript
-)
+# The cargo-workspace language plugins, by directory under plugins/: the
+# `cargo` kind of build-targets.sh's plugin list, read from the build-targets.sh
+# beside this script. Each carries its own version and is checked by
+# `check_crate_backed_plugin_versions` (see this script's header comment for
+# the rule, and why Go is not here).
+CRATE_BACKED_PLUGINS=()
+crate_backed_plugins="$(bash "$(dirname "${BASH_SOURCE[0]}")/build-targets.sh" --plugins cargo)" ||
+	die "could not read the cargo plugins from build-targets.sh --plugins cargo"
+while IFS= read -r plugin; do
+	[ -z "$plugin" ] || CRATE_BACKED_PLUGINS+=("$plugin")
+done <<<"$crate_backed_plugins"
+unset crate_backed_plugins plugin
+[ ${#CRATE_BACKED_PLUGINS[@]} -gt 0 ] || die "build-targets.sh --plugins cargo named no plugin"
 
 # The release-versioned crates every plugin in CRATE_BACKED_PLUGINS is built
 # from. Their `src/` and `Cargo.toml` are shipped inputs of each plugin.
@@ -477,8 +480,8 @@ check_crate_backed_plugin_versions() {
 		dir="plugins/$plugin"
 		cargo_toml="$REPO_ROOT/$dir/Cargo.toml"
 		plugin_toml="$REPO_ROOT/$dir/plugin.toml"
-		[ -f "$cargo_toml" ] || die "plugin manifest not found: $dir/Cargo.toml (update CRATE_BACKED_PLUGINS in this script if it moved or was removed)"
-		[ -f "$plugin_toml" ] || die "plugin manifest not found: $dir/plugin.toml (update CRATE_BACKED_PLUGINS in this script if it moved or was removed)"
+		[ -f "$cargo_toml" ] || die "plugin manifest not found: $dir/Cargo.toml (update PLUGINS in scripts/build-targets.sh if it moved or was removed)"
+		[ -f "$plugin_toml" ] || die "plugin manifest not found: $dir/plugin.toml (update PLUGINS in scripts/build-targets.sh if it moved or was removed)"
 		crate_version="$(package_version "$cargo_toml")"
 		[ -n "$crate_version" ] || die "could not determine version from $dir/Cargo.toml"
 		toml_version="$(plugin_toml_version "$plugin_toml")"
