@@ -49,6 +49,7 @@ use crate::control::lock::{self, DaemonLock};
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
 use crate::embedding::rerank::{OutcomeRecord, RerankModelState, RerankOutcome};
+use crate::fsutil::mtime_millis;
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
 use crate::indexing_status::{group_thousands, ProgressSnapshot};
@@ -57,7 +58,6 @@ use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::project_walk;
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{SemanticLeftover, MAX_LANGUAGE_RETRIES};
-use crate::watcher::staleness::mtime_millis;
 
 /// Whether a daemon core is serving this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,7 +203,7 @@ pub struct Coverage {
     ///
     /// A bulk-indexed file with no `indexed_files` row is *not* counted: the
     /// walk leaves no baseline when it cannot prove it saw the current bytes
-    /// (`watcher::staleness::record_walk_baselines`), and older indexes have
+    /// (`ingest::staleness::record_walk_baselines`), and older indexes have
     /// none at all, so a missing baseline means "not checked since", not
     /// "stale".
     pub dirty: usize,

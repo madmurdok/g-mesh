@@ -1,5 +1,7 @@
 use super::*;
+use crate::ingest::convert::{to_edge_record, to_node_record};
 use crate::protocol::jsonrpc::read_message;
+use crate::protocol::types::FileChangeDiff;
 use crate::protocol::types::{
     EdgeKind, NodeKind, PlaceholderTarget, Position, QualifiedPath, Range, SourceTier, TargetKey,
     TargetScope, Visibility, WireEdge, WireNode,
@@ -7,6 +9,7 @@ use crate::protocol::types::{
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::write::apply_diff;
+use crate::storage::write::{DeclarationRecord, EdgeRecord, NodeRecord};
 use rusqlite::Connection;
 use std::io::BufReader;
 

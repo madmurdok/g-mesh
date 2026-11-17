@@ -46,8 +46,8 @@ use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::seed::SeedGate;
 use crate::daemon::semantic;
+use crate::daemon::watch_loop::{spawn_watch_consumer, ConsumerStart};
 use crate::daemon::workspace_reindex;
-use crate::daemon::ConsumerStart;
 use crate::embedding::EmbeddingPipeline;
 use crate::indexing_status::{IndexingStatus, Phase};
 use crate::plugin_manifest::DiscoveredPlugins;
@@ -185,7 +185,7 @@ impl ActivationCtx {
                 (true, Some(gate)) => ConsumerStart::Seeded(gate),
                 (true, None) => ConsumerStart::Reconcile,
             };
-            super::spawn_watch_consumer(
+            spawn_watch_consumer(
                 watcher,
                 Arc::clone(&self.conn),
                 Arc::clone(&self.registry),

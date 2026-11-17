@@ -25,7 +25,7 @@
 //! detached daemon, the real bundled JS/TS plugin, and a real `rmcp` client.
 //! File mtimes are set explicitly rather than left to when the fixture
 //! happened to be written, because the walk's baseline rule is about mtimes
-//! relative to the walk's start (`watcher::staleness::record_walk_baselines`)
+//! relative to the walk's start (`ingest::staleness::record_walk_baselines`)
 //! and a slow machine must not move a file from one side of it to the other.
 
 use std::path::{Path, PathBuf};
@@ -33,9 +33,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use g_mesh::daemon;
+use g_mesh::ingest::apply::HOLD_COMPUTE_FILE_ENV;
 use g_mesh::mcp::{PROGRESS_INTERVAL_ENV, TRACE_CALLS_ENV};
 use g_mesh::storage::connection::project_dir;
-use g_mesh::watcher::apply::HOLD_COMPUTE_FILE_ENV;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, RunningService};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -61,7 +61,7 @@ const OLD: [(&str, &str); 2] = [
 /// must leave it without a baseline, and its first query must reindex it.
 const LATE: (&str, &str) = ("src/late.ts", "export function late(): void {}\n");
 
-/// What `watcher::apply`'s test-only hold logs once a round trip is parked.
+/// What `ingest::apply`'s test-only hold logs once a round trip is parked.
 const HOLDING_LINE: &str = "holding a reparse's lock-free embedding window open";
 
 /// How long test 3 keeps the reindex in flight. At a 200 ms heartbeat that is
@@ -275,7 +275,7 @@ async fn the_first_query_after_a_walk_takes_the_fast_path() {
 /// never moves a baseline - only `ensure_fresh` does - so the check itself
 /// must still see the walk's old hash and reindex (`ReindexedViaHashMismatch`).
 ///
-/// Control: in `watcher::staleness::decide`, return `Decision::AlreadyFresh`
+/// Control: in `ingest::staleness::decide`, return `Decision::AlreadyFresh`
 /// whenever a prior record exists (ignoring its mtime and hash). The trace
 /// then reads `outcome=AlreadyFresh` and the outcome assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

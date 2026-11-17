@@ -16,7 +16,7 @@
 //! (`daemon::lifecycle::PLUGIN_IDLE_ENV`, the same knob `idle_lifecycle.rs`
 //! uses), edit a file while it is asleep so the change queues rather than
 //! being applied, then hold the replay's round trip open with
-//! `watcher::apply::HOLD_COMPUTE_FILE_ENV` - the same hook
+//! `ingest::apply::HOLD_COMPUTE_FILE_ENV` - the same hook
 //! `first_query_after_walk.rs`'s test 3 uses to hold `ensure_file_fresh`'s
 //! own reindex - so the test controls exactly how long the replay takes
 //! rather than racing a real tsserver-class cold start.
@@ -30,9 +30,9 @@ use std::time::{Duration, SystemTime};
 
 use g_mesh::daemon;
 use g_mesh::daemon::lifecycle::PLUGIN_IDLE_ENV;
+use g_mesh::ingest::apply::HOLD_COMPUTE_FILE_ENV;
 use g_mesh::mcp::{PROGRESS_INTERVAL_ENV, TRACE_CALLS_ENV};
 use g_mesh::storage::connection::project_dir;
-use g_mesh::watcher::apply::HOLD_COMPUTE_FILE_ENV;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, RunningService};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -65,7 +65,7 @@ const BETA: &str = "export function beta(): number {\n  return 3;\n}\n";
 /// identically-named constant, and the same value.
 const PLUGIN_IDLE: Duration = Duration::from_millis(1_500);
 
-/// What `watcher::apply`'s test-only hold logs once a round trip is parked -
+/// What `ingest::apply`'s test-only hold logs once a round trip is parked -
 /// unconditionally, whether or not the hold file actually exists (see
 /// `hold_compute_open_for_tests`'s own doc comment), so the whole-project
 /// semantic pass that runs during cold start prints this line too. The test

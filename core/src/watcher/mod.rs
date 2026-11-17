@@ -1,10 +1,8 @@
-pub mod apply;
 pub mod batch;
 pub mod burst;
 pub mod debounce;
 pub mod ignore_layers;
 pub mod rescan;
-pub mod staleness;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};

@@ -9,12 +9,17 @@ use std::sync::Arc;
 use rusqlite::Connection;
 
 use super::*;
-use crate::daemon::test_plugin;
+use crate::ingest::select::{
+    indexed_file_count, indexed_files_of, indexed_importers, reads, scan_imports, select_affected,
+    select_with,
+};
 use crate::plugin_manifest::discover;
 use crate::protocol::types::{
     EdgeKind, Matcher, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
 };
+use crate::protocol::types::{ImportMatch, ImportSelector, PathScope, TargetScopeKind};
 use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
+use crate::test_plugin;
 
 // -------------------------------------------------------------------------
 // select_affected, on a seeded in-memory index
