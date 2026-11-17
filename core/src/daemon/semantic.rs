@@ -1393,4 +1393,24 @@ mod tests {
         assert_eq!(second.completed, vec!["alpha".to_string()], "{:?}", second.failed);
         assert_eq!(test_plugin::semantic_passes(&alpha_dir), vec!["[]".to_string(), "[]".to_string()]);
     }
+
+    /// The semantic-pass timeout scales with a language's indexed `File`
+    /// count, and a count that cannot be read falls back to 0 (the flat
+    /// floor) instead of failing the pass. Control: return 1 instead of 0
+    /// on the error arm of `indexed_file_count` -> the fallback assertion fails.
+    #[test]
+    fn indexed_file_count_counts_one_languages_files_and_reads_0_when_it_cannot() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::storage::schema::apply(&conn).unwrap();
+        seed_file(&conn, "a", "typescript", "a.ts");
+        seed_file(&conn, "b", "typescript", "b.ts");
+        seed_file(&conn, "c", "python", "c.py");
+        let store = IndexStore::new(conn);
+
+        assert_eq!(indexed_file_count(&store, "typescript"), 2);
+        assert_eq!(indexed_file_count(&store, "python"), 1);
+
+        store.with(|conn| conn.execute("DROP TABLE nodes", [])).unwrap();
+        assert_eq!(indexed_file_count(&store, "typescript"), 0);
+    }
 }
