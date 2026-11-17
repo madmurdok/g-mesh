@@ -1098,9 +1098,21 @@ impl ControlRequest {
             },
         };
 
+        // A method that reads no params (or an unknown one, which is
+        // acknowledged) is judged by its method alone, whatever `params` holds.
+        let reads_params = matches!(
+            method.as_str(),
+            "reindex"
+                | "workspaceChanged"
+                | "fileChanged"
+                | "filesCreated"
+                | "semanticPass"
+                | "resolutionChanged"
+        );
         let mut params = match envelope.remove("params") {
             None | Some(Value::Null) => serde_json::Map::new(),
             Some(Value::Object(params)) => params,
+            Some(_) if !reads_params => serde_json::Map::new(),
             Some(_) => {
                 let error = ControlDecodeError::BadParams("params is not an object".to_string());
                 return Ok(Self::failed(id, method, error));
