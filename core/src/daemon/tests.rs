@@ -30,8 +30,19 @@ fn writing_a_pid_file_leaves_no_temporary_behind() {
     assert!(leftovers.is_empty(), "the temporary must be renamed, not left: {leftovers:?}");
 }
 use super::*;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::mpsc;
+
+use super::watch_loop::{watch_and_route_once, Rescans, DEBOUNCE_WINDOW};
 use crate::paths::state_dir::{project_dir, DAEMON_LOCK_FILE, DAEMON_SERVING_FILE};
 use crate::storage::index_store::IndexStore;
+use crate::storage::schema;
+use crate::test_plugin;
+use crate::watcher::debounce::Debouncer;
+use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
+use crate::watcher::rescan::RescanScheduler;
+use crate::watcher::ProjectWatcher;
 
 /// Forces the exact shape of task 165's race deterministically, instead
 /// of relying on a real `kill -9`'s unpredictable teardown delay the way
@@ -927,7 +938,7 @@ fn exited_pid() -> u32 {
 #[test]
 fn a_rebuild_marker_counts_only_while_its_pid_lives_and_the_daemon_lock_is_held() {
     let dir = tempfile::tempdir().unwrap();
-    let marker = rebuild_marker_path_in(dir.path());
+    let marker = StateDir::at(dir.path()).rebuild_marker_file();
     assert_eq!(rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), None, "no marker");
 
     StateDir::at(dir.path()).write_rebuild_marker("init").unwrap();
@@ -965,80 +976,26 @@ fn a_live_rebuild_marker_under_an_unopenable_daemon_lock_is_no_rebuild() {
     assert_eq!(rebuild_in_progress_in(&state_dir).unwrap(), None);
 }
 
-/// Every compat wrapper names the same file, endpoint or record as the
-/// `StateDir` method it wraps, over one temp state directory (`_in` forms)
-/// and one temp project root (root forms, under the environment's home).
-///
-/// Control: point one wrapper at another method (`phase_path_in` at
-/// `progress_file`): its row mismatches.
+/// A state directory reports the plugin pid files, suspension markers,
+/// progress snapshot, phase and serving owner its files hold.
 #[test]
-fn every_compat_wrapper_names_what_its_state_dir_method_names() {
+fn a_state_dir_reports_what_its_files_hold() {
     let dir = tempfile::tempdir().unwrap();
     let sd = StateDir::at(dir.path());
-    let root = tempfile::tempdir().unwrap();
-    let of = StateDir::of(root.path()).unwrap();
-    let home = crate::paths::g_mesh_home().unwrap();
-
-    let mut rows: Vec<(&str, PathBuf, PathBuf)> = vec![
-        ("pid_path", pid_path(root.path()).unwrap(), of.pid_file()),
-        ("pid_path_in", pid_path_in(dir.path()), sd.pid_file()),
-        (
-            "plugin_pid_path",
-            plugin_pid_path(root.path()).unwrap(),
-            of.plugin_pid_file(plugin::BUNDLED_LANGUAGE),
-        ),
-        ("plugin_pid_path_in", plugin_pid_path_in(dir.path()), sd.plugin_pid_file(plugin::BUNDLED_LANGUAGE)),
-        ("phase_path_in", phase_path_in(dir.path()), sd.phase_file()),
-        ("progress_path_in", progress_path_in(dir.path()), sd.progress_file()),
-        ("rerank_outcome_path_in", rerank_outcome_path_in(dir.path()), sd.rerank_outcome_file()),
-        ("build_stamp_path", build_stamp_path(root.path()).unwrap(), of.build_stamp_file()),
-        ("build_stamp_path_in", build_stamp_path_in(dir.path()), sd.build_stamp_file()),
-        ("rebuild_marker_path_in", rebuild_marker_path_in(dir.path()), sd.rebuild_marker_file()),
-        ("daemon_lock_path_in", daemon_lock_path_in(dir.path()), sd.daemon_lock_file()),
-        ("lock_path", lock_path(root.path()).unwrap(), of.bootstrap_lock_file()),
-        ("shim::DAEMON_LOG_FILE", dir.path().join(crate::shim::DAEMON_LOG_FILE), sd.daemon_log_file()),
-        (
-            "config::project_config_path",
-            crate::config::project_config_path(root.path()).unwrap(),
-            of.config_file(),
-        ),
-        (
-            "config::global_config_path",
-            crate::config::global_config_path().unwrap(),
-            crate::paths::state_dir::global_config_file(&home),
-        ),
-    ];
-    #[cfg(unix)]
-    rows.push(("socket_path", socket_path(root.path()).unwrap(), of.socket_file()));
-    let mismatches: Vec<String> = rows
-        .iter()
-        .filter(|(_, wrapper, method)| wrapper != method)
-        .map(|(name, wrapper, method)| format!("{name}: {} != {}", wrapper.display(), method.display()))
-        .collect();
-    assert!(mismatches.is_empty(), "wrappers that disagree with StateDir:\n{}", mismatches.join("\n"));
-
-    assert_eq!(endpoint_in(dir.path()), ipc::endpoint_for(&sd), "endpoint_in");
-    assert_eq!(endpoint(root.path()).unwrap(), ipc::endpoint_for(&of).unwrap(), "endpoint");
-
     std::fs::write(sd.plugin_pid_file("rust"), "1\n").unwrap();
     std::fs::write(sd.plugin_suspended_marker("go"), "crashed\n").unwrap();
-    assert_eq!(registry::discovered_pid_files(dir.path()), sd.plugin_pid_files());
     assert_eq!(sd.plugin_pid_files().len(), 1);
-    assert_eq!(registry::discovered_suspended_markers(dir.path()), sd.suspended_markers());
     assert_eq!(sd.suspended_markers(), vec![("go".to_string(), "crashed".to_string())]);
 
     let snapshot = indexing_status::ProgressSnapshot { pid: 7, phase: "walk".into(), ..Default::default() };
     std::fs::write(sd.progress_file(), serde_json::to_string(&snapshot).unwrap()).unwrap();
-    assert_eq!(read_progress_in(dir.path()), indexing_status::read_progress(&sd));
-    assert_eq!(read_progress_in(dir.path()), Some(snapshot));
+    assert_eq!(indexing_status::read_progress(&sd), Some(snapshot));
 
     std::fs::write(sd.phase_file(), "walk\n").unwrap();
-    assert_eq!(read_phase_in(dir.path()), sd.read_phase());
-    assert_eq!(read_phase_in(dir.path()).as_deref(), Some("walk"));
+    assert_eq!(sd.read_phase().as_deref(), Some("walk"));
 
     sd.record_serving_owner(4321);
-    assert_eq!(serving_owner_in(dir.path()), sd.serving_owner());
-    assert_eq!(serving_owner_in(dir.path()), Some(4321));
+    assert_eq!(sd.serving_owner(), Some(4321));
 }
 
 // --- GM-616: a Rescan reconciles the subtree whose events the OS dropped ---
@@ -1080,7 +1037,7 @@ fn indexed_file(root: &Path, conn: &IndexStore, file_path: &str) {
     let path = root.join(file_path);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "v0").unwrap();
-    let mtime = crate::watcher::staleness::mtime_millis(&fs::metadata(&path).unwrap()).unwrap();
+    let mtime = crate::fsutil::mtime_millis(&fs::metadata(&path).unwrap()).unwrap();
     conn.with(|c| crate::storage::write::upsert_indexed_file(c, file_path, mtime, "indexed")).unwrap();
 }
 
@@ -1098,7 +1055,7 @@ fn edit(root: &Path, file_path: &str) {
 }
 
 fn is_stale(conn: &IndexStore, root: &Path, file_path: &str) -> bool {
-    conn.with(|c| crate::watcher::staleness::is_stale(c, root, file_path)).unwrap()
+    conn.with(|c| crate::ingest::staleness::is_stale(c, root, file_path)).unwrap()
 }
 
 /// Runs `watch_and_route_once` until `done` holds after an iteration, or
@@ -1192,7 +1149,7 @@ fn a_deletion_and_a_creation_whose_events_were_dropped_are_reconciled_by_a_resca
     );
     assert!(!requested(plugin_dir, "kept.python-src"), "an untouched file is not reparsed");
     let baseline = |file_path: &str| {
-        conn.with(|c| crate::watcher::staleness::has_indexed_baseline(c, file_path)).unwrap()
+        conn.with(|c| crate::ingest::staleness::has_indexed_baseline(c, file_path)).unwrap()
     };
     assert!(!baseline("gone.python-src"), "the deleted file is retired from the index");
     assert!(baseline("new.python-src"), "the created file is indexed");

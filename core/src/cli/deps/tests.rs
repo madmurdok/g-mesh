@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::graph::containers::container_id;
-use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
+use crate::model::{Diff, EdgeRecord, NodeRecord};
+use crate::storage::write::apply_diff;
 use g_mesh_wire::native_kind::RESOLVED_MODULE_NATIVE_KIND;
 
 fn file_id(path: &str) -> String {
@@ -289,4 +290,26 @@ fn targets_of_and_common_dir_follow_the_directory_rule() {
     assert_eq!(common_dir(&paths(&["a.py"])), Some(".".to_string()));
     assert_eq!(parent_dir("a/b/c.rs"), "a/b");
     assert_eq!(parent_dir("c.rs"), ".");
+}
+
+/// An importer that is itself one of the files defining the container it
+/// imports drops only the edge onto itself; the container's other files are
+/// still its targets. Control: in `export`'s visitor, turn the inner
+/// `onto_itself` `continue` into `return Ok(())` -> the edge onto `b/y.go`
+/// is lost.
+#[test]
+fn an_import_of_a_container_the_importer_helps_define_keeps_the_other_files() {
+    let conn = index(
+        vec![
+            file("a/x.go", "go"),
+            file("b/y.go", "go"),
+            member("a/x.go", "go", "split"),
+            member("b/y.go", "go", "split"),
+        ],
+        vec![import_container("x-split", "a/x.go", "go", "split")],
+        &indexed(&["go"]),
+    );
+    let report = report(&conn);
+    assert_eq!(report["edges"], json!([edge("a/x.go", "b/y.go", "file", "go", Some("split"))]), "{report}");
+    assert_eq!(report["coverage"]["go"]["edges"], 1, "{report}");
 }

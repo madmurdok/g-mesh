@@ -36,13 +36,13 @@ use std::sync::{LockResult, Mutex, MutexGuard, PoisonError};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::embedding::pipeline::ComputedBatch;
-use crate::embedding::EmbeddingPipeline;
-use crate::graph::symbol_links::LinkRules;
-use crate::graph::{imports, symbol_links};
+use crate::link::symbol_links::LinkRules;
+use crate::link::{imports, symbol_links};
+use crate::model::Diff;
 use crate::storage::file_rows::{self, FileScope};
 use crate::storage::language_swap::{self, SwapBookkeeping};
-use crate::storage::write::{apply_diff, apply_semantic_diff, upsert_indexed_file, Diff};
+use crate::storage::vectors::VectorWrite;
+use crate::storage::write::{apply_diff, apply_semantic_diff, upsert_indexed_file};
 
 thread_local! {
     static HELD: Cell<bool> = const { Cell::new(false) };
@@ -64,7 +64,7 @@ pub enum Unit {
     /// One plugin round trip: commit and link its diff, then store the
     /// vectors computed from it.
     WatcherApply,
-    /// `watcher::staleness::ensure_fresh`: decide, reindex, record the baseline.
+    /// `ingest::staleness::ensure_fresh`: decide, reindex, record the baseline.
     QueryTimeReindex,
     /// One language's bulk walk: its batch commits and its bookkeeping row.
     BulkWalk,
@@ -363,7 +363,7 @@ impl IndexStore {
     pub fn swap_language(
         &self,
         staging_path: &std::path::Path,
-        vectors: Option<(&EmbeddingPipeline, &ComputedBatch)>,
+        vectors: Option<&dyn VectorWrite>,
         bookkeeping: &SwapBookkeeping<'_>,
     ) -> Result<usize> {
         // The kept ids are recorded before the guard drops, so no diff can
@@ -544,10 +544,10 @@ impl Writer<'_> {
     }
 
     /// Stores precomputed vectors and deletes the filtered nodes' ones, in
-    /// one step. Best-effort, like
-    /// [`EmbeddingPipeline::store`].
-    pub fn store_vectors(&mut self, embedding: &EmbeddingPipeline, computed: &ComputedBatch) {
-        self.step(|conn| embedding.store(conn, computed));
+    /// one step. Best-effort, like `EmbeddingPipeline::store`, which
+    /// `EmbeddingPipeline::vector_write` wraps.
+    pub fn store_vectors(&mut self, vectors: &dyn VectorWrite) {
+        self.step(|conn| vectors.write(conn));
     }
 
     /// [`IndexStore::commit_batch`] as one step of this unit.
@@ -608,8 +608,8 @@ impl Deref for ReadGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::NodeRecord;
     use crate::storage::schema;
-    use crate::storage::write::NodeRecord;
 
     fn store() -> IndexStore {
         let conn = Connection::open_in_memory().unwrap();
@@ -832,11 +832,11 @@ mod tests {
             ])
             .unwrap();
         let never_answered = || -> Vec<(String, usize)> {
-            crate::cli::status::index_status(
+            crate::index_health::index_status(
                 project.path(),
                 &db_path,
                 &plugins,
-                crate::cli::status::Mode::Light,
+                crate::index_health::Mode::Light,
             )
             .unwrap()
             .semantic_leftovers
@@ -905,7 +905,7 @@ mod tests {
         let file =
             |path: &str| NodeRecord::new(format!("File:{path}"), "File", path, path, path, "typescript");
         let import = |from: &str, to: &str| {
-            crate::storage::write::EdgeRecord::new(
+            crate::model::EdgeRecord::new(
                 format!("i:{from}->{to}"),
                 format!("File:{from}"),
                 format!("File:{to}"),
@@ -975,7 +975,7 @@ mod tests {
         let mut placeholder =
             NodeRecord::new("ph:use.ts:lib.ts", "Module", "lib.ts", "lib.ts", "use.ts", "typescript");
         placeholder.native_kind = Some("resolved_module".to_string());
-        placeholder.target = Some(crate::storage::write::PlaceholderTargetRecord {
+        placeholder.target = Some(crate::model::PlaceholderTargetRecord {
             scope_kind: "file".to_string(),
             scope: "lib.ts".to_string(),
             key_kind: "name".to_string(),
@@ -989,7 +989,7 @@ mod tests {
                 NodeRecord::new("File:use.ts", "File", "use.ts", "use.ts", "use.ts", "typescript"),
                 placeholder,
             ],
-            upsert_edges: vec![crate::storage::write::EdgeRecord::new(
+            upsert_edges: vec![crate::model::EdgeRecord::new(
                 "i:use.ts->lib.ts",
                 "File:use.ts",
                 "ph:use.ts:lib.ts",
@@ -1049,7 +1049,7 @@ mod tests {
             upsert_edges: imports
                 .iter()
                 .map(|&(from, to)| {
-                    crate::storage::write::EdgeRecord::new(
+                    crate::model::EdgeRecord::new(
                         format!("i:{from}->{to}"),
                         from,
                         to,
@@ -1211,7 +1211,7 @@ mod tests {
             "typescript",
         );
         node.native_kind = Some(g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND.to_string());
-        node.target = Some(crate::storage::write::PlaceholderTargetRecord {
+        node.target = Some(crate::model::PlaceholderTargetRecord {
             scope_kind: "file".to_string(),
             scope: "lib.ts".to_string(),
             key_kind: "name".to_string(),
@@ -1223,8 +1223,8 @@ mod tests {
         node
     }
 
-    fn call_onto_placeholder(name: &str) -> crate::storage::write::EdgeRecord {
-        crate::storage::write::EdgeRecord::new(
+    fn call_onto_placeholder(name: &str) -> crate::model::EdgeRecord {
+        crate::model::EdgeRecord::new(
             format!("e-{name}"),
             USE_STRING,
             placeholder_id(name),
@@ -1262,9 +1262,8 @@ mod tests {
         let mut seed = resave();
         seed.upsert_nodes.retain(|node| node.id != EXTRA);
         seed.upsert_nodes.extend([ts_symbol("lib.ts", "parse"), ts_symbol("lib.ts", "format")]);
-        seed.upsert_edges.push(crate::storage::write::EdgeRecord::new(
-            "e-bound", USE_STRING, PARSE, "CALLS", "semantic", true,
-        ));
+        seed.upsert_edges
+            .push(crate::model::EdgeRecord::new("e-bound", USE_STRING, PARSE, "CALLS", "semantic", true));
         store.unit(Unit::WatcherApply, |writer| writer.apply_diff_linked(&seed, "seed")).unwrap();
         (store, path)
     }
@@ -1572,7 +1571,7 @@ mod tests {
         let mut placeholder =
             NodeRecord::new(id.clone(), "Module", "@env/a", "@env/a", importer, "typescript");
         placeholder.native_kind = Some("resolved_module".to_string());
-        placeholder.target = Some(crate::storage::write::PlaceholderTargetRecord {
+        placeholder.target = Some(crate::model::PlaceholderTargetRecord {
             scope_kind: "file".to_string(),
             scope: "generated/a".to_string(),
             key_kind: "name".to_string(),
@@ -1593,7 +1592,7 @@ mod tests {
                 ),
                 placeholder,
             ],
-            upsert_edges: vec![crate::storage::write::EdgeRecord::new(
+            upsert_edges: vec![crate::model::EdgeRecord::new(
                 format!("i:{importer}->@env/a"),
                 format!("File:{importer}"),
                 id,

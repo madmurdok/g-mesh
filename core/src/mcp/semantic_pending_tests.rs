@@ -11,14 +11,16 @@ use rusqlite::Connection;
 use super::session_hints::SessionHints;
 use super::{find_callers_callees, find_implementations, find_references};
 use super::{FindImplementationsParams, SymbolQueryParams};
+use crate::embedding::text::TextRule;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::MAX_RESPONSE_BYTES;
+use crate::mcp::response_bound::MAX_RESPONSE_BYTES;
+use crate::model::{Diff, EdgeRecord, NodeRecord};
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::storage::connection::open_staging;
 use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
 use crate::storage::schema;
-use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
+use crate::storage::write::apply_diff;
 
 fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
     HashMap::from([(
@@ -96,7 +98,14 @@ fn after_a_swap() -> (tempfile::TempDir, Arc<IndexStore>) {
 
     let mut staging = open_staging(&staging_path).unwrap();
     apply_diff(&mut staging, &walk("fn a(x: u32)")).unwrap();
-    language_swap::plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+    language_swap::plan(
+        &mut staging,
+        live_path.to_str().unwrap(),
+        "rust",
+        &TextRule { version: "model" },
+        true,
+    )
+    .unwrap();
     drop(staging);
     let capable = HashSet::from(["rust".to_string()]);
     language_swap::swap(

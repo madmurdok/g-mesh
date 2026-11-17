@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use g_mesh::storage::schema;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
@@ -144,12 +144,16 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        for path in
-            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())].into_iter().flatten()
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ]
+        .into_iter()
+        .flatten()
         {
             common::kill_pid_file(&path);
         }
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
         if let Ok(state) = project_dir(self.root()) {
@@ -233,7 +237,7 @@ async fn connecting_alone_indexes_nothing() {
     // worktree, inside `daemon::run`, right after `indexing.attach_phase_file`),
     // and this assertion fails alongside the two above: the daemon moves to
     // `Walking` before this test ever gets to read the file.
-    let phase = std::fs::read_to_string(daemon::phase_path_in(&project_dir(project.root()).unwrap()))
+    let phase = std::fs::read_to_string(StateDir::at(project_dir(project.root()).unwrap()).phase_file())
         .expect("a running daemon must have published its index.phase");
     assert_eq!(phase.trim(), "unindexed", "connecting alone must not move the daemon past Unindexed");
 
@@ -527,7 +531,7 @@ async fn a_panicking_embedding_pass_does_not_fail_structural_tools() {
     // out its whole (90s-scale) timeout instead of failing fast on the
     // `failed` it actually reached.
     let phase_path =
-        daemon::phase_path_in(&project_dir(project.root()).expect("failed to resolve state dir"));
+        StateDir::at(project_dir(project.root()).expect("failed to resolve state dir")).phase_file();
     let settle_deadline = std::time::Instant::now() + Duration::from_secs(20);
     let settled = loop {
         let phase = std::fs::read_to_string(&phase_path).unwrap_or_default();

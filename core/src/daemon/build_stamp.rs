@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::daemon::plugin;
-use crate::watcher::staleness::mtime_millis;
+use crate::fsutil::mtime_millis;
 
 /// Keys written into the stamp file. Spelled out rather than derived so the
 /// file stays a stable, greppable contract between two processes that may be

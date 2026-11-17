@@ -592,15 +592,15 @@ use rusqlite::Connection;
 use crate::mcp::host_fake::FakeHost;
 
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::queries::upsert_node;
 use crate::indexing_status::{IndexingStatus, Phase};
 use crate::languages::{self, CATALOGUE};
 use crate::mcp::GMeshMcpServer;
 use crate::mcp::McpHost;
+use crate::model::NodeRecord;
 use crate::plugin_manifest::{discover, DiscoveredPlugins};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::NodeRecord;
+use crate::storage::write::upsert_node;
 
 /// The generic "unsupported" sentence (ADR 0022, section 3): said once,
 /// naming no catalogue.
@@ -1674,7 +1674,7 @@ fn a_real_missing_plugin_binary_renders_the_os_cause_without_the_path() {
         ),
     )
     .unwrap();
-    crate::daemon::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
+    crate::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 
@@ -1844,7 +1844,7 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
         ),
     )
     .unwrap();
-    crate::daemon::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
+    crate::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 
@@ -2277,4 +2277,29 @@ fn a_failed_walk_keeps_the_failed_sentence_without_a_retry_state() {
         "{rendered}"
     );
     assert!(!rendered.contains("next start") && !rendered.contains("without success"), "{rendered}");
+}
+
+/// The cold start does no store read: with the store held by this thread
+/// (so any read would trip `IndexStore`'s re-entry panic), `Unindexed` and
+/// `Walking` still render the cold-start text, while `Ready` does read and
+/// trips it (the seam observes reads). Control: in `instructions`, call
+/// `language_overview(&self.store.read())` before the phase branch -> the
+/// cold start panics.
+#[test]
+fn the_cold_start_instructions_take_no_store_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(IndexStore::new(store_with_files(&["typescript"])));
+    let held = store.lock().unwrap();
+
+    for phase in [Phase::Unindexed, Phase::Walking] {
+        let server = server_over(&dir, real_plugins(&["typescript"]), Arc::clone(&store), phase);
+        let rendered = server.instructions();
+        assert!(rendered.contains("Plugins installed: typescript."), "{rendered}");
+    }
+
+    let server = server_over(&dir, real_plugins(&["typescript"]), Arc::clone(&store), Phase::Ready);
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.instructions()));
+    drop(held);
+    assert!(read.is_err(), "a ready server reads the store, so holding it must trip the re-entry check");
+    assert!(server.instructions().contains("Indexed here: typescript."));
 }

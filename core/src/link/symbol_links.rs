@@ -2,7 +2,7 @@
 //! symbol* placeholder into a real `CALLS`/`REFERENCES`/`SUPERTYPE_OF` edge
 //! onto the symbol another file (or another member of a container) declares.
 //!
-//! `graph::imports` does this one level coarser, for whole modules; this is
+//! `link::imports` does this one level coarser, for whole modules; this is
 //! the same handshake for the symbols reached through them. A language plugin
 //! sees one file at a time, so `foo()` after `import { foo } from "./x"` has
 //! no local declaration to point at - and dropping that edge, which is what
@@ -246,7 +246,7 @@
 //!
 //! ## Why the placeholder is kept
 //!
-//! Unlike `graph::imports`, a linked-away placeholder is *not* deleted, even
+//! Unlike `link::imports`, a linked-away placeholder is *not* deleted, even
 //! once nothing points at it. An import placeholder can only ever carry the
 //! one `IMPORTS` edge from its own file, so once that has moved it is
 //! genuinely spent; a symbol placeholder carries one edge per *usage*, and a
@@ -295,9 +295,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Statement};
 
 use crate::graph::containers;
 use crate::graph::queries::{declaration_only, NON_DECLARATION_NATIVE_KINDS};
+use crate::model::qualified_path;
+use crate::model::Diff;
 use crate::protocol::types::QualifiedPath;
-use crate::storage::qualified_path;
-use crate::storage::write::Diff;
 
 pub use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_ALL_NAME, REEXPORT_NATIVE_KIND};
 
@@ -407,7 +407,7 @@ fn required_target_kind(edge_kind: &str, engine_answer: bool) -> Option<Option<&
 ///    and a `REFERENCES` edge onto one import record of one file is precisely
 ///    the per-file fragmentation GM-367 measured as useless (63 rows for
 ///    `net/http` on gin). What a caller genuinely wants said about an
-///    external specifier is said by the `IMPORTS` edge `graph::imports`
+///    external specifier is said by the `IMPORTS` edge `link::imports`
 ///    deliberately leaves on the node, and by
 ///    `mcp::find_definition::import_only_refusal`.
 ///  - **The one list is the point.** Two lists answering "is this a

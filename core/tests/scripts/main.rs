@@ -27,6 +27,7 @@ mod module_cycles_script;
 mod new_task_worktree_script;
 mod prune_stale_objects_script;
 mod release_packaging_scripts;
+mod sql_sites_script;
 mod test_local_script;
 mod test_sections_scripts;
 mod test_select_scripts;

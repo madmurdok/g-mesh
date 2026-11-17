@@ -37,8 +37,8 @@ THRESHOLD_SECS = 10.0
 # Run locally with fewer seeds (`G_MESH_CONTAINERS_SEEDS`) instead of being
 # skipped, so their full-run time says nothing about the list.
 REDUCED_LOCALLY = {
-    ("g-mesh", "graph::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence"),
-    ("g-mesh", "graph::containers::tests::bulk_batch_boundaries_do_not_change_the_result"),
+    ("g-mesh", "storage::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence"),
+    ("g-mesh", "storage::containers::tests::bulk_batch_boundaries_do_not_change_the_result"),
 }
 
 TERM = re.compile(r"binary_id\(([^)]+)\)\s*&\s*test\(=([^)]+)\)")

@@ -27,14 +27,16 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, Direction};
+use crate::graph::pagination;
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
+use crate::graph::Direction;
+use crate::mcp::response_bound;
 use crate::mcp::PathCoverage;
+use crate::model::NodeRecord;
 use crate::plugin_manifest::Capabilities;
 use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
 
 use super::not_indexed::{self, NotIndexed};
 use super::query_shapes::QueryShapes;
@@ -111,7 +113,7 @@ struct ImplementationPage<'a> {
 /// Paginates the incoming `SUPERTYPE_OF` edges for `anchor_id` and resolves
 /// each one to the implementing/extending node, cut so that the response
 /// `response_len` measures for a candidate page fits
-/// `pagination::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
+/// `response_bound::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
 /// drive it with a small `page_size` without needing a page-size field on
 /// the public tool parameters.
 fn list_implementations(
@@ -159,7 +161,7 @@ fn list_implementations(
         });
     }
 
-    Ok(pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
+    Ok(response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
 }
 
 #[cfg(test)]
@@ -232,7 +234,7 @@ fn handle_in(
         params.cursor.as_deref(),
         |candidate| {
             let (hint, provenance) = disclosures(candidate, false);
-            pagination::wire_len(&ImplementationPage {
+            response_bound::wire_len(&ImplementationPage {
                 anchor: &anchor_info,
                 results: &candidate.results,
                 has_more: candidate.has_more,
@@ -403,7 +405,8 @@ fn bound_walk(
         }
     }
 
-    let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES - reserve)
+    let Some(cut) =
+        response_bound::longest_prefix_fitting(&dtos, response_bound::MAX_RESPONSE_BYTES - reserve)
     else {
         let truncated_by = result.truncated_by.map(wire_name);
         return TransitiveImplementationWalk {

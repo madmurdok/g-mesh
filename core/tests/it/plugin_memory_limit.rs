@@ -1,6 +1,6 @@
 //! GM-291's own acceptance test: `[plugin] memoryLimitMb` (GM-274) enforced
 //! against a REAL rust-analyzer, not GM-274's synthetic "memory-hungry" Node
-//! fixture (`daemon::test_plugin::install_memory_hungry`,
+//! fixture (`test_plugin::install_memory_hungry`,
 //! `core/src/daemon/lifecycle.rs`'s own
 //! `a_plugin_over_its_memory_limit_is_put_to_sleep_and_its_language_suspended`).
 //! Same shape as that test - a real [`PluginSupervisor`] driven directly, not
@@ -106,8 +106,8 @@ use g_mesh::daemon::bulk_index;
 use g_mesh::daemon::lifecycle::PluginSupervisor;
 use g_mesh::daemon::manifest::{read_manifest, DiscoveredPlugins, PluginManifest};
 use g_mesh::daemon::memory::process_tree_sample;
-use g_mesh::daemon::registry;
 use g_mesh::embedding::EmbeddingPipeline;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
@@ -636,11 +636,11 @@ impl Drop for DaemonProject {
 }
 
 /// Polls until "rust" has a suspension marker on disk
-/// (`daemon::registry::discovered_suspended_markers`, the same file
+/// (`StateDir::suspended_markers`, the same file
 /// `cli::status` reads) or `deadline` passes.
 fn wait_for_rust_suspended(state_dir: &Path, deadline: Instant) {
     loop {
-        let markers = registry::discovered_suspended_markers(state_dir);
+        let markers = StateDir::at(state_dir).suspended_markers();
         if markers.iter().any(|(language, _)| language == "rust") {
             return;
         }

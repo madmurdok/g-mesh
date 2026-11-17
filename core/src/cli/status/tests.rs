@@ -1,7 +1,15 @@
+use std::fs;
+
+use rusqlite::Connection;
+
 use super::*;
+use crate::fsutil::mtime_millis;
+use crate::index_health::discover_source_files;
 use crate::indexing_status::{EmbedProgress, SemanticProgress, WalkProgress};
 use crate::paths::state_dir::project_dir;
+use crate::plugin_manifest::DiscoveredPlugins;
 use crate::storage::schema;
+use crate::storage::schema::SemanticLeftover;
 
 /// The plugins this checkout ships - their real `plugin.toml`s, read from
 /// `plugins/` beside `core/` exactly as `plugin_manifest::bundled_roots` finds them in
@@ -807,14 +815,14 @@ fn the_repair_advice_is_shown_only_when_no_live_daemon_is_working() {
 fn embedding_progress_shows_the_daemons_own_done_and_total_as_a_percentage() {
     let dir = tempfile::tempdir().unwrap();
     let indexing = crate::indexing_status::IndexingStatus::structural();
-    indexing.attach_progress_file_every(daemon::progress_path_in(dir.path()), Duration::ZERO);
+    indexing.attach_progress_file_every(StateDir::at(dir.path()).progress_file(), Duration::ZERO);
     indexing.set_phase(crate::indexing_status::Phase::Embedding);
     indexing.set_embed_total(1_200);
     indexing.add_embed_done(300);
 
     let mut report = phase_fixture(true, Some("embedding"));
     report.core = CoreState::Running { pid: std::process::id() };
-    report.progress = daemon::read_progress_in(dir.path());
+    report.progress = crate::indexing_status::read_progress(&StateDir::at(dir.path()));
     let rendered = render(&report);
 
     assert_eq!(indexing.embed_progress(), (300, 1_200));
@@ -1020,7 +1028,7 @@ fn a_daemon_holding_a_rebuilt_plugin_is_named_as_that_and_not_as_an_old_binary()
     let state = tempfile::tempdir().unwrap();
     let mut incumbent = build_stamp::of_running_process().unwrap();
     incumbent.plugin = format!("{}-before", incumbent.plugin);
-    build_stamp::write(&daemon::build_stamp_path_in(state.path()), &incumbent).unwrap();
+    build_stamp::write(&StateDir::at(state.path()).build_stamp_file(), &incumbent).unwrap();
 
     assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::PluginChanged);
     let described = describe_build(BuildState::PluginChanged).unwrap();
@@ -1031,7 +1039,7 @@ fn a_daemon_holding_a_rebuilt_plugin_is_named_as_that_and_not_as_an_old_binary()
 fn a_daemon_that_published_this_builds_stamp_reads_as_current() {
     let state = tempfile::tempdir().unwrap();
     let ours = build_stamp::of_running_process().unwrap();
-    build_stamp::write(&daemon::build_stamp_path_in(state.path()), &ours).unwrap();
+    build_stamp::write(&StateDir::at(state.path()).build_stamp_file(), &ours).unwrap();
 
     assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Current);
     // Still comparable for a daemon that is up but not answering on its
@@ -1044,7 +1052,7 @@ fn a_daemon_that_published_an_older_builds_stamp_reads_as_outdated() {
     let state = tempfile::tempdir().unwrap();
     let mut older = build_stamp::of_running_process().unwrap();
     older.exe_mtime_millis -= 24 * 60 * 60 * 1000;
-    build_stamp::write(&daemon::build_stamp_path_in(state.path()), &older).unwrap();
+    build_stamp::write(&StateDir::at(state.path()).build_stamp_file(), &older).unwrap();
 
     assert_eq!(build_state(CoreState::Running { pid: 1 }, state.path()), BuildState::Outdated);
 }
@@ -1113,9 +1121,9 @@ fn idle_durations_read_the_way_a_human_would_say_them() {
 #[test]
 fn a_daemon_suspended_language_is_reported_by_a_separate_status_read() {
     use crate::daemon::lifecycle::PluginSupervisor;
-    use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
     use crate::plugin_manifest::read_manifest;
+    use crate::test_plugin;
     use std::sync::Arc;
 
     let project = tempfile::tempdir().unwrap();
@@ -1772,7 +1780,7 @@ fn rerank_line(status: RerankStatus) -> String {
 
 fn write_outcome(state_dir: &Path, pid: u32, outcome: &str) {
     std::fs::write(
-        daemon::rerank_outcome_path_in(state_dir),
+        StateDir::at(state_dir).rerank_outcome_file(),
         format!(r#"{{"pid":{pid},"outcome":"{outcome}","dir":"/models/rerank"}}"#),
     )
     .unwrap();
@@ -1815,7 +1823,7 @@ fn a_leftover_record_falls_back_to_the_on_disk_check() {
     write_outcome(state.path(), 4242, "loaded");
     assert!(alive(rerank_status(CoreState::Running { pid: 7 }, state.path())), "another pid's record");
     assert!(!alive(rerank_status(CoreState::NotRunning, state.path())), "no daemon");
-    std::fs::write(daemon::rerank_outcome_path_in(state.path()), "garbage").unwrap();
+    std::fs::write(StateDir::at(state.path()).rerank_outcome_file(), "garbage").unwrap();
     assert!(alive(rerank_status(CoreState::Running { pid: 4242 }, state.path())), "an unreadable record");
 }
 
@@ -1900,4 +1908,99 @@ fn the_json_names_the_daemon_outcome_or_the_on_disk_state() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// The `index_health` read model: its reads leave a missing index missing,
+// trust only languages a plugin can pass, and keep the MCP overview's
+// three reads apart.
+// ---------------------------------------------------------------------
+
+/// No status read conjures an index: with no `index.db`, the full and light
+/// status, the language section, the retry counts and the last-used read all
+/// answer without creating one. Control: add `SQLITE_OPEN_CREATE` to
+/// `storage::connection::open_existing` -> `language_retries` creates it.
+#[test]
+fn no_status_read_creates_a_missing_index() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let plugins = bundled_plugins();
+
+    let full = index_status(fixture.root(), &fixture.db_path(), &plugins, Mode::Full).unwrap();
+    let light = index_status(fixture.root(), &fixture.db_path(), &plugins, Mode::Light).unwrap();
+    let section = language_section(&fixture.db_path(), false).unwrap();
+    let retries = language_retries(&fixture.db_path());
+    let last_used = crate::gc::last_used::read_from_project_dir(fixture.state.path()).unwrap();
+
+    assert_eq!(full.coverage, Some(Coverage { discovered: 1, indexed: 0, dirty: 1 }));
+    assert_eq!(light.coverage, None);
+    assert_eq!(section, LanguageSection::NoIndex);
+    assert!(retries.is_empty());
+    assert!(last_used.is_none());
+    assert!(!fixture.db_path().exists(), "a status read created {}", fixture.db_path().display());
+    assert_eq!(fs::read_dir(fixture.state.path()).unwrap().count(), 0, "nothing written beside it either");
+}
+
+/// Pending and stale semantic files are reported only for a language some
+/// installed plugin can run the semantic pass for: a recorded language with
+/// no such plugin is dropped from both. Control: drop the
+/// `capable.contains(&language) &&` guard from `index_health::semantic_pending`
+/// and `semantic_stale` -> the unknown language is listed.
+#[test]
+fn pending_and_stale_semantic_files_name_only_languages_a_plugin_can_pass() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+    conn.execute_batch(
+        "INSERT INTO semantic_pending (language, since) VALUES
+             ('typescript', '2026-09-26T10:14:03Z'), ('no-such-language', '2026-09-26T10:14:03Z');
+         INSERT INTO semantic_pending_files (language, filePath) VALUES
+             ('typescript', 'a.ts'), ('no-such-language', 'x.none');",
+    )
+    .unwrap();
+
+    let status = fixture.status();
+    assert_eq!(
+        status.semantic_pending,
+        vec![("typescript".to_string(), "2026-09-26T10:14:03Z".to_string(), 1)]
+    );
+
+    schema::record_language_semantic_pass_failure(&conn, "typescript", "not run").unwrap();
+    schema::record_language_semantic_pass_failure(&conn, "no-such-language", "not run").unwrap();
+    let status = fixture.status();
+    assert!(status.semantic_pending.is_empty(), "{:?}", status.semantic_pending);
+    assert_eq!(status.semantic_stale, vec![("typescript".to_string(), 1)]);
+}
+
+/// `language_overview` returns the three reads the MCP instructions use,
+/// each its own `Result`: a missing `language_retry` table fails only the
+/// retries, a missing `language_outcome` table only the outcomes. Control:
+/// read the retries with `language_retries_if_present` (a gone table reads
+/// as no retries) -> `retries` is `Ok`.
+#[test]
+fn the_language_overview_reads_each_part_on_its_own() {
+    let fixture = Fixture::new(&[]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+    let outcomes = BTreeMap::from([("typescript".to_string(), LanguageOutcome::Indexed { files: 1 })]);
+    schema::record_language_outcomes(&conn, &outcomes).unwrap();
+    schema::begin_language_retry(&conn, "typescript").unwrap();
+
+    let overview = crate::index_health::language_overview(&conn);
+    assert_eq!(overview.present.unwrap(), vec![("typescript".to_string(), false)]);
+    assert_eq!(
+        overview.outcomes.unwrap(),
+        vec![("typescript".to_string(), LanguageOutcome::Indexed { files: 1 })]
+    );
+    assert_eq!(overview.retries.unwrap(), BTreeMap::from([("typescript".to_string(), 1)]));
+
+    conn.execute("DROP TABLE language_retry", []).unwrap();
+    let overview = crate::index_health::language_overview(&conn);
+    assert!(overview.retries.is_err(), "a gone retry table must read as a failure, not as no retries");
+    assert_eq!(overview.present.unwrap(), vec![("typescript".to_string(), false)]);
+    assert_eq!(overview.outcomes.unwrap().len(), 1);
+
+    conn.execute("DROP TABLE language_outcome", []).unwrap();
+    let overview = crate::index_health::language_overview(&conn);
+    assert!(overview.outcomes.is_err());
+    assert_eq!(overview.present.unwrap(), vec![("typescript".to_string(), false)]);
 }

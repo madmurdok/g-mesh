@@ -13,8 +13,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
-use g_mesh::daemon;
 use g_mesh::ipc;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
@@ -121,7 +121,7 @@ fn reconciled_line(root: &Path, log: &Path) -> String {
         let text = std::fs::read_to_string(log).unwrap_or_default();
         let whole = &text[..text.rfind('\n').map_or(0, |end| end + 1)];
         line = whole.lines().find(|line| line.contains("files with the disk in")).map(str::to_string);
-        if line.is_none() && daemon::read_phase_in(&state_dir).as_deref() == Some("walking") {
+        if line.is_none() && StateDir::at(&state_dir).read_phase().as_deref() == Some("walking") {
             panic!("the restarted daemon is walking the project instead of reconciling it; its log:\n{text}");
         }
         line.is_some()
@@ -184,7 +184,8 @@ fn reconciled_line_fails_at_once_when_the_restart_walks() {
     std::fs::write(&log, "g-mesh daemon: serving\n").expect("failed to write the log");
     let state_dir = RemoveOnDrop(project_dir(root.path()).expect("failed to resolve the state directory"));
     std::fs::create_dir_all(&state_dir.0).expect("failed to create the state directory");
-    std::fs::write(daemon::phase_path_in(&state_dir.0), "walking\n").expect("failed to publish the phase");
+    std::fs::write(StateDir::at(&state_dir.0).phase_file(), "walking\n")
+        .expect("failed to publish the phase");
 
     let wait = {
         let root = root.path().to_path_buf();
@@ -366,7 +367,7 @@ fn a_pre_existing_project_is_indexed_by_the_cold_start_walk_alone() {
     let db_path = project_dir(project.root()).unwrap().join("index.db");
     assert!(db_path.exists(), "the daemon must open (and thus create) the project's SQLite file");
 
-    let endpoint = daemon::endpoint(project.root()).unwrap();
+    let endpoint = StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)).unwrap();
     let responses = mcp_session(&endpoint, vec![outline_request(1, "src/greeter.ts")]);
 
     assert_eq!(
@@ -400,7 +401,7 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     project.seed_before_walk("src/first.ts", "export function first(): number {\n  return 1;\n}\n");
 
     let mut first_daemon = spawn_daemon(project.root());
-    let pid_file = daemon::pid_path(project.root()).unwrap();
+    let pid_file = StateDir::of(project.root()).map(|sd| sd.pid_file()).unwrap();
     // The first daemon has to be allowed to *finish* its walk: killed part
     // way through it would leave the completion marker unset, and the second
     // start would legitimately walk again - which is the very thing this test
@@ -433,7 +434,7 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
          untouched one alone: {reconciled}"
     );
 
-    let endpoint = daemon::endpoint(project.root()).unwrap();
+    let endpoint = StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)).unwrap();
     let responses =
         mcp_session(&endpoint, vec![outline_request(1, "src/first.ts"), outline_request(2, "src/second.ts")]);
 
@@ -464,10 +465,10 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
 fn unknown_method_gets_a_json_rpc_error_not_a_crash() {
     let project = Project::new();
     let mut daemon = spawn_daemon(project.root());
-    let pid_file = daemon::pid_path(project.root()).unwrap();
+    let pid_file = StateDir::of(project.root()).map(|sd| sd.pid_file()).unwrap();
     wait_for("the daemon to start listening", || pid_file.exists());
 
-    let endpoint = daemon::endpoint(project.root()).unwrap();
+    let endpoint = StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)).unwrap();
     // The follow-up tools/list on the *same* connection is the point of the
     // test: a garbage request has to be answered and shrugged off, not take
     // the session down with it.
@@ -497,7 +498,7 @@ fn a_rejected_tool_call_reports_an_error_result_rather_than_failing_the_session(
     // still-indexing guard ahead of it instead, and prove nothing.
     wait_until_indexed(project.root());
 
-    let endpoint = daemon::endpoint(project.root()).unwrap();
+    let endpoint = StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)).unwrap();
     let responses = mcp_session(
         &endpoint,
         vec![

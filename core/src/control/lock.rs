@@ -61,7 +61,7 @@ pub fn is_listening(state_dir: &StateDir) -> Result<bool> {
 }
 
 /// [`ipc::endpoint_for`], an error for a state directory with no final component.
-pub(crate) fn endpoint(state_dir: &StateDir) -> Result<ipc::Endpoint> {
+pub fn endpoint(state_dir: &StateDir) -> Result<ipc::Endpoint> {
     ipc::endpoint_for(state_dir)
         .with_context(|| format!("failed to derive the daemon endpoint from {}", state_dir.path().display()))
 }

@@ -495,7 +495,7 @@
 //!   declaration at all - `stream-order` requires both endpoints to be nodes
 //!   of the edge's own file - so it travels as a placeholder, and a
 //!   placeholder edge the linker repoints is set `resolved = 1` by
-//!   `graph::symbol_links` whatever the plugin said. Measured: flipping all
+//!   `link::symbol_links` whatever the plugin said. Measured: flipping all
 //!   ten edges the Go plugin's `go/types` tier answers with changes nothing
 //!   in the index, because every one of them lands on a placeholder core
 //!   then resolves.
@@ -514,7 +514,7 @@
 //!
 //! `find_callers`/`find_references` attach `files` exactly when it says
 //! something `results` does not: the page is incomplete, or its rows repeat
-//! a file (`pagination::tally_is_worth_sending`). Decision 4 has already
+//! a file (`response_bound::tally_is_worth_sending`). Decision 4 has already
 //! ruled the first half out here, so within this kit the field is present
 //! precisely when the rows repeat a file - which makes both of its states
 //! worth pinning:
@@ -584,7 +584,7 @@
 //!
 //! `count` is asserted beside `files` rather than derived from it because
 //! the wire keeps them apart for a reason: the count is exact and uncapped,
-//! the tally is cut at `pagination::MAX_EXCLUDED_FILE_TALLY`, and
+//! the tally is cut at `response_bound::MAX_EXCLUDED_FILE_TALLY`, and
 //! understating the gap is the one thing this disclosure must never do. A
 //! response that sets `filesTruncated` fails the entry rather than being
 //! compared against a capped list - decision 4's rule once more, and no
@@ -626,7 +626,8 @@ use serde_json::Value;
 
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, Direction};
+use crate::graph::pagination;
+use crate::graph::Direction;
 use crate::mcp::query_shapes::QueryShapes;
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{
@@ -1389,7 +1390,7 @@ fn files_finding(value: &Value, expected: Option<&[String]>) -> Option<String> {
         )),
         (Some(expected), None) => Some(format!(
             "files = {{{}}}, but the response carries no files tally at all: it is claiming its \
-             rows already sit one per file (pagination::tally_is_worth_sending), which is the \
+             rows already sit one per file (response_bound::tally_is_worth_sending), which is the \
              opposite of what this entry says (decision 12)",
             format_set(&expected.iter().cloned().collect())
         )),
@@ -1430,7 +1431,7 @@ fn excluded_references_finding(value: &Value, expected: Option<&ExcludedExpectat
             if block.get("filesTruncated").and_then(Value::as_bool) == Some(true) {
                 return Some(
                     "the response set excludedReferences.filesTruncated - its tally was cut at \
-                     pagination::MAX_EXCLUDED_FILE_TALLY, so decision 13 will not compare it \
+                     response_bound::MAX_EXCLUDED_FILE_TALLY, so decision 13 will not compare it \
                      against a fixture's whole list; narrow the fixture"
                         .to_string(),
                 );

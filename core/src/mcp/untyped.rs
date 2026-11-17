@@ -24,7 +24,8 @@
 use rusqlite::Connection;
 
 use super::unlinked::{self, CandidateTally};
-use crate::storage::write::NodeRecord;
+use crate::graph::queries;
+use crate::model::NodeRecord;
 
 /// Calls named like a method, made through an untyped receiver, that may
 /// reach the anchor. `count` is the number of calling functions, not of call
@@ -56,44 +57,11 @@ pub(crate) fn probe(
     if !is_method(conn, anchor) {
         return None;
     }
-    let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&anchor.name, &anchor.language, &anchor.id];
-    sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
-    sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
-
-    let mut stmt = conn.prepare(&candidate_sql(edge_kinds.len(), file_paths.len())).ok()?;
-    let rows = stmt
-        .query_map(sql_params.as_slice(), |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-        .ok()?;
-    let by_file: Vec<(String, i64)> = rows.collect::<rusqlite::Result<_>>().ok()?;
+    let by_file =
+        queries::untyped_call_files(conn, &anchor.name, &anchor.language, &anchor.id, edge_kinds, file_paths)
+            .ok()?;
     let count = by_file.iter().map(|(_, refs)| *refs as usize).sum();
     CandidateTally::from_files(count, by_file, UNTYPED_RECEIVER_CALLS_HINT)
-}
-
-/// `?1` is the name, `?2` the language, `?3` the anchor id, then `kinds` edge
-/// kinds, then `paths` scope paths. Yields `(caller's file, calling
-/// functions)`; the table's primary key `(name, nodeId)` makes each row one
-/// calling function, and serves the `name = ?1` lookup.
-fn candidate_sql(kinds: usize, paths: usize) -> String {
-    let kind_params: Vec<String> = (0..kinds).map(|i| format!("?{}", i + 4)).collect();
-    let scope_filter = if paths == 0 {
-        "1 = 1".to_string()
-    } else {
-        let params: Vec<String> = (0..paths).map(|i| format!("?{}", i + 4 + kinds)).collect();
-        format!("f.filePath IN ({})", params.join(", "))
-    };
-    format!(
-        "SELECT f.filePath, COUNT(*) \
-         FROM untyped_calls u \
-         JOIN nodes f ON f.id = u.nodeId \
-         WHERE u.name = ?1 AND f.language = ?2 \
-           AND {scope_filter} \
-           AND NOT EXISTS (SELECT 1 FROM edges e \
-                           WHERE e.fromId = u.nodeId AND e.toId = ?3 AND e.kind IN ({})) \
-           AND NOT EXISTS (SELECT 1 FROM edges e JOIN nodes t ON t.id = e.toId \
-                           WHERE e.fromId = u.nodeId AND e.source = 'semantic' AND t.name = u.name) \
-         GROUP BY f.filePath",
-        kind_params.join(", ")
-    )
 }
 
 /// Whether a receiver call `x.f()` can reach `anchor`: a `Function` that is

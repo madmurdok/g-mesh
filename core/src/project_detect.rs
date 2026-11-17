@@ -21,9 +21,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 use crate::paths::state_dir::project_dir;
+use crate::storage::connection::open_existing;
 use crate::storage::schema;
 
 /// What marks a directory as a project. Each is probed with one
@@ -207,17 +208,14 @@ fn completed_index_in(state_dir: &Path) -> bool {
 
 /// Opens `<state dir>/index.db` if it exists.
 ///
-/// Opened read-write *without* `CREATE`, as `cli::status::index_status` and
-/// `gc::last_used` open it: recovering a WAL an abandoned daemon left behind
-/// needs write access, and a missing database must never be conjured into
-/// existence by a check. Never through `connection::open`, which creates the
-/// file.
+/// Opened through [`open_existing`]: never through `connection::open`, which
+/// creates the file.
 fn open_existing_index(state_dir: &Path) -> Option<Connection> {
     let db_path = crate::paths::state_dir::StateDir::at(state_dir).index_db();
     if fs::symlink_metadata(&db_path).is_err() {
         return None;
     }
-    Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI).ok()
+    open_existing(&db_path).ok()
 }
 
 /// Whether the index records a finished walk. Any failure to read it (no

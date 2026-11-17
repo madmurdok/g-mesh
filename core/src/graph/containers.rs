@@ -46,7 +46,7 @@
 //! of files is the shape that rules out re-deriving a whole container's member
 //! list on every edit):
 //!
-//!  1. [`detach`] runs first, before `apply_diff` deletes or upserts anything.
+//!  1. `storage::containers::detach` runs first, before `apply_diff` deletes or upserts anything.
 //!     For every node the diff names, it reads the membership the index holds
 //!     for it *now* and compares it with the membership the diff leaves it with
 //!     (the last upsert of that id, or none if the diff only deletes it). Where
@@ -54,7 +54,7 @@
 //!     the node delete: `edges.toId` is a foreign key, and in the test
 //!     connections that enforce it a member cannot be deleted while an edge
 //!     still points at it.
-//!  2. [`attach`] runs last, once every node is written. Each member the diff
+//!  2. `storage::containers::attach` runs last, once every node is written. Each member the diff
 //!     leaves in a container gets its container node, its `containers` row and
 //!     its `DEFINES` edge, each written `ON CONFLICT DO NOTHING` - so an
 //!     already-member node re-upserted with the same container writes nothing
@@ -81,14 +81,14 @@
 //!
 //! # Decision: inside `apply_diff`'s transaction, not a pass after it
 //!
-//! `graph::imports::link_diff`/`graph::symbol_links::link_diff` run after the
+//! `link::imports::link_diff`/`link::symbol_links::link_diff` run after the
 //! commit, and can afford to: an unlinked placeholder is a *correct* graph with
 //! less in it, and the next pass finishes the job. Half-applied membership is
 //! not correct - a committed member delete whose container still counts it, or
 //! a new member with no container node, is exactly the drift this module exists
 //! to rule out - so membership commits or rolls back with the diff that caused
 //! it. It also covers every writer at once: the per-file reparse
-//! (`watcher::apply`), each cold-start bulk batch (`daemon::bulk_index::commit`),
+//! (`ingest::apply`), each cold-start bulk batch (`daemon::bulk_index::commit`),
 //! the burst batcher and `graph::queries`' helpers all write through
 //! `apply_diff`, so none of them needs to know containers exist.
 //!
@@ -104,7 +104,7 @@
 //! Any node with a non-empty `container`, except a container node itself and
 //! the four kinds that are an *address* rather than a declaration
 //! (`pending_symbol`, `reexport`, `resolved_module`, `external_module`). Two
-//! things break if a placeholder is counted: `graph::imports` deletes a
+//! things break if a placeholder is counted: `link::imports` deletes a
 //! linked-away `resolved_module` placeholder with plain SQL (outside
 //! `apply_diff`, so this module would never see it leave), and it only does
 //! so once no edge touches the placeholder - which a `DEFINES` edge from its
@@ -112,19 +112,19 @@
 //! rather than as a container whose key is the empty string, which no
 //! language in the design doc's table has.
 //!
-//! [`membership`] reads this exclusion off `graph::queries::
+//! `storage::containers::membership` reads this exclusion off `graph::queries::
 //! NON_DECLARATION_NATIVE_KINDS` (GM-376) - the same list `find_by_name`,
 //! `find_by_qualified_name`, `find_by_position` and `mcp::find_definition`'s
-//! candidate page consult, and the one `graph::symbol_links::is_declaration`
+//! candidate page consult, and the one `link::symbol_links::is_declaration`
 //! has read since GM-372 - rather than spelling its own copy. It had been a
 //! four-kind copy missing `external_module` until now, which
-//! `graph::symbol_links::requesters_below_new_containers`' own comment names
+//! `link::symbol_links::requesters_below_new_containers`' own comment names
 //! as the coupling to watch: that function compares its upserted-member count
 //! against the `containers.memberCount` this module maintains, so the two
 //! must exclude the same kinds. They agreed on everything any plugin actually
 //! sends only because an import record carries no container at all, so it is
 //! filtered out one line above by the `is_empty` check regardless of which
-//! list is consulted - see `graph::containers::tests::
+//! list is consulted - see `storage::containers::tests::
 //! placeholders_and_empty_keys_are_never_members` for the case that only a
 //! hand-built node (not a shipped plugin) can reach, where the two lists used
 //! to disagree.
@@ -160,7 +160,7 @@
 //! importer whose `IMPORTS` edge pointed at a now-deleted package keeps no edge
 //! at all until that importer is reindexed, when its plugin re-sends the
 //! placeholder and the linker tries again. That is deliberately the same
-//! non-eager behaviour `graph::imports` documents for a deleted target file
+//! non-eager behaviour `link::imports` documents for a deleted target file
 //! ("Not covered, deliberately: a file *deleted* from the project"), for the
 //! same reason: re-placeholdering eagerly would mean core inventing a
 //! plugin-shaped node it has no content for.
@@ -183,377 +183,15 @@
 //! `upsert_nodes`, and container nodes are never in one - and would embed
 //! nothing anyway, having no signature or doc comment).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use sha2::{Digest, Sha256};
 
-use crate::graph::queries::{declaration_only, NON_DECLARATION_NATIVE_KINDS};
-use crate::storage::write::{Diff, NodeRecord};
+use crate::model::kinds::{declaration_only, DEFINES_KIND, FILE_KIND, MODULE_KIND};
 
+pub use crate::model::container_id;
 pub use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
-
-const MODULE_KIND: &str = "Module";
-const DEFINES_KIND: &str = "DEFINES";
-/// Only [`defining_containers`] needs this, to find the file node whose span
-/// says which of a file's own declarations *is* the file.
-const FILE_KIND: &str = "File";
-
-/// `edges.engine` on the `DEFINES` edges written here. A diagnostic label only
-/// (`storage::schema`'s DDL comment on `edges`): it says "core wrote this, no
-/// plugin did", which is what anyone reading a `DEFINES` edge out of a
-/// container needs to know.
-const CORE_ENGINE: &str = "g-mesh-core";
-
-/// A container's identity: `(language, key)`. Keys are only unique within a
-/// language - a Go import path and a Rust module path can be the same string -
-/// so the pair is the unit everywhere, matching `containers`' own `UNIQUE
-/// (language, key)`.
-type Key = (String, String);
-
-/// The id of the container node for `key` in `language`.
-///
-/// Same family as every plugin-computed id (`node_id` in
-/// plugins/sdk/src/ids.rs): sha256 over a type-marked string,
-/// lowercase hex, truncated to 32 characters. The preimage is
-/// `"container " + language + "\0" + key`:
-///
-///  - The `container ` marker is what keeps it disjoint from plugin ids, whose
-///    preimages start `node ` (`nodeIdFor`) or `edge ` (`edgeIdFor`). Two ids
-///    can then only coincide by a collision in 128 bits of sha256, not by any
-///    choice of path, name or key.
-///  - NUL, not a space, between language and key, because a key is free text
-///    and may contain spaces (a C++ namespace never does, but nothing here
-///    should rely on which languages exist). `language` is a plugin directory
-///    name (`plugin_manifest` requires the two to match) and no filesystem
-///    allows NUL in one, so the split is unambiguous.
-///
-/// A plugin that ever needs to address a container node directly computes the
-/// same string; the design doc's "plugins and core compute the same id" is this
-/// function.
-pub fn container_id(language: &str, key: &str) -> String {
-    let digest = Sha256::digest(format!("container {language}\0{key}").as_bytes());
-    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
-}
-
-/// The id of the `DEFINES` edge from `container_node_id` to `member_id`,
-/// the space-joined hash of `edge <from> DEFINES <to>`. This is core's own
-/// scheme, not the NUL-joined one in `plugins/sdk/src/ids.rs`; it cannot
-/// collide with a plugin edge id because the `from` half is a container id no
-/// plugin node can have (see [`container_id`]).
-fn defines_edge_id(container_node_id: &str, member_id: &str) -> String {
-    let digest = Sha256::digest(format!("edge {container_node_id} {DEFINES_KIND} {member_id}").as_bytes());
-    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
-}
-
-/// Whether a node of this `nativeKind` with this `container` is a member, and
-/// of which container. See the module doc's "Who counts as a member".
-fn membership(language: &str, container: Option<&str>, native_kind: Option<&str>) -> Option<Key> {
-    let key = container.filter(|key| !key.is_empty())?;
-    let excluded = native_kind.is_some_and(|kind| NON_DECLARATION_NATIVE_KINDS.contains(&kind));
-    (!excluded).then(|| (language.to_string(), key.to_string()))
-}
-
-fn record_membership(node: &NodeRecord) -> Option<Key> {
-    membership(&node.language, node.container.as_deref(), node.native_kind.as_deref())
-}
-
-/// What [`detach`] worked out before `apply_diff` wrote anything, for
-/// [`attach`] to finish once it has.
-pub(crate) struct Pending {
-    /// Every member the diff leaves in a container, one entry per id, in the
-    /// order of that id's last upsert.
-    members: Vec<(String, Key)>,
-    /// `(container, containerParent)` for every member record in the diff, in
-    /// diff order - *all* records, not only each id's last one, so a stream
-    /// applied in one batch and the same stream cut into several agree on who
-    /// wrote a container's parent last.
-    parents: Vec<(Key, Option<String>)>,
-    /// Every container whose member set this diff may have changed.
-    touched: BTreeSet<Key>,
-}
-
-/// Phase one, run inside `apply_diff`'s transaction before any delete or
-/// upsert: removes the `DEFINES` edge of every node that the diff takes out of
-/// its current container. See the module doc for why this cannot wait until
-/// after the node writes.
-///
-/// `None` when the diff cannot touch any container: none of its upserts carry
-/// one, and the index holds no container either - so none of the nodes it names
-/// can currently be a member. That is every diff from a language without
-/// containers (all of TS/JS) in a project with no containered language, and it
-/// costs one lookup of an empty table rather than one per node.
-pub(crate) fn detach(conn: &Connection, diff: &Diff) -> Result<Option<Pending>> {
-    let any_upsert_joins = diff.upsert_nodes.iter().any(|node| record_membership(node).is_some());
-    if !any_upsert_joins {
-        let any_container: bool = conn
-            .prepare_cached("SELECT EXISTS (SELECT 1 FROM containers)")
-            .context("failed to prepare the any-container check")?
-            .query_row([], |row| row.get(0))
-            .context("failed to check whether the index holds any container")?;
-        if !any_container {
-            return Ok(None);
-        }
-    }
-
-    // What the diff leaves each upserted id with: its last record wins, the
-    // same way the last `INSERT ... ON CONFLICT DO UPDATE` does.
-    let mut final_membership: HashMap<&str, Option<Key>> = HashMap::new();
-    let mut parents = Vec::new();
-    for node in &diff.upsert_nodes {
-        let joined = record_membership(node);
-        if let Some(key) = &joined {
-            parents.push((key.clone(), node.container_parent.clone()));
-        }
-        final_membership.insert(node.id.as_str(), joined);
-    }
-
-    let mut touched = BTreeSet::new();
-    {
-        let mut current = conn
-            .prepare_cached("SELECT language, container, nativeKind FROM nodes WHERE id = ?1")
-            .context("failed to prepare the current-membership lookup")?;
-        let mut drop_edge = conn
-            .prepare_cached("DELETE FROM edges WHERE id = ?1")
-            .context("failed to prepare the DEFINES edge delete")?;
-
-        // Deleted ids first, then upserted ones, each once. An id both deleted
-        // and upserted ends up upserted (`apply_diff` deletes before it
-        // upserts), which `final_membership` already says - but its edge is
-        // still dropped here, because its row really is deleted in between:
-        // on a connection enforcing foreign keys (this module's tests, half
-        // of the time) that delete is refused while an edge still points at
-        // it, and on one that does not (the daemon's - see the module doc) the
-        // same code path is what removes the edge of a member deleted for
-        // good, which nothing else would. [`attach`] puts the edge back for an
-        // id that is re-upserted, and the recount never sees the gap.
-        let deleted: HashSet<&str> = diff.delete_node_ids.iter().map(String::as_str).collect();
-        let mut seen: HashSet<&str> = HashSet::new();
-        let named = diff
-            .delete_node_ids
-            .iter()
-            .map(String::as_str)
-            .chain(diff.upsert_nodes.iter().map(|n| n.id.as_str()));
-        for id in named {
-            if !seen.insert(id) {
-                continue;
-            }
-            let was: Option<Key> = current
-                .query_row(params![id], |row| {
-                    let language: String = row.get(0)?;
-                    let container: Option<String> = row.get(1)?;
-                    let native_kind: Option<String> = row.get(2)?;
-                    Ok(membership(&language, container.as_deref(), native_kind.as_deref()))
-                })
-                .optional()
-                .context("failed to read a node's current container")?
-                .flatten();
-            let Some(was) = was else { continue };
-            let will_be = final_membership.get(id).cloned().flatten();
-            if will_be.as_ref() != Some(&was) || deleted.contains(id) {
-                drop_edge
-                    .execute(params![defines_edge_id(&container_id(&was.0, &was.1), id)])
-                    .context("failed to detach a member from its old container")?;
-                touched.insert(was);
-            }
-        }
-    }
-
-    let mut members = Vec::new();
-    let mut listed: HashSet<&str> = HashSet::new();
-    for node in diff.upsert_nodes.iter().rev() {
-        if !listed.insert(node.id.as_str()) {
-            continue;
-        }
-        if let Some(Some(key)) = final_membership.get(node.id.as_str()) {
-            touched.insert(key.clone());
-            members.push((node.id.clone(), key.clone()));
-        }
-    }
-    members.reverse();
-    touched.extend(parents.iter().map(|(key, _)| key.clone()));
-
-    Ok(Some(Pending { members, parents, touched }))
-}
-
-/// Phase two, run inside `apply_diff`'s transaction after every node and edge
-/// write: attaches each member to its container (materializing the container
-/// on first sight), applies `containerParent`, then recounts every touched
-/// container and deletes the ones left empty.
-pub(crate) fn attach(conn: &Connection, pending: Pending) -> Result<()> {
-    let Pending { members, parents, touched } = pending;
-
-    let mut created: HashSet<Key> = HashSet::new();
-    {
-        let mut add_edge = conn
-            .prepare_cached(
-                "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved, toDeclaration)
-                 VALUES (?1, ?2, ?3, ?4, 'syntactic', ?5, 1, NULL)
-                 ON CONFLICT(id) DO NOTHING",
-            )
-            .context("failed to prepare the DEFINES edge insert")?;
-        for (member_id, key) in &members {
-            let node_id = container_id(&key.0, &key.1);
-            if ensure_container(conn, &node_id, key)? {
-                created.insert(key.clone());
-            }
-            add_edge
-                .execute(params![
-                    defines_edge_id(&node_id, member_id),
-                    node_id,
-                    member_id,
-                    DEFINES_KIND,
-                    CORE_ENGINE
-                ])
-                .context("failed to attach a member to its container")?;
-        }
-    }
-
-    apply_parents(conn, &parents, &created)?;
-
-    let mut count = conn
-        .prepare_cached("SELECT COUNT(*) FROM edges WHERE fromId = ?1 AND kind = ?2")
-        .context("failed to prepare the member count")?;
-    let mut store_count = conn
-        .prepare_cached("UPDATE containers SET memberCount = ?2 WHERE nodeId = ?1")
-        .context("failed to prepare the member count update")?;
-    for key in touched {
-        let node_id = container_id(&key.0, &key.1);
-        let members: i64 = count
-            .query_row(params![node_id, DEFINES_KIND], |row| row.get(0))
-            .context("failed to count a container's members")?;
-        if members == 0 {
-            delete_container(conn, &node_id)?;
-        } else {
-            store_count
-                .execute(params![node_id, members])
-                .context("failed to store a container's member count")?;
-        }
-    }
-    Ok(())
-}
-
-/// Writes the container node and its `containers` row if they are not there
-/// yet. Returns whether the row was created by this call, which
-/// [`apply_parents`] needs to tell a container's first parent from a change of
-/// parent.
-///
-/// `memberCount` starts at 0 and `parentKey` at NULL: both are overwritten
-/// before the transaction commits (the count by [`attach`]'s recount, the
-/// parent by [`apply_parents`]), so neither initial value is ever observable.
-fn ensure_container(conn: &Connection, node_id: &str, key: &Key) -> Result<bool> {
-    let (language, container_key) = key;
-    // `name` and `qualifiedName` are both the key. There is no language-neutral
-    // rule for a key's last segment (`::`, `.` and `/` mean different things in
-    // different languages - the design doc's reason for sending parents rather
-    // than deriving them), and the key is the one string every language agrees
-    // names the container. `visibility = 'public'`: a container is addressable
-    // from anywhere; who may see its *members* is each member's own business.
-    conn.prepare_cached(
-        "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, visibility, language, nativeKind)
-         VALUES (?1, ?2, ?3, ?3, '', 0, 0, 0, 0, 'public', ?4, ?5)
-         ON CONFLICT(id) DO NOTHING",
-    )
-    .context("failed to prepare the container node insert")?
-    .execute(params![node_id, MODULE_KIND, container_key, language, CONTAINER_NATIVE_KIND])
-    .context("failed to materialize a container node")?;
-
-    let inserted = conn
-        .prepare_cached(
-            "INSERT INTO containers (nodeId, language, key, parentKey, memberCount)
-             VALUES (?1, ?2, ?3, NULL, 0)
-             ON CONFLICT DO NOTHING",
-        )
-        .context("failed to prepare the containers row insert")?
-        .execute(params![node_id, language, container_key])
-        .context("failed to materialize a containers row")?;
-    Ok(inserted == 1)
-}
-
-/// Applies each member record's `containerParent` to its container in diff
-/// order, so the last record wins, and logs a container whose members
-/// disagree. See the module doc for why this is not a rejection.
-///
-/// A container that ends the diff with no row (every member it was named by
-/// has since left, and it had none before) is skipped: the `UPDATE` matches
-/// nothing, and the recount after this deletes nothing either.
-fn apply_parents(conn: &Connection, parents: &[(Key, Option<String>)], created: &HashSet<Key>) -> Result<()> {
-    if parents.is_empty() {
-        return Ok(());
-    }
-    let mut stored = conn
-        .prepare_cached("SELECT parentKey FROM containers WHERE language = ?1 AND key = ?2")
-        .context("failed to prepare the parent lookup")?;
-
-    // `None`: nothing has named this container's parent yet - it has no row,
-    // or its row was created by this very diff. `Some(p)`: the parent
-    // currently in force, from the row or from an earlier record in this diff.
-    let mut in_force: HashMap<&Key, Option<Option<String>>> = HashMap::new();
-    let mut disagreeing: BTreeSet<&Key> = BTreeSet::new();
-    for (key, parent) in parents {
-        let current = match in_force.get(key) {
-            Some(current) => current.clone(),
-            None if created.contains(key) => None,
-            None => stored
-                .query_row(params![key.0, key.1], |row| row.get::<_, Option<String>>(0))
-                .optional()
-                .context("failed to read a container's parent")?,
-        };
-        if matches!(&current, Some(previous) if previous != parent) {
-            disagreeing.insert(key);
-        }
-        in_force.insert(key, Some(parent.clone()));
-    }
-
-    for key in &disagreeing {
-        crate::log_line!(
-            "g-mesh: members of the {} container {:?} disagree about its parent (containerParent) - a \
-             plugin bug; keeping the one sent last, {:?}",
-            key.0,
-            key.1,
-            in_force.get(key).cloned().flatten().flatten(),
-        );
-    }
-
-    let mut update = conn
-        .prepare_cached("UPDATE containers SET parentKey = ?3 WHERE language = ?1 AND key = ?2")
-        .context("failed to prepare the parent update")?;
-    for (key, parent) in in_force {
-        let parent = parent.flatten();
-        update.execute(params![key.0, key.1, parent]).context("failed to store a container's parent")?;
-    }
-    Ok(())
-}
-
-/// Deletes an empty container and everything keyed by its id, explicitly,
-/// since foreign keys are off on the daemon's connection. Edges first, both
-/// directions, so the node delete is legal on a connection that does enforce
-/// them. See the module doc for what happens to the importers whose edges go.
-fn delete_container(conn: &Connection, node_id: &str) -> Result<()> {
-    for sql in [
-        "DELETE FROM edges WHERE fromId = ?1",
-        "DELETE FROM edges WHERE toId = ?1",
-        "DELETE FROM containers WHERE nodeId = ?1",
-        // Neither ever exists for a container node today; deleted anyway,
-        // for the reason `apply_diff` gives for its own node deletes - an
-        // orphan here would be inherited by whatever next takes this id,
-        // which for a content-derived id is this same container coming back.
-        "DELETE FROM vectors WHERE nodeId = ?1",
-        "DELETE FROM declarations WHERE nodeId = ?1",
-        "DELETE FROM placeholder_targets WHERE nodeId = ?1",
-        "DELETE FROM placeholder_also_scopes WHERE nodeId = ?1",
-        "DELETE FROM qualified_suffixes WHERE nodeId = ?1",
-        "DELETE FROM untyped_calls WHERE nodeId = ?1",
-        "DELETE FROM nodes WHERE id = ?1",
-    ] {
-        conn.prepare_cached(sql)
-            .context("failed to prepare an empty-container delete")?
-            .execute(params![node_id])
-            .context("failed to delete an empty container")?;
-    }
-    Ok(())
-}
 
 /// The ancestors of container `key` in `language`, nearest first, not including
 /// `key` itself - the walk the visibility check (design doc: Interfaces >
@@ -714,6 +352,16 @@ pub fn defining_containers(conn: &Connection, file_path: &str) -> Result<Vec<Def
     Ok(outermost)
 }
 
+/// Container node id -> container key.
+pub fn container_keys(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn
+        .prepare("SELECT nodeId, key FROM containers")
+        .context("failed to prepare the container listing")?;
+    let rows =
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).context("failed to list the containers")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read the containers")
+}
+
 /// [`defining_containers`] for every `File` node at once, inverted: each
 /// container's node id to the paths of the files that define it, sorted.
 /// A container no file defines has no entry (see [`member_files`]).
@@ -800,6 +448,3 @@ pub fn has_file(conn: &Connection, file_path: &str) -> Result<bool> {
         .query_row(params![FILE_KIND, file_path], |row| row.get(0))
         .context("failed to look up a file")
 }
-
-#[cfg(test)]
-mod tests;

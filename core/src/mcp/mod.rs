@@ -23,7 +23,7 @@ use serde::Deserialize;
 
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
-use crate::graph::pagination::Direction;
+use crate::graph::Direction;
 use crate::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::ipc::AsyncStream;
 use crate::plugin_manifest::Capabilities;
@@ -56,6 +56,7 @@ mod overrides;
 mod progress;
 mod provenance;
 pub(crate) mod query_shapes;
+pub(crate) mod response_bound;
 #[cfg(test)]
 mod response_bound_tests;
 mod search_code;
@@ -358,7 +359,7 @@ impl GMeshMcpServer {
             .collect()
     }
 
-    /// Query-time staleness check (`watcher::staleness::ensure_fresh`) for the
+    /// Query-time staleness check (`ingest::staleness::ensure_fresh`) for the
     /// three tools anchored on one file (`find_definition`, `get_file_outline`,
     /// `get_dependencies`): catches changes the watcher never saw, which never
     /// enter the replay queue. The symbol-anchored tools skip it: their files
@@ -601,14 +602,8 @@ impl GMeshMcpServer {
             );
         }
 
-        let (present, outcomes, retries) = {
-            let conn = self.store.read();
-            (
-                crate::storage::schema::present_languages_with_semantic_state(&conn),
-                crate::storage::schema::language_outcomes(&conn),
-                crate::storage::schema::language_retries(&conn),
-            )
-        };
+        let crate::index_health::LanguageOverview { present, outcomes, retries } =
+            crate::index_health::language_overview(&self.store.read());
         // A walk that failed every language is retried whole on the next
         // tool call, not by a daemon start's per-language retry.
         let retries = match retries {

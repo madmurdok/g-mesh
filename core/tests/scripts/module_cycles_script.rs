@@ -5,8 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// The edges whose removal broke core's large module cycle.
-const REMOVED_EDGES: [&str; 8] = [
+/// The edges whose removal broke core's large module cycle and the
+/// `storage`/`graph`/`embedding` cycle: storage reaches graph and embedding
+/// only through the `model` leaf, the `link` module and the vector seams.
+const REMOVED_EDGES: [&str; 15] = [
     "project_walk->watcher",
     "protocol->graph",
     "shim->mcp",
@@ -15,7 +17,32 @@ const REMOVED_EDGES: [&str; 8] = [
     "storage->daemon",
     "config->storage",
     "embedding->daemon",
+    "storage->graph",
+    "storage->embedding",
+    "graph->storage",
+    "link->storage",
+    "model->storage",
+    "model->graph",
+    "plugin_manifest->graph",
 ];
+
+/// GM-707: `watcher` keeps only the event source and `ingest` sits below
+/// `daemon`, so neither reaches up into the daemon (`select_with` lives in
+/// `ingest::select`), `watcher` no longer reaches `protocol` or `embedding`,
+/// `ingest` does not reach back into `watcher`, and `cli` reads
+/// `mtime_millis` from `fsutil`, not `watcher`.
+const INGEST_SPLIT_ABSENT_EDGES: [&str; 6] = [
+    "watcher->daemon",
+    "watcher->protocol",
+    "watcher->embedding",
+    "ingest->daemon",
+    "ingest->watcher",
+    "cli->watcher",
+];
+
+/// GM-707: no `crate::daemon` path anywhere under `watcher/` or `ingest/`,
+/// tests included (`test_plugin` moved below both).
+const INGEST_SPLIT_ABSENT_EDGES_WITH_TESTS: [&str; 2] = ["watcher->daemon", "ingest->daemon"];
 
 fn repo_root() -> PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).to_path_buf()
@@ -62,6 +89,34 @@ fn the_removed_core_edges_stay_absent_and_no_cycle_exceeds_five_modules() {
             describe(&output)
         );
     }
+}
+
+fn assert_absent(edges: &[&str], extra: &[&str]) {
+    let mut args = absent_args(edges);
+    args.extend(extra.iter().map(|arg| (*arg).to_string()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let output = module_cycles(&repo_root().join("core/src"), &args);
+
+    assert!(output.status.success(), "{}", describe(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for edge in edges {
+        assert!(
+            stdout.contains(&format!("ok: edge {edge} absent")),
+            "{edge} was not checked\n{}",
+            describe(&output)
+        );
+    }
+}
+
+#[test]
+fn watcher_and_ingest_never_reach_into_the_daemon_and_cli_never_into_the_watcher() {
+    assert_absent(&INGEST_SPLIT_ABSENT_EDGES, &[]);
+}
+
+#[test]
+fn no_test_under_watcher_or_ingest_reaches_into_the_daemon() {
+    assert_absent(&INGEST_SPLIT_ABSENT_EDGES_WITH_TESTS, &["--include-tests"]);
 }
 
 /// The check above passes vacuously if the script cannot see an edge; on a

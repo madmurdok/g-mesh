@@ -7,7 +7,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::pagination::Direction;
+use crate::graph::Direction;
 
 /// One node a resumed walk restarts from, at the depth it was originally
 /// reached at.

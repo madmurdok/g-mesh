@@ -28,8 +28,26 @@
 //! but packing to the binary form ourselves avoids formatting/parsing floats
 //! as text on every insert and every query.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+
+/// Writes a batch of vectors onto `conn`. The per-language swap calls it on
+/// its own transaction, after the row upserts and before the bookkeeping, so
+/// the vectors commit or roll back with the rows they describe: an
+/// implementation must write through the connection it is given and never
+/// open, commit or release a transaction or savepoint of its own.
+/// Best-effort, like `EmbeddingPipeline::store`, which logs its own errors.
+pub trait VectorWrite {
+    fn write(&self, conn: &Connection);
+}
+
+impl<F: Fn(&Connection)> VectorWrite for F {
+    fn write(&self, conn: &Connection) {
+        self(conn)
+    }
+}
 
 /// Registers the sqlite-vec extension with SQLite's process-wide
 /// auto-extension hook. Idempotent - guarded by [`std::sync::Once`] so
@@ -117,6 +135,31 @@ pub fn search(conn: &Connection, query: &[f32], limit: usize) -> Result<Vec<Matc
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to read vector similarity search results")?;
     Ok(rows)
+}
+
+/// The ids among `node_ids` that have a `vectors` row.
+pub(crate) fn nodes_with_vectors<'a>(
+    conn: &Connection,
+    node_ids: impl Iterator<Item = &'a str>,
+) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM vectors WHERE nodeId = ?1)")?;
+    let mut found = HashSet::new();
+    for node_id in node_ids {
+        if stmt.query_row([node_id], |row| row.get::<_, bool>(0))? {
+            found.insert(node_id.to_string());
+        }
+    }
+    Ok(found)
+}
+
+/// How many vectors belong to a node still in the graph: the set
+/// `graph::search` ranks from.
+pub fn count_embedded_nodes(conn: &Connection) -> Result<u64> {
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM vectors v JOIN nodes n ON n.id = v.nodeId", [], |row| {
+            row.get(0)
+        })?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 #[cfg(test)]

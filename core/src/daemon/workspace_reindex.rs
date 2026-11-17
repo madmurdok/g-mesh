@@ -6,7 +6,7 @@
 //!
 //! A workspace file decides where module and crate boundaries are, which
 //! every other file's container key (`graph::containers`) and every
-//! placeholder's scope (`graph::symbol_links`, `graph::imports`) were
+//! placeholder's scope (`link::symbol_links`, `link::imports`) were
 //! computed against, so a single-file diff cannot correct it: the language
 //! is walked again from nothing, with the same one-shot `--bulk-index`
 //! machinery the cold start uses, restricted to one manifest.
@@ -90,14 +90,15 @@ use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::embedding::pipeline::ComputedBatch;
 use crate::embedding::EmbedStats;
+use crate::ingest::apply::SemanticPassOutcome;
+use crate::ingest::staleness;
 use crate::paths::state_dir::StateDir;
 use crate::plugin_manifest::{self, PluginManifest};
 use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
 use crate::storage::schema;
-use crate::watcher::apply::SemanticPassOutcome;
-use crate::watcher::staleness;
+use crate::storage::vectors::VectorWrite;
 
 /// Where `language`'s staging index lives in the project's state directory.
 fn staging_path(state_dir: &Path, language: &str) -> PathBuf {
@@ -296,7 +297,7 @@ fn semantic_pass_after_swap(
             // `PluginSupervisor::semantic_pass`). The language stays owed for
             // whoever next asks; status shows why.
             // Incomplete, with the unfinished files named: already recorded
-            // residual by the pass (`watcher::apply`); the next daemon start
+            // residual by the pass (`ingest::apply`); the next daemon start
             // asks only those files.
             Ok(Some(SemanticPassOutcome::Residual { left })) => crate::log_line!(
                 "g-mesh daemon: the {language} semantic pass after {after} left {left} file(s) \
@@ -439,7 +440,7 @@ fn rebuild(
         &mut staged,
         live_path,
         language,
-        embedding.embedding_version(),
+        &embedding.text_rule(),
         keep_semantic_placeholders,
     )?;
     drop(staged);
@@ -452,8 +453,9 @@ fn rebuild(
 
     let semantic_pass_languages: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
     let fingerprint = plugin::fingerprint(manifest);
+    let write = embedding.vector_write(&computed);
     let vectors = match kind {
-        Rebuild::Reindex => Some((embedding.as_ref(), &computed)),
+        Rebuild::Reindex => Some(&write as &dyn VectorWrite),
         Rebuild::Retry => None,
     };
     store.swap_language(
@@ -493,10 +495,11 @@ mod tests {
     use rusqlite::OptionalExtension;
 
     use super::*;
-    use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
+    use crate::model::{Diff, NodeRecord};
     use crate::plugin_manifest::discover;
-    use crate::storage::write::{apply_diff, Diff, NodeRecord};
+    use crate::storage::write::apply_diff;
+    use crate::test_plugin;
 
     /// A file-backed index in `project`'s state directory, where the daemon
     /// keeps it: the swap attaches the live index by its path. Foreign keys
@@ -1145,11 +1148,11 @@ mod tests {
     // the test writes (`test_plugin::set_bulk_stream`).
     // -----------------------------------------------------------------
 
+    use crate::model::EdgeRecord;
     use crate::protocol::types::{
         EdgeKind, NodeKind, PlaceholderTarget, Position, QualifiedPath, Range, SourceTier, TargetKey,
         TargetScope, Visibility, WireDeclaration, WireEdge, WireNode,
     };
-    use crate::storage::write::EdgeRecord;
 
     fn wire_node(id: &str, file_path: &str) -> WireNode {
         WireNode {
@@ -2081,7 +2084,7 @@ mod tests {
     /// and `alpha-old` may be what it never got to.
     ///
     /// Control: sweep before the `outcome.incomplete && whole_project` check
-    /// in `watcher::apply::apply_semantic_pass_in` -> `alpha-old` is gone.
+    /// in `ingest::apply::apply_semantic_pass_in` -> `alpha-old` is gone.
     #[test]
     fn an_incomplete_typescript_pass_sweeps_nothing() {
         let kept = vec![
@@ -2212,7 +2215,7 @@ mod tests {
     /// sends it: kept at the swap, deleted with its edge after the pass.
     ///
     /// Control: remove the `store.sweep_unclaimed_nodes(language)` call from
-    /// `watcher::apply::apply_semantic_pass_in` -> `alpha-sp` is still there
+    /// `ingest::apply::apply_semantic_pass_in` -> `alpha-sp` is still there
     /// after the pass (its edge goes with the edge sweep either way).
     #[test]
     fn a_kept_placeholder_the_next_complete_pass_does_not_send_is_deleted() {

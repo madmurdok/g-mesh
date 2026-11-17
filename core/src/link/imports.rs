@@ -58,12 +58,12 @@
 //! already writes for every placeholder carrying a `target`
 //! (`storage::write::PlaceholderTargetRecord`) - and branches on
 //! `scopeKind`. This is the storage layer GM-264 built and GM-267 is the
-//! first reader of for `resolved_module`: `graph::symbol_links` (GM-266)
+//! first reader of for `resolved_module`: `link::symbol_links` (GM-266)
 //! still parses `qualifiedName` for its own placeholder kinds until that task
 //! lands, so the two linkers move onto the structured table on their own
 //! schedules rather than together.
 //!
-//! The row's `keyKind`/`key` (which `graph::symbol_links` needs to pick one
+//! The row's `keyKind`/`key` (which `link::symbol_links` needs to pick one
 //! declaration out of several visible under the same name) are never read
 //! here: an import addresses a whole file or a whole container, and there is
 //! only ever one node to repoint onto once the address resolves, so nothing
@@ -89,7 +89,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::storage::write::Diff;
+use crate::model::Diff;
 
 pub use g_mesh_wire::native_kind::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
 
@@ -175,7 +175,7 @@ pub fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
 /// into the deleted node are left pointing at it, not re-placeholdered by
 /// this pass. For a file, core re-extracts its importers in the delete's
 /// round trip (`storage::file_rows::importers_of`,
-/// `watcher::apply::apply_file_change_in`), and each import falls back to
+/// `ingest::apply::apply_file_change_in`), and each import falls back to
 /// another candidate or comes back as an unresolved placeholder. For a
 /// container, the edges dangle until those importers are next reindexed, as
 /// `graph::containers`' own module doc documents.
@@ -404,8 +404,9 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{EdgeRecord, NodeRecord, PlaceholderTargetRecord};
     use crate::storage::schema;
-    use crate::storage::write::{apply_diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
+    use crate::storage::write::apply_diff;
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -959,7 +960,7 @@ mod tests {
     /// GM-265's documented lifecycle, the realistic sequence: a container is
     /// GCed when its last member leaves (dropping the importer's edge with
     /// it, per `graph::containers`' own module doc - "the same non-eager
-    /// behaviour `graph::imports` documents for a deleted target file"), and
+    /// behaviour `link::imports` documents for a deleted target file"), and
     /// only comes back once both a member re-appears *and* the importer is
     /// reindexed (re-sending a fresh placeholder - GC does not resurrect the
     /// importer's edge on its own). This is the scenario GM-265 promised and
