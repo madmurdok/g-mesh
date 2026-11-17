@@ -67,8 +67,8 @@ pub(super) fn run(root: &Path, state_dir: &StateDir, singleton: File, detection:
     write_state_file_atomic(&state_dir.phase_file(), &format!("{FRONT_PHASE}\n"), "phase file");
     state_dir.record_serving_owner(std::process::id());
 
-    crate::log_line!(
-        "g-mesh daemon: {} is a folder of {} projects - serving the front (no index)",
+    crate::log_role!(
+        "{} is a folder of {} projects - serving the front (no index)",
         canonical_root.display(),
         detection.candidates.len()
     );
@@ -129,7 +129,7 @@ fn serve_forever(
             tokio::spawn(async move {
                 let _attached = attached;
                 if let Err(err) = mcp::front::serve_connection(stream, front, core_activity).await {
-                    crate::log_line!("g-mesh daemon: front connection ended: {err:#}");
+                    crate::log_role!("front connection ended: {err:#}");
                 }
             });
         }

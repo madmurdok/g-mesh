@@ -11,6 +11,11 @@
 //! `docs/architecture/gm-520-line-atomic-logs.md` is the design. The plugin
 //! SDK carries an identical copy (`g_mesh_plugin_sdk::log_line!`), since the
 //! SDK does not depend on core.
+//!
+//! Code shared by the daemon and the CLI logs through
+//! [`log_role!`](crate::log_role), which prefixes the line with the process's
+//! role: `g-mesh daemon: ` in the daemon, `g-mesh: ` anywhere else. The entry
+//! point sets the role once ([`set_role`]); shared code takes no role argument.
 
 /// Writes one line to stderr in a single `write`, like `eprintln!` but
 /// line-atomic against other processes appending to the same file. A failed
@@ -32,6 +37,53 @@ pub fn write_line(args: std::fmt::Arguments<'_>) {
     // One write(2) under the stderr lock. A failed log write is ignored: a
     // diagnostic must never take the process down (eprintln! panics).
     let _ = std::io::stderr().lock().write_all(line.as_bytes());
+}
+
+/// Which kind of process is logging: decides the prefix of [`log_role!`](crate::log_role) lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The long-lived daemon (and its front); set by `cli::dispatch`.
+    Daemon,
+    /// Any other process: the CLI, the shim, a test binary. The default.
+    Cli,
+}
+
+static ROLE: std::sync::OnceLock<Role> = std::sync::OnceLock::new();
+
+/// Sets the process's role. The first call wins; later calls are ignored.
+pub fn set_role(role: Role) {
+    let _ = ROLE.set(role);
+}
+
+/// The process's role; [`Role::Cli`] until [`set_role`] is called.
+pub fn role() -> Role {
+    ROLE.get().copied().unwrap_or(Role::Cli)
+}
+
+/// The line prefix for `role`.
+pub const fn prefix_for(role: Role) -> &'static str {
+    match role {
+        Role::Daemon => "g-mesh daemon: ",
+        Role::Cli => "g-mesh: ",
+    }
+}
+
+/// The line prefix for this process's role.
+pub fn role_prefix() -> &'static str {
+    prefix_for(role())
+}
+
+/// Like [`log_line!`](crate::log_line), prefixed with the process's role
+/// prefix. Still one `write(2)`.
+#[macro_export]
+macro_rules! log_role {
+    ($($arg:tt)*) => {
+        $crate::log::write_line(::std::format_args!(
+            "{}{}",
+            $crate::log::role_prefix(),
+            ::std::format_args!($($arg)*)
+        ))
+    };
 }
 
 /// The variable that turns on [`log_timing!`](crate::log_timing) lines (GM-435):

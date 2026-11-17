@@ -690,8 +690,8 @@ pub fn discover(roots: &[PathBuf]) -> Result<DiscoveredPlugins> {
             let manifest = read_manifest(&dir)?;
 
             if let Some(existing) = manifests.get(&manifest.language) {
-                crate::log_line!(
-                    "g-mesh daemon: plugin \"{}\" at {} shadows the same language already \
+                crate::log_role!(
+                    "plugin \"{}\" at {} shadows the same language already \
                      found at {} - the earlier one wins",
                     manifest.language,
                     manifest.manifest_dir.display(),

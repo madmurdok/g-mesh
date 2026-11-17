@@ -67,8 +67,8 @@ pub(super) async fn with_heartbeat<F: Future>(
                     .with_message(message());
                 match ctx.peer.notify_progress(param).await {
                     Ok(()) => sent += 1,
-                    Err(err) => crate::log_line!(
-                        "g-mesh daemon: could not send a progress notification for request {}: {err}",
+                    Err(err) => crate::log_role!(
+                        "could not send a progress notification for request {}: {err}",
                         ctx.id
                     ),
                 }

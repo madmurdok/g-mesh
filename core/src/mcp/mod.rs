@@ -105,7 +105,7 @@ pub(crate) use similarity::floor as shipped_similarity_floor;
 /// ```
 fn trace_call(what: std::fmt::Arguments<'_>) {
     if std::env::var_os(TRACE_CALLS_ENV).is_some_and(|v| !v.is_empty()) {
-        crate::log_line!("g-mesh daemon: {what}");
+        crate::log_role!("{what}");
     }
 }
 
@@ -331,7 +331,7 @@ impl GMeshMcpServer {
         let replayed = match joined {
             Ok(count) => count,
             Err(err) => {
-                crate::log_line!("g-mesh daemon: the plugin wake task failed: {err}");
+                crate::log_role!("the plugin wake task failed: {err}");
                 0
             }
         };
@@ -425,9 +425,9 @@ impl GMeshMcpServer {
         match joined {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => {
-                crate::log_line!("g-mesh daemon: query-time staleness check failed for {owned_path}: {err:#}")
+                crate::log_role!("query-time staleness check failed for {owned_path}: {err:#}")
             }
-            Err(err) => crate::log_line!("g-mesh daemon: the staleness-check task failed: {err}"),
+            Err(err) => crate::log_role!("the staleness-check task failed: {err}"),
         }
     }
 
@@ -584,7 +584,7 @@ impl GMeshMcpServer {
     fn mark_used(&self) {
         self.host.request();
         if let Err(err) = self.store.with(last_used::touch) {
-            crate::log_line!("g-mesh daemon: failed to record lastUsed: {err:#}");
+            crate::log_role!("failed to record lastUsed: {err:#}");
         }
     }
 
@@ -626,8 +626,8 @@ impl GMeshMcpServer {
             _ if matches!(phase, Phase::Failed(_)) => None,
             Ok(retries) => Some(retries),
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: failed to read language retries for the MCP instructions, \
+                crate::log_role!(
+                    "failed to read language retries for the MCP instructions, \
                      leaving the retry state unsaid: {err:#}"
                 );
                 None
@@ -639,8 +639,8 @@ impl GMeshMcpServer {
                 &capabilities,
             )),
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: failed to read present languages for the MCP instructions, \
+                crate::log_role!(
+                    "failed to read present languages for the MCP instructions, \
                      falling back to the installed plugins: {err:#}"
                 );
                 instructions::Covered::Installed(installed())
@@ -652,8 +652,8 @@ impl GMeshMcpServer {
             }
             (covered, outcomes) => {
                 if let Err(err) = outcomes {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to read language outcomes for the MCP instructions, \
+                    crate::log_role!(
+                        "failed to read language outcomes for the MCP instructions, \
                          falling back to the missing plugins: {err:#}"
                     );
                 }

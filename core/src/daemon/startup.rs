@@ -159,10 +159,10 @@ pub(super) fn claim(dir: &StateDir) -> Result<Option<File>> {
     match build_stamp::of_running_process() {
         Ok(stamp) => {
             if let Err(err) = build_stamp::write(&dir.build_stamp_file(), &stamp) {
-                crate::log_line!("g-mesh daemon: could not publish its build stamp: {err:#}");
+                crate::log_role!("could not publish its build stamp: {err:#}");
             }
         }
-        Err(err) => crate::log_line!("g-mesh daemon: could not describe its own build: {err:#}"),
+        Err(err) => crate::log_role!("could not describe its own build: {err:#}"),
     }
     Ok(Some(singleton))
 }
@@ -189,11 +189,7 @@ pub(super) fn open_index(root: &Path, dir: &StateDir) -> Result<OpenedIndex> {
     seed::remove_stale_seed_tmp(dir.path());
     // Before `connection::open`, which would create an empty `index.db`.
     if let Some(origin) = seed::seed_if_eligible(root, dir.path(), &registry::indexer_version(&discovered)) {
-        crate::log_line!(
-            "g-mesh daemon: index seeded from {} in {} ms",
-            origin.source_root.display(),
-            origin.copy_ms
-        );
+        crate::log_role!("index seeded from {} in {} ms", origin.source_root.display(), origin.copy_ms);
     }
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
     // Read before `ensure_current`, whose reset would hide that one existed:
@@ -204,7 +200,7 @@ pub(super) fn open_index(root: &Path, dir: &StateDir) -> Result<OpenedIndex> {
     let reinitialized = schema::ensure_current(&conn, &registry::indexer_version(&discovered))
         .context("failed to check the index's schema and indexer versions")?;
     if reinitialized {
-        crate::log_line!("g-mesh daemon: index (re)initialized - a full reindex is needed");
+        crate::log_role!("index (re)initialized - a full reindex is needed");
     }
     // Next to the staging cleanup above, once the tables exist: pending rows
     // no pass will clear (a removed plugin, a clear that failed) go.
@@ -231,22 +227,18 @@ pub(super) fn open_index(root: &Path, dir: &StateDir) -> Result<OpenedIndex> {
         let discovered_languages: Vec<&str> = discovered.manifests.keys().map(String::as_str).collect();
         let retry_languages =
             schema::languages_owed_a_retry(&conn, &discovered_languages).unwrap_or_else(|err| {
-                crate::log_line!(
-                    "g-mesh daemon: could not read which failed languages to retry - none is: {err:#}"
-                );
+                crate::log_role!("could not read which failed languages to retry - none is: {err:#}");
                 Vec::new()
             });
         // A seed copied before this open (or by a start that died before its
         // reconcile finished) is served only after that reconcile.
         let seeded = schema::seed_pending(&conn).unwrap_or_else(|err| {
-            crate::log_line!(
-                "g-mesh daemon: could not read whether the index is an unreconciled seed: {err:#}"
-            );
+            crate::log_role!("could not read whether the index is an unreconciled seed: {err:#}");
             false
         });
         if seeded {
-            crate::log_line!(
-                "g-mesh daemon: the index is a seed - reconciling it with this worktree before tool calls answer"
+            crate::log_role!(
+                "the index is a seed - reconciling it with this worktree before tool calls answer"
             );
         }
         WalkFacts::Walked { semantic_pass_completed, retry_languages, seeded }

@@ -190,8 +190,8 @@ pub const HOLD_LOCK_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_LOCK_FILE";
 fn hold_the_lock_open_for_tests() {
     let Some(path) = std::env::var_os(HOLD_LOCK_FILE_ENV).filter(|p| !p.is_empty()) else { return };
     let path = std::path::PathBuf::from(path);
-    crate::log_line!(
-        "g-mesh daemon: holding a bulk-index batch's lock open until {} is removed ({HOLD_LOCK_FILE_ENV})",
+    crate::log_role!(
+        "holding a bulk-index batch's lock open until {} is removed ({HOLD_LOCK_FILE_ENV})",
         path.display()
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

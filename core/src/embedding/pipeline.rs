@@ -302,8 +302,8 @@ impl EmbeddingPipeline {
             .get_or_init(|| match self.model_dir().and_then(|dir| (self.loader)(&dir)) {
                 Ok(model) => Some(model),
                 Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: embedding model {:?} is not available ({err:#}) - \
+                    crate::log_role!(
+                        "embedding model {:?} is not available ({err:#}) - \
                          indexing will continue without semantic search",
                         self.model_name
                     );
@@ -391,7 +391,7 @@ impl EmbeddingPipeline {
         match model.embed(text) {
             Ok(embedding) => Some(embedding),
             Err(err) => {
-                crate::log_line!("g-mesh daemon: failed to embed search query ({err:#})");
+                crate::log_role!("failed to embed search query ({err:#})");
                 None
             }
         }
@@ -474,8 +474,8 @@ impl EmbeddingPipeline {
                 let texts: Vec<&str> = misses.iter().map(|&index| pending[index].1.as_str()).collect();
                 let embedded = model.embed_batch(&texts);
                 if embedded.len() != misses.len() {
-                    crate::log_line!(
-                        "g-mesh daemon: the model returned {} vectors for {} texts - the rest are left unembedded",
+                    crate::log_role!(
+                        "the model returned {} vectors for {} texts - the rest are left unembedded",
                         embedded.len(),
                         misses.len()
                     );
@@ -502,9 +502,7 @@ impl EmbeddingPipeline {
                     computed.push(ComputedEmbedding { node_id: node_id.to_string(), embedding, text });
                 }
                 Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to embed node {node_id} ({err:#}) - it is left unembedded"
-                    )
+                    crate::log_role!("failed to embed node {node_id} ({err:#}) - it is left unembedded")
                 }
             }
         }
@@ -701,23 +699,21 @@ impl EmbeddingPipeline {
                 None => vectors::delete(conn, node_id),
             });
             if let Err(err) = deleted {
-                crate::log_line!(
-                    "g-mesh daemon: failed to delete the vector of filtered node {node_id} ({err:#})"
-                );
+                crate::log_role!("failed to delete the vector of filtered node {node_id} ({err:#})");
             }
         }
         if computed.embeddings.is_empty() {
             return;
         }
         if let Err(err) = crate::storage::schema::set_embedding_model(conn, &self.version) {
-            crate::log_line!("g-mesh daemon: failed to record the active embedding model ({err:#})");
+            crate::log_role!("failed to record the active embedding model ({err:#})");
         }
         for entry in &computed.embeddings {
             match current_embeddable_text(conn, &entry.node_id) {
                 Ok(Some(current_text)) if current_text == entry.text => {
                     if let Err(err) = vectors::insert(conn, &entry.node_id, &entry.embedding, &self.version) {
-                        crate::log_line!(
-                            "g-mesh daemon: failed to store the embedding for node {} ({err:#}) - it is \
+                        crate::log_role!(
+                            "failed to store the embedding for node {} ({err:#}) - it is \
                              left unembedded",
                             entry.node_id
                         );
@@ -729,8 +725,8 @@ impl EmbeddingPipeline {
                 // newer content owns re-embedding it; this vector would only
                 // ever be stale.
                 Ok(_) => {}
-                Err(err) => crate::log_line!(
-                    "g-mesh daemon: failed to verify node {} before storing its embedding ({err:#}) - it is \
+                Err(err) => crate::log_role!(
+                    "failed to verify node {} before storing its embedding ({err:#}) - it is \
                      left unembedded",
                     entry.node_id
                 ),
@@ -752,8 +748,8 @@ fn model_files_exist(dir: &Path) -> bool {
 }
 
 fn log_stats(label: &str, stats: &EmbedStats, elapsed: Duration) {
-    crate::log_line!(
-        "g-mesh daemon: embeddings [{label}]: {} texts, {} cache hits, {} embedded, {} cache errors, {:.1}s",
+    crate::log_role!(
+        "embeddings [{label}]: {} texts, {} cache hits, {} embedded, {} cache errors, {:.1}s",
         stats.texts,
         stats.hits,
         stats.embedded,

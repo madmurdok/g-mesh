@@ -528,8 +528,9 @@ impl Reranker {
                     Ok(scorer) => Outcome::Loaded(scorer),
                     Err(err) => {
                         (self.log)(&format!(
-                            "g-mesh daemon: rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
-                             search_code keeps the embedding order. Run g-mesh model fetch to enable it."
+                            "{prefix}rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
+                             search_code keeps the embedding order. Run g-mesh model fetch to enable it.",
+                            prefix = crate::log::role_prefix()
                         ));
                         let absent = dir.as_ref().is_some_and(|dir| {
                             [ONNX_FILE_NAME, TOKENIZER_FILE_NAME].iter().any(|name| !dir.join(name).exists())
@@ -549,8 +550,9 @@ impl Reranker {
                     .and_then(|json| std::fs::write(path, json).map_err(anyhow::Error::from));
                 if let Err(err) = written {
                     (self.log)(&format!(
-                        "g-mesh daemon: failed to record the rerank outcome at {} ({err:#})",
-                        path.display()
+                        "{prefix}failed to record the rerank outcome at {} ({err:#})",
+                        path.display(),
+                        prefix = crate::log::role_prefix()
                     ));
                 }
             }
@@ -572,8 +574,9 @@ impl Reranker {
             Ok(logits) => logits,
             Err(err) => {
                 (self.log)(&format!(
-                    "g-mesh daemon: the rerank failed for one search_code call ({err:#}) - it keeps the \
-                     embedding order"
+                    "{prefix}the rerank failed for one search_code call ({err:#}) - it keeps the \
+                     embedding order",
+                    prefix = crate::log::role_prefix()
                 ));
                 return None;
             }
@@ -581,10 +584,11 @@ impl Reranker {
         let order = blended_order(&logits, cosines);
         if order.is_none() {
             (self.log)(&format!(
-                "g-mesh daemon: the rerank produced {} logits for {} rows, or a non-finite one - this \
+                "{prefix}the rerank produced {} logits for {} rows, or a non-finite one - this \
                  search_code call keeps the embedding order",
                 logits.len(),
-                cosines.len()
+                cosines.len(),
+                prefix = crate::log::role_prefix()
             ));
         }
         order

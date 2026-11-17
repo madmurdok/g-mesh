@@ -414,8 +414,8 @@ fn hold_the_walk_open_for_tests() {
     // action, not blurred by a delay on top.
     if let Some(path) = std::env::var_os(WALK_HOLD_FILE_ENV).filter(|p| !p.is_empty()) {
         let path = std::path::PathBuf::from(path);
-        crate::log_line!(
-            "g-mesh daemon: holding the finished bulk walk until {} is removed ({WALK_HOLD_FILE_ENV})",
+        crate::log_role!(
+            "holding the finished bulk walk until {} is removed ({WALK_HOLD_FILE_ENV})",
             path.display()
         );
         // Polled, and bounded so a test that forgets to release it fails as a
@@ -430,7 +430,7 @@ fn hold_the_walk_open_for_tests() {
     let Some(millis) = std::env::var(WALK_DELAY_ENV).ok().and_then(|v| v.trim().parse().ok()) else {
         return;
     };
-    crate::log_line!("g-mesh daemon: holding the finished bulk walk open for {millis}ms ({WALK_DELAY_ENV})");
+    crate::log_role!("holding the finished bulk walk open for {millis}ms ({WALK_DELAY_ENV})");
     std::thread::sleep(std::time::Duration::from_millis(millis));
 }
 
@@ -487,7 +487,7 @@ fn ingest_in<R: BufRead>(
                 if err.downcast_ref::<std::io::Error>().is_some() {
                     return Err(err).context("failed to read the plugin's bulk-index stream");
                 }
-                crate::log_line!("g-mesh daemon: skipping malformed bulk-index line: {err:#}");
+                crate::log_role!("skipping malformed bulk-index line: {err:#}");
                 ctx.summary.skipped_lines += 1;
                 continue;
             }

@@ -134,8 +134,8 @@ pub(crate) fn parse_timeout(raw: Option<&str>, default: Duration, name: &str) ->
         Ok(0) => None,
         Ok(millis) => Some(Duration::from_millis(millis)),
         Err(_) => {
-            crate::log_line!(
-                "g-mesh daemon: ignoring {name}={raw:?} - not a whole number of milliseconds; \
+            crate::log_role!(
+                "ignoring {name}={raw:?} - not a whole number of milliseconds; \
                  using the default {default:?}"
             );
             Some(default)
@@ -341,15 +341,15 @@ impl PluginSupervisor {
                 // mid-write, and it has already been killed and relaunched). Queue it
                 // like a change seen while asleep, so the next `replay_pending` sends it
                 // to the fresh process instead of dropping it.
-                crate::log_line!(
-                    "g-mesh daemon: {} plugin timed out applying a file change ({err:#}) - \
+                crate::log_role!(
+                    "{} plugin timed out applying a file change ({err:#}) - \
                      the plugin was relaunched and {retry_path} is queued for replay",
                     self.manifest.language
                 );
                 inner.dirty.push(retry_path);
                 self.pending.store(true, Ordering::SeqCst);
             } else {
-                crate::log_line!("g-mesh daemon: failed to apply file change: {err:#}");
+                crate::log_role!("failed to apply file change: {err:#}");
             }
         }
     }
@@ -376,8 +376,8 @@ impl PluginSupervisor {
         let queued = inner.dirty.drain();
         self.pending.store(false, Ordering::SeqCst);
         // Lists the paths, so the log tells a queue replay from a project rescan.
-        crate::log_line!(
-            "g-mesh daemon: waking the {} plugin to replay {} queued file change(s): {}",
+        crate::log_role!(
+            "waking the {} plugin to replay {} queued file change(s): {}",
             self.manifest.language,
             queued.len(),
             queued.join(", ")
@@ -395,7 +395,7 @@ impl PluginSupervisor {
                 }
                 // One unreadable file does not cost the rest of the queue its replay.
                 Err(err) => {
-                    crate::log_line!("g-mesh daemon: failed to replay queued change to {file_path}: {err:#}")
+                    crate::log_role!("failed to replay queued change to {file_path}: {err:#}")
                 }
             }
         }
@@ -628,8 +628,8 @@ impl PluginSupervisor {
             return;
         };
         if confirmed_mb <= limit_mb {
-            crate::log_line!(
-                "g-mesh daemon: the {} plugin's process tree read {measured_mb}MB against a \
+            crate::log_role!(
+                "the {} plugin's process tree read {measured_mb}MB against a \
                  memoryLimitMb of {limit_mb}MB, but a confirming sample read {confirmed_mb}MB - \
                  treating that as a transient member of the tree rather than a sustained overage, \
                  and leaving the plugin running",
@@ -651,8 +651,8 @@ impl PluginSupervisor {
     /// The "no evidence either way" log, emitted once per supervisor.
     fn log_sampling_unavailable_once(&self, pid: u32) {
         if !self.sampling_unavailable_logged.swap(true, Ordering::SeqCst) {
-            crate::log_line!(
-                "g-mesh daemon: could not sample the {} plugin's process-tree memory \
+            crate::log_role!(
+                "could not sample the {} plugin's process-tree memory \
                  (pid {pid}) - memoryLimitMb has nothing to enforce against until a later \
                  sample succeeds; logged once",
                 self.manifest.language
@@ -676,17 +676,11 @@ impl PluginSupervisor {
         let path = self.suspended_marker_path();
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         if let Err(err) = fs::write(&temporary, format!("{reason}\n")) {
-            crate::log_line!(
-                "g-mesh daemon: failed to write suspension marker {}: {err}",
-                temporary.display()
-            );
+            crate::log_role!("failed to write suspension marker {}: {err}", temporary.display());
             return;
         }
         if let Err(err) = fs::rename(&temporary, &path) {
-            crate::log_line!(
-                "g-mesh daemon: failed to put suspension marker {} in place: {err}",
-                path.display()
-            );
+            crate::log_role!("failed to put suspension marker {} in place: {err}", path.display());
             let _ = fs::remove_file(&temporary);
         }
     }
@@ -696,13 +690,13 @@ impl PluginSupervisor {
     fn put_to_sleep(&self, process: PluginProcess, reason: &str) {
         let pid = process.pid();
         if let Err(err) = process.shutdown(PLUGIN_EXIT_GRACE) {
-            crate::log_line!("g-mesh daemon: the plugin (pid {pid}) did not shut down cleanly: {err:#}");
+            crate::log_role!("the plugin (pid {pid}) did not shut down cleanly: {err:#}");
         }
         // Removed: a pid file naming a deliberately exited process reads as a
         // crashed daemon to `cli::stop` and `cli::status`.
         let _ = fs::remove_file(&self.pid_file);
-        crate::log_line!(
-            "g-mesh daemon: {} plugin (pid {pid}) put to sleep - {reason}; file changes will be \
+        crate::log_role!(
+            "{} plugin (pid {pid}) put to sleep - {reason}; file changes will be \
              queued until a request needs it again",
             self.manifest.language
         );
@@ -906,8 +900,8 @@ pub fn supervise(
         // First in the tick: an orphan has nothing left to time and no reason to
         // pay for a `sysinfo` scan on its way out.
         if let Some(orphan) = orphan_check(project_root, std::env::current_exe(), lifeline) {
-            crate::log_line!(
-                "g-mesh daemon: {orphan} - shutting down; nothing can ask this daemon for \
+            crate::log_role!(
+                "{orphan} - shutting down; nothing can ask this daemon for \
                  anything again, and a fresh one will be started if the project comes back"
             );
             // The same teardown as the idle exit below.
@@ -925,8 +919,8 @@ pub fn supervise(
         registry.check_memory_limits_all();
 
         if let Some(idle) = core.idle_beyond(timeouts.core) {
-            crate::log_line!(
-                "g-mesh daemon: no MCP requests for {idle:?} - shutting down; the next request \
+            crate::log_role!(
+                "no MCP requests for {idle:?} - shutting down; the next request \
                  will start a fresh daemon for this project"
             );
             registry.sleep_all_now("the core is shutting down");
@@ -969,8 +963,8 @@ const GROUP_EXIT_GRACE: Duration = Duration::from_secs(1);
 fn end_process_group() {
     match crate::process::kill_own_group(GROUP_EXIT_GRACE) {
         crate::process::GroupSweep::Swept { terminated, killed } if terminated > 0 => {
-            crate::log_line!(
-                "g-mesh daemon: ended {terminated} process(es) left in its process group \
+            crate::log_role!(
+                "ended {terminated} process(es) left in its process group \
                  ({killed} needed SIGKILL)"
             );
         }
@@ -1015,18 +1009,16 @@ pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
     }
     let wait = crate::control::purge::LockWait::UpTo(PURGE_LOCK_WAIT);
     match crate::control::purge::purge_orphaned_state_dir(state_dir, wait) {
-        Ok(crate::control::purge::Purge::Deleted) => crate::log_line!(
-            "g-mesh daemon: deleted the state of {} ({}) - its project root no longer exists",
+        Ok(crate::control::purge::Purge::Deleted) => crate::log_role!(
+            "deleted the state of {} ({}) - its project root no longer exists",
             root.display(),
             state_dir.display()
         ),
-        Ok(crate::control::purge::Purge::Kept(reason)) => crate::log_line!(
-            "g-mesh daemon: kept the state of {} ({}): {reason}",
-            root.display(),
-            state_dir.display()
-        ),
-        Err(err) => crate::log_line!(
-            "g-mesh daemon: could not delete the state of {} ({}): {err:#} - `g-mesh clean orphaned` \
+        Ok(crate::control::purge::Purge::Kept(reason)) => {
+            crate::log_role!("kept the state of {} ({}): {reason}", root.display(), state_dir.display())
+        }
+        Err(err) => crate::log_role!(
+            "could not delete the state of {} ({}): {err:#} - `g-mesh clean orphaned` \
              or the next shim's sweep will",
             root.display(),
             state_dir.display()

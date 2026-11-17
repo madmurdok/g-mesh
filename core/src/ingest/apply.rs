@@ -1043,9 +1043,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
 fn nodes_with_vectors(conn: &rusqlite::Connection, diff: &Diff) -> HashSet<String> {
     vectors::nodes_with_vectors(conn, diff.upsert_nodes.iter().map(|node| node.id.as_str())).unwrap_or_else(
         |err| {
-            crate::log_line!(
-                "g-mesh daemon: failed to check a semantic answer's nodes for vectors ({err:#})"
-            );
+            crate::log_role!("failed to check a semantic answer's nodes for vectors ({err:#})");
             HashSet::new()
         },
     )
