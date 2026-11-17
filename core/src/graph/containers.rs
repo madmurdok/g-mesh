@@ -88,7 +88,7 @@
 //! a new member with no container node, is exactly the drift this module exists
 //! to rule out - so membership commits or rolls back with the diff that caused
 //! it. It also covers every writer at once: the per-file reparse
-//! (`watcher::apply`), each cold-start bulk batch (`daemon::bulk_index::commit`),
+//! (`ingest::apply`), each cold-start bulk batch (`daemon::bulk_index::commit`),
 //! the burst batcher and `graph::queries`' helpers all write through
 //! `apply_diff`, so none of them needs to know containers exist.
 //!

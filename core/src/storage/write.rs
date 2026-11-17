@@ -49,7 +49,7 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
 /// so its signature, docComment, span and the rest may be newer than what
 /// core holds. Writing them would put text on the row that core has not
 /// reparsed and that the row's vector was not computed from
-/// (`watcher::apply::round_trip` keeps a re-sent node's vector). Core's own
+/// (`ingest::apply::round_trip` keeps a re-sent node's vector). Core's own
 /// reparse of that file is what brings the new text, row and vector together.
 ///
 /// A node the index has no row for (a placeholder the pass mints, or a

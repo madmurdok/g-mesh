@@ -36,6 +36,7 @@ mod daemon_missing_plugin_binary;
 mod daemon_plugin_bin_dir;
 mod daemon_plugin_discovery_failure;
 mod daemon_sigterm;
+mod daemon_start_clears_dead_state;
 mod default_export_linking;
 mod dynamic_import_resolution;
 mod edit_timing_lines;

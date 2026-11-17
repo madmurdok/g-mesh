@@ -7,7 +7,7 @@
 //! the handshake is verified by `protocol::handshake::verify`, each bulk
 //! stream is committed by `daemon::bulk_index::ingest` (the real batching)
 //! and linked by `link::imports::link_all` + `link::symbol_links::link_all`,
-//! and every control-plane round trip is `watcher::apply::apply_file_change`
+//! and every control-plane round trip is `ingest::apply::apply_file_change`
 //! / `apply_semantic_pass` - including the `semantic_pass` capability gate
 //! `apply_file_change` applies itself - so the diffs land through the real
 //! `storage::write::apply_diff`, container maintenance, and `link_diff`.
@@ -73,6 +73,7 @@ use super::expectations::FilesCreatedPair;
 use crate::daemon::bulk_index::{self, WalkContext, BULK_INDEX_FLAG};
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
+use crate::ingest::apply::{apply_file_change, apply_semantic_pass, SemanticPassOutcome};
 use crate::paths;
 use crate::plugin_manifest::PluginManifest;
 use crate::protocol::handshake;
@@ -84,7 +85,6 @@ use crate::protocol::types::{
 };
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::watcher::apply::{apply_file_change, apply_semantic_pass, SemanticPassOutcome};
 
 /// The directory the kit hands every plugin process it spawns, via this
 /// environment variable, for the plugin-side markers the kit defines.
@@ -1394,7 +1394,7 @@ pub(crate) struct Session {
 }
 
 /// Copies every byte read through it, so the session can recover the raw
-/// response frames `watcher::apply` consumed.
+/// response frames `ingest::apply` consumed.
 struct TeeReader<R> {
     inner: R,
     log: Vec<u8>,
@@ -1712,7 +1712,7 @@ impl<'a> Driver<'a> {
         Ok(())
     }
 
-    /// Runs one operation through `watcher::apply` and records what crossed
+    /// Runs one operation through `ingest::apply` and records what crossed
     /// the wire. Returns whether the session can continue.
     fn step(&mut self, label: &str, file: &str, operation: &Operation) -> bool {
         let id = RequestId::Number(self.next_id);

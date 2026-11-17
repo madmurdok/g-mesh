@@ -30,6 +30,7 @@ it:daemon_missing_plugin_binary                          none
 it:daemon_plugin_bin_dir                                 rust
 it:daemon_plugin_discovery_failure                       none
 it:daemon_sigterm                                        typescript rust python go
+it:daemon_start_clears_dead_state                        typescript
 it:default_export_linking                                typescript rust python go
 it:dynamic_import_resolution                             typescript rust python go
 it:edit_timing_lines                                     typescript
@@ -52,6 +53,7 @@ it:layout                                                rust
 it:lazy_activation                                       typescript rust python go
 it:log_line_atomic                                       rust
 it:mcp_e2e                                               typescript rust python go
+it:module_boundaries                                     rust
 it:module_tree_refresh_rust                              rust
 it:multi_project_front                                   typescript rust python go
 it:named_glob_shadowing                                  rust

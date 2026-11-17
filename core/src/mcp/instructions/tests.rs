@@ -1688,7 +1688,7 @@ fn a_real_missing_plugin_binary_renders_the_os_cause_without_the_path() {
         ),
     )
     .unwrap();
-    crate::daemon::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
+    crate::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 
@@ -1858,7 +1858,7 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
         ),
     )
     .unwrap();
-    crate::daemon::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
+    crate::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 

@@ -380,7 +380,7 @@ impl GMeshMcpServer {
             .collect()
     }
 
-    /// Query-time staleness check (`watcher::staleness::ensure_fresh`) for the
+    /// Query-time staleness check (`ingest::staleness::ensure_fresh`) for the
     /// three tools anchored on one file (`find_definition`, `get_file_outline`,
     /// `get_dependencies`): catches changes the watcher never saw, which never
     /// enter the replay queue. The symbol-anchored tools skip it: their files

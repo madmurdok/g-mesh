@@ -175,7 +175,7 @@ pub fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
 /// into the deleted node are left pointing at it, not re-placeholdered by
 /// this pass. For a file, core re-extracts its importers in the delete's
 /// round trip (`storage::file_rows::importers_of`,
-/// `watcher::apply::apply_file_change_in`), and each import falls back to
+/// `ingest::apply::apply_file_change_in`), and each import falls back to
 /// another candidate or comes back as an unresolved placeholder. For a
 /// container, the edges dangle until those importers are next reindexed, as
 /// `graph::containers`' own module doc documents.

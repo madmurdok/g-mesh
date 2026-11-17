@@ -1,5 +1,8 @@
 use super::*;
+use crate::ingest::convert::{to_edge_record, to_node_record};
+use crate::model::{DeclarationRecord, EdgeRecord, NodeRecord};
 use crate::protocol::jsonrpc::read_message;
+use crate::protocol::types::FileChangeDiff;
 use crate::protocol::types::{
     EdgeKind, NodeKind, PlaceholderTarget, Position, QualifiedPath, Range, SourceTier, TargetKey,
     TargetScope, Visibility, WireEdge, WireNode,

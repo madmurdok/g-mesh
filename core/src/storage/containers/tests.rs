@@ -565,7 +565,7 @@ fn parent_chain_ends_at_a_cycle() {
 }
 
 /// The daemon's own write path: a real `FileChangeDiff`-shaped wire node
-/// goes through `watcher::apply::to_node_record`, which must carry
+/// goes through `ingest::convert::to_node_record`, which must carry
 /// `containerParent` through rather than drop it as it did before GM-265.
 #[test]
 fn the_wire_conversion_carries_container_parent_through_to_the_row() {
@@ -595,7 +595,7 @@ fn the_wire_conversion_carries_container_parent_through_to_the_row() {
     let mut conn = setup(false);
     apply_diff(
         &mut conn,
-        &upsert(vec![crate::watcher::apply::to_node_record(wire, &mut Default::default())]),
+        &upsert(vec![crate::ingest::convert::to_node_record(wire, &mut Default::default())]),
     )
     .unwrap();
     assert_eq!(

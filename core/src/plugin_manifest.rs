@@ -168,7 +168,7 @@ pub struct Capabilities {
     /// edge this plugin stands behind, and every placeholder node such an edge
     /// lands on, and says `incomplete` whenever it did not. `true`: after such
     /// a pass core deletes this language's semantic edges the pass did not
-    /// re-send (`watcher::apply::sweep_semantic_edges`), and the swap of a
+    /// re-send (`ingest::apply::sweep_semantic_edges`), and the swap of a
     /// workspace reindex keeps the language's pending-symbol placeholders the
     /// walk no longer emits until that pass, which deletes those it did not
     /// re-send (`IndexStore::sweep_unclaimed_nodes`). `false` (the default):

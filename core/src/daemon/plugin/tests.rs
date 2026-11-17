@@ -532,7 +532,7 @@ fn a_refused_query_time_reindex_relaunches_the_plugin_so_the_retry_applies_the_e
             .unwrap()
     };
     let on_disk = |path: &Path| -> (i64, String) {
-        let mtime = staleness::mtime_millis(&fs::metadata(path).unwrap()).unwrap();
+        let mtime = crate::fsutil::mtime_millis(&fs::metadata(path).unwrap()).unwrap();
         let hash = Sha256::digest(fs::read(path).unwrap()).iter().map(|b| format!("{b:02x}")).collect();
         (mtime, hash)
     };

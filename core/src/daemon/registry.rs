@@ -100,6 +100,7 @@ use sha2::{Digest, Sha256};
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
+use crate::ingest::staleness::{self, StalenessOutcome};
 use crate::model::Diff;
 use crate::paths::state_dir::StateDir;
 use crate::plugin_manifest::{self, DiscoveredPlugins};
@@ -108,7 +109,6 @@ use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{self, IndexStore, Unit};
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
-use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// Every `plugin-<language>.pid` file currently present in `state_dir`, paired
 /// with its language. Compat wrapper over `StateDir::plugin_pid_files`.
@@ -1568,12 +1568,12 @@ impl PluginRegistry {
     /// pass still owes ([`schema::owed_semantic_pending_files`]: the seeded
     /// reconcile's reparsed files, including those of an earlier start that
     /// died before their pass), plus the language's owed files. The rows
-    /// clear only when that pass completes ([`watcher::apply`]'s per-file
+    /// clear only when that pass completes ([`ingest::apply`]'s per-file
     /// settling); an unfinished or failed pass leaves them for the next
     /// start. Best-effort: a failure is logged and the files keep their
     /// structural edges.
     ///
-    /// [`watcher::apply`]: crate::watcher::apply
+    /// [`ingest::apply`]: crate::ingest::apply
     pub(crate) fn owed_semantic_file_passes(&self, conn: &IndexStore) {
         let owed = match conn.with(schema::owed_semantic_pending_files) {
             Ok(owed) => owed,

@@ -11,7 +11,7 @@ use super::language_outcome::LanguageOutcome;
 /// of truth.
 ///
 /// Bumped to "2" when `indexed_files` was added (query-time staleness
-/// checking - see `watcher::staleness`): it records the on-disk mtime/hash
+/// checking - see `ingest::staleness`): it records the on-disk mtime/hash
 /// a file's index was last built from, which didn't exist in "1".
 ///
 /// Bumped to "3" when `meta.bulkIndexedAt` was added (cold-start bulk index -
@@ -565,7 +565,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 -- Baseline on-disk state (mtime + content hash) a file's index was last
--- built from - see watcher::staleness. mtime is a cheap fast-path check
+-- built from - see ingest::staleness. mtime is a cheap fast-path check
 -- (no file read); contentHash is the authoritative fallback used only when
 -- mtime disagrees, so a query touching many files doesn't have to hash all
 -- of them every time.
@@ -616,7 +616,7 @@ CREATE TABLE IF NOT EXISTS pending_reindex (
 );
 
 -- The files of `language` a source edit's `affected` answer selected for a
--- re-extract (GM-507, `watcher::apply`), written before the first of them is
+-- re-extract (GM-507, `ingest::apply`), written before the first of them is
 -- re-extracted and removed once all of them and their semantic pass are done.
 -- A row outliving its daemon means the loop was interrupted: the next start
 -- re-extracts them again (`daemon::config_reindex::resume_owed_reextracts`).
