@@ -480,3 +480,11 @@ Keep the draft order; R-9 first because S3 converts the reads S2 moves into `con
 - **S4** opus review of S2+S3.
 - **S5** tests: T1-T10 and the controls above.
 - **S6** verify.
+
+## 5. Owner review (2026-11-17)
+
+- D1: "При старте (Recommended)".
+- D11: "g-mesh: (Recommended)".
+- D7: "Как в ноте (Recommended)".
+- Slicing and D2-D6, D8-D10, D12 as recommended: "R-20 отдельным слайсом (Recommended)" —
+  S2 R-9 (opus), S3 R-31 (sonnet), S4 R-20 (sonnet), then review, tests, verify.
