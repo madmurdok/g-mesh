@@ -115,6 +115,10 @@ path = "junit.xml"
 # (docs/adr/0031-local-test-runs.md); `test-local.sh --full` runs them and
 # reports any test whose time crossed 10s either way against this list. A test
 # joins at 10s or more and leaves only after two batch-end runs under 10s.
+# Exception: the three `watcher::tests` entries are listed for a dev
+# machine's FS-event load, not their time (a flooded fseventsd delivers
+# nothing for minutes; docs/design/GM-720-watcher-tests-under-load.md). They
+# stay even when the report names them under 10s.
 [profile.local]
 inherits = "default"
 default-filter = """
@@ -186,6 +190,9 @@ not (
     (binary_id(g-mesh::it) & test(=one_plugin_binary_missing::status_reports_each_languages_outcome_in_light_and_full_json)) |
     (binary_id(g-mesh::it) & test(=overload_call_resolution::an_overloaded_function_resolves_correctly_through_the_real_mcp_tools)) |
     (binary_id(g-mesh::it) & test(=plugin_bridge::an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass)) |
-    (binary_id(g-mesh::it) & test(=cli_clean::clean_orphaned_without_force_reports_and_deletes_nothing))
+    (binary_id(g-mesh::it) & test(=cli_clean::clean_orphaned_without_force_reports_and_deletes_nothing)) |
+    (binary_id(g-mesh) & test(=watcher::tests::write_to_tracked_file_produces_an_event)) |
+    (binary_id(g-mesh) & test(=watcher::tests::write_to_gitignored_path_produces_no_event)) |
+    (binary_id(g-mesh) & test(=watcher::tests::links::edits_creates_and_deletes_under_an_alias_only_target_surface_under_the_link))
 )
 """
