@@ -154,10 +154,7 @@ use crate::storage::write::Diff;
 /// version check needs only discovery's output and has to run before anything
 /// trusts the index at all), and `cli::init`/`cli::reindex` never build a
 /// registry in the first place. Taking `&DiscoveredPlugins` directly removes
-/// that ordering problem rather than working around it - the same shape, and
-/// for the same reason, as [`discovered_pid_files`] above: a fact about
-/// plugins that callers with no live registry still have to be able to ask
-/// for.
+/// that ordering problem rather than working around it.
 pub fn indexer_version(discovered: &DiscoveredPlugins) -> String {
     format!("{CURRENT_INDEXER_VERSION}+{}", plugins_digest(discovered))
 }

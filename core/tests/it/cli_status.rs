@@ -554,7 +554,7 @@ fn status_ignores_a_dead_daemons_leftover_rerank_outcome() {
 /// A daemon clears a leftover outcome when it starts; while it runs,
 /// `status` reports the outcome its pid wrote.
 ///
-/// *Control:* drop the `remove_file(rerank_outcome_path_in(..))` from
+/// *Control:* drop the `remove_file(state.rerank_outcome_file())` from
 /// `daemon::run` -> the planted leftover is never cleared and the wait
 /// times out.
 #[test]
