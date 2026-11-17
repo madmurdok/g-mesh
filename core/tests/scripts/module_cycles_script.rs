@@ -75,9 +75,9 @@ fn absent_args(edges: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn the_removed_core_edges_stay_absent_and_no_cycle_exceeds_five_modules() {
+fn the_removed_core_edges_stay_absent_and_core_has_no_module_cycle() {
     let mut args = absent_args(&REMOVED_EDGES);
-    args.extend(["--max-scc".to_string(), "5".to_string()]);
+    args.extend(["--max-scc".to_string(), "1".to_string()]);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let output = module_cycles(&repo_root().join("core/src"), &args);
