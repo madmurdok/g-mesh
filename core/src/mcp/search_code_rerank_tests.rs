@@ -5,9 +5,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rmcp::model::CallToolResult;
+
 use rusqlite::Connection;
 
 use super::context::QueryCtx;
+use super::query::test_support::Rendered;
 use super::query_shapes::QueryShapes;
 use super::search_code::handle;
 use super::SearchCodeParams;
@@ -100,11 +102,12 @@ pub(super) fn call(
     cursor: Option<String>,
 ) -> CallToolResult {
     let params = SearchCodeParams { query: query.to_string(), cursor, limit };
-    handle(&ctx_for(store, embedding), params, None).unwrap()
+    handle(&ctx_for(store, embedding), params, None).unwrap().rendered()
 }
 
 /// The JSON body of a one-block result.
-pub(super) fn body(result: &CallToolResult) -> serde_json::Value {
+pub(super) fn body(result: &impl Rendered) -> serde_json::Value {
+    let result = &result.rendered();
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
         other => panic!("expected text/json content, got {other:?}"),
@@ -551,7 +554,10 @@ fn a_partial_page_is_not_reranked() {
     );
     let partial = |embedding: &Arc<EmbeddingPipeline>| {
         let params = SearchCodeParams { query: "parseConfig".to_string(), cursor: None, limit: Some(5) };
-        serde_json::to_value(handle(&ctx_for(&store, embedding), params, coverage.as_ref()).unwrap()).unwrap()
+        serde_json::to_value(
+            handle(&ctx_for(&store, embedding), params, coverage.as_ref()).unwrap().rendered(),
+        )
+        .unwrap()
     };
     assert_eq!(partial(&on), partial(&off));
     let complete = body(&call(&store, &on, "parseConfig", Some(5), None));
@@ -744,7 +750,8 @@ fn scored_texts(store: &Arc<IndexStore>, query: &str, project_root: Option<&Path
         project_root: project_root.map(Path::to_path_buf).unwrap_or_default(),
         ..ctx_for(store, &embedding)
     };
-    let result = handle(&ctx, params, None).unwrap_or_else(|err| panic!("the call failed: {err:?}"));
+    let result =
+        handle(&ctx, params, None).unwrap_or_else(|err| panic!("the call failed: {err:?}")).rendered();
     assert_ne!(result.is_error, Some(true), "{result:?}");
     assert_eq!(lines.count(), 0, "the rerank fell back: {:?}", lines.0.lock().unwrap());
     let page = body(&result);
@@ -1086,7 +1093,7 @@ fn a_partial_page_does_not_spend_the_hint() {
     );
     assert!(coverage.is_some(), "the fixture must be a partial page");
     let params = SearchCodeParams { query: "parseConfig".to_string(), cursor: None, limit: Some(5) };
-    let result = handle(&ctx_for(&store, &embedding), params, coverage.as_ref()).unwrap();
+    let result = handle(&ctx_for(&store, &embedding), params, coverage.as_ref()).unwrap().rendered();
     // A partial result may lead with a plain-text note; the page is the JSON block.
     let partial = result
         .content

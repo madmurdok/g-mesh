@@ -1,5 +1,6 @@
 use super::*;
 use crate::mcp::context::QueryCtx;
+use crate::mcp::query::test_support::Rendered;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,7 +39,8 @@ fn node_with_span(
     node
 }
 
-fn json_body(result: &CallToolResult) -> serde_json::Value {
+fn json_body(result: &impl Rendered) -> serde_json::Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -46,7 +48,8 @@ fn json_body(result: &CallToolResult) -> serde_json::Value {
     }
 }
 
-fn error_text(result: &CallToolResult) -> String {
+fn error_text(result: &impl Rendered) -> String {
+    let result = &result.rendered();
     assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => text.text.clone(),
@@ -66,7 +69,7 @@ fn import_placeholder(id: &str, name: &str, specifier: &str, file: &str) -> Node
     node
 }
 
-fn resolved_by_name(conn: &Connection, name: &str) -> Result<CallToolResult, ErrorData> {
+fn resolved_by_name(conn: &Connection, name: &str) -> Result<ToolAnswer<DefinitionNode>, ErrorData> {
     by_name(conn, None, &SemanticRung::off(), name, None)
 }
 
@@ -966,11 +969,15 @@ fn with_the_shipped_shapes_a_specifier_is_refused_before_it_is_embedded() {
 
 /// The second pass of the ladder with a query vector identical to `near`'s,
 /// so the semantic rung scores 1.0 and answers whenever it is consulted.
-fn with_a_matching_vector(conn: &Connection, name: &str) -> CallToolResult {
+fn with_a_matching_vector(conn: &Connection, name: &str) -> ToolAnswer<DefinitionNode> {
     with_a_matching_vector_and(conn, QueryShapes::shipped(), name)
 }
 
-fn with_a_matching_vector_and(conn: &Connection, shapes: &QueryShapes, name: &str) -> CallToolResult {
+fn with_a_matching_vector_and(
+    conn: &Connection,
+    shapes: &QueryShapes,
+    name: &str,
+) -> ToolAnswer<DefinitionNode> {
     let query = [1.0_f32, 0.0];
     by_name(conn, None, &SemanticRung::Embedded { name, query: Some(&query), shapes }, name, None).unwrap()
 }
@@ -1349,7 +1356,7 @@ fn ts_decl(conn: &mut Connection, id: &str, name: &str, qualified_name: &str, la
 
 /// The ladder with no model and `map`'s declarations in place of the
 /// shipped ones.
-fn resolved_with(conn: &Connection, map: &QueryShapes, name: &str) -> CallToolResult {
+fn resolved_with(conn: &Connection, map: &QueryShapes, name: &str) -> ToolAnswer<DefinitionNode> {
     let embedding = EmbeddingPipeline::disabled();
     by_name(conn, None, &SemanticRung::deferred(&embedding, map), name, None).unwrap()
 }
@@ -1737,7 +1744,11 @@ fn definition_params() -> FindDefinitionParams {
     }
 }
 
-fn define(store: &Arc<IndexStore>, root: &std::path::Path, params: FindDefinitionParams) -> CallToolResult {
+fn define(
+    store: &Arc<IndexStore>,
+    root: &std::path::Path,
+    params: FindDefinitionParams,
+) -> ToolAnswer<DefinitionNode> {
     QueryCtx { project_root: root.to_path_buf(), ..QueryCtx::for_test(store) }
         .resolve_lazily(handle, params)
         .unwrap()
@@ -2113,7 +2124,7 @@ fn covered_call(
     conn: Connection,
     coverage: Option<&PathCoverage>,
     params: FindDefinitionParams,
-) -> CallToolResult {
+) -> ToolAnswer<DefinitionNode> {
     handle(
         &QueryCtx {
             project_root: no_sources().to_path_buf(),

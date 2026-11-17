@@ -184,14 +184,14 @@ fn commit_batch_on(conn: &mut Connection, diff: &Diff) -> Result<()> {
 /// lock open, for tests that need the lock itself held (not merely the
 /// indexing phase reported). A no-op unless set; bounded at 30 s so a test
 /// that forgets to delete the file fails as a timeout.
-pub const HOLD_LOCK_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_LOCK_FILE";
+pub const HOLD_LOCK_FILE_ENV: &str = crate::knobs::BULK_INDEX_HOLD_LOCK_FILE.name;
 
 /// Honors [`HOLD_LOCK_FILE_ENV`], inside [`IndexStore::commit_batch`]'s hold.
 fn hold_the_lock_open_for_tests() {
-    let Some(path) = std::env::var_os(HOLD_LOCK_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let Some(path) = crate::knobs::os_non_empty(&crate::knobs::BULK_INDEX_HOLD_LOCK_FILE) else { return };
     let path = std::path::PathBuf::from(path);
-    crate::log_line!(
-        "g-mesh daemon: holding a bulk-index batch's lock open until {} is removed ({HOLD_LOCK_FILE_ENV})",
+    crate::log_role!(
+        "holding a bulk-index batch's lock open until {} is removed ({HOLD_LOCK_FILE_ENV})",
         path.display()
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

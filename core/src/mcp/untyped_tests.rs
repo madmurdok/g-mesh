@@ -6,11 +6,11 @@ use crate::mcp::context::QueryCtx;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
 use super::*;
 use crate::graph::queries;
+use crate::mcp::query::test_support::Rendered;
 use crate::mcp::response_bound::MAX_RESPONSE_BYTES;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
 use crate::model::{Diff, EdgeRecord};
@@ -320,7 +320,8 @@ fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
     )])
 }
 
-fn body(result: &CallToolResult) -> (serde_json::Value, usize) {
+fn body(result: &impl Rendered) -> (serde_json::Value, usize) {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => (serde_json::from_str(&text.text).unwrap(), text.text.len()),

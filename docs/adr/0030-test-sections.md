@@ -47,6 +47,10 @@ section has one CI step.
   `scripts/test-sections-check.py` fails on a test in no section, in two
   sections, or matched by a section but absent from the suite. CI's linux row
   and `cut-release.sh` run it.
+- **A CI step check.** `check` first runs `check-ci`: each section in
+  `SECTIONS` has exactly one `tests: <section>` step in `ci.yml` that runs it
+  and selects it by name, and no step runs an unlisted section. Adding a
+  section is a `SECTIONS` entry plus its step; a missing step fails `check`.
 - **CI: steps in one job, not a matrix.** One build step, then one step per
   section with its own timeout and JUnit file. A matrix over sections would
   be 44 jobs, each with its own cold build.

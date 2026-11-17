@@ -11,6 +11,9 @@ path = "src/lib.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+# `ControlRequest::parse` decodes a control frame tolerantly, through a
+# `serde_json::Value` pre-pass; already in every consumer's dependency tree.
+serde_json = "1"
 
 # Only for the `JsonSchema` derive on `Position`, which core needs so its MCP
 # tool schemas can describe a position with the very type the wire and the
@@ -18,10 +21,6 @@ serde = { version = "1", features = ["derive"] }
 # built on `plugins/sdk` - which publishes no schemas - does not compile a
 # schema generator to send NDJSON. Core enables it explicitly.
 schemars = { version = "1", optional = true }
-
-[dev-dependencies]
-# The round-trip tests in this crate assert against real wire bytes.
-serde_json = "1"
 
 [features]
 default = []

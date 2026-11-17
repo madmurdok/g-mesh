@@ -47,25 +47,25 @@ fn bin_dir_of(exe: &Path) -> Option<PathBuf> {
 /// Where a spawned plugin is told to find the manifest core read about it.
 /// Must match `g_mesh_plugin_sdk::MANIFEST_PATH_ENV` (core does not depend on
 /// the SDK); a divergence silently drops an SDK plugin to its in-code spec.
-pub const MANIFEST_PATH_ENV: &str = "G_MESH_PLUGIN_MANIFEST";
+pub const MANIFEST_PATH_ENV: &str = crate::knobs::PLUGIN_MANIFEST.name;
 
 /// Overrides [`default_roots`]'s entire return value with a single directory
 /// (tests point discovery at one fixture directory). Real installs never set it.
-pub const PLUGIN_ROOTS_OVERRIDE_ENV: &str = "G_MESH_PLUGIN_ROOTS_OVERRIDE";
+pub const PLUGIN_ROOTS_OVERRIDE_ENV: &str = crate::knobs::PLUGIN_ROOTS_OVERRIDE.name;
 
 /// The roots [`discover`] scans, in precedence order: `~/.g-mesh/plugins/`
 /// (skipped if the home directory cannot be resolved), then [`bundled_roots`].
 /// With [`PLUGIN_ROOTS_OVERRIDE_ENV`] set, that one path replaces them all.
 pub fn default_roots() -> Vec<PathBuf> {
-    roots_with_override(std::env::var(PLUGIN_ROOTS_OVERRIDE_ENV).ok())
+    roots_with_override(crate::knobs::os_raw(&crate::knobs::PLUGIN_ROOTS_OVERRIDE).map(PathBuf::from))
 }
 
 /// [`default_roots`] with [`PLUGIN_ROOTS_OVERRIDE_ENV`]'s value given rather
 /// than read, so a test can supply it without writing a variable every other
 /// thread in the process reads.
-fn roots_with_override(override_root: Option<String>) -> Vec<PathBuf> {
+fn roots_with_override(override_root: Option<PathBuf>) -> Vec<PathBuf> {
     if let Some(over) = override_root {
-        return vec![PathBuf::from(over)];
+        return vec![over];
     }
 
     let mut roots = Vec::new();
@@ -690,8 +690,8 @@ pub fn discover(roots: &[PathBuf]) -> Result<DiscoveredPlugins> {
             let manifest = read_manifest(&dir)?;
 
             if let Some(existing) = manifests.get(&manifest.language) {
-                crate::log_line!(
-                    "g-mesh daemon: plugin \"{}\" at {} shadows the same language already \
+                crate::log_role!(
+                    "plugin \"{}\" at {} shadows the same language already \
                      found at {} - the earlier one wins",
                     manifest.language,
                     manifest.manifest_dir.display(),

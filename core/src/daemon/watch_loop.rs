@@ -83,8 +83,8 @@ pub(crate) fn spawn_watch_consumer(
                 // A daemon killed before this line repeats the seeded
                 // reconcile, which finds the files fresh.
                 if let Err(err) = conn.with(schema::record_seed_reconciled) {
-                    crate::log_line!(
-                        "g-mesh daemon: could not record that the seeded index was reconciled - the next start \
+                    crate::log_role!(
+                        "could not record that the seeded index was reconciled - the next start \
                          reconciles it again: {err:#}"
                     );
                 }

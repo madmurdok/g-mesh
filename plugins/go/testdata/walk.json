@@ -1,0 +1,396 @@
+{
+  "cases": [
+    {
+      "expect": [
+        "main.go"
+      ],
+      "files": [
+        "main.go",
+        "generated.go",
+        "api_gen.go",
+        "x1.go",
+        "xy.go",
+        "README.md"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "generated.go\n*_gen.go\nx?.go\n"
+        }
+      ],
+      "links": [],
+      "name": "root gitignore literal and wildcard"
+    },
+    {
+      "expect": [
+        "a.go"
+      ],
+      "files": [
+        "a.go",
+        "b.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "# a.go\n\nb.go\n"
+        }
+      ],
+      "links": [],
+      "name": "comments and blank lines are not patterns"
+    },
+    {
+      "expect": [
+        "a.go",
+        "other/b.go",
+        "sub/a.go"
+      ],
+      "files": [
+        "a.go",
+        "sub/a.go",
+        "sub/b.go",
+        "other/b.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "sub",
+          "text": "b.go\n"
+        }
+      ],
+      "links": [],
+      "name": "nested gitignore applies below its directory only"
+    },
+    {
+      "expect": [
+        "keep.go"
+      ],
+      "files": [
+        "a.go",
+        "keep.go",
+        "drop.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "*.go\n!keep.go\n"
+        }
+      ],
+      "links": [],
+      "name": "negation re-includes an earlier match"
+    },
+    {
+      "expect": [
+        "sub/a.go",
+        "sub/deep/a.go"
+      ],
+      "files": [
+        "a.go",
+        "sub/a.go",
+        "sub/b.go",
+        "sub/deep/a.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "*.go\n"
+        },
+        {
+          "dir": "sub",
+          "text": "!a.go\n"
+        }
+      ],
+      "links": [],
+      "name": "deeper layer overrides an ancestor"
+    },
+    {
+      "expect": [
+        "a/b/c.go",
+        "main.go"
+      ],
+      "files": [
+        "main.go",
+        "a/gen/x.go",
+        "a/b/gen/y.go",
+        "a/b/c.go",
+        "logs/one.go",
+        "logs/two/three.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "**/gen/*.go\nlogs/**\n"
+        }
+      ],
+      "links": [],
+      "name": "double star matches any depth"
+    },
+    {
+      "expect": [
+        "c/b.go"
+      ],
+      "files": [
+        "a/b.go",
+        "a/x/b.go",
+        "a/x/y/b.go",
+        "c/b.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "a/**/b.go\n"
+        }
+      ],
+      "links": [],
+      "name": "double star between segments"
+    },
+    {
+      "expect": [
+        "main.go"
+      ],
+      "files": [
+        "build/out.go",
+        "src/build",
+        "main.go",
+        "pkg/build/inner.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "build/\n"
+        }
+      ],
+      "links": [],
+      "name": "trailing slash matches directories only"
+    },
+    {
+      "expect": [
+        "sub/deep/x.go",
+        "sub/x.go"
+      ],
+      "files": [
+        "x.go",
+        "sub/x.go",
+        "sub/deep/x.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "/x.go\n"
+        }
+      ],
+      "links": [],
+      "name": "leading slash anchors to the layer directory"
+    },
+    {
+      "expect": [
+        "c/a/b.go"
+      ],
+      "files": [
+        "a/b.go",
+        "c/a/b.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "a/b.go\n"
+        }
+      ],
+      "links": [],
+      "name": "embedded slash anchors"
+    },
+    {
+      "expect": [
+        "main.go"
+      ],
+      "files": [
+        "main.go",
+        "vendor/dep/dep.go",
+        "testdata/fixture.go",
+        "pkg/vendor/v.go",
+        "pkg/testdata/t.go",
+        ".git/hooks/h.go",
+        ".claude/worktrees/w.go"
+      ],
+      "gitignores": [],
+      "links": [],
+      "name": "hard-excluded directories at any depth"
+    },
+    {
+      "expect": [
+        "Mixed.Go",
+        "UPPER.GO",
+        "dir/x.GO",
+        "lower.go"
+      ],
+      "files": [
+        "lower.go",
+        "UPPER.GO",
+        "Mixed.Go",
+        "notgo.gox",
+        "dir/x.GO"
+      ],
+      "gitignores": [],
+      "links": [],
+      "name": "extension match is case-insensitive"
+    },
+    {
+      "expect": [
+        "main.go",
+        "real/a.go"
+      ],
+      "files": [
+        "real/a.go",
+        "main.go"
+      ],
+      "gitignores": [],
+      "links": [
+        {
+          "link": "alias",
+          "target": "real"
+        }
+      ],
+      "name": "symlinked directory is followed once"
+    },
+    {
+      "expect": [
+        "real.go"
+      ],
+      "files": [
+        "real.go"
+      ],
+      "gitignores": [],
+      "links": [
+        {
+          "link": "link.go",
+          "target": "real.go"
+        }
+      ],
+      "name": "symlinked file to a walked file is listed once"
+    },
+    {
+      "expect": [
+        "main.go",
+        "view/a.go"
+      ],
+      "files": [
+        "hidden/a.go",
+        "main.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "hidden/\n"
+        }
+      ],
+      "links": [
+        {
+          "link": "view",
+          "target": "hidden"
+        }
+      ],
+      "name": "gitignored target reached only through a link is listed under the link"
+    },
+    {
+      "expect": [
+        "a/b/c.go",
+        "main.go"
+      ],
+      "files": [
+        "a/b/c.go",
+        "main.go"
+      ],
+      "gitignores": [],
+      "links": [
+        {
+          "link": "a/b/up",
+          "target": "../.."
+        }
+      ],
+      "name": "link to an ancestor terminates"
+    },
+    {
+      "expect": [
+        "main.go"
+      ],
+      "files": [
+        "main.go"
+      ],
+      "gitignores": [],
+      "links": [
+        {
+          "link": "broken",
+          "target": "does-not-exist"
+        },
+        {
+          "link": "broken.go",
+          "target": "missing.go"
+        }
+      ],
+      "name": "dangling link is skipped"
+    },
+    {
+      "expect": [
+        "main.go"
+      ],
+      "files": [
+        "main.go",
+        "../outside/o.go"
+      ],
+      "gitignores": [],
+      "links": [
+        {
+          "link": "out",
+          "target": "../outside"
+        },
+        {
+          "link": "out.go",
+          "target": "../outside/o.go"
+        }
+      ],
+      "name": "link outside the root is refused"
+    },
+    {
+      "expect": [
+        "main.go"
+      ],
+      "files": [
+        "main.go",
+        "vendor/dep/dep.go"
+      ],
+      "gitignores": [],
+      "links": [
+        {
+          "link": "dep",
+          "target": "vendor/dep"
+        }
+      ],
+      "name": "link into an excluded directory is refused"
+    },
+    {
+      "expect": [
+        "one/a.go",
+        "one/sub/b.go"
+      ],
+      "files": [
+        "target/a.go",
+        "target/sub/b.go"
+      ],
+      "gitignores": [
+        {
+          "dir": "",
+          "text": "target/\n"
+        }
+      ],
+      "links": [
+        {
+          "link": "one",
+          "target": "target"
+        },
+        {
+          "link": "two",
+          "target": "target"
+        }
+      ],
+      "name": "nested links into one target list each file once"
+    }
+  ]
+}

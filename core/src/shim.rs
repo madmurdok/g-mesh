@@ -37,16 +37,6 @@ pub(crate) use router::Rebuilding;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Shortens [`BOOTSTRAP_TIMEOUT`] for the test suite. Real installs never set
-/// it: the point of the constant is to be longer than any honest bind, and
-/// nothing outside a test wants it shorter.
-///
-/// It exists so that "a project whose cold-start walk outlasts the shim's
-/// bootstrap timeout still gets served" can be asserted in a couple of
-/// seconds - shrinking the timeout below the walk, rather than stretching the
-/// walk past ten real seconds on every commit.
-const BOOTSTRAP_TIMEOUT_ENV: &str = "G_MESH_BOOTSTRAP_TIMEOUT_MS";
-
 /// Set by Claude Code on every stdio MCP server it spawns, in every
 /// registration scope (local/project/user) - unlike the process's cwd, which
 /// Claude Code's own docs call unreliable for learning the session's project
@@ -77,7 +67,7 @@ pub const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 /// Sharing is safe because every writer to this file - the daemon
 /// (`g_mesh::log_line!`) and each plugin (`g_mesh_plugin_sdk::log_line!`) -
 /// emits a whole line in one `write`, which `O_APPEND` keeps intact.
-pub const DAEMON_LOG_ENV: &str = "G_MESH_DAEMON_LOG";
+pub const DAEMON_LOG_ENV: &str = crate::knobs::DAEMON_LOG.name;
 
 /// The file in the project's state directory a shim-bootstrapped daemon's
 /// stderr is appended to when [`DAEMON_LOG_ENV`] is unset.
@@ -505,15 +495,12 @@ fn acquire_bootstrap_lock_under(home: &Path, root: &Path) -> Result<File> {
     Ok(file)
 }
 
-/// [`BOOTSTRAP_TIMEOUT`], unless [`BOOTSTRAP_TIMEOUT_ENV`] names a shorter
+/// [`BOOTSTRAP_TIMEOUT`], unless [`crate::knobs::BOOTSTRAP_TIMEOUT_MS`] names a shorter
 /// one. An unparseable value is ignored rather than fatal - a malformed knob
 /// nobody in production sets must not be a reason an MCP client fails to
 /// start.
 fn bootstrap_timeout() -> Duration {
-    std::env::var(BOOTSTRAP_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .map_or(BOOTSTRAP_TIMEOUT, Duration::from_millis)
+    crate::knobs::millis_lenient(&crate::knobs::BOOTSTRAP_TIMEOUT_MS, BOOTSTRAP_TIMEOUT)
 }
 
 fn wait_until_listening(endpoint: &ipc::Endpoint) -> Result<ipc::Stream> {
@@ -598,7 +585,7 @@ fn spawn_daemon_reaper(mut child: Child) {
 /// write it does not know is unread. A file and `/dev/null` both absorb writes unconditionally, which is
 /// the property the detached daemon's stderr has to keep.
 fn daemon_stderr(root: &Path) -> Stdio {
-    let path = match std::env::var_os(DAEMON_LOG_ENV).filter(|value| !value.is_empty()) {
+    let path = match crate::knobs::os_non_empty(&crate::knobs::DAEMON_LOG) {
         Some(path) => PathBuf::from(path),
         None => match project_daemon_log(root) {
             Ok(path) => path,

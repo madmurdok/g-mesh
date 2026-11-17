@@ -12,8 +12,8 @@
 //! that a line names the plugin and the first changed path; not the wording.
 //!
 //! `GM_CUT_RELEASE_SH` replaces the script under test with another copy (its
-//! `scripts/lib/` beside it), so a control revert can be run against this
-//! test binary without editing the checkout. Bash only, so Unix only: the
+//! `scripts/lib/` and `build-targets.sh` beside it), so a control revert can
+//! be run against this test binary without editing the checkout. Bash only, so Unix only: the
 //! release is cut from a Unix shell.
 
 use std::fs;
@@ -513,4 +513,69 @@ fn two_wrong_plugins_are_both_listed_in_one_run() {
     let checked = repo.commit_and_check();
     checked.refused("rust", "plugins/rust/plugin.toml");
     checked.refused("python", "plugins/python/src/lib.rs");
+}
+
+/// The plugin list of build-targets.sh as it stands in `PLUGINS=( ... )`.
+const PLUGIN_LIST: &str = "PLUGINS=(\n\ttypescript:cargo\n\tgo:go\n\trust:cargo\n\tpython:cargo\n)\n";
+
+/// `CRATE_BACKED_PLUGINS` of the script under test, sourced from a copy of
+/// its directory whose build-targets.sh lists `plugin_list` instead, and what
+/// that copy prints for `--plugins cargo`.
+fn crate_backed_plugins_with(plugin_list: &str) -> (Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = script().parent().unwrap().to_path_buf();
+    let scripts = dir.path().join("scripts");
+    fs::create_dir_all(scripts.join("lib")).unwrap();
+    fs::copy(script(), scripts.join("cut-release.sh")).unwrap();
+    for lib in fs::read_dir(source_dir.join("lib")).unwrap() {
+        let lib = lib.unwrap();
+        fs::copy(lib.path(), scripts.join("lib").join(lib.file_name())).unwrap();
+    }
+    let build_targets = fs::read_to_string(source_dir.join("build-targets.sh")).unwrap();
+    assert_eq!(
+        build_targets.matches(PLUGIN_LIST).count(),
+        1,
+        "build-targets.sh no longer holds {PLUGIN_LIST:?}"
+    );
+    fs::write(scripts.join("build-targets.sh"), build_targets.replace(PLUGIN_LIST, plugin_list)).unwrap();
+
+    let lines = |output: Output| -> Vec<String> {
+        assert!(
+            output.status.success(),
+            "status: {}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).collect()
+    };
+    let sourced = isolated("bash")
+        .arg("-c")
+        .arg(r#"source "$1" && printf '%s\n' "${CRATE_BACKED_PLUGINS[@]}""#)
+        .arg("cut-release-test")
+        .arg(scripts.join("cut-release.sh"))
+        .output()
+        .expect("failed to run bash");
+    let cargo = isolated("bash")
+        .arg(scripts.join("build-targets.sh"))
+        .args(["--plugins", "cargo"])
+        .output()
+        .expect("failed to run bash");
+    (lines(sourced), lines(cargo))
+}
+
+/// The crate-backed plugins cut-release checks are the `cargo` plugins of
+/// build-targets.sh's list: a cargo plugin added there is checked, a go one
+/// is not.
+///
+/// Control: restore the literal `CRATE_BACKED_PLUGINS=(rust python typescript)`
+/// - `foo` is missing and this fails.
+#[test]
+fn the_crate_backed_plugins_are_the_cargo_plugins_of_build_targets() {
+    let (checked, cargo) = crate_backed_plugins_with(PLUGIN_LIST);
+    assert_eq!(checked, cargo);
+
+    let (checked, cargo) =
+        crate_backed_plugins_with("PLUGINS=(\n\ttypescript:cargo\n\tgo:go\n\tfoo:cargo\n\tbar:go\n)\n");
+    assert_eq!(checked, ["typescript", "foo"]);
+    assert_eq!(checked, cargo);
 }

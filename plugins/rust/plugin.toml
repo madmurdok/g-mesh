@@ -15,7 +15,7 @@
 #
 # GM-288 (distribution) does not reuse this file for a release archive: it
 # generates a separate, installed manifest per target
-# (scripts/bundle-rust-plugin.sh) whose command names that target's actual
+# (scripts/bundle-cargo-plugin.sh) whose command names that target's actual
 # staged binary (`./g-mesh-plugin-rust` or `./g-mesh-plugin-rust.exe`), the
 # same way plugins/typescript/plugin.toml's checked-in dev manifest is never
 # the one an archive ships either (see scripts/bundle-plugin.sh).

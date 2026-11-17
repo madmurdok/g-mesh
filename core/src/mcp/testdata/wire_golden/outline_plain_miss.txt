@@ -1,0 +1,3 @@
+isError: Some(true)
+--- block 0 ---
+g-mesh: no file 'src/nope.rs' found in the index

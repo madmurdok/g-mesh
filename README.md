@@ -383,12 +383,12 @@ from any host, and writes an installed `plugin.toml` naming that binary.
 
 The JS/TS, Rust and Python plugins are cargo binaries in core's own
 workspace. `scripts/bundle-plugin.sh` (JS/TS, GM-326),
-`scripts/bundle-rust-plugin.sh` (GM-288) and `scripts/bundle-python-plugin.sh`
-(GM-298) each build their crate for the target with
+`scripts/bundle-cargo-plugin.sh <rust|python>` (GM-288, GM-298)
+each build their crate for the target with
 `cargo build --target <triple>`, the same way `build-targets.sh` already
 builds core, and write an installed `plugin.toml` naming the binary they
 staged. The Python plugin ships via
-`scripts/bundle-python-plugin.sh` — it is a tree-sitter-based structural
+`scripts/bundle-cargo-plugin.sh python` — it is a tree-sitter-based structural
 extractor written in Rust, not a program run by a Python interpreter, so
 **no Python interpreter is required on the machine being indexed** for the
 structural tier it ships today. A future semantic tier over `pyright` would

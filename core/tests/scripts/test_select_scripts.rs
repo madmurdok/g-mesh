@@ -257,11 +257,17 @@ fn crlf_lines_and_blank_lines_are_tolerated() {
     assert_eq!(select_raw("docs/a.md\r\n"), "none");
 }
 
-/// A scratch checkout holding the real selector and section scripts and
-/// `map` as `scripts/test-plugin-spawns.txt`.
+/// A scratch checkout holding the real selector and section scripts, the
+/// `build-targets.sh` they read the plugin list from, and `map` as
+/// `scripts/test-plugin-spawns.txt`.
 fn scratch_root_with_map(map: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    for script in ["scripts/test-select.sh", "scripts/test-sections.sh"] {
+    for script in [
+        "scripts/test-select.sh",
+        "scripts/test-sections.sh",
+        "scripts/build-targets.sh",
+        "scripts/lib/runnable.sh",
+    ] {
         write_executable(&dir.path().join(script), &fs::read_to_string(repo_root().join(script)).unwrap());
     }
     write_file(dir.path(), "scripts/test-plugin-spawns.txt", map);
@@ -367,6 +373,46 @@ fn a_scripts_row_in_the_map_keeps_the_selectors_until_core_scripts_runs() {
             &["plugins/typescript/src/x.rs", "core/src/config/mod.rs", "core/tests/scripts/x.rs"]
         ),
         core_plus(&["plugin-typescript"])
+    );
+}
+
+/// The plugin list of build-targets.sh as it stands in `PLUGINS=( ... )`.
+const PLUGIN_LIST: &str = "PLUGINS=(\n\ttypescript:cargo\n\tgo:go\n\trust:cargo\n\tpython:cargo\n)\n";
+
+/// The `core-spawns-*` selectors are printed in `build-targets.sh --plugins`
+/// order, cargo plugins first, and only for listed plugins: reordering the
+/// list reorders them, dropping a plugin drops its selector.
+///
+/// Control: restore the literal `for s in core-spawns-typescript
+/// core-spawns-rust core-spawns-python core-spawns-go` loop - this fails.
+#[test]
+fn core_spawns_selectors_follow_the_plugin_list_of_build_targets() {
+    let with_plugins = |plugin_list: &str| {
+        let root = scratch_root_with_map("it:alpha typescript\n");
+        let build_targets = root.path().join("scripts/build-targets.sh");
+        let text = fs::read_to_string(&build_targets).unwrap();
+        assert_eq!(text.matches(PLUGIN_LIST).count(), 1, "build-targets.sh no longer holds {PLUGIN_LIST:?}");
+        fs::write(&build_targets, text.replace(PLUGIN_LIST, plugin_list)).unwrap();
+        root
+    };
+    let paths = [
+        "plugins/go/main.go",
+        "plugins/python/src/a.rs",
+        "plugins/typescript/src/b.rs",
+        "plugins/rust/src/c.rs",
+    ];
+
+    let root = with_plugins("PLUGINS=(\n\tgo:go\n\tpython:cargo\n\trust:cargo\n\ttypescript:cargo\n)\n");
+    assert_eq!(
+        narrowed_in(root.path(), &paths),
+        "plugin-typescript plugin-rust plugin-python \
+         core-spawns-python core-spawns-rust core-spawns-typescript core-spawns-go"
+    );
+
+    let root = with_plugins("PLUGINS=(\n\ttypescript:cargo\n\tgo:go\n\tpython:cargo\n)\n");
+    assert_eq!(
+        narrowed_in(root.path(), &paths),
+        "plugin-typescript plugin-rust plugin-python core-spawns-typescript core-spawns-python core-spawns-go"
     );
 }
 
@@ -547,14 +593,20 @@ fn write_file(root: &Path, relative: &str, body: &str) {
     fs::write(path, body).unwrap();
 }
 
-/// A scratch repository holding copies of the two section scripts, a doc,
+/// A scratch repository holding copies of the two section scripts (and the
+/// `build-targets.sh` they read the plugin list from), a doc,
 /// a core file and a wire file, committed on `main` and branched as
 /// `release-9.9.9`, with HEAD on `main`.
 fn scratch_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q", "-b", "main"]);
-    for script in ["scripts/test-select.sh", "scripts/test-sections.sh"] {
+    for script in [
+        "scripts/test-select.sh",
+        "scripts/test-sections.sh",
+        "scripts/build-targets.sh",
+        "scripts/lib/runnable.sh",
+    ] {
         let body = fs::read_to_string(repo_root().join(script)).unwrap();
         write_executable(&root.join(script), &body);
     }
