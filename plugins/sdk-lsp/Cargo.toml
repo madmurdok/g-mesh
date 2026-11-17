@@ -1,0 +1,35 @@
+[package]
+name = "g-mesh-plugin-sdk-lsp"
+version = "4.33.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The LSP bridge a g-mesh language plugin uses for its semantic pass: a SemanticEngine that asks a language server"
+
+[lib]
+name = "g_mesh_plugin_sdk_lsp"
+path = "src/lib.rs"
+
+# The scripted language server `tests/lsp_bridge.rs` spawns through the real
+# `LspBridge`. A `[[bin]]` for the same reason the toy plugin is one -
+# cargo exports `CARGO_BIN_EXE_g-mesh-fake-lsp` to this package's integration
+# tests and builds it before they run - and in a top-level directory rather
+# than under `tests/` because cargo auto-discovers `tests/*/main.rs` as an
+# integration test target of its own.
+#
+# It is not shipped: nothing installs it, no manifest names it, and its only
+# caller is a `#[test]`. See its own module doc for why the fixture is a
+# process rather than a mock.
+[[bin]]
+name = "g-mesh-fake-lsp"
+path = "fake-lsp/main.rs"
+
+[dependencies]
+anyhow = "1"
+g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-wire = { path = "../../wire" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

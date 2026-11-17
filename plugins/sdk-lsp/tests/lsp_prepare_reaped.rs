@@ -1,15 +1,16 @@
 //! A language server started early, by `SemanticEngine::prepare`, is reaped
-//! by `kill_live_servers` - the path a plugin takes when core closes the
-//! control stream while the plugin is busy - like one a pass started.
+//! by the SDK's lifeline exit hooks - the path a plugin takes when core
+//! closes the control stream while the plugin is busy - like one a pass
+//! started: starting it registers the kill.
 //!
-//! Its own test binary, because `kill_live_servers` kills every server this
-//! process has started: next to the other bridge tests it would kill theirs.
+//! Its own test binary, because the kill reaches every server this process
+//! has started: next to the other bridge tests it would kill theirs.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use g_mesh_plugin_sdk::lsp::{kill_live_servers, Budgets, LspBridge, SemanticConfig};
-use g_mesh_plugin_sdk::SemanticEngine;
+use g_mesh_plugin_sdk::{run_lifeline_exit_hooks, SemanticEngine};
+use g_mesh_plugin_sdk_lsp::{Budgets, LspBridge, SemanticConfig};
 use serde_json::json;
 
 struct Scratch(PathBuf);
@@ -28,7 +29,7 @@ fn asked(log: &Path, method: &str) -> usize {
 /// the killed server is still running, so the second `prepare` finds it
 /// alive and starts nothing - `initialize` stays at one.
 #[test]
-fn a_server_started_by_prepare_is_reaped_by_kill_live_servers() {
+fn a_server_started_by_prepare_is_reaped_by_the_lifeline_exit_hooks() {
     let scratch =
         Scratch(std::env::temp_dir().join(format!("g-mesh-lsp-prepare-reaped-{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&scratch.0);
@@ -53,7 +54,7 @@ fn a_server_started_by_prepare_is_reaped_by_kill_live_servers() {
     bridge.prepare();
     assert_eq!(asked(&log, "initialize"), 1, "prepare started a server");
 
-    kill_live_servers();
+    run_lifeline_exit_hooks();
 
     // A bridge whose server is gone starts a new one; one whose server
     // survived the kill has nothing to do.

@@ -53,7 +53,7 @@
 //!    two. The bridge's edge onto a placeholder shares the structural edge's
 //!    id only when the structural edge is itself onto a placeholder of the
 //!    same address (a declaration in another file), so agreement is tested
-//!    on the target as well as on the id (`plugins/sdk/src/lsp/bridge.rs`).
+//!    on the target as well as on the id (`plugins/sdk-lsp/src/bridge.rs`).
 //!  - **`x.f`** - a field read through a receiver (anything but `self`
 //!    inside an `impl`), recorded as [`OpenSiteKind::ReceiverField`]. When
 //!    this file spells out the receiver's type `T`, the read also gets the

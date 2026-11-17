@@ -19,7 +19,7 @@
 //! it, to protect a string only the plugin ever reads.
 //!
 //! The SDK already re-reads `plugin.toml` for its own walk
-//! ([`crate::manifest`], whose module doc argues the case), so reading three
+//! (the SDK's `manifest` module, whose doc argues the case), so reading three
 //! more keys out of the same file costs one more struct and no new mechanism.
 //! Core's parser ignores unknown sections (it has no `deny_unknown_fields`),
 //! which is what makes the two readers of one file possible at all.
@@ -323,7 +323,7 @@ impl SemanticConfig {
     }
 
     /// Reads `[plugin.semantic]` from this plugin's own manifest, wherever
-    /// [`crate::manifest`] finds it.
+    /// [`g_mesh_plugin_sdk::manifest_path`] finds it.
     ///
     /// `Ok(None)` means there is no manifest, or it has no `[plugin.semantic]`
     /// section - a plugin with no LSP tier, which is not an error. An `Err` is
@@ -333,14 +333,14 @@ impl SemanticConfig {
     /// server, which is the failure this crate spends most of its doc comments
     /// refusing to produce.
     pub fn from_manifest() -> Result<Option<Self>> {
-        match crate::manifest::manifest_path() {
+        match g_mesh_plugin_sdk::manifest_path() {
             Some(path) => Self::from_manifest_at(&path),
             None => Ok(None),
         }
     }
 
     /// [`SemanticConfig::from_manifest`] with the search already done - the
-    /// testable half, for the same reason [`crate::manifest`] splits its own
+    /// testable half, for the same reason the SDK's `manifest` module splits its own
     /// resolution that way (a process-global environment variable is not
     /// something parallel tests can each set).
     pub fn from_manifest_at(path: &Path) -> Result<Option<Self>> {

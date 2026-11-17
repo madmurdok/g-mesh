@@ -1,9 +1,9 @@
 use super::super::position::PositionEncoding;
 use super::*;
 use super::{answers::*, landing::*, pass::*, questions::*};
-use crate::graph::NodeSpec;
-use crate::graph::{FileGraphBuilder, OpenSite, OpenSiteKind, PlaceholderKind};
-use crate::semantic::SemanticEngine;
+use g_mesh_plugin_sdk::NodeSpec;
+use g_mesh_plugin_sdk::SemanticEngine;
+use g_mesh_plugin_sdk::{FileGraphBuilder, OpenSite, OpenSiteKind, PlaceholderKind};
 use g_mesh_wire::Visibility;
 use g_mesh_wire::{
     EdgeKind, NodeKind, PlaceholderTarget, Position, Range, TargetKey, TargetScope, WireDeclaration,

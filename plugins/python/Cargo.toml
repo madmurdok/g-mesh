@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-plugin-sdk-lsp = { path = "../sdk-lsp" }
 g-mesh-wire = { path = "../../wire" }
 # `pyproject.toml` parsing for the project model (`project::pyproject`) - read
 # as data, never by executing `setup.py` or any other project code (the

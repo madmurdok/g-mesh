@@ -13,9 +13,9 @@ use super::{
     landing::{choose_overload, Choice},
     questions::{declaration_name_position, Ask, Hovered, Question},
 };
-use crate::graph::{EdgeSpec, FileGraphBuilder, OpenSite, OpenSiteKind, PlaceholderKind};
-use crate::index::SdkIndex;
-use crate::path::RelPath;
+use g_mesh_plugin_sdk::RelPath;
+use g_mesh_plugin_sdk::SdkIndex;
+use g_mesh_plugin_sdk::{EdgeSpec, FileGraphBuilder, OpenSite, OpenSiteKind, PlaceholderKind};
 
 /// Accumulates one pass's answer.
 pub(super) struct Answers {
@@ -134,8 +134,8 @@ pub(super) fn answer_ids(
     target: &PlaceholderTarget,
     to_declaration: Option<u32>,
 ) -> (String, String) {
-    let placeholder = crate::graph::placeholder_id(in_file, PlaceholderKind::PendingSymbol, target);
-    let edge = crate::ids::edge_id(from_id, kind, &placeholder, to_declaration);
+    let placeholder = g_mesh_plugin_sdk::placeholder_id(in_file, PlaceholderKind::PendingSymbol, target);
+    let edge = g_mesh_plugin_sdk::ids::edge_id(from_id, kind, &placeholder, to_declaration);
     (placeholder, edge)
 }
 
@@ -311,7 +311,7 @@ impl Answers {
             }
         };
 
-        let id = crate::ids::edge_id(from_id, kind, &placeholder, to_declaration);
+        let id = g_mesh_plugin_sdk::ids::edge_id(from_id, kind, &placeholder, to_declaration);
         if !self.edges.insert(id.clone()) {
             return id;
         }

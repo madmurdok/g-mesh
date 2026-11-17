@@ -21,10 +21,10 @@ use super::{
     questions::{questions, Ask, Question},
 };
 use super::{exited, Budgets, LspBridge, EXIT_GRACE};
-use crate::graph::{OpenSite, OpenSiteKind};
-use crate::index::{contains as node_contains, SdkIndex};
-use crate::path::RelPath;
-use crate::semantic::{SemanticAnswer, SemanticEngine};
+use g_mesh_plugin_sdk::RelPath;
+use g_mesh_plugin_sdk::{node_contains, SdkIndex};
+use g_mesh_plugin_sdk::{OpenSite, OpenSiteKind};
+use g_mesh_plugin_sdk::{SemanticAnswer, SemanticEngine};
 
 /// Runs the question list against a live server.
 ///
@@ -68,7 +68,7 @@ pub(super) fn run_pass(
     let warm_up = budgets.warm_up.map(|warm_up| warm_up.max(budgets.request));
     let mut warm_up_logged = false;
     // GM-435's `lsp_answered` line: measured only when it is written.
-    let mut timing = crate::log::timing_enabled().then(PassTiming::default);
+    let mut timing = g_mesh_plugin_sdk::log::timing_enabled().then(PassTiming::default);
 
     loop {
         // A deferred question goes back on the queue only once the server has
@@ -90,7 +90,7 @@ pub(super) fn run_pass(
         };
         if warming && !warm_up_logged && !queue.is_empty() {
             warm_up_logged = true;
-            crate::log_line!(
+            g_mesh_plugin_sdk::log_line!(
                 "[{language}] the server has not answered yet - its first question may take up to {request_budget:?} \
                  (warm-up), the rest {:?}",
                 budgets.request
@@ -121,13 +121,15 @@ pub(super) fn run_pass(
                     // not a failure to write.
                     match client.exit_status(EXIT_GRACE) {
                         Some(status) => {
-                            crate::log_line!(
+                            g_mesh_plugin_sdk::log_line!(
                                 "[{language}] the language server exited during the pass ({status})"
                             );
                             fail(exited(Some(status)));
                         }
                         None => {
-                            crate::log_line!("[{language}] could not ask the language server ({err:#})");
+                            g_mesh_plugin_sdk::log_line!(
+                                "[{language}] could not ask the language server ({err:#})"
+                            );
                             fail(format!("could not ask the language server: {err:#}"));
                         }
                     }
@@ -142,7 +144,7 @@ pub(super) fn run_pass(
 
         let now = Instant::now();
         if now >= deadline {
-            crate::log_line!(
+            g_mesh_plugin_sdk::log_line!(
                 "[{language}] the semantic pass ran out of its budget with {} question(s) \
                  outstanding and {} unasked",
                 in_flight.len(),
@@ -238,7 +240,7 @@ pub(super) fn run_pass(
                 // the file it was in is not covered - but the pass goes on:
                 // one bad position is not a reason to drop the other nine
                 // thousand answers.
-                crate::log_line!(
+                g_mesh_plugin_sdk::log_line!(
                     "[{language}] the server refused a question about {} ({message})",
                     question.file
                 );
@@ -246,7 +248,7 @@ pub(super) fn run_pass(
                 failed_files.insert(question.accounted_to().clone());
             }
             Poll::Closed => {
-                crate::log_line!(
+                g_mesh_plugin_sdk::log_line!(
                     "[{language}] the language server exited during the pass - keeping the {} \
                      answer(s) it did give and reporting the pass incomplete",
                     answers.edges.len()
@@ -279,7 +281,7 @@ pub(super) fn run_pass(
                 for id in expired {
                     let Some((question, _)) = in_flight.remove(&id) else { continue };
                     client.cancel(id);
-                    crate::log_line!(
+                    g_mesh_plugin_sdk::log_line!(
                         "[{language}] the server did not answer a question about {} within {:?}{}",
                         question.file,
                         request_budget,
@@ -298,7 +300,7 @@ pub(super) fn run_pass(
     if let Some(mut timing) = timing {
         timing.latencies.sort_unstable();
         let ms = |at: Option<&Duration>| at.map_or(0, Duration::as_millis);
-        crate::log_timing!(
+        g_mesh_plugin_sdk::log_timing!(
             "lsp_answered language={language} questions={} answers={} failed={} content_modified={} \
              max_request_ms={} p50_request_ms={}",
             timing.questions,
@@ -769,7 +771,7 @@ impl SemanticEngine for LspBridge {
 
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {
         let whole_project = files.is_empty();
-        if self.client_watches_files {
+        if self.profile.client_watches_files {
             self.unforwarded.extend(files.iter().cloned());
         }
         // What this pass was sent - core adds the files earlier passes did not
@@ -791,7 +793,7 @@ impl SemanticEngine for LspBridge {
         let deadline = self.pass_deadline(started, whole_project, scope.len());
         let plan = questions(index, &scope, &self.config, &self.budgets);
         if plan.unanswerable > 0 {
-            crate::log_line!(
+            g_mesh_plugin_sdk::log_line!(
                 "[{}] {} open site(s) of a kind this bridge does not answer were skipped",
                 self.language,
                 plan.unanswerable
@@ -830,7 +832,7 @@ impl SemanticEngine for LspBridge {
         }
 
         let language = self.language.clone();
-        let language_ids = self.language_ids;
+        let language_ids = self.profile.language_ids;
         let engine = self.config.engine.clone();
         let budgets = self.budgets;
         let disambiguation = self.config.overload_disambiguation;
@@ -854,10 +856,10 @@ impl SemanticEngine for LspBridge {
                         Self::forward_watched(client, &mut unforwarded, &mut opened, &root, index);
                     synced.extend(asked_about.iter().cloned());
                     Self::sync_documents(client, &mut opened, &root, index, &synced, &language, language_ids);
-                    crate::log_timing!("lsp_synced language={language} files={}", synced.len());
+                    g_mesh_plugin_sdk::log_timing!("lsp_synced language={language} files={}", synced.len());
                     let ready_started = Instant::now();
                     let ready = Self::wait_ready(client, &budgets, deadline, &language);
-                    crate::log_timing!(
+                    g_mesh_plugin_sdk::log_timing!(
                         "lsp_ready language={language} waited_ms={} ready={}",
                         ready_started.elapsed().as_millis(),
                         ready.is_ok()
@@ -935,7 +937,7 @@ impl SemanticEngine for LspBridge {
             }
         }
 
-        crate::log_timing!(
+        g_mesh_plugin_sdk::log_timing!(
             "lsp_done language={} files={} nodes={} edges={} retracted={} incomplete={}",
             self.language,
             scope.len(),
@@ -944,7 +946,7 @@ impl SemanticEngine for LspBridge {
             diff.delete_edge_ids.len(),
             failure.is_some() || plan.truncated
         );
-        crate::log_line!(
+        g_mesh_plugin_sdk::log_line!(
             "[{}] semantic pass: {} file(s), {} node(s)/{} edge(s) upserted, {} edge(s) retracted, \
              in {:?}{}",
             self.language,

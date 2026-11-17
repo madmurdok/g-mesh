@@ -29,9 +29,9 @@
 //!   dependency here is paid seven times and removed never.
 //!
 //! The counter-argument - "hand-rolled protocol code is where bugs live" - is
-//! real, and is why the framing is [`crate::framing`] (one implementation,
+//! real, and is why the framing is [`g_mesh_plugin_sdk::framing`] (one implementation,
 //! already exercised against core) and why the fake server in
-//! `plugins/sdk/fake-lsp` drives every path in this file, including the ones
+//! `plugins/sdk-lsp/fake-lsp` drives every path in this file, including the ones
 //! a real server only reaches when something goes wrong.
 //!
 //! # The server is a child, deliberately
@@ -51,16 +51,19 @@
 //! reading its pipes.
 //!
 //! `Drop` does not run on `process::exit`, which is how the plugin ends when
-//! core dies while it is busy on a request (GM-397, `run::read_control_stream`).
+//! core dies while it is busy on a request (the SDK's control-stream reader).
 //! For that path every running server's `Child` is also registered in
-//! [`LIVE_SERVERS`], and [`kill_live_servers`] ends them from any thread.
+//! [`LIVE_SERVERS`], and [`kill_live_servers`] ends them from any thread; the
+//! first server started registers it with
+//! [`g_mesh_plugin_sdk::on_lifeline_exit`], which the reader runs before it
+//! exits.
 
 use std::collections::BTreeMap;
 use std::io::BufReader;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Once, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -68,7 +71,8 @@ use serde_json::{json, Value};
 
 use super::config::{SemanticConfig, ServerReadiness};
 use super::position::{file_uri, PositionEncoding};
-use crate::framing::{read_frame, write_message};
+use g_mesh_plugin_sdk::framing::{read_frame, write_message};
+use g_mesh_plugin_sdk::on_lifeline_exit;
 
 /// How many lines of a server's stderr are forwarded before the rest is
 /// counted instead of printed.
@@ -112,10 +116,11 @@ pub(crate) enum Poll {
 static LIVE_SERVERS: Mutex<Vec<Weak<Mutex<Child>>>> = Mutex::new(Vec::new());
 
 /// Kills and reaps every language server still running, from whatever thread
-/// is about to call `process::exit` (GM-397). The only caller is the
-/// control-plane reader's lifeline path, which ends the process while the main
-/// thread may be deep in a request holding the clients - so the kill goes
-/// through the shared `Child` handles rather than through `LspClient`.
+/// is about to call `process::exit`. The only caller is the SDK's
+/// control-plane reader's lifeline path (through [`on_lifeline_exit`]),
+/// which ends the process while the main thread may be deep in a request
+/// holding the clients - so the kill goes through the shared `Child` handles
+/// rather than through `LspClient`.
 pub fn kill_live_servers() {
     let servers = LIVE_SERVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     for server in servers.iter().filter_map(Weak::upgrade) {
@@ -197,7 +202,7 @@ pub(crate) struct LspClient {
     /// bit as readiness (GM-550) - see [`LspClient::settle`].
     quiescent_signal: bool,
     /// Whether `initialize` claims `workspace.didChangeWatchedFiles`
-    /// dynamic registration - see [`super::bridge::LspBridge::client_watches_files`].
+    /// dynamic registration - see [`crate::ServerProfile::client_watches_files`].
     client_watches_files: bool,
     /// The `quiescent` bit of the last `experimental/serverStatus` the server
     /// sent, or `None` while it has sent none. Read only when
@@ -271,6 +276,8 @@ impl LspClient {
             servers.retain(|server| server.strong_count() > 0);
             servers.push(Arc::downgrade(&child));
         }
+        static REGISTERED: Once = Once::new();
+        REGISTERED.call_once(|| on_lifeline_exit(kill_live_servers));
 
         let mut client = Self {
             language: language.to_string(),
@@ -754,7 +761,10 @@ impl LspClient {
         let mut child = lock(&self.child);
         if child.kill().is_ok() {
             let _ = child.wait();
-            crate::log_line!("[{}] the language server did not exit when asked - killed it", self.language);
+            g_mesh_plugin_sdk::log_line!(
+                "[{}] the language server did not exit when asked - killed it",
+                self.language
+            );
         }
     }
 
@@ -797,7 +807,7 @@ impl Drop for LspClient {
 /// `window/workDoneProgress/create` (an acknowledgement),
 /// `client/registerCapability` (an acknowledgement: a server registering
 /// file watchers with a bridge built with
-/// [`client_watches_files`](super::bridge::LspBridge::client_watches_files)
+/// [`client_watches_files`](crate::ServerProfile::client_watches_files)
 /// is told yes and then hears only what the plugin forwards) and whatever a future server
 /// invents. None of these is language-specific: they are base-protocol
 /// methods.
@@ -839,9 +849,9 @@ fn drain_stderr(language: &str, server: &str, stderr: std::process::ChildStderr)
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
         lines += 1;
         if lines <= STDERR_LINE_BUDGET {
-            crate::log_line!("[{language}] {server}: {line}");
+            g_mesh_plugin_sdk::log_line!("[{language}] {server}: {line}");
             if lines == STDERR_LINE_BUDGET {
-                crate::log_line!(
+                g_mesh_plugin_sdk::log_line!(
                     "[{language}] {server}: further output is counted rather than printed - \
                      {STDERR_LINE_BUDGET} lines is this log's share of it"
                 );
@@ -851,7 +861,7 @@ fn drain_stderr(language: &str, server: &str, stderr: std::process::ChildStderr)
         }
     }
     if suppressed > 0 {
-        crate::log_line!(
+        g_mesh_plugin_sdk::log_line!(
             "[{language}] {server}: {suppressed} further line(s) of server output were suppressed"
         );
     }

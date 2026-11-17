@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 
 use g_mesh_plugin_python::extractor::PythonExtractor;
 use g_mesh_plugin_python::project::ProjectContext;
-use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
 use g_mesh_plugin_sdk::wire::WireEdge;
 use g_mesh_plugin_sdk::{Extractor, RelPath, SdkIndex, SemanticAnswer, SemanticEngine};
+use g_mesh_plugin_sdk_lsp::{LspBridge, SemanticConfig};
 
 /// The design note's fixture (`docs/architecture/gm-348-bridge-overload-binding.md`
 /// section 1), plus a caller in the same module.

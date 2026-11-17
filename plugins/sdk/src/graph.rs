@@ -194,7 +194,7 @@ pub struct OpenSite {
     /// the extractor knows which edge it wrote for which site, so only the
     /// extractor can say. A semantic engine retracts this id when its answer
     /// lands somewhere else, and leaves it alone when the answer confirms it
-    /// (see [`crate::lsp::LspBridge`]'s retraction rules).
+    /// (see `g_mesh_plugin_sdk_lsp::LspBridge`'s retraction rules).
     pub replaces: Option<String>,
 }
 

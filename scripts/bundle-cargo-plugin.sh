@@ -33,8 +33,9 @@
 #   <language>/
 #     plugin.toml                       installed manifest; spawns the binary below
 #     g-mesh-plugin-<language>[.exe]    the plugin binary, statically linking the
-#                                       SDK and wire crates (plugins/sdk and wire/
-#                                       never ship separately)
+#                                       SDK, SDK-LSP and wire crates (plugins/sdk,
+#                                       plugins/sdk-lsp and wire/ never ship
+#                                       separately)
 
 set -euo pipefail
 

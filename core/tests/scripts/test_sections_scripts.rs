@@ -6,7 +6,7 @@
 //! The checker runs for real on fixture `cargo nextest list` JSON, so no cargo
 //! work is paid for. The section script's argument handling runs with a
 //! stand-in `cargo` on `PATH` that records any call. One test runs `check` on
-//! the real tree; it lists the whole suite twelve times, so it is ignored here
+//! the real tree; it lists the whole suite thirteen times, so it is ignored here
 //! and CI runs the same `check` as its own step. Bash and python3 only, so Unix
 //! only, like `release_packaging_scripts.rs`.
 
@@ -17,7 +17,7 @@ use std::process::{Command, Output};
 
 use serde_json::{json, Map, Value};
 
-const SECTIONS: [&str; 12] = [
+const SECTIONS: [&str; 13] = [
     "core-it",
     "core-scripts",
     "core-mcp",
@@ -26,6 +26,7 @@ const SECTIONS: [&str; 12] = [
     "core-graph",
     "core-rest",
     "sdk",
+    "sdk-lsp",
     "plugin-typescript",
     "plugin-rust",
     "plugin-python",
@@ -237,7 +238,7 @@ fn sections_script(path_env: &str, args: &[&str]) -> Output {
 }
 
 #[test]
-fn list_prints_the_twelve_sections_in_run_order() {
+fn list_prints_the_thirteen_sections_in_run_order() {
     let dir = tempfile::tempdir().unwrap();
     let output = sections_script(&recording_cargo(dir.path()), &["list"]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
@@ -703,12 +704,12 @@ fn core_spawns_selectors_take_the_plugins_of_build_targets_and_no_other() {
 }
 
 /// The real tree: lists the whole workspace suite once plus once per section,
-/// on the current build. Ignored because that is twelve full listings; CI
+/// on the current build. Ignored because that is thirteen full listings; CI
 /// runs the same `scripts/test-sections.sh check` as its own step on the
 /// linux row, and cut-release runs it before waiting for CI. Run it with
 /// `cargo nextest run -p g-mesh --test scripts -E 'test(/^test_sections_scripts::/)' --run-ignored only`.
 #[test]
-#[ignore = "lists the whole suite 12 times; CI's coverage-check step runs the same check"]
+#[ignore = "lists the whole suite 13 times; CI's coverage-check step runs the same check"]
 fn the_real_sections_partition_the_real_suite() {
     let mut cmd = Command::new("bash");
     cmd.arg(repo_root().join("scripts/test-sections.sh")).arg("check");

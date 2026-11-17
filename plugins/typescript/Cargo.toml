@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-plugin-sdk-lsp = { path = "../sdk-lsp" }
 g-mesh-wire = { path = "../../wire" }
 # Order-preserving JSON for package.json and tsconfig (`project::jsonc`).
 serde = { version = "1", features = ["derive"] }

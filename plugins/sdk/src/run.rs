@@ -365,7 +365,7 @@ fn read_control_stream(language: &str) -> Receiver<anyhow::Result<Option<Vec<u8>
             }
         }
         std::thread::sleep(LIFELINE_GRACE);
-        crate::lsp::kill_live_servers();
+        crate::lifeline::run_lifeline_exit_hooks();
         crate::log_line!("[{language}] core closed the control stream mid-request - exiting");
         std::process::exit(1);
     });
@@ -1042,7 +1042,7 @@ fn extract_caught<E: Extractor>(
 //
 // LSP-style `Content-Length` framing, the same wire core's
 // `protocol::jsonrpc` writes and reads, and the same wire a semantic tier
-// speaks to a language server ([`crate::lsp`]). It lives in `framing` because
+// speaks to a language server (`g_mesh_plugin_sdk_lsp`). It lives in `framing` because
 // this process speaks it in both directions - see that module's doc.
 
 #[cfg(test)]

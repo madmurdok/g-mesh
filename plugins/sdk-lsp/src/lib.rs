@@ -1,4 +1,4 @@
-//! `LspBridge`: a [`SemanticEngine`](crate::SemanticEngine) that answers a
+//! `LspBridge`: a [`SemanticEngine`](g_mesh_plugin_sdk::SemanticEngine) that answers a
 //! structural pass's open sites by driving a language server, with nothing in
 //! it that knows which language.
 //!
@@ -9,7 +9,7 @@
 //! `initialize` and mirror the SDK's file cache into it, ask
 //! `textDocument/definition` at each open site and `textDocument/implementation`
 //! on each trait-like node, map every location back to a node by position, and
-//! bound the whole thing. This module is that, and the argument for each
+//! bound the whole thing. This crate is that, and the argument for each
 //! decision the sketch left open is in the module or type it belongs to:
 //!
 //! | Decision | Where it is argued |
@@ -20,7 +20,7 @@
 //! | 4. Readiness when `$/progress` is optional | [`LspBridge`] |
 //! | 5. What a semantic answer may retract | [`LspBridge`] |
 //! | 6. Per-request, per-pass and concurrency budgets | [`Budgets`] |
-//! | 7. Reporting a pass that did not finish | [`SemanticAnswer`](crate::SemanticAnswer) |
+//! | 7. Reporting a pass that did not finish | [`SemanticAnswer`](g_mesh_plugin_sdk::SemanticAnswer) |
 //! | 8. A server's readiness *shape*, declared rather than waited out | [`config`] and [`ServerReadiness`] |
 //!
 //! # Generic by construction
@@ -38,10 +38,10 @@
 //!   calls "trait", "interface", "protocol". This is the one place a bridge
 //!   would otherwise have had to know a language, and it is a string
 //!   comparison against a list the manifest supplies.
-//! - **What to ask about** is [`OpenSite`](crate::OpenSite), which the
+//! - **What to ask about** is [`OpenSite`](g_mesh_plugin_sdk::OpenSite), which the
 //!   extractor produced, carrying a position and a name and nothing about
 //!   syntax.
-//! - **What an answer means** is [`SdkIndex`](crate::SdkIndex): a location
+//! - **What an answer means** is [`SdkIndex`](g_mesh_plugin_sdk::SdkIndex): a location
 //!   becomes a node by position, and the node's own `container` and
 //!   `qualifiedName` become the address. No parsing, no naming rules, no
 //!   knowledge of what a module path looks like.
@@ -53,7 +53,7 @@
 //! # A plugin wires it up like this
 //!
 //! ```no_run
-//! use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
+//! use g_mesh_plugin_sdk_lsp::{LspBridge, SemanticConfig};
 //! use g_mesh_plugin_sdk::{run, PluginSpec, SemanticEngine};
 //! # use g_mesh_plugin_sdk::{Extractor, FileGraph, RelPath};
 //! # struct MyExtractor;
@@ -79,22 +79,26 @@
 //! }
 //! ```
 
+#![deny(missing_docs)]
+
 mod bridge;
 mod client;
 mod config;
 #[cfg(all(test, windows))]
 mod cwd_exe_lookup_windows_tests;
 mod position;
+mod profile;
 mod resolve;
 
 pub use bridge::{Budgets, LspBridge};
 pub use config::{OverloadDisambiguation, SemanticConfig, ServerReadiness};
+pub use profile::ServerProfile;
 pub use resolve::{
     is_bare, npm_candidates_on_path, probe, resolve, script_spellings, Candidate, NpmServer, Resolved,
     HOST_SCRIPT_EXTENSIONS, NO_CWD_EXE_LOOKUP, PROBE_BUDGET, WINDOWS_SCRIPT_EXTENSIONS,
 };
 
-/// Public only so an integration test can take the lifeline's path; a
-/// plugin never calls it (`run`'s control-stream reader does).
+/// Public only so an integration test can call it directly; a plugin never
+/// does (the SDK's lifeline exit hooks do, once a server has started).
 #[doc(hidden)]
 pub use client::kill_live_servers;

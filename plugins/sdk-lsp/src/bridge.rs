@@ -12,8 +12,9 @@ use serde_json::{json, Value};
 use super::client::{LspClient, Poll};
 use super::config::SemanticConfig;
 use super::position::{file_uri, without_verbatim_prefix};
-use crate::index::SdkIndex;
-use crate::path::RelPath;
+use super::profile::ServerProfile;
+use g_mesh_plugin_sdk::RelPath;
+use g_mesh_plugin_sdk::SdkIndex;
 
 /// Every number the bridge is bounded by.
 ///
@@ -116,8 +117,9 @@ use crate::path::RelPath;
 ///   empty answer still waits for `settle`, and the warm-up question's own
 ///   empty answer counts as an answer (the server is responsive). `None` - the
 ///   default - is exactly the behaviour before it existed. The one value a
-///   plugin sets ([`LspBridge::warm_up`]), because how long a server takes to
-///   load a project is a fact about that server.
+///   plugin sets ([`ServerProfile::warm_up`], through
+///   [`LspBridge::with_profile`]), because how long a server takes to load a
+///   project is a fact about that server.
 ///
 /// None of these is configuration, `warm_up` aside. They are this type's fields so a test can
 /// drive a real timer with small values instead of faking the clock, which is
@@ -180,7 +182,7 @@ impl Default for Budgets {
 /// per file someone saves.
 const MAX_SERVER_STARTS: u32 = 4;
 
-/// A [`SemanticEngine`](crate::SemanticEngine) that answers a structural
+/// A [`SemanticEngine`](g_mesh_plugin_sdk::SemanticEngine) that answers a structural
 /// pass's open sites by asking a language server.
 ///
 /// # What it asks, and for what
@@ -395,7 +397,7 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// **A server that says when it has finished loading is asked to** (GM-550).
 /// rust-analyzer 1.97 under load paused 2.04s and 2.47s between `Fetching`
 /// and `Building CrateGraph` - longer than the settle - and the bridge called
-/// it ready inside the gap. [`LspBridge::quiescent_signal`] advertises
+/// it ready inside the gap. [`ServerProfile::quiescent_status`] advertises
 /// rust-analyzer's `experimental.serverStatusNotification` capability; the
 /// server then reports `quiescent: false` from its first progress until the
 /// last start-up phase (cache priming included) has ended, and `true` within
@@ -486,10 +488,10 @@ const MAX_SERVER_STARTS: u32 = 4;
 ///   `replaces` exists instead.
 pub struct LspBridge {
     language: String,
-    /// `(extension, languageId)` pairs for a `didOpen` - see
-    /// [`LspBridge::language_ids`]. A file no pair matches is opened as
-    /// `language`.
-    language_ids: &'static [(&'static str, &'static str)],
+    /// What the plugin's code declares about this server - see
+    /// [`LspBridge::with_profile`]. Its `warm_up` is applied to `budgets`
+    /// when set, and read from there.
+    profile: ServerProfile,
     root: PathBuf,
     /// The project root with symlinks resolved. A server reports absolute
     /// paths, and on macOS `$TMPDIR` is `/var/folders/…`, a symlink to
@@ -534,16 +536,10 @@ pub struct LspBridge {
     /// Core's deadline for the pass about to be answered, when core sent one
     /// (`budgetMs`, GM-521) - see [`LspBridge::pass_deadline`].
     core_deadline: Option<Instant>,
-    /// Whether readiness reads the server's `experimental/serverStatus`
-    /// `quiescent` bit - see [`LspBridge::quiescent_signal`].
-    quiescent_signal: bool,
-    /// Whether the server is told this client watches files - see
-    /// [`LspBridge::client_watches_files`].
-    client_watches_files: bool,
     /// Files passes were sent whose change on disk the server has not been
     /// told about yet: a pass that starts no server (nothing to ask) leaves
     /// them for the next one that does. Only filled when
-    /// [`client_watches_files`](LspBridge::client_watches_files) is set.
+    /// [`ServerProfile::client_watches_files`] is set.
     unforwarded: BTreeSet<RelPath>,
 }
 
@@ -564,59 +560,21 @@ impl LspBridge {
         Self::with_budgets(language, root, config, Budgets::default())
     }
 
-    /// Opens each file whose name ends with one of the `(extension,
-    /// languageId)` pairs' extensions under that `languageId`, and every other
-    /// file under the bridge's language.
-    ///
-    /// A server may parse a document by its `languageId` rather than by its
-    /// file name: tsserver reads `typescriptreact` as TSX, and a `.tsx` file
-    /// opened as `typescript` is parsed without JSX.
-    pub fn language_ids(mut self, by_extension: &'static [(&'static str, &'static str)]) -> Self {
-        self.language_ids = by_extension;
+    /// Applies `profile`: its `warm_up`, when set, replaces
+    /// [`Budgets::warm_up`]; its other fields are read where the bridge
+    /// starts the server and syncs documents.
+    #[must_use]
+    pub fn with_profile(mut self, profile: ServerProfile) -> Self {
+        if profile.warm_up.is_some() {
+            self.budgets.warm_up = profile.warm_up;
+        }
+        self.profile = profile;
         self
     }
 
-    /// Gives each server's first question `budget` instead of
-    /// [`Budgets::request`] - see [`Budgets`]'s `warm_up`. For a server that
-    /// answers nothing while it loads a project and reports no progress for
-    /// the load.
-    #[must_use]
-    pub fn warm_up(mut self, budget: Duration) -> Self {
-        self.budgets.warm_up = Some(budget);
-        self
-    }
-
-    /// Asks the server for rust-analyzer's `experimental/serverStatus`
-    /// notification and believes it ready when it reports `quiescent: true`
-    /// with nothing in flight, rather than after [`Budgets::settle`] of
-    /// silence - see this type's doc on readiness (GM-550). For a server whose
-    /// start-up phases can be separated by gaps longer than the settle. A
-    /// server that never sends a status keeps the quiet-period rule.
-    #[must_use]
-    pub fn quiescent_signal(mut self) -> Self {
-        self.quiescent_signal = true;
-        self
-    }
-
-    /// Tells the server this client watches files for it
-    /// (`workspace.didChangeWatchedFiles.dynamicRegistration`), so a server
-    /// that would otherwise run its own file watcher registers its globs
-    /// with the client instead. The bridge then forwards, as
-    /// `workspace/didChangeWatchedFiles`, only the files core sends a pass
-    /// (the plugin's own source files, which changed), and only inside
-    /// [`SemanticEngine::answer`], just before that pass's documents are
-    /// synced; an already open one is re-synced with `didChange`, and one the
-    /// index holds is opened with `didOpen`, instead (GM-624) - so in
-    /// practice only deleted files and files outside the index are announced.
-    /// Any other change on disk (a manifest, a config) reaches the server
-    /// only when the plugin asks it to (for rust-analyzer,
-    /// `rust-analyzer/reloadWorkspace` through [`LspBridge::request`]): for a
-    /// plugin that must vet a change before the server may react to it, and
-    /// that wraps `answer` in that vetting.
-    #[must_use]
-    pub fn client_watches_files(mut self) -> Self {
-        self.client_watches_files = true;
-        self
+    /// The profile this bridge was given, [`ServerProfile::DEFAULT`] if none.
+    pub fn profile(&self) -> &ServerProfile {
+        &self.profile
     }
 
     /// Sends `method` with `params` to the running server as a request whose
@@ -641,7 +599,7 @@ impl LspBridge {
             .unwrap_or_else(|_| root.to_path_buf());
         Self {
             language: language.to_string(),
-            language_ids: &[],
+            profile: ServerProfile::DEFAULT,
             root: root.to_path_buf(),
             real_root,
             config,
@@ -654,8 +612,6 @@ impl LspBridge {
             emitted: BTreeMap::new(),
             trimmed: BTreeMap::new(),
             core_deadline: None,
-            quiescent_signal: false,
-            client_watches_files: false,
             unforwarded: BTreeSet::new(),
         }
     }
@@ -699,7 +655,10 @@ impl LspBridge {
     /// be one.
     fn ensure_client(&mut self, deadline: Instant) -> Option<&mut LspClient> {
         if self.client.as_mut().is_some_and(LspClient::gone) {
-            crate::log_line!("[{}] the language server is gone - starting a new one", self.language);
+            g_mesh_plugin_sdk::log_line!(
+                "[{}] the language server is gone - starting a new one",
+                self.language
+            );
             self.client = None;
         }
         if self.client.is_none() {
@@ -719,8 +678,8 @@ impl LspBridge {
                 &self.config,
                 &self.root,
                 deadline,
-                self.quiescent_signal,
-                self.client_watches_files,
+                self.profile.quiescent_status,
+                self.profile.client_watches_files,
             ) {
                 Ok(client) => self.client = Some(client),
                 Err(err) => {
@@ -730,7 +689,7 @@ impl LspBridge {
                     ));
                     if missing_binary(&err) {
                         self.unavailable = true;
-                        crate::log_line!(
+                        g_mesh_plugin_sdk::log_line!(
                             "[{}] the language server {} could not be started ({err:#}) - this \
                              language's semantic tier is off for the rest of this process's life; \
                              the structural graph is unaffected",
@@ -738,7 +697,7 @@ impl LspBridge {
                             self.config.command.display()
                         );
                     } else {
-                        crate::log_line!(
+                        g_mesh_plugin_sdk::log_line!(
                             "[{}] the language server did not come up ({err:#}) - this pass is \
                              incomplete and the next one will try again",
                             self.language
@@ -769,7 +728,7 @@ impl LspBridge {
     /// about gains nothing by being open, because the server reads the ones it
     /// merely has to *resolve into* off disk itself.
     ///
-    /// Plus, when [`LspBridge::client_watches_files`] is set, every indexed
+    /// Plus, when [`ServerProfile::client_watches_files`] is set, every indexed
     /// file a pass was sent (an edited one), asked about or not - see
     /// [`LspBridge::forward_watched`] (GM-624). Those stay open too, so what
     /// `memoryLimitMb` is charged for grows with the files edited during the
@@ -837,7 +796,7 @@ impl LspBridge {
     }
 
     /// Tells the server about every file in `pending` - see
-    /// [`LspBridge::client_watches_files`] - and returns the ones to hand to
+    /// [`ServerProfile::client_watches_files`] - and returns the ones to hand to
     /// [`LspBridge::sync_documents`] instead of announcing them.
     ///
     /// A file the server holds open is not announced: its text is the
@@ -917,7 +876,7 @@ impl LspBridge {
             let now = Instant::now();
             if now >= until {
                 let waited = now.saturating_duration_since(started);
-                crate::log_line!(
+                g_mesh_plugin_sdk::log_line!(
                     "[{language}] the language server was still indexing after {waited:?} - this pass asks \
                      nothing rather than recording its empty answers as real"
                 );

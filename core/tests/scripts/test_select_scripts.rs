@@ -777,7 +777,7 @@ fn run_full_runs_the_same_sections_as_run_all() {
     assert!(full.status.success(), "{}", describe(&full));
     let (all, all_calls) = recording_run(&["all"]);
     assert!(all.status.success(), "{}", describe(&all));
-    assert_eq!(run_calls(&full_calls).len(), 12, "{full_calls}");
+    assert_eq!(run_calls(&full_calls).len(), 13, "{full_calls}");
     assert_eq!(run_calls(&full_calls), run_calls(&all_calls));
 }
 

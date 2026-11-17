@@ -761,6 +761,7 @@ version = "4.33.0"
 dependencies = [
  "anyhow",
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "g-mesh-wire",
  "serde",
  "serde_json",
@@ -776,6 +777,7 @@ version = "4.33.0"
 dependencies = [
  "anyhow",
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "g-mesh-wire",
  "landlock",
  "libc",
@@ -801,11 +803,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "g-mesh-plugin-sdk-lsp"
+version = "4.33.0"
+dependencies = [
+ "anyhow",
+ "g-mesh-plugin-sdk",
+ "g-mesh-wire",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "g-mesh-plugin-typescript"
 version = "4.33.0"
 dependencies = [
  "anyhow",
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "g-mesh-wire",
  "serde",
  "serde_json",

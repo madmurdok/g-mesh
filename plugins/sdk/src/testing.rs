@@ -227,7 +227,7 @@ impl PluginCheck {
     /// The generated manifest carries the keys core's `read_manifest`
     /// validates and nothing else, which was enough while no SDK plugin had a
     /// semantic tier of its own. A plugin whose engine is configured *by that
-    /// manifest* - anything on [`crate::lsp::LspBridge`], whose
+    /// manifest* - anything on `g_mesh_plugin_sdk_lsp::LspBridge`, whose
     /// `SemanticConfig::from_manifest` reads `[plugin.semantic]` out of the
     /// same file - cannot be checked without it: the run would write a
     /// manifest promising `semantic_pass = true` and then hand the plugin no

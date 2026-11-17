@@ -62,6 +62,7 @@ name = "g-mesh-plugin-python"
 version = "1.0.0"
 dependencies = [
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "python-only",
 ]
 
@@ -71,6 +72,7 @@ version = "1.0.0"
 dependencies = [
  "dup 1.0.0",
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "rust-only",
 ]
 
@@ -84,10 +86,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "g-mesh-plugin-sdk-lsp"
+version = "1.0.0"
+dependencies = [
+ "g-mesh-plugin-sdk",
+ "g-mesh-wire",
+]
+
+[[package]]
 name = "g-mesh-plugin-typescript"
 version = "1.0.0"
 dependencies = [
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "typescript-only",
 ]
 
@@ -163,9 +174,16 @@ impl Repo {
         repo.git(&["init", "-q", "-b", "main"]);
         repo.write("core/Cargo.toml", &manifest("g-mesh", ""));
         repo.write("plugins/sdk/Cargo.toml", &manifest("g-mesh-plugin-sdk", ""));
+        repo.write(
+            "plugins/sdk-lsp/Cargo.toml",
+            &manifest(
+                "g-mesh-plugin-sdk-lsp",
+                "\n[dependencies]\ng-mesh-plugin-sdk = { path = \"../sdk\" }\n",
+            ),
+        );
         repo.write("wire/Cargo.toml", &manifest("g-mesh-wire", ""));
         repo.write("walk/Cargo.toml", &manifest("g-mesh-walk", ""));
-        for crate_dir in ["core", "plugins/sdk", "wire", "walk"] {
+        for crate_dir in ["core", "plugins/sdk", "plugins/sdk-lsp", "wire", "walk"] {
             repo.write(&format!("{crate_dir}/src/lib.rs"), "pub fn f() {}\n");
         }
         for plugin in PLUGINS {
@@ -174,7 +192,8 @@ impl Repo {
                 &format!("{dir}/Cargo.toml"),
                 &manifest(
                     &format!("g-mesh-plugin-{plugin}"),
-                    "\n[dependencies]\ng-mesh-plugin-sdk = { path = \"../sdk\" }\n",
+                    "\n[dependencies]\ng-mesh-plugin-sdk = { path = \"../sdk\" }\n\
+                     g-mesh-plugin-sdk-lsp = { path = \"../sdk-lsp\" }\n",
                 ),
             );
             repo.write(
@@ -328,10 +347,16 @@ impl Checked {
 #[test]
 fn the_release_bump_of_core_and_the_shared_crates_changes_no_plugin() {
     let repo = Repo::tagged();
-    for manifest in ["core/Cargo.toml", "plugins/sdk/Cargo.toml", "wire/Cargo.toml", "walk/Cargo.toml"] {
+    for manifest in [
+        "core/Cargo.toml",
+        "plugins/sdk/Cargo.toml",
+        "plugins/sdk-lsp/Cargo.toml",
+        "wire/Cargo.toml",
+        "walk/Cargo.toml",
+    ] {
         repo.set_crate_version(manifest, RELEASE);
     }
-    for name in ["g-mesh", "g-mesh-plugin-sdk", "g-mesh-wire", "g-mesh-walk"] {
+    for name in ["g-mesh", "g-mesh-plugin-sdk", "g-mesh-plugin-sdk-lsp", "g-mesh-wire", "g-mesh-walk"] {
         repo.set_lock_version(name, "1.0.0", RELEASE);
     }
     repo.commit_and_check().accepted();

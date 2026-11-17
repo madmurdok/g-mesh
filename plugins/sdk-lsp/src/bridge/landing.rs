@@ -9,9 +9,9 @@ use serde_json::Value;
 use super::super::config::OverloadDisambiguation;
 use super::super::position::{line_text, path_from_uri, PositionEncoding};
 use super::answers::{address_of, answer_ids, is_addressable};
-use crate::graph::OpenSite;
-use crate::index::SdkIndex;
-use crate::path::RelPath;
+use g_mesh_plugin_sdk::OpenSite;
+use g_mesh_plugin_sdk::RelPath;
+use g_mesh_plugin_sdk::SdkIndex;
 
 /// A location a server answered with, in the server's own coordinates.
 pub(super) struct ServerLocation {

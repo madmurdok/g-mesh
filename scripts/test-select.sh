@@ -41,6 +41,11 @@
 #   plugins/<p>/ other than its plugin.toml or Cargo.toml (which core tests
 #   read) selects `plugin-<p>` and `core-spawns-<p>` instead of every core
 #   section: the core tests scripts/test-plugin-spawns.txt says start <p>.
+#   A plugin here is one with a `plugin-<p>` section in SECTIONS; a path
+#   under any other plugins/<p>/ (go and sdk-lsp aside) selects `full`.
+# - A change under plugins/sdk-lsp/ selects `sdk-lsp`, every `plugin-<p>`
+#   section and every core section. With `--narrow`, other than its
+#   Cargo.toml, `sdk-lsp`, every `plugin-<p>` and its `core-spawns-<p>`.
 # - A `core-spawns-<p>` selector is printed only while some core section that
 #   holds a test binary of scripts/test-plugin-spawns.txt is missing from the
 #   selection; it is a subset of the core sections.
@@ -139,9 +144,11 @@ SECTIONS=($(scripts/test-sections.sh list))
 [ ${#SECTIONS[@]} -gt 0 ] || die "scripts/test-sections.sh list printed nothing"
 CORE=()
 CORE_LIB=()
+PLUGIN_SECTIONS=()
 for s in "${SECTIONS[@]}"; do
 	case "$s" in core-*) CORE+=("$s") ;; esac
 	case "$s" in core-it | core-scripts) ;; core-*) CORE_LIB+=("$s") ;; esac
+	case "$s" in plugin-*) PLUGIN_SECTIONS+=("$s") ;; esac
 done
 
 full=0
@@ -179,12 +186,14 @@ classify() {
 	core/tests/it/*) if [ -n "$narrow" ]; then add core-it; else add "${CORE[@]}"; fi ;;
 	core/tests/scripts/*) if [ -n "$narrow" ]; then add core-it core-scripts; else add "${CORE[@]}"; fi ;;
 	core/*) add "${CORE[@]}" ;;
-	plugins/python/* | plugins/rust/* | plugins/typescript/*)
-		local plugin="${1#plugins/}"
-		plugin="${plugin%%/*}"
+	plugins/sdk-lsp/*)
 		case "$narrow:$1" in
-		1:plugins/*/plugin.toml | 1:plugins/*/Cargo.toml | :*) add "plugin-$plugin" "${CORE[@]}" ;;
-		*) add "plugin-$plugin" "core-spawns-$plugin" ;;
+		1:plugins/sdk-lsp/Cargo.toml | :*) add sdk-lsp "${PLUGIN_SECTIONS[@]}" "${CORE[@]}" ;;
+		*)
+			local s
+			add sdk-lsp "${PLUGIN_SECTIONS[@]}"
+			for s in "${PLUGIN_SECTIONS[@]}"; do add "core-spawns-${s#plugin-}"; done
+			;;
 		esac
 		;;
 	plugins/go/*)
@@ -192,6 +201,19 @@ classify() {
 		case "$narrow:$1" in
 		1:plugins/go/plugin.toml | :*) add "${CORE[@]}" ;;
 		*) add core-spawns-go ;;
+		esac
+		;;
+	plugins/*/*)
+		local plugin="${1#plugins/}"
+		plugin="${plugin%%/*}"
+		case " ${PLUGIN_SECTIONS[*]} " in
+		*" plugin-$plugin "*)
+			case "$narrow:$1" in
+			1:plugins/*/plugin.toml | 1:plugins/*/Cargo.toml | :*) add "plugin-$plugin" "${CORE[@]}" ;;
+			*) add "plugin-$plugin" "core-spawns-$plugin" ;;
+			esac
+			;;
+		*) full=1 ;;
 		esac
 		;;
 	README.md) add core-cli ;;

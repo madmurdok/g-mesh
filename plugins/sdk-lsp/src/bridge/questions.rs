@@ -9,9 +9,9 @@ use super::super::config::SemanticConfig;
 use super::super::position::line_text;
 use super::Budgets;
 use super::{answers::is_addressable, hover::hover_text, landing::locations};
-use crate::graph::{OpenSite, OpenSiteKind, PlaceholderKind};
-use crate::index::SdkIndex;
-use crate::path::RelPath;
+use g_mesh_plugin_sdk::RelPath;
+use g_mesh_plugin_sdk::SdkIndex;
+use g_mesh_plugin_sdk::{OpenSite, OpenSiteKind, PlaceholderKind};
 
 /// One thing to ask the server, and what to do with the answer.
 #[derive(Debug, Clone)]
@@ -257,7 +257,7 @@ pub(super) fn site_key(site: &OpenSite) -> (String, u32, u32) {
 /// `export const handler = make()` imported by name is asked (GM-596): the
 /// linker would leave it unlinked, and only an engine answer widens `CALLS`
 /// to a `Variable`.
-pub(super) fn unsettled_hop(index: &SdkIndex, graph: &crate::graph::FileGraph, replaced: &str) -> bool {
+pub(super) fn unsettled_hop(index: &SdkIndex, graph: &g_mesh_plugin_sdk::FileGraph, replaced: &str) -> bool {
     let Some(edge) = graph.edges.iter().find(|edge| edge.id == replaced) else { return false };
     let Some(placeholder) = graph.nodes.iter().find(|node| node.id == edge.to_id) else { return false };
     if placeholder.native_kind.as_deref() != Some(PlaceholderKind::PendingSymbol.native_kind()) {
@@ -326,7 +326,7 @@ impl Overloaded {
     /// Whether structural edge `replaced` of `graph` lands on an overload
     /// set: a node that carries `declarations`, or a placeholder whose key
     /// names one somewhere in the index.
-    pub(super) fn targets(&self, graph: &crate::graph::FileGraph, replaced: &str) -> bool {
+    pub(super) fn targets(&self, graph: &g_mesh_plugin_sdk::FileGraph, replaced: &str) -> bool {
         let Some(edge) = graph.edges.iter().find(|edge| edge.id == replaced) else { return false };
         if self.ids.contains(&edge.to_id) {
             return true;

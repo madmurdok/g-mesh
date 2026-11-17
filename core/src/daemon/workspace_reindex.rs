@@ -2050,7 +2050,7 @@ mod tests {
     /// this pass did not re-send: what the pass sent and the syntactic edge
     /// stay. The plugin never retracts across processes
     /// (`a_new_bridge_does_not_retract_what_an_earlier_process_emitted` in
-    /// `plugins/sdk/tests/lsp_bridge.rs`), so core's sweep is what removes it.
+    /// `plugins/sdk-lsp/tests/lsp_bridge.rs`), so core's sweep is what removes it.
     ///
     /// Control: `semantic_sweep = false` in `plugins/typescript/plugin.toml`
     /// -> `alpha-old` survives.
