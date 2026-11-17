@@ -132,7 +132,7 @@ fn stand_down(root: &Path) -> Result<()> {
         // `Free`: the incumbent released the lock after the failed attempt; the
         // next bootstrap wins.
         DaemonLock::Free | DaemonLock::Serving | DaemonLock::Starting => {
-            crate::log_line!("g-mesh daemon: another daemon already serves {} - exiting", root.display());
+            crate::log_role!("another daemon already serves {} - exiting", root.display());
             Ok(())
         }
     }
@@ -178,7 +178,7 @@ fn serve_forever(
                 // is also what restarts the core's idle clock.
                 let _attached = attached;
                 if let Err(err) = mcp::serve_connection(stream, conn, host, indexing, embedding).await {
-                    crate::log_line!("g-mesh daemon: connection ended: {err:#}");
+                    crate::log_role!("connection ended: {err:#}");
                 }
             });
         }

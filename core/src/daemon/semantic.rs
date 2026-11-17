@@ -194,8 +194,8 @@ pub(crate) fn indexed_file_count(conn: &IndexStore, language: &str) -> usize {
     match conn.with(|conn| crate::graph::files::indexed_file_count(conn, language)) {
         Ok(count) => count,
         Err(err) => {
-            crate::log_line!(
-                "g-mesh daemon: failed to count {language}'s indexed files for the semantic-pass \
+            crate::log_role!(
+                "failed to count {language}'s indexed files for the semantic-pass \
                  timeout ({err:#}) - falling back to the flat floor"
             );
             0
@@ -400,9 +400,7 @@ pub fn run_with_registry_and_progress(
     let owed = match conn.with(|conn| schema::owed_semantic_pass_languages(conn, &capable)) {
         Ok(owed) => owed,
         Err(err) => {
-            crate::log_line!(
-                "g-mesh daemon: failed to determine which languages owe a semantic pass ({err:#})"
-            );
+            crate::log_role!("failed to determine which languages owe a semantic pass ({err:#})");
             Vec::new()
         }
     };
@@ -468,8 +466,8 @@ fn prepare_owed(registry: &PluginRegistry, owed: &[String]) -> HashMap<String, A
                 holds.insert(language.clone(), hold);
             }
             Ok(None) => {}
-            Err(err) => crate::log_line!(
-                "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) - \
+            Err(err) => crate::log_role!(
+                "could not tell the {language} plugin its semantic pass is owed ({err:#}) - \
                  it starts its engine when the pass is asked instead"
             ),
         }
@@ -573,9 +571,7 @@ pub(crate) use crate::storage::state::semantic::NOT_RUN_REASON;
 /// Logs and records that `language`'s pass was not run because its plugin was
 /// asleep or memory-suspended. The language stays owed.
 pub(crate) fn record_not_run(conn: &IndexStore, language: &str) {
-    crate::log_line!(
-        "g-mesh daemon: the {language} semantic pass was not run - its plugin is asleep or suspended"
-    );
+    crate::log_role!("the {language} semantic pass was not run - its plugin is asleep or suspended");
     record_reason(conn, language, NOT_RUN_REASON);
 }
 

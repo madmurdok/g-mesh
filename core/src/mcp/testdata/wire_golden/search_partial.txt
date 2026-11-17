@@ -1,0 +1,5 @@
+isError: Some(false)
+--- block 0 ---
+g-mesh: the embedding pass for /wire-golden/project is still running (embeddings 3 of 10 computed, this call waited 200ms). Only symbols embedded so far were ranked. A symbol missing from these results may simply not be embedded yet. Call again later for complete results.
+--- block 1 ---
+{"results":[{"symbolId":"n0","qualifiedName":"n0","kind":"Function","filePath":"a.ts","startLine":1,"startCol":0,"score":#},{"symbolId":"n1","qualifiedName":"n1","kind":"Function","filePath":"a.ts","startLine":1,"startCol":0,"score":#},{"symbolId":"n2","qualifiedName":"n2","kind":"Function","filePath":"a.ts","startLine":1,"startCol":0,"score":#}],"hasMore":false,"nextCursor":null,"partial":{"embedded":3,"total":10}}

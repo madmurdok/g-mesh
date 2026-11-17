@@ -37,7 +37,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 /// Environment switch: `0` disables seeding (also the opt-out for a user),
 /// `1` enables it even when [`SEEDING_DEFAULT`] is off.
-pub const SEED_ENV: &str = "G_MESH_SEED";
+pub const SEED_ENV: &str = crate::knobs::SEED.name;
 
 /// Whether a daemon seeds without [`SEED_ENV`] set.
 const SEEDING_DEFAULT: bool = true;
@@ -52,7 +52,7 @@ pub struct SeedOrigin {
 /// Whether seeding is switched on, from `G_MESH_SEED` and
 /// [`SEEDING_DEFAULT`].
 fn seed_enabled() -> bool {
-    seed_enabled_from(std::env::var(SEED_ENV).ok().as_deref())
+    seed_enabled_from(crate::knobs::string_raw(&crate::knobs::SEED).as_deref())
 }
 
 /// [`seed_enabled`] with the variable's value passed in, so a test need not
@@ -71,10 +71,10 @@ fn seed_enabled_from(value: Option<&str>) -> bool {
 /// so a test that forgets the file fails instead of wedging the daemon. A
 /// no-op unless set.
 pub(crate) fn hold_the_seeded_reconcile_for_tests() {
-    let Some(path) = std::env::var_os(HOLD_RECONCILE_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let Some(path) = crate::knobs::os_non_empty(&crate::knobs::SEED_HOLD_RECONCILE_FILE) else { return };
     let path = PathBuf::from(path);
-    crate::log_line!(
-        "g-mesh daemon: holding the seeded reconcile until {} is removed ({HOLD_RECONCILE_FILE_ENV})",
+    crate::log_role!(
+        "holding the seeded reconcile until {} is removed ({HOLD_RECONCILE_FILE_ENV})",
         path.display()
     );
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -85,7 +85,7 @@ pub(crate) fn hold_the_seeded_reconcile_for_tests() {
 
 /// Path whose deletion releases a seeded reconcile held by
 /// [`hold_the_seeded_reconcile_for_tests`].
-pub const HOLD_RECONCILE_FILE_ENV: &str = "G_MESH_SEED_HOLD_RECONCILE_FILE";
+pub const HOLD_RECONCILE_FILE_ENV: &str = crate::knobs::SEED_HOLD_RECONCILE_FILE.name;
 
 /// Held by whoever runs a seeded index's first-start reconcile; while it is
 /// held the phase stays `Walking`, so tool calls wait on `Need::Structural`.
@@ -203,10 +203,7 @@ pub(crate) fn remove_stale_seed_tmp(state_dir: &Path) {
         let path = with_suffix(&StateDir::at(state_dir).seed_tmp_file(), suffix);
         if let Err(err) = fs::remove_file(&path) {
             if err.kind() != std::io::ErrorKind::NotFound {
-                crate::log_line!(
-                    "g-mesh daemon: could not remove the stale seed file {} ({err})",
-                    path.display()
-                );
+                crate::log_role!("could not remove the stale seed file {} ({err})", path.display());
             }
         }
     }
@@ -222,7 +219,7 @@ pub(crate) fn seed_if_eligible(root: &Path, state_dir: &Path, indexer_version: &
     let home = match crate::paths::g_mesh_home() {
         Ok(home) => home,
         Err(err) => {
-            crate::log_line!("g-mesh daemon: not seeding - no g-mesh home ({err:#})");
+            crate::log_role!("not seeding - no g-mesh home ({err:#})");
             return None;
         }
     };
@@ -244,15 +241,12 @@ fn seed_if_eligible_under(
     let source_db = match StateDir::of_under(home, &source_root) {
         Ok(dir) => dir.index_db(),
         Err(err) => {
-            crate::log_line!(
-                "g-mesh daemon: not seeding - no state dir for {} ({err:#})",
-                source_root.display()
-            );
+            crate::log_role!("not seeding - no state dir for {} ({err:#})", source_root.display());
             return None;
         }
     };
     if fs::symlink_metadata(&source_db).is_err() {
-        crate::log_line!("g-mesh daemon: not seeding - {} has no index", source_root.display());
+        crate::log_role!("not seeding - {} has no index", source_root.display());
         return None;
     }
     match seed_from(&source_db, state_dir, &source_root, indexer_version) {
@@ -260,7 +254,7 @@ fn seed_if_eligible_under(
         Ok(None) => None,
         Err(err) => {
             remove_stale_seed_tmp(state_dir);
-            crate::log_line!("g-mesh daemon: not seeding from {} ({err:#})", source_root.display());
+            crate::log_role!("not seeding from {} ({err:#})", source_root.display());
             None
         }
     }
@@ -299,7 +293,7 @@ fn seed_from(
     source.busy_timeout(Duration::from_secs(5)).context("failed to set a busy timeout")?;
     // Checked before copying, so a mismatch never costs a copy.
     if let Err(reason) = check_source(&source, indexer_version) {
-        crate::log_line!("g-mesh daemon: not seeding from {} - {reason:#}", source_root.display());
+        crate::log_role!("not seeding from {} - {reason:#}", source_root.display());
         return Ok(None);
     }
 
@@ -326,7 +320,7 @@ fn seed_from(
         if let Err(reason) = check_source(&dest, indexer_version) {
             drop(dest);
             remove_stale_seed_tmp(state_dir);
-            crate::log_line!("g-mesh daemon: not seeding from {} - {reason:#}", source_root.display());
+            crate::log_role!("not seeding from {} - {reason:#}", source_root.display());
             return Ok(None);
         }
         schema::record_seed_origin(&dest, &source_root.to_string_lossy())?;

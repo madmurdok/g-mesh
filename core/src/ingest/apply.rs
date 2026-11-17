@@ -1043,9 +1043,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
 fn nodes_with_vectors(conn: &rusqlite::Connection, diff: &Diff) -> HashSet<String> {
     vectors::nodes_with_vectors(conn, diff.upsert_nodes.iter().map(|node| node.id.as_str())).unwrap_or_else(
         |err| {
-            crate::log_line!(
-                "g-mesh daemon: failed to check a semantic answer's nodes for vectors ({err:#})"
-            );
+            crate::log_role!("failed to check a semantic answer's nodes for vectors ({err:#})");
             HashSet::new()
         },
     )
@@ -1075,7 +1073,7 @@ fn file_scope(project_root: &Path, file_path: &str, diff: &Diff, complete: bool)
 /// concurrent store user is not blocked on an incremental reparse's
 /// embedding step without real model weights. A no-op unless set.
 fn hold_compute_open_for_tests() {
-    let Some(path) = std::env::var_os(HOLD_COMPUTE_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let Some(path) = crate::knobs::os_non_empty(&crate::knobs::ROUND_TRIP_HOLD_COMPUTE_FILE) else { return };
     let path = std::path::PathBuf::from(path);
     crate::log_line!(
         "g-mesh: holding a reparse's lock-free embedding window open until {} is removed \
@@ -1092,7 +1090,7 @@ fn hold_compute_open_for_tests() {
 
 /// Path whose *deletion* releases a round trip that is holding its lock-free
 /// embedding window open for a test - see [`hold_compute_open_for_tests`].
-pub const HOLD_COMPUTE_FILE_ENV: &str = "G_MESH_ROUND_TRIP_HOLD_COMPUTE_FILE";
+pub const HOLD_COMPUTE_FILE_ENV: &str = crate::knobs::ROUND_TRIP_HOLD_COMPUTE_FILE.name;
 
 /// The wire `method` string for a control message, for error messages that
 /// name the request that failed. Matched rather than round-tripped through

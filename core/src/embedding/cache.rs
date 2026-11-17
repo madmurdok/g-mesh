@@ -36,7 +36,7 @@ use crate::storage::vectors;
 
 /// Set to `off` to bypass the cache entirely, whatever the global config
 /// says: every text is embedded, nothing is read or written.
-pub const CACHE_ENV: &str = "G_MESH_EMBEDDING_CACHE";
+pub const CACHE_ENV: &str = crate::knobs::EMBEDDING_CACHE.name;
 
 /// Version of the code this crate owns between the text handed to the model
 /// and the stored vector: the tokenizer call options (special tokens, the

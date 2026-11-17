@@ -364,9 +364,9 @@ mod tests {
     #[test]
     #[ignore = "needs the real cross-encoder; see rerank.rs's tests"]
     fn every_fixture_case_equals_the_python_text_under_the_rerank_tokenizer() {
-        use crate::embedding::rerank::{default_rerank_model_dir, CrossEncoder, Scorer};
+        use crate::embedding::rerank::{env_rerank_model_dir, CrossEncoder, Scorer};
 
-        let dir = default_rerank_model_dir().unwrap();
+        let dir = env_rerank_model_dir();
         let model = CrossEncoder::load(&dir)
             .unwrap_or_else(|err| panic!("could not load the cross-encoder: {err:#}"));
         let fixture: Fixture = serde_json::from_str(include_str!("testdata/ce_text.json")).unwrap();

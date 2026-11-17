@@ -5,10 +5,10 @@ use crate::mcp::context::QueryCtx;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
 use super::{find_callers_callees, find_references, Answer, SymbolQueryParams};
+use crate::mcp::query::test_support::Rendered;
 use crate::model::{EdgeRecord, NodeRecord};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -21,7 +21,8 @@ enum Tool {
     Callees,
 }
 
-fn body(result: &CallToolResult) -> serde_json::Value {
+fn body(result: &impl Rendered) -> serde_json::Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -32,9 +33,15 @@ fn body(result: &CallToolResult) -> serde_json::Value {
 fn call(tool: Tool, store: &Arc<IndexStore>, params: SymbolQueryParams) -> serde_json::Value {
     let ctx = QueryCtx::for_test(store);
     let result = match tool {
-        Tool::References => ctx.resolve_lazily(find_references::handle, params),
-        Tool::Callers => ctx.resolve_lazily(find_callers_callees::handle_callers, params),
-        Tool::Callees => ctx.resolve_lazily(find_callers_callees::handle_callees, params),
+        Tool::References => {
+            ctx.resolve_lazily(find_references::handle, params).map(|answer| answer.rendered())
+        }
+        Tool::Callers => {
+            ctx.resolve_lazily(find_callers_callees::handle_callers, params).map(|answer| answer.rendered())
+        }
+        Tool::Callees => {
+            ctx.resolve_lazily(find_callers_callees::handle_callees, params).map(|answer| answer.rendered())
+        }
     };
     body(&result.unwrap())
 }

@@ -1,0 +1,3 @@
+isError: Some(false)
+--- block 0 ---
+{"results":[{"symbolId":"n1","name":"first","kind":"Function","startLine":1,"endLine":3,"exported":false},{"symbolId":"n2","name":"second","kind":"Function","startLine":10,"endLine":12,"exported":false}],"hasMore":false,"nextCursor":null}

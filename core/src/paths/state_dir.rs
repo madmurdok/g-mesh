@@ -173,11 +173,11 @@ pub(crate) fn ensure_project_dir_under(home: &Path, root: &Path) -> Result<PathB
 pub(crate) fn write_state_file_atomic(path: &Path, contents: &str, what: &str) {
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     if let Err(err) = fs::write(&temporary, contents) {
-        crate::log_line!("g-mesh daemon: failed to write {what} {}: {err}", temporary.display());
+        crate::log_role!("failed to write {what} {}: {err}", temporary.display());
         return;
     }
     if let Err(err) = fs::rename(&temporary, path) {
-        crate::log_line!("g-mesh daemon: failed to put {what} {} in place: {err}", path.display());
+        crate::log_role!("failed to put {what} {} in place: {err}", path.display());
         let _ = fs::remove_file(&temporary);
     }
 }
@@ -486,7 +486,7 @@ impl StateDir {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => crate::log_line!("g-mesh daemon: failed to clear {}: {err}", path.display()),
+            Err(err) => crate::log_role!("failed to clear {}: {err}", path.display()),
         }
     }
 
@@ -526,9 +526,9 @@ impl StateDir {
     pub(crate) fn clear_stale_rebuild_marker(&self) {
         let path = self.rebuild_marker_file();
         match fs::remove_file(&path) {
-            Ok(()) => crate::log_line!("g-mesh daemon: removed a stale rebuild marker {}", path.display()),
+            Ok(()) => crate::log_role!("removed a stale rebuild marker {}", path.display()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => crate::log_line!("g-mesh daemon: failed to remove {}: {err}", path.display()),
+            Err(err) => crate::log_role!("failed to remove {}: {err}", path.display()),
         }
     }
 }
