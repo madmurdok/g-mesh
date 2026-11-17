@@ -696,3 +696,10 @@ the fake server); B1/B2 keep their 5x repeats.
    a `SemanticConfig` field.
 3. P3: plugin `bridge` fn + value tests (Recommended) / keep source-text pins.
 4. P6: derive the plugin sections in the `sdk-lsp` row (Recommended) / literal list as D8.
+
+### 6.6 Owner review of the addendum (2026-11-17)
+
+- P1: "4 кодовых, манифест не трогаем (Recommended)".
+- P2: "with_profile, new не меняется (Recommended)".
+- P3: "bridge() + проверка значений (Recommended)".
+- P6: "Выводить из SECTIONS (Recommended)".
