@@ -581,13 +581,17 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
             }
-            foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
+            $bundled = @(& bash scripts/build-targets.sh --plugins)
+            if ($LASTEXITCODE -ne 0 -or $bundled.Count -eq 0) {
+              throw "build-targets.sh --plugins exited $LASTEXITCODE or named no plugin"
+            }
+            foreach ($lang in $bundled) {
               if ($pluginsOutput -notmatch "(?m)^$lang +[0-9]") {
                 throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$pluginsOutput"
               }
             }
 
-            Write-Host "PASS: install.ps1 installed g-mesh $version from the staged archive, and the installed binary runs with all four bundled plugins discovered"
+            Write-Host "PASS: install.ps1 installed g-mesh $version from the staged archive, and the installed binary runs with every bundled plugin discovered ($($bundled -join ', '))"
 
             Write-Host "==> indexing scripts/release-smoke-fixture with the installed binary"
             Copy-Item -LiteralPath (Join-Path $PWD 'scripts/release-smoke-fixture') -Destination $smokeProject -Recurse
@@ -750,9 +754,11 @@ jobs:
   # default install directory and user-Path edit. Once under PowerShell 7
   # (`pwsh`) and once under Windows PowerShell 5.1 (`powershell`, what stock
   # Windows ships). It tests what is already published, not this commit, so
-  # it has no checkout and no build. It runs on a manual dispatch and on a tag
-  # run once `publish` succeeded; on a tag run `releases/latest` must be that
-  # tag. Its token is read-only; it publishes nothing.
+  # it builds nothing; it checks out only scripts/, for the plugin list the
+  # installed binary must see (`build-targets.sh --plugins`). It runs on a
+  # manual dispatch and on a tag run once `publish` succeeded; on a tag run
+  # `releases/latest` must be that tag. Its token is read-only; it publishes
+  # nothing.
   install-latest:
     name: Install the latest published release on Windows
     needs: publish
@@ -766,6 +772,15 @@ jobs:
       # runner IPs run out of the unauthenticated 60-per-hour limit.
       GITHUB_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+      - name: Bundled plugin languages
+        shell: bash
+        run: |
+          bundled="$(bash scripts/build-targets.sh --plugins | tr '\n' ' ')"
+          [ -n "${bundled// /}" ] || { echo "build-targets.sh --plugins named no plugin" >&2; exit 1; }
+          echo "G_MESH_BUNDLED_PLUGINS=${bundled% }" >> "$GITHUB_ENV"
       - name: README one-liner under PowerShell 7 (pwsh)
         shell: pwsh
         run: |
@@ -787,12 +802,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
           }
-          foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
+          $bundled = @($env:G_MESH_BUNDLED_PLUGINS -split ' ' | Where-Object { $_ })
+          if ($bundled.Count -eq 0) {
+            throw "G_MESH_BUNDLED_PLUGINS is empty"
+          }
+          foreach ($lang in $bundled) {
             if ($plugins -notmatch "(?m)^$lang +[0-9]") {
               throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$plugins"
             }
           }
-          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with all four bundled plugins"
+          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with every bundled plugin ($($bundled -join ', '))"
 
       - name: README one-liner under Windows PowerShell 5.1 (powershell)
         shell: powershell
@@ -818,12 +837,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
           }
-          foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
+          $bundled = @($env:G_MESH_BUNDLED_PLUGINS -split ' ' | Where-Object { $_ })
+          if ($bundled.Count -eq 0) {
+            throw "G_MESH_BUNDLED_PLUGINS is empty"
+          }
+          foreach ($lang in $bundled) {
             if ($plugins -notmatch "(?m)^$lang +[0-9]") {
               throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$plugins"
             }
           }
-          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with all four bundled plugins"
+          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with every bundled plugin ($($bundled -join ', '))"
 
   # The publish job's dangerous half - "are these the right files, under the
   # right names" - rehearsed on every non-tag run, so it is not first exercised

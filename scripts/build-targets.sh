@@ -14,7 +14,8 @@
 #   scripts/build-targets.sh x86_64-apple-darwin  # one explicit target
 #   scripts/build-targets.sh --list               # the four supported triples
 #   scripts/build-targets.sh --version            # version the artifacts are named after
-#   scripts/build-targets.sh --plugins            # the bundled plugin languages
+#   scripts/build-targets.sh --plugins [cargo|go] # the bundled plugin languages,
+#                                                 # all or of one build kind
 #   scripts/build-targets.sh --asset-names [target...]
 #                                                 # names a full release publishes
 #   scripts/build-targets.sh --stage-dir <target>
@@ -123,11 +124,30 @@ SUPPORTED_TARGETS=(
 )
 
 # Every language whose plugin is bundled into the main archive and published
-# as its own plugin asset. Both the bundling step and `--asset-names` iterate
-# this array, so the two cannot list different languages. It must name the
-# same languages as core's `languages::CATALOGUE`, so that every
+# as its own plugin asset, as <language>:<kind>. The kind is how the plugin is
+# built: `cargo` is a cargo workspace crate under plugins/<language> with its
+# own version, `go` a Go module. This is the one plugin list: scripts and
+# workflows read it through `--plugins`. Both the bundling step and
+# `--asset-names` iterate it, so the two cannot list different languages. It
+# must name the same languages as core's `languages::CATALOGUE`, so that every
 # `install_command()` core prints has an asset behind it.
-BUNDLED_PLUGINS=(typescript go rust python)
+PLUGINS=(
+	typescript:cargo
+	go:go
+	rust:cargo
+	python:cargo
+)
+BUNDLED_PLUGINS=("${PLUGINS[@]%%:*}")
+
+# Prints the languages of PLUGINS whose kind is $1, or all of them for no $1.
+plugins_of_kind() {
+	local entry
+	case "${1:-}" in "" | cargo | go) ;; *) die "unknown plugin kind '$1' (try cargo, go)" ;; esac
+	for entry in "${PLUGINS[@]}"; do
+		[ -z "${1:-}" ] || [ "${entry#*:}" = "$1" ] || continue
+		printf '%s\n' "${entry%%:*}"
+	done
+}
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/runnable.sh
@@ -309,13 +329,14 @@ build_one() {
 	if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" = "1" ]; then
 		echo "build-targets: WARNING: G_MESH_SKIP_PLUGIN_BUNDLE=1 - packaging $target with no plugins. The resulting archive CANNOT index anything and must not be published." >&2
 	else
-		local lang
+		local lang bundle_script
 		for lang in "${BUNDLED_PLUGINS[@]}"; do
 			log "bundling the $lang plugin for $target"
+			bundle_script="$(bundle_script_for "$lang")"
 			# bundle-cargo-plugin.sh serves several languages and takes the language first.
 			local lang_arg=()
-			case "$lang" in rust | python) lang_arg=("$lang") ;; esac
-			CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/$(bundle_script_for "$lang")" ${lang_arg[@]+"${lang_arg[@]}"} "$target" "$stage_dir/plugins"
+			[ "$bundle_script" != bundle-cargo-plugin.sh ] || lang_arg=("$lang")
+			CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/$bundle_script" ${lang_arg[@]+"${lang_arg[@]}"} "$target" "$stage_dir/plugins"
 		done
 		# From the stage just bundled and before the main archive, so both
 		# carry the same bytes.
@@ -402,7 +423,7 @@ main() {
 		return 0
 		;;
 	--plugins)
-		printf '%s\n' "${BUNDLED_PLUGINS[@]}"
+		plugins_of_kind "${2:-}"
 		return 0
 		;;
 	--asset-names)

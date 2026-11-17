@@ -319,9 +319,11 @@ The release archive's plugin assets are named after **core's** version
 `plugin_version` inside it says which plugin build.
 
 A new plugin's author: pick the rule by which category the plugin falls into
-(joins the cargo workspace, or ships its own toolchain), add it to the
-matching list in `scripts/cut-release.sh` (`CRATE_BACKED_PLUGINS` for a
-workspace plugin), and this file's example above still applies unchanged.
+(joins the cargo workspace, or ships its own toolchain), add it to
+`PLUGINS` in `scripts/build-targets.sh` with that kind (`cargo` or `go`; the
+one plugin list, which `cut-release.sh`, the other scripts and the release
+workflow read through `build-targets.sh --plugins`), and this file's example
+above still applies unchanged.
 
 **Built-in baseline ignore, applied to every plugin regardless of
 manifest**: `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`,
