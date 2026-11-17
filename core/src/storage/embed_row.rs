@@ -89,6 +89,69 @@ pub fn read(conn: &Connection, node_id: &str) -> Result<Option<EmbedRow>> {
     .context("failed to read node for its embedding row")
 }
 
+/// One node owed a vector: its id, the `visibility` its embedding tier reads,
+/// and its embedded-text inputs.
+pub struct EmbedCandidate {
+    pub id: String,
+    pub visibility: String,
+    pub row: EmbedRow,
+}
+
+/// How many nodes are owed a vector under `version`: every node with
+/// embeddable text (a doc comment or a signature) that is not generated and
+/// has no `vectors` row yet, or one made under another `embeddingVersion`.
+/// The same `WHERE` clause as [`fetch_candidate_page`]: this is the unpaged
+/// count of the set that query pages through.
+pub fn count_candidates(conn: &Connection, version: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
+         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?1) \
+         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0",
+        [version],
+        |row| row.get(0),
+    )
+}
+
+/// One keyset page of [`count_candidates`]' set strictly after `after_id`
+/// (or from the start, if `None`), ordered by `id`, so paging never revisits
+/// or skips a row however many pages have run.
+pub fn fetch_candidate_page(
+    conn: &Connection,
+    version: &str,
+    after_id: Option<&str>,
+    limit: i64,
+) -> rusqlite::Result<Vec<EmbedCandidate>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT n.id, n.visibility, {} \
+         FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
+         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
+         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0 \
+         AND n.id > ?1 ORDER BY n.id LIMIT ?2",
+        embed_columns("n."),
+    ))?;
+    // Every real node id is a non-empty string, so `id > ''` is true for all
+    // of them: one statement serves both "from the very start" (`after_id`
+    // is `None`) and "strictly after the last page's id".
+    let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit, version], |row| {
+        Ok(EmbedCandidate { id: row.get(0)?, visibility: row.get(1)?, row: EmbedRow::from_row(row, 2)? })
+    })?;
+    rows.collect()
+}
+
+/// One keyset page of the nodes with a vector strictly after `after_id`,
+/// ordered by id, each with its embedded-text inputs.
+pub fn embedded_rows_after(conn: &Connection, after_id: &str, limit: i64) -> Result<Vec<(String, EmbedRow)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT n.id, {} FROM vectors v JOIN nodes n ON n.id = v.nodeId \
+             WHERE v.nodeId > ?1 ORDER BY v.nodeId LIMIT ?2",
+        embed_columns("n."),
+    ))?;
+    let rows = stmt.query_map(rusqlite::params![after_id, limit], |row| {
+        Ok((row.get(0)?, EmbedRow::from_row(row, 1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

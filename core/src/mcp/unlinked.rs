@@ -24,6 +24,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::graph::pagination::{self, FileTally};
+use crate::graph::queries;
 use crate::mcp::response_bound;
 use crate::model::qualified_path;
 use crate::model::NodeRecord;
@@ -163,38 +164,7 @@ fn candidate_rows(
     edge_kinds: &[&str],
     file_paths: &[&str],
 ) -> rusqlite::Result<Vec<(String, Option<String>)>> {
-    let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&anchor.name, &anchor.language];
-    sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
-    sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
-
-    let mut stmt = conn.prepare(&candidate_sql(edge_kinds.len(), file_paths.len()))?;
-    let rows = stmt.query_map(sql_params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))?;
-    rows.collect()
-}
-
-/// `?1` is the name and `?2` the language, then `kinds` edge kinds, then
-/// `paths` scope paths. The placeholder kind is a literal so the planner can
-/// use the partial `idx_nodes_pending_name`; without it this is a scan of
-/// every node of the language on every call.
-fn candidate_sql(kinds: usize, paths: usize) -> String {
-    let kind_params: Vec<String> = (0..kinds).map(|i| format!("?{}", i + 3)).collect();
-    let scope_filter = if paths == 0 {
-        "1 = 1".to_string()
-    } else {
-        let params: Vec<String> = (0..paths).map(|i| format!("?{}", i + 3 + kinds)).collect();
-        format!("f.filePath IN ({})", params.join(", "))
-    };
-    format!(
-        "SELECT f.filePath, p.keyPath \
-         FROM nodes t \
-         JOIN placeholder_targets p ON p.nodeId = t.id \
-         JOIN edges e ON e.toId = t.id \
-         JOIN nodes f ON f.id = e.fromId \
-         WHERE t.name = ?1 AND t.language = ?2 AND t.nativeKind = '{PENDING_SYMBOL_NATIVE_KIND}' \
-           AND e.kind IN ({}) \
-           AND {scope_filter}",
-        kind_params.join(", ")
-    )
+    queries::placeholder_usages(conn, &anchor.name, &anchor.language, edge_kinds, file_paths)
 }
 
 /// Whether the anchor's parent path names a `Type` node of its language. An
@@ -212,12 +182,7 @@ pub(super) fn is_type_member(
         parent.push_str(segment.sep.as_deref().unwrap_or(""));
         parent.push_str(&segment.name);
     }
-    conn.query_row(
-        "SELECT 1 FROM nodes WHERE qualifiedName = ?1 AND language = ?2 AND kind = 'Type' LIMIT 1",
-        rusqlite::params![parent, anchor.language],
-        |_| Ok(()),
-    )
-    .is_ok()
+    queries::has_type_named(conn, &parent, &anchor.language)
 }
 
 #[cfg(test)]

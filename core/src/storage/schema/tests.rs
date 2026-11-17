@@ -1,3 +1,7 @@
+use std::collections::{BTreeMap, HashSet};
+
+use rusqlite::params;
+
 use super::*;
 
 /// A generation string shaped like the one `daemon::plugin::indexer_version`

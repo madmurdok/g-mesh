@@ -2292,3 +2292,28 @@ fn a_failed_walk_keeps_the_failed_sentence_without_a_retry_state() {
     );
     assert!(!rendered.contains("next start") && !rendered.contains("without success"), "{rendered}");
 }
+
+/// The cold start does no store read: with the store held by this thread
+/// (so any read would trip `IndexStore`'s re-entry panic), `Unindexed` and
+/// `Walking` still render the cold-start text, while `Ready` does read and
+/// trips it (the seam observes reads). Control: in `instructions`, call
+/// `language_overview(&self.store.read())` before the phase branch -> the
+/// cold start panics.
+#[test]
+fn the_cold_start_instructions_take_no_store_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(IndexStore::new(store_with_files(&["typescript"])));
+    let held = store.lock().unwrap();
+
+    for phase in [Phase::Unindexed, Phase::Walking] {
+        let server = server_over(&dir, real_plugins(&["typescript"]), Arc::clone(&store), phase);
+        let rendered = server.instructions();
+        assert!(rendered.contains("Plugins installed: typescript."), "{rendered}");
+    }
+
+    let server = server_over(&dir, real_plugins(&["typescript"]), Arc::clone(&store), Phase::Ready);
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.instructions()));
+    drop(held);
+    assert!(read.is_err(), "a ready server reads the store, so holding it must trip the re-entry check");
+    assert!(server.instructions().contains("Indexed here: typescript."));
+}

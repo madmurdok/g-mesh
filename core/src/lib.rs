@@ -6,6 +6,7 @@ pub mod embedding;
 pub mod fsutil;
 pub mod gc;
 pub mod graph;
+pub mod index_health;
 pub mod indexing_status;
 pub mod ingest;
 pub mod ipc;

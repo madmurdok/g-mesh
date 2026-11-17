@@ -1,7 +1,15 @@
+use std::fs;
+
+use rusqlite::Connection;
+
 use super::*;
+use crate::fsutil::mtime_millis;
+use crate::index_health::discover_source_files;
 use crate::indexing_status::{EmbedProgress, SemanticProgress, WalkProgress};
 use crate::paths::state_dir::project_dir;
+use crate::plugin_manifest::DiscoveredPlugins;
 use crate::storage::schema;
+use crate::storage::schema::SemanticLeftover;
 
 /// The plugins this checkout ships - their real `plugin.toml`s, read from
 /// `plugins/` beside `core/` exactly as `plugin_manifest::bundled_roots` finds them in
@@ -1900,4 +1908,99 @@ fn the_json_names_the_daemon_outcome_or_the_on_disk_state() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// The `index_health` read model: its reads leave a missing index missing,
+// trust only languages a plugin can pass, and keep the MCP overview's
+// three reads apart.
+// ---------------------------------------------------------------------
+
+/// No status read conjures an index: with no `index.db`, the full and light
+/// status, the language section, the retry counts and the last-used read all
+/// answer without creating one. Control: add `SQLITE_OPEN_CREATE` to
+/// `storage::connection::open_existing` -> `language_retries` creates it.
+#[test]
+fn no_status_read_creates_a_missing_index() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let plugins = bundled_plugins();
+
+    let full = index_status(fixture.root(), &fixture.db_path(), &plugins, Mode::Full).unwrap();
+    let light = index_status(fixture.root(), &fixture.db_path(), &plugins, Mode::Light).unwrap();
+    let section = language_section(&fixture.db_path(), false).unwrap();
+    let retries = language_retries(&fixture.db_path());
+    let last_used = crate::gc::last_used::read_from_project_dir(fixture.state.path()).unwrap();
+
+    assert_eq!(full.coverage, Some(Coverage { discovered: 1, indexed: 0, dirty: 1 }));
+    assert_eq!(light.coverage, None);
+    assert_eq!(section, LanguageSection::NoIndex);
+    assert!(retries.is_empty());
+    assert!(last_used.is_none());
+    assert!(!fixture.db_path().exists(), "a status read created {}", fixture.db_path().display());
+    assert_eq!(fs::read_dir(fixture.state.path()).unwrap().count(), 0, "nothing written beside it either");
+}
+
+/// Pending and stale semantic files are reported only for a language some
+/// installed plugin can run the semantic pass for: a recorded language with
+/// no such plugin is dropped from both. Control: drop the
+/// `capable.contains(&language) &&` guard from `index_health::semantic_pending`
+/// and `semantic_stale` -> the unknown language is listed.
+#[test]
+fn pending_and_stale_semantic_files_name_only_languages_a_plugin_can_pass() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+    conn.execute_batch(
+        "INSERT INTO semantic_pending (language, since) VALUES
+             ('typescript', '2026-09-26T10:14:03Z'), ('no-such-language', '2026-09-26T10:14:03Z');
+         INSERT INTO semantic_pending_files (language, filePath) VALUES
+             ('typescript', 'a.ts'), ('no-such-language', 'x.none');",
+    )
+    .unwrap();
+
+    let status = fixture.status();
+    assert_eq!(
+        status.semantic_pending,
+        vec![("typescript".to_string(), "2026-09-26T10:14:03Z".to_string(), 1)]
+    );
+
+    schema::record_language_semantic_pass_failure(&conn, "typescript", "not run").unwrap();
+    schema::record_language_semantic_pass_failure(&conn, "no-such-language", "not run").unwrap();
+    let status = fixture.status();
+    assert!(status.semantic_pending.is_empty(), "{:?}", status.semantic_pending);
+    assert_eq!(status.semantic_stale, vec![("typescript".to_string(), 1)]);
+}
+
+/// `language_overview` returns the three reads the MCP instructions use,
+/// each its own `Result`: a missing `language_retry` table fails only the
+/// retries, a missing `language_outcome` table only the outcomes. Control:
+/// read the retries with `language_retries_if_present` (a gone table reads
+/// as no retries) -> `retries` is `Ok`.
+#[test]
+fn the_language_overview_reads_each_part_on_its_own() {
+    let fixture = Fixture::new(&[]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+    let outcomes = BTreeMap::from([("typescript".to_string(), LanguageOutcome::Indexed { files: 1 })]);
+    schema::record_language_outcomes(&conn, &outcomes).unwrap();
+    schema::begin_language_retry(&conn, "typescript").unwrap();
+
+    let overview = crate::index_health::language_overview(&conn);
+    assert_eq!(overview.present.unwrap(), vec![("typescript".to_string(), false)]);
+    assert_eq!(
+        overview.outcomes.unwrap(),
+        vec![("typescript".to_string(), LanguageOutcome::Indexed { files: 1 })]
+    );
+    assert_eq!(overview.retries.unwrap(), BTreeMap::from([("typescript".to_string(), 1)]));
+
+    conn.execute("DROP TABLE language_retry", []).unwrap();
+    let overview = crate::index_health::language_overview(&conn);
+    assert!(overview.retries.is_err(), "a gone retry table must read as a failure, not as no retries");
+    assert_eq!(overview.present.unwrap(), vec![("typescript".to_string(), false)]);
+    assert_eq!(overview.outcomes.unwrap().len(), 1);
+
+    conn.execute("DROP TABLE language_outcome", []).unwrap();
+    let overview = crate::index_health::language_overview(&conn);
+    assert!(overview.outcomes.is_err());
+    assert_eq!(overview.present.unwrap(), vec![("typescript".to_string(), false)]);
 }

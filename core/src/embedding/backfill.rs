@@ -97,13 +97,13 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{Connection, Result as SqlResult};
+use rusqlite::Connection;
 
 use crate::embedding::text::{embed_tier, is_noise, EmbedInput, EmbedTier, NOISE_RULE_VERSION};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::indexing_status::IndexingStatus;
 use crate::model::{Diff, NodeRecord};
-use crate::storage::embed_row::{embed_columns, EmbedRow};
+use crate::storage::embed_row::{self, count_candidates, fetch_candidate_page, EmbedCandidate as Candidate};
 use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::{schema, vectors};
 
@@ -316,18 +316,7 @@ fn purge_noise_page(
     after_id: &str,
     limit: i64,
 ) -> anyhow::Result<(usize, Option<String>)> {
-    type Row = (String, EmbedRow);
-    let rows: Vec<Row> = {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT n.id, {} FROM vectors v JOIN nodes n ON n.id = v.nodeId \
-             WHERE v.nodeId > ?1 ORDER BY v.nodeId LIMIT ?2",
-            embed_columns("n."),
-        ))?;
-        let rows = stmt.query_map(rusqlite::params![after_id, limit], |row| {
-            Ok((row.get(0)?, EmbedRow::from_row(row, 1)?))
-        })?;
-        rows.collect::<SqlResult<_>>()?
-    };
+    let rows = embed_row::embedded_rows_after(conn, after_id, limit)?;
     let Some(last_id) = rows.last().map(|row| row.0.clone()) else { return Ok((0, None)) };
     let mut deleted = 0;
     for (id, row) in &rows {
@@ -338,15 +327,6 @@ fn purge_noise_page(
         }
     }
     Ok((deleted, Some(last_id)))
-}
-
-/// One candidate row: a node's id plus the columns
-/// [`EmbeddingPipeline::compute`] actually reads, and the `visibility`
-/// [`candidate_tier`] reads.
-struct Candidate {
-    id: String,
-    visibility: String,
-    row: EmbedRow,
 }
 
 /// Builds a [`NodeRecord`] carrying only what
@@ -364,48 +344,6 @@ fn to_node_record(candidate: Candidate) -> NodeRecord {
 /// The embedding tier `candidate` belongs to.
 fn candidate_tier(candidate: &Candidate) -> EmbedTier {
     embed_tier(&EmbedInput::from_row(&candidate.row), &candidate.visibility)
-}
-
-/// Total rows this pass owes the project right now: every node with
-/// embeddable text (a doc comment or a signature) and no `vectors` row yet,
-/// or one made under an `embeddingVersion` other than `version`.
-/// Mirrors [`fetch_candidate_page`]'s own `WHERE` clause exactly - this is
-/// the unpaged count of the same set that query pages through.
-fn count_candidates(conn: &Connection, version: &str) -> SqlResult<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
-         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?1) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0",
-        [version],
-        |row| row.get(0),
-    )
-}
-
-/// One keyset page of candidates strictly after `after_id` (or from the
-/// start, if `None`), ordered by `id` so paging never revisits or skips a
-/// row regardless of how many pages have already run - see this module's own
-/// "Termination" doc section.
-fn fetch_candidate_page(
-    conn: &Connection,
-    version: &str,
-    after_id: Option<&str>,
-    limit: i64,
-) -> SqlResult<Vec<Candidate>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT n.id, n.visibility, {} \
-         FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
-         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0 \
-         AND n.id > ?1 ORDER BY n.id LIMIT ?2",
-        embed_columns("n."),
-    ))?;
-    // Every real node id is a non-empty string, so `id > ''` is true for all
-    // of them - the same query serves both "from the very start" (`after_id`
-    // is `None`) and "strictly after the last page's id" with one statement.
-    let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit, version], |row| {
-        Ok(Candidate { id: row.get(0)?, visibility: row.get(1)?, row: EmbedRow::from_row(row, 2)? })
-    })?;
-    rows.collect()
 }
 
 /// Honors [`HOLD_FILE_ENV`]. A no-op unless it is set, which is every real
@@ -441,6 +379,8 @@ fn panic_before_first_batch_for_tests() {
 mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    use rusqlite::Result as SqlResult;
 
     use super::*;
     use crate::storage::schema;

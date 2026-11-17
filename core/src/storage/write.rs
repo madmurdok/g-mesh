@@ -434,6 +434,36 @@ pub fn delete_edge(conn: &mut Connection, id: &str) -> Result<()> {
     apply_diff(conn, &Diff { delete_edge_ids: vec![id.to_string()], ..Default::default() })
 }
 
+/// Deletes every edge with `source = 'semantic'` whose `fromId` is a node of
+/// `language` and whose id is not in `kept`, in one transaction, and returns
+/// how many went. Placeholder nodes the deleted edges pointed at stay, as
+/// every linked-away placeholder does (`link::symbol_links`, "Why the
+/// placeholder is kept").
+pub(crate) fn sweep_semantic_edges(
+    conn: &mut Connection,
+    language: &str,
+    kept: &std::collections::HashSet<String>,
+) -> Result<usize> {
+    let tx = conn.transaction().context("failed to start the semantic-edge sweep")?;
+    let candidates: Vec<String> = tx
+        .prepare(
+            "SELECT e.id FROM edges e JOIN nodes n ON n.id = e.fromId
+             WHERE e.source = 'semantic' AND n.language = ?1",
+        )
+        .and_then(|mut statement| {
+            statement.query_map(rusqlite::params![language], |row| row.get(0))?.collect()
+        })
+        .context("failed to read the semantic edges to sweep")?;
+    let mut swept = 0;
+    for id in candidates.iter().filter(|id| !kept.contains(*id)) {
+        swept += tx
+            .execute("DELETE FROM edges WHERE id = ?1", rusqlite::params![id])
+            .context("failed to delete a semantic edge the pass no longer sends")?;
+    }
+    tx.commit().context("failed to commit the semantic-edge sweep")?;
+    Ok(swept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,10 @@
 pub mod containers;
+pub mod files;
+pub mod importers;
 pub mod pagination;
 pub mod queries;
 pub mod resume_token;
+pub mod search;
 pub mod traversal;
 
 use serde::{Deserialize, Serialize};

@@ -19,10 +19,10 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::graph::queries::{declaration_only, map_node_row};
+use crate::graph::queries;
 use crate::model::NodeRecord;
 use crate::plugin_manifest::MemberOverrides;
 
@@ -108,29 +108,7 @@ fn owner_of(conn: &Connection, anchor: &NodeRecord) -> Option<NodeRecord> {
         parent.push_str(segment.sep.as_deref().unwrap_or(""));
         parent.push_str(&segment.name);
     }
-    let declaration = declaration_only("");
-    let (scope, scope_value) = scope_of(anchor);
-    conn.query_row(
-        &format!(
-            "SELECT * FROM nodes WHERE qualifiedName = ?1 AND language = ?2 AND kind = 'Type' \
-             AND {declaration} AND {scope} ORDER BY id LIMIT 1"
-        ),
-        rusqlite::params![parent, anchor.language, scope_value],
-        map_node_row,
-    )
-    .optional()
-    .ok()
-    .flatten()
-}
-
-/// The SQL condition (on parameter `?3`) and its value that keep a lookup in
-/// `node`'s container, or in its file when it has none: Go has a `T` in
-/// every package, TypeScript a `C` in every file.
-fn scope_of(node: &NodeRecord) -> (&'static str, &str) {
-    match &node.container {
-        Some(container) => ("container = ?3", container.as_str()),
-        None => ("container IS NULL AND filePath = ?3", node.file_path.as_str()),
-    }
+    queries::type_in_scope_of(conn, &parent, anchor).ok().flatten()
 }
 
 /// D2: breadth-first over `owner`'s supertypes (resolved `SUPERTYPE_OF`
@@ -173,17 +151,7 @@ fn walk_up(conn: &Connection, anchor: &NodeRecord, owner: &NodeRecord) -> Option
 /// declaration. A placeholder base (an external `unittest.TestCase`) is
 /// skipped: it has no member to name.
 fn supertypes(conn: &Connection, type_id: &str) -> Option<Vec<NodeRecord>> {
-    let declaration = declaration_only("n.");
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT n.* FROM edges e JOIN nodes n ON n.id = e.toId \
-             WHERE e.fromId = ?1 AND e.kind = 'SUPERTYPE_OF' AND e.resolved = 1 \
-               AND n.kind = 'Type' AND {declaration} \
-             ORDER BY n.qualifiedName, n.id"
-        ))
-        .ok()?;
-    let rows = stmt.query_map([type_id], map_node_row).ok()?;
-    rows.collect::<rusqlite::Result<_>>().ok()
+    queries::resolved_supertypes(conn, type_id).ok()
 }
 
 /// The `Function` declaration named `name` that is a direct member of
@@ -200,23 +168,7 @@ fn member_of(
     let Some(owner_path) = owner.qualified_path.as_ref() else {
         return Some(None);
     };
-    let declaration = declaration_only("");
-    let (scope, scope_value) = scope_of(owner);
-    // Every member's qualifiedName starts with the owner's, so a range scan on
-    // `idx_nodes_qualifiedName` bounds the lookup; U+10FFFF is the highest
-    // character, so the upper bound sorts after every extension of the prefix.
-    let upper = format!("{}\u{10FFFF}", owner.qualified_name);
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT * FROM nodes WHERE qualifiedName > ?4 AND qualifiedName < ?5 \
-               AND name = ?1 AND language = ?2 AND kind = 'Function' AND {declaration} AND {scope} \
-             ORDER BY qualifiedName, id"
-        ))
-        .ok()?;
-    let rows = stmt
-        .query_map(rusqlite::params![name, language, scope_value, owner.qualified_name, upper], map_node_row)
-        .ok()?;
-    let candidates: Vec<NodeRecord> = rows.collect::<rusqlite::Result<_>>().ok()?;
+    let candidates = queries::functions_named_under(conn, owner, name, language).ok()?;
     Some(candidates.into_iter().find(|candidate| {
         candidate.qualified_path.as_ref().is_some_and(|path| {
             let segments = path.segments();
@@ -228,17 +180,7 @@ fn member_of(
 /// D3: the members `anchor` states it implements - its outgoing resolved
 /// `SUPERTYPE_OF` edges onto a `Function` declaration, by `qualifiedName`.
 fn declared(conn: &Connection, anchor: &NodeRecord) -> Option<Vec<NodeRecord>> {
-    let declaration = declaration_only("n.");
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT DISTINCT n.* FROM edges e JOIN nodes n ON n.id = e.toId \
-             WHERE e.fromId = ?1 AND e.kind = 'SUPERTYPE_OF' AND e.resolved = 1 \
-               AND n.kind = 'Function' AND {declaration} \
-             ORDER BY n.qualifiedName, n.id"
-        ))
-        .ok()?;
-    let rows = stmt.query_map([&anchor.id], map_node_row).ok()?;
-    rows.collect::<rusqlite::Result<_>>().ok()
+    queries::implemented_functions(conn, &anchor.id).ok()
 }
 
 #[cfg(test)]

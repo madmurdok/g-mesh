@@ -201,7 +201,7 @@ pub fn run_with_progress(
     let WalkContext { mut summary, walked_files, .. } = ctx;
     let walked_files = walked_files.unwrap_or_default();
 
-    let file_counts = conn.with(file_counts_by_language)?;
+    let file_counts = conn.with(crate::graph::files::file_counts_by_language)?;
     summary.outcomes = discovered
         .manifests
         .values()
@@ -284,17 +284,7 @@ pub fn run_with_progress(
 /// records as owed to a deleted file's importers name files purged here too,
 /// so the language's owed re-extracts are cleared with its resolution facts.
 fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
-    let paths: Vec<String> = conn.with(|conn| -> Result<Vec<String>> {
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT filePath FROM nodes WHERE language = ?1 AND filePath <> '' ORDER BY filePath")
-            .context("failed to prepare the language's file query")?;
-        let rows = stmt
-            .query_map([language], |row| row.get(0))
-            .context("failed to query the language's files")?
-            .collect::<rusqlite::Result<_>>()
-            .context("failed to read the language's files")?;
-        Ok(rows)
-    })?;
+    let paths: Vec<String> = conn.with(|conn| crate::graph::files::file_paths_of_language(conn, language))?;
     conn.unit(Unit::BulkWalk, |store| {
         for path in &paths {
             let mut diff = Diff::default();
@@ -305,19 +295,6 @@ fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
             schema::set_resolution_facts(conn, language, None, &[])
         })
     })
-}
-
-/// Each language's `File`-node count.
-fn file_counts_by_language(conn: &rusqlite::Connection) -> Result<BTreeMap<String, usize>> {
-    let mut stmt = conn
-        .prepare("SELECT language, COUNT(*) FROM nodes WHERE kind = ?1 GROUP BY language")
-        .context("failed to prepare the per-language file count")?;
-    let rows = stmt
-        .query_map([FILE_NODE_KIND], |row| {
-            Ok((row.get::<_, String>(0)?, usize::try_from(row.get::<_, i64>(1)?).unwrap_or(0)))
-        })
-        .context("failed to count each language's files")?;
-    rows.collect::<rusqlite::Result<_>>().context("failed to read each language's file count")
 }
 
 /// Spawns `manifest`'s plugin in its one-shot `--bulk-index` mode for

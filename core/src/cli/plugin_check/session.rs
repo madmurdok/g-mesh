@@ -73,6 +73,8 @@ use super::expectations::FilesCreatedPair;
 use crate::daemon::bulk_index::{self, WalkContext, BULK_INDEX_FLAG};
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
+use crate::graph::queries;
+pub(crate) use crate::graph::queries::{ImportRow, StoredRange};
 use crate::ingest::apply::{apply_file_change, apply_semantic_pass, SemanticPassOutcome};
 use crate::paths;
 use crate::plugin_manifest::PluginManifest;
@@ -569,14 +571,8 @@ pub(crate) fn ingest_and_link(conn: &IndexStore, bytes: &[u8]) -> Result<()> {
 /// repointed its edge onto the real file. Comparing raw bulk output against
 /// the index would report every linked import as a missing id.
 pub(crate) fn file_node_ids(store: &IndexStore, file: &str) -> Result<BTreeSet<String>> {
-    let conn = store.read();
-    let mut statement = conn.prepare("SELECT id FROM nodes WHERE filePath = ?1")?;
-    let ids = statement.query_map([file], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?;
-    Ok(ids)
+    queries::node_ids_in_file(&store.read(), file)
 }
-
-/// A node's `(startLine, startCol, endLine, endCol)` as the index stores it.
-pub(crate) type StoredRange = (i64, i64, i64, i64);
 
 /// `file`'s nodes and where the linked index says each one is - read after
 /// the session's declaration edit was applied, and from a fresh index that
@@ -584,15 +580,7 @@ pub(crate) type StoredRange = (i64, i64, i64, i64);
 /// `id-stability.declaration-edit-applies`. Index against index for the same
 /// reason [`file_node_ids`] is.
 pub(crate) fn file_node_ranges(store: &IndexStore, file: &str) -> Result<BTreeMap<String, StoredRange>> {
-    let conn = store.read();
-    let mut statement =
-        conn.prepare("SELECT id, startLine, startCol, endLine, endCol FROM nodes WHERE filePath = ?1")?;
-    let rows = statement
-        .query_map([file], |row| {
-            Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+    queries::node_ranges_in_file(&store.read(), file)
 }
 
 // --- the edited file ----------------------------------------------------------
@@ -776,52 +764,12 @@ pub(crate) fn choose_edit_target(
 
 // --- filesCreated -------------------------------------------------------------
 
-/// One `IMPORTS` edge leaving a node of the importer, and where it lands in
-/// the linked index - `capabilities.files-created-resolves`' evidence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ImportRow {
-    pub to_file: String,
-    pub to_kind: String,
-    pub to_name: String,
-    pub to_native_kind: Option<String>,
-    pub resolved: bool,
-    /// When the edge lands on a core-owned container (a Python module, a Go
-    /// package), the files of that container's members - empty otherwise.
-    pub container_member_files: Vec<String>,
-}
-
 /// Every `IMPORTS` edge whose `fromId` is a node of `importer`, with its
 /// landing node, as the linked index holds them - and, for a landing node
 /// that is a core-owned container, the files its members live in (the
 /// container's `DEFINES` edges, which core alone writes).
 pub(crate) fn import_rows(store: &IndexStore, importer: &str) -> Result<Vec<ImportRow>> {
-    let conn = store.read();
-    let mut statement = conn.prepare(
-        "SELECT t.filePath, t.kind, t.name, t.nativeKind, e.resolved, \
-                (SELECT group_concat(DISTINCT m.filePath) FROM containers c \
-                   JOIN edges d ON d.fromId = c.nodeId AND d.kind = 'DEFINES' \
-                   JOIN nodes m ON m.id = d.toId \
-                 WHERE c.nodeId = t.id) \
-         FROM edges e JOIN nodes f ON f.id = e.fromId JOIN nodes t ON t.id = e.toId \
-         WHERE e.kind = 'IMPORTS' AND f.filePath = ?1 \
-         ORDER BY t.filePath, t.name",
-    )?;
-    let rows = statement
-        .query_map([importer], |row| {
-            let members: Option<String> = row.get(5)?;
-            Ok(ImportRow {
-                to_file: row.get(0)?,
-                to_kind: row.get(1)?,
-                to_name: row.get(2)?,
-                to_native_kind: row.get(3)?,
-                resolved: row.get::<_, i64>(4)? != 0,
-                container_member_files: members
-                    .map(|members| members.split(',').map(str::to_string).collect())
-                    .unwrap_or_default(),
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+    queries::import_rows_of(&store.read(), importer)
 }
 
 /// Why `pair` cannot be run against `workspace`, one finding per violation -

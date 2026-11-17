@@ -2,9 +2,11 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use anyhow::Result;
+use rusqlite::Connection;
 
+use crate::graph::files;
+use crate::graph::importers::{self, StoredImport};
 use crate::protocol::types::{ImportMatch, ImportSelector, Matcher, PathScope, TargetScopeKind};
 
 /// A selection of more than this share of the language's indexed files is
@@ -79,14 +81,14 @@ pub(crate) fn select_with(
 /// `File` path or the container key it points at; of an unlinked one, its
 /// placeholder's `placeholder_targets.scope`.
 ///
-/// A selector on one exact target is answered by [`indexed_importers`], whose
+/// A selector on one exact target is answered by [`importers::importers_by_key`], whose
 /// cost follows the edges pointing there; only the other selectors read every
 /// import of the language, in one [`scan_imports`].
 ///
 /// `own` is the edited file's path and the importers whose imports waited
 /// unresolved at it until the edit's commit linked them. An exact `File` key
 /// equal to that path selects only those importers (within the selector's
-/// `importers` scope), not [`indexed_importers`]: every other import linked
+/// `importers` scope), not [`importers::importers_by_key`]: every other import linked
 /// to the file was linked before the edit and is unaffected by it.
 pub(crate) fn select_affected(
     conn: &Connection,
@@ -114,7 +116,7 @@ pub(crate) fn select_affected(
                 selected.extend(waiting.iter().filter(|path| selector.importers.contains(path)).cloned());
             }
             ImportMatch::Target { scope_kind, matcher: Matcher::Exact(key) } => {
-                for importer in indexed_importers(conn, language, *scope_kind, key)? {
+                for importer in importers::importers_by_key(conn, language, *scope_kind, key)? {
                     if selector.importers.contains(&importer) {
                         selected.insert(importer);
                     }
@@ -133,78 +135,14 @@ pub(crate) fn select_affected(
 pub(crate) fn indexed_files_of(conn: &Connection, language: &str) -> Result<Vec<String>> {
     #[cfg(test)]
     reads::bump(&reads::FILE_LISTS);
-    conn.prepare_cached("SELECT filePath FROM nodes WHERE kind = 'File' AND language = ?1")
-        .and_then(|mut statement| statement.query_map(params![language], |row| row.get(0))?.collect())
-        .with_context(|| format!("failed to read {language}'s indexed files"))
+    files::indexed_file_paths_of(conn, language)
 }
 
 /// How many `File` nodes `language` has indexed.
 pub(crate) fn indexed_file_count(conn: &Connection, language: &str) -> Result<usize> {
     #[cfg(test)]
     reads::bump(&reads::FILE_LISTS);
-    conn.prepare_cached("SELECT COUNT(*) FROM nodes WHERE kind = 'File' AND language = ?1")
-        .and_then(|mut statement| statement.query_row(params![language], |row| row.get::<_, i64>(0)))
-        .map(|count| count as usize)
-        .with_context(|| format!("failed to count {language}'s indexed files"))
-}
-
-/// The importers in `language` of every `IMPORTS` edge whose target of
-/// `scope_kind` is exactly `key`, by the same rule as [`StoredImport::target`]:
-/// an unlinked edge through its placeholder's scope, a linked one through the
-/// `File` path or container key of the node it points at; for a `File` key,
-/// also an unlinked edge whose placeholder lists `key` among its extra
-/// waiting scopes. Each part starts at an index on the key
-/// (`idx_targets_scope`, `idx_also_scopes_scope`, `idx_nodes_filePath`, the
-/// containers' `(language, key)`), then follows `idx_edges_toId`.
-///
-/// A linked container is looked up in the importer's language: the linker
-/// resolves a container placeholder in the placeholder's language, which is
-/// its importer's, since imports never cross a language boundary.
-pub(crate) fn indexed_importers(
-    conn: &Connection,
-    language: &str,
-    scope_kind: TargetScopeKind,
-    key: &str,
-) -> Result<Vec<String>> {
-    let sql = match scope_kind {
-        TargetScopeKind::File => {
-            "SELECT src.filePath FROM placeholder_targets pt
-             JOIN nodes t ON t.id = pt.nodeId
-             JOIN edges e ON e.toId = t.id
-             JOIN nodes src ON src.id = e.fromId
-             WHERE pt.scopeKind = 'file' AND pt.scope = ?2 AND e.kind = 'IMPORTS' AND src.language = ?1
-             UNION
-             SELECT src.filePath FROM placeholder_also_scopes a
-             JOIN edges e ON e.toId = a.nodeId
-             JOIN nodes src ON src.id = e.fromId
-             WHERE a.scope = ?2 AND e.kind = 'IMPORTS' AND src.language = ?1
-             UNION
-             SELECT src.filePath FROM nodes t
-             JOIN edges e ON e.toId = t.id
-             JOIN nodes src ON src.id = e.fromId
-             WHERE t.filePath = ?2 AND t.kind = 'File'
-               AND NOT EXISTS (SELECT 1 FROM placeholder_targets pt WHERE pt.nodeId = t.id)
-               AND e.kind = 'IMPORTS' AND src.language = ?1"
-        }
-        TargetScopeKind::Container => {
-            "SELECT src.filePath FROM placeholder_targets pt
-             JOIN nodes t ON t.id = pt.nodeId
-             JOIN edges e ON e.toId = t.id
-             JOIN nodes src ON src.id = e.fromId
-             WHERE pt.scopeKind = 'container' AND pt.scope = ?2 AND e.kind = 'IMPORTS' AND src.language = ?1
-             UNION
-             SELECT src.filePath FROM containers c
-             JOIN nodes t ON t.id = c.nodeId
-             JOIN edges e ON e.toId = t.id
-             JOIN nodes src ON src.id = e.fromId
-             WHERE c.language = ?1 AND c.key = ?2
-               AND NOT EXISTS (SELECT 1 FROM placeholder_targets pt WHERE pt.nodeId = t.id)
-               AND e.kind = 'IMPORTS' AND src.language = ?1"
-        }
-    };
-    conn.prepare_cached(sql)
-        .and_then(|mut statement| statement.query_map(params![language, key], |row| row.get(0))?.collect())
-        .with_context(|| format!("failed to look up {language}'s importers of {key}"))
+    files::indexed_file_count(conn, language)
 }
 
 /// Adds to `selected` the importer of every `IMPORTS` edge of `language` that
@@ -217,51 +155,14 @@ pub(crate) fn scan_imports(
 ) -> Result<()> {
     #[cfg(test)]
     reads::bump(&reads::IMPORT_SCANS);
-    let mut statement = conn
-        .prepare(
-            "SELECT src.filePath, e.specifier, t.kind, t.filePath, c.key, pt.scopeKind, pt.scope
-             FROM edges e
-             JOIN nodes src ON src.id = e.fromId
-             JOIN nodes t ON t.id = e.toId
-             LEFT JOIN containers c ON c.nodeId = t.id
-             LEFT JOIN placeholder_targets pt ON pt.nodeId = t.id
-             WHERE e.kind = 'IMPORTS' AND src.language = ?1",
-        )
-        .context("failed to prepare the import scan")?;
-    let rows = statement
-        .query_map(params![language], |row| {
-            Ok(StoredImport {
-                importer: row.get(0)?,
-                specifier: row.get(1)?,
-                target_kind: row.get(2)?,
-                target_file: row.get(3)?,
-                container_key: row.get(4)?,
-                placeholder_scope_kind: row.get(5)?,
-                placeholder_scope: row.get(6)?,
-            })
-        })
-        .with_context(|| format!("failed to scan {language}'s imports"))?;
-    for row in rows {
-        let import = row.with_context(|| format!("failed to read one of {language}'s imports"))?;
+    importers::scan_import_rows(conn, language, |import| {
         if selected.contains(&import.importer) {
-            continue;
+            return;
         }
         if selectors.iter().any(|selector| import.matches(selector)) {
             selected.insert(import.importer);
         }
-    }
-    Ok(())
-}
-
-/// One `IMPORTS` edge as [`select_affected`] reads it.
-struct StoredImport {
-    importer: String,
-    specifier: Option<String>,
-    target_kind: String,
-    target_file: String,
-    container_key: Option<String>,
-    placeholder_scope_kind: Option<String>,
-    placeholder_scope: Option<String>,
+    })
 }
 
 impl StoredImport {

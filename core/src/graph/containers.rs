@@ -352,6 +352,16 @@ pub fn defining_containers(conn: &Connection, file_path: &str) -> Result<Vec<Def
     Ok(outermost)
 }
 
+/// Container node id -> container key.
+pub fn container_keys(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn
+        .prepare("SELECT nodeId, key FROM containers")
+        .context("failed to prepare the container listing")?;
+    let rows =
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).context("failed to list the containers")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read the containers")
+}
+
 /// [`defining_containers`] for every `File` node at once, inverted: each
 /// container's node id to the paths of the files that define it, sorted.
 /// A container no file defines has no entry (see [`member_files`]).

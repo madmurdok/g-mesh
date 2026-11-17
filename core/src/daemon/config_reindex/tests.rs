@@ -9,9 +9,9 @@ use std::sync::Arc;
 use rusqlite::Connection;
 
 use super::*;
+use crate::graph::importers::importers_by_key;
 use crate::ingest::select::{
-    indexed_file_count, indexed_files_of, indexed_importers, reads, scan_imports, select_affected,
-    select_with,
+    indexed_file_count, indexed_files_of, reads, scan_imports, select_affected, select_with,
 };
 use crate::model::{Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 use crate::plugin_manifest::discover;
@@ -335,7 +335,7 @@ fn exact_cases() -> Vec<(&'static str, Vec<PathScope>, Vec<ImportSelector>, Vec<
 /// no import scan runs, and the answer is exactly the scan's.
 ///
 /// Controls: in `select_affected`, send every selector to `scanned` (a scan
-/// runs); drop either UNION half of `indexed_importers`' File or Container
+/// runs); drop either UNION half of `importers_by_key`' File or Container
 /// arm, or the `selector.importers.contains` filter (a case differs from the
 /// scan).
 #[test]
@@ -362,7 +362,7 @@ fn an_exact_target_delta_runs_no_scan_and_selects_what_the_scan_does() {
 /// another trigger (or none) still reads both halves.
 ///
 /// Control: in `select_affected`, remove the own-path arm (the key goes to
-/// `indexed_importers`: the linked importers come back).
+/// `importers_by_key`: the linked importers come back).
 #[test]
 fn an_own_path_file_key_with_nobody_waiting_selects_nothing() {
     use TargetScopeKind::File;
@@ -1174,7 +1174,7 @@ fn an_owed_re_extract_of_a_file_gone_from_disk_is_settled_without_a_re_extract()
 /// naming no extra scope selects nothing.
 ///
 /// Control: drop the `placeholder_also_scopes` UNION from
-/// `indexed_importers`' File arm (the key selects nothing).
+/// `importers_by_key`' File arm (the key selects nothing).
 #[test]
 fn a_file_key_selects_an_import_waiting_there_through_an_also_scope() {
     let mut conn = seeded();
@@ -1188,9 +1188,9 @@ fn a_file_key_selects_an_import_waiting_there_through_an_also_scope() {
     .unwrap();
 
     use TargetScopeKind::File;
-    assert_eq!(indexed_importers(&conn, "ts", File, "src/env").unwrap(), paths(&["app/b.ts"]));
-    assert!(indexed_importers(&conn, "ts", File, "src/other").unwrap().is_empty());
-    assert!(indexed_importers(&conn, "ts", TargetScopeKind::Container, "src/env").unwrap().is_empty());
+    assert_eq!(importers_by_key(&conn, "ts", File, "src/env").unwrap(), paths(&["app/b.ts"]));
+    assert!(importers_by_key(&conn, "ts", File, "src/other").unwrap().is_empty());
+    assert!(importers_by_key(&conn, "ts", TargetScopeKind::Container, "src/env").unwrap().is_empty());
     let selected: Vec<String> = select_affected(&conn, "ts", &[], &[by_target(File, exact("src/env"))], None)
         .unwrap()
         .into_iter()

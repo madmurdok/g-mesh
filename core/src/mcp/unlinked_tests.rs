@@ -337,7 +337,7 @@ fn a_free_function_named_like_an_untyped_call_carries_no_marker() {
 /// The acceptance control: when every function with an untyped `frob` call
 /// already has an edge to `W::frob`, it is a row, and the marker is absent.
 /// Control: drop the first `NOT EXISTS` (the edge to the anchor) from
-/// `untyped::candidate_sql` (the marker counts both callers).
+/// `graph::queries::untyped_calls_sql` (the marker counts both callers).
 #[test]
 fn the_marker_is_absent_when_every_candidate_already_calls_the_method() {
     let fixture = Fixture::with_files(UNTYPED_USER, &[("src/user/caller.rs", TYPED_TOO_CALLER)]);
@@ -600,7 +600,7 @@ fn the_file_tally_is_capped_while_the_count_stays_whole() {
 fn the_candidate_lookup_seeks_the_placeholder_name_index() {
     let conn = setup();
     let plan: Vec<String> = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {}", candidate_sql(3, 2)))
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", crate::graph::queries::placeholder_usages_sql(3, 2)))
         .unwrap()
         .query_map(rusqlite::params_from_iter(["x"; 7]), |row| row.get(3))
         .unwrap()
