@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -27,10 +26,9 @@ use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::search::{self, NodeTextColumns};
 use crate::indexing_status::Phase;
-use crate::storage::index_store::IndexStore;
 use crate::storage::vectors;
 
-use super::query_shapes::QueryShapes;
+use super::context::QueryCtx;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::similarity;
 use super::tool_result::{error, internal_error, success};
@@ -275,19 +273,13 @@ pub(crate) fn top_k_for_eval(
 /// serving. Dropping the returned future (a cancelled call) does not stop
 /// the blocking work: it runs to completion and its answer is discarded.
 pub(super) async fn handle_off_worker(
-    store: Arc<IndexStore>,
-    embedding: Arc<EmbeddingPipeline>,
-    shapes: Arc<QueryShapes>,
-    hints: SessionHints,
+    ctx: QueryCtx,
     params: SearchCodeParams,
     coverage: Option<Coverage>,
-    project_root: Option<PathBuf>,
 ) -> Result<CallToolResult, ErrorData> {
-    tokio::task::spawn_blocking(move || {
-        handle(&store, &embedding, &shapes, &hints, params, coverage.as_ref(), project_root.as_deref())
-    })
-    .await
-    .map_err(|e| internal_error("search_code task failed", e.into()))?
+    tokio::task::spawn_blocking(move || handle(&ctx, params, coverage.as_ref()))
+        .await
+        .map_err(|e| internal_error("search_code task failed", e.into()))?
 }
 
 /// Answers one `search_code` call. `coverage` is `Some` when the embedding
@@ -299,16 +291,14 @@ pub(super) async fn handle_off_worker(
 /// Only a first, complete page is reranked (`embedding::rerank`), and its
 /// verdict is judged on the embedding order's page, so the verdict never
 /// depends on the rerank. The reranker's texts read their body lines from
-/// the files under `project_root`; with `None` they have no body.
+/// the files under `ctx.project_root`; an empty root has no body.
 pub(super) fn handle(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    hints: &SessionHints,
+    ctx: &QueryCtx,
     params: SearchCodeParams,
     coverage: Option<&Coverage>,
-    project_root: Option<&Path>,
 ) -> Result<CallToolResult, ErrorData> {
+    let QueryCtx { store, embedding, shapes, hints, .. } = ctx;
+    let project_root = Some(ctx.project_root.as_path()).filter(|root| !root.as_os_str().is_empty());
     let Some(query_vector) = embedding.embed_query(&params.query) else {
         return error(
             "g-mesh: semantic search is not available for this project - no embedding model \
@@ -629,7 +619,11 @@ fn rerank_model_hint(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::mcp::query_shapes::QueryShapes;
+    use crate::storage::index_store::IndexStore;
     use crate::storage::schema;
     use crate::storage::vectors::{insert, register_extension};
 
@@ -752,7 +746,7 @@ mod tests {
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
         let result =
-            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None)
+            handle(&QueryCtx { embedding: Arc::new(embedding), ..QueryCtx::for_test(&conn) }, params, None)
                 .unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
@@ -773,7 +767,7 @@ mod tests {
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
         let result =
-            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None)
+            handle(&QueryCtx { embedding: Arc::new(embedding), ..QueryCtx::for_test(&conn) }, params, None)
                 .unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
@@ -1020,7 +1014,7 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None)
+            &handle(&QueryCtx { embedding: Arc::new(embedding), ..QueryCtx::for_test(&conn) }, params, None)
                 .unwrap(),
         );
 

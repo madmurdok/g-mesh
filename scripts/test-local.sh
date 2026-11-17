@@ -185,13 +185,13 @@ fi
 
 if [ "$dry_run" -eq 0 ]; then
 	scripts/prune-stale-objects.sh
-	cargo nextest run --workspace --no-run
+	cargo nextest run --workspace --features g-mesh/embed-eval --no-run
 fi
 
 # The tests matching $1 under $profile, one `<package> <binary id> <name>`
 # per line, grouped by binary.
 listed() {
-	cargo nextest list --workspace --profile "$profile" --message-format json -E "$1" |
+	cargo nextest list --workspace --features g-mesh/embed-eval --profile "$profile" --message-format json -E "$1" |
 		"$(python_cmd)" -c '
 import json, sys
 for suite in json.load(sys.stdin)["rust-suites"].values():
@@ -307,7 +307,7 @@ else
 	start=$SECONDS
 	status=0
 	[ "$full" -eq 0 ] || rm -f "$junit"
-	cargo nextest run --workspace --profile "$profile" --no-tests=pass -E "$rest_filter" 2>&1 |
+	cargo nextest run --workspace --features g-mesh/embed-eval --profile "$profile" --no-tests=pass -E "$rest_filter" 2>&1 |
 		tee "$log_dir/nextest.log" || status=$?
 	result=PASS
 	[ "$status" -eq 0 ] || {

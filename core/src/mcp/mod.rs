@@ -801,16 +801,7 @@ impl GMeshMcpServer {
             Ok(coverage) => coverage,
             Err(early) => return Ok(early),
         };
-        search_code::handle_off_worker(
-            Arc::clone(&self.store),
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            self.hints.clone(),
-            params.0,
-            coverage,
-            Some(self.host.project_root().to_path_buf()),
-        )
-        .await
+        search_code::handle_off_worker(self.query_ctx(None, None), params.0, coverage).await
     }
 }
 

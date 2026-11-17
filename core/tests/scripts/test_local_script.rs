@@ -302,7 +302,10 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
     let lib_filter = lists[0].value_of("-E");
     let tests = calls_of(&calls, &["test"]);
     assert_eq!(tests.len(), 1);
-    assert_eq!(tests[0].args, ["test", "-p", "g-mesh", "--lib", "--", "--exact", "cli::a", "cli::b"]);
+    assert_eq!(
+        tests[0].args,
+        ["test", "-p", "g-mesh", "--features", "embed-eval", "--lib", "--", "--exact", "cli::a", "cli::b"]
+    );
     assert_eq!(tests[0].seeds.as_deref(), Some("2"));
 
     // The lib filter is the core-mcp section's lib tests; nextest runs the
@@ -338,7 +341,18 @@ fn each_crate_runs_its_own_names_in_its_own_process() {
     assert_eq!(
         tests,
         [
-            vec!["test", "-p", "g-mesh", "--lib", "--", "--exact", "cli::a", "cli::b"],
+            vec![
+                "test",
+                "-p",
+                "g-mesh",
+                "--features",
+                "embed-eval",
+                "--lib",
+                "--",
+                "--exact",
+                "cli::a",
+                "cli::b"
+            ],
             vec!["test", "-p", "g-mesh-plugin-sdk", "--lib", "--", "--exact", "cli::a"],
         ]
     );
