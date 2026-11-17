@@ -440,3 +440,259 @@ S3; nothing in S2 depends on S3.
   slice.
 - D5: "Реестр fn() в sdk (Recommended)" — as written.
 - D9 / note: "Утвердить (Recommended)" — approved with this order.
+
+## 6. Addendum: ServerProfile and the sdk-lsp test section
+
+Written after the owner review (section 5): D4 is now "build `ServerProfile` in R-28", D8 is
+now "a new section `sdk-lsp`". Line numbers are the main checkout's (4.33.0 before S2); the
+R-28 slice locates items by symbol, since S2 moves them inside `bridge/`.
+
+### 6.0 Where we start (per-server knobs)
+
+| Knob | Where today | Set by | Read by |
+|---|---|---|---|
+| `language_ids: &'static [(&str, &str)]` | `LspBridge` field + builder `LspBridge::language_ids` (bridge.rs:580) | typescript `engine` (`semantic.rs:102`, `LANGUAGE_IDS` :60); sdk test `a_document_is_opened_under_the_language_id_its_extension_maps_to` | the pass's document sync (`answer`, bridge.rs:3230) |
+| `warm_up: Option<Duration>` | `Budgets::warm_up` (bridge.rs:155) + builder `LspBridge::warm_up` (:590) | typescript `engine` (`WARM_UP` :80, 120 s); every sdk warm-up test sets `Budgets { warm_up, .. }` directly (`warm_budgets`, lsp_bridge.rs:3625), none calls the builder | `run_pass` (bridge.rs:2465) |
+| `quiescent_signal: bool` | `LspBridge` field + builder (:602) | rust `engine_with` (`semantic.rs:138`); rust tests `semantic_runs_no_project_code.rs:1006,1277,1336,1876`; sdk tests `signalled_bridge`, `only_a_signalled_bridge_asks_for_the_server_status` | `ensure_client` -> `LspClient::start` arg (bridge.rs:728; client.rs:326,457,632) |
+| `client_watches_files: bool` | `LspBridge` field + builder (:623) | rust `engine_with`; 7 sdk tests (lsp_bridge.rs 4072-4475) | `ensure_client` (:729; client.rs:333), `answer` (:3169) |
+| `readiness: ServerReadiness` | `SemanticConfig` field, manifest key `readiness` (`config.rs` `from_manifest_at`, `RawSemantic`) | `plugins/{typescript,python,rust}/plugin.toml` (on-demand, on-demand, indexed); 3 sdk tests | `LspClient::start` (client.rs:285-286) |
+| `overload_disambiguation` | `SemanticConfig` field, manifest key | `plugins/python/plugin.toml:156` (`hover`) ; sdk `overload_bridge` | `answer` (bridge.rs:3233) |
+
+Python calls no builder (`python/src/semantic.rs:255`). Two tests pin the builder call as
+source text: `the_engine_reads_rust_analyzers_quiescent_status` (rust `semantic.rs:1202`,
+`"LspBridge::new(LANGUAGE, root, config).quiescent_signal()"`) and
+`the_engine_gives_vtsls_a_two_minute_warm_up` (typescript `semantic.rs:273`,
+`".warm_up(WARM_UP)"`). Doc links naming the builders: bridge.rs 125, 404, 496, 544, 547, 552,
+778, 846; client.rs 200, 800.
+
+### 6.1 Decisions
+
+#### P1. Which knobs a `ServerProfile` holds: the four code knobs; the two manifest knobs stay in `SemanticConfig`
+
+- **Today:** six knobs, four set in plugin code through builders, two in `[plugin.semantic]`.
+- **Change (recommended, a):** `ServerProfile` holds `language_ids`, `warm_up`,
+  `quiescent_status`, `client_watches_files`. `readiness` and `overload_disambiguation` stay
+  `SemanticConfig` fields read by `config.rs` as today. The rule written into the type's doc:
+  a knob is a manifest key when the bridge alone acts on it and a packager may change it
+  without a rebuild; it is a profile field when plugin code depends on it
+  (`client_watches_files` is safe only under rust's `CheckedBridge`; `language_ids` mirrors
+  the plugin's extension table; `quiescent_status` is a rust-analyzer protocol extension).
+  `warm_up` is a number and could be either; it stays code because the plugin's test pins it
+  and moving it would add a manifest key that R-24's schema would have to carry.
+- **Example:** typescript `PROFILE = ServerProfile { language_ids: &LANGUAGE_IDS, warm_up:
+  Some(WARM_UP), ..ServerProfile::DEFAULT }`; its `plugin.toml` still says
+  `readiness = "on-demand"`.
+- **Consequence:** no `plugin.toml` or `config.rs` edit in this task, so nothing here
+  collides with R-24's rewrite of `RawSemantic`. A new server quirk is one profile field
+  (the review's goal). The profile is not "every per-server fact", only the code-side half.
+- **Alternative (b):** profile holds all six; `from_manifest_at` fills
+  `readiness`/`overload_disambiguation` into it. One place for every knob, but it rewrites
+  `config.rs` now and R-24 rewrites it again.
+- **Alternative (c):** all knobs in the manifest (`warm_up_secs`, `[plugin.semantic.language_ids]`,
+  `client_watches_files = true`). Declarative, but a manifest flip of `client_watches_files`
+  without `CheckedBridge` would let rust-analyzer reload unvetted workspaces, and every new key
+  is R-24 schema work.
+
+#### P2. Type and constructor: a `Copy` struct with public fields and a `DEFAULT` const; one `with_profile` builder replaces four
+
+- **Change (recommended, a):** new `plugins/sdk-lsp/src/profile.rs`, re-exported from
+  `lib.rs` (`pub use profile::ServerProfile;`):
+  ```rust
+  /// How the bridge talks to one particular server, as its plugin's code declares it.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  pub struct ServerProfile {
+      /// `(extension, languageId)` pairs for `didOpen`; a file no pair matches
+      /// is opened under the bridge's language.
+      pub language_ids: &'static [(&'static str, &'static str)],
+      /// The budget of a server's first question, if longer than `Budgets::request`.
+      pub warm_up: Option<Duration>,
+      /// Readiness is rust-analyzer's `experimental/serverStatus` `quiescent`
+      /// bit rather than a quiet period.
+      pub quiescent_status: bool,
+      /// The client claims `didChangeWatchedFiles` dynamic registration and forwards
+      /// only the files a pass is sent.
+      pub client_watches_files: bool,
+  }
+  impl ServerProfile {
+      pub const DEFAULT: Self = Self { language_ids: &[], warm_up: None, quiescent_status: false, client_watches_files: false };
+  }
+  impl Default for ServerProfile { fn default() -> Self { Self::DEFAULT } }
+  ```
+  `LspBridge`: the fields `language_ids`, `quiescent_signal`, `client_watches_files` become one
+  `profile: ServerProfile` (initialised `ServerProfile::DEFAULT` in `with_budgets`); the four
+  builders are deleted; added `#[must_use] pub fn with_profile(mut self, profile:
+  ServerProfile) -> Self` (stores it; `if profile.warm_up.is_some() { self.budgets.warm_up =
+  profile.warm_up }`, the exact effect of today's `warm_up` builder) and `pub fn profile(&self)
+  -> &ServerProfile`. `Budgets::warm_up` stays: the sdk warm-up tests drive it with small
+  values. Field `quiescent_signal` is renamed `quiescent_status` (it names what is read, not
+  a signal the bridge sends); `LspClient::start`'s two `bool` args are unchanged.
+- **Example:** `LspBridge::new(LANGUAGE, root, config).with_profile(PROFILE)`.
+- **Consequence:** `new`/`with_budgets` keep their signatures (11 and 77 call sites
+  untouched). The struct-literal-with-`..DEFAULT` shape means adding a field is a
+  non-breaking change for plugins. Python passes nothing and gets `DEFAULT`, as today.
+- **Alternative (b):** profile as a required argument of `new` and `with_budgets`. The
+  compiler forces every bridge to state one, but 88 call sites change, 74 of them in
+  `lsp_bridge.rs`.
+- **Alternative (c):** profile as a `SemanticConfig` field set by the plugin after
+  `from_manifest`. No bridge signature change, but mixes code-declared and manifest-read
+  values in one struct, which is the confusion P1 avoids.
+
+#### P3. The two builder-text tests become value tests through a plugin `bridge` function
+
+- **Today:** the wiring is pinned by searching `engine`'s source text, because `engine`
+  returns `Box<dyn SemanticEngine>` and the knobs are private.
+- **Change (recommended, a):** each of rust and typescript gets `pub const PROFILE:
+  ServerProfile` and a `fn bridge(root: &Path, config: SemanticConfig) -> LspBridge {
+  LspBridge::new(LANGUAGE, root, config).with_profile(PROFILE) }` that `engine` /
+  `engine_with` call (rust then wraps it in `CheckedBridge`). The tests become:
+  - rust `the_engine_reads_rust_analyzers_quiescent_status` ->
+    `the_bridge_reads_quiescent_status_and_watches_files`: `bridge(tmp, SemanticConfig::new("ra"))
+    .profile()` has `quiescent_status` and `client_watches_files` true (constructing a bridge
+    starts nothing).
+  - typescript `the_engine_gives_vtsls_a_two_minute_warm_up` -> same name: `assert_eq!(WARM_UP,
+    120 s)`, and `bridge(..).profile()` has `warm_up == Some(WARM_UP)` and `language_ids ==
+    &LANGUAGE_IDS`.
+- **Consequence:** reverting the wiring (drop `.with_profile(PROFILE)`) fails the test by
+  behaviour, not by text; renaming a variable no longer breaks it.
+- **Alternative (b):** keep source-text pins, now for `.with_profile(PROFILE)`, plus a value
+  assertion on `PROFILE`. No new function, but a text pin stays.
+
+#### P4. The rust tests that set only `quiescent_signal` keep exactly that
+
+`semantic_runs_no_project_code.rs:1006,1277,1336,1876` build a bare bridge (no
+`CheckedBridge`) with `.quiescent_signal()` only. They become `.with_profile(ServerProfile {
+quiescent_status: true, ..ServerProfile::DEFAULT })` (one local `const SIGNALLED`), not
+`.with_profile(semantic::PROFILE)`: the plugin profile would also turn on
+`client_watches_files`, which changes what those tests' passes forward.
+
+#### P5. How R-24 absorbs it later
+
+Under P1(a) R-24 touches nothing of `ServerProfile`: it replaces `RawSemantic` with its schema's
+`SemanticSection` (same keys, `readiness` and `overload_disambiguation` included) inside
+`SemanticConfig::from_manifest_at`, which this task leaves as moved. If a later task wants a
+code knob in the manifest (e.g. `warm_up`), R-24's `SemanticSection` gains the key and
+`SemanticConfig` gains an `Option<_>` override that `with_profile` (or `ensure_client`) applies
+over the profile; the profile type does not change. Nothing here blocks on R-24.
+
+#### P6. The `sdk-lsp` row derives its plugin sections instead of naming them
+
+- **Change (recommended, a):** in `test-select.sh`, the loop that builds `CORE`/`CORE_LIB` from
+  `SECTIONS` (138-150) also builds `PLUGIN_SECTIONS` (every `plugin-*`); the `plugins/sdk-lsp/*`
+  row adds `sdk-lsp "${PLUGIN_SECTIONS[@]}"` and, narrow, one `core-spawns-${s#plugin-}` per
+  plugin section. Go has no `plugin-go` section and does not link sdk-lsp, so it is correctly
+  absent.
+- **Consequence:** no new literal of the three plugin names, which is the list GM-712 (R-13) is
+  removing; a fourth crate-backed plugin is picked up by its section alone.
+- **Alternative (b):** literal `plugin-typescript plugin-rust plugin-python` as D8 drafted.
+  Simpler to read; one more copy of the list GM-712 is consolidating.
+
+### 6.2 `sdk-lsp` section edit map (replaces D8's "widen `sdk`")
+
+1. `scripts/test-sections.sh`: `SECTIONS` (39-51) insert `sdk-lsp` after `sdk` (47);
+   `section_filter` insert after line 110: `sdk-lsp) echo 'package(g-mesh-plugin-sdk-lsp)' ;;`
+   (`sdk` stays `package(g-mesh-plugin-sdk)`).
+2. `.github/workflows/ci.yml`: after the `"tests: sdk"` step (821-825) a copy with every `sdk`
+   replaced by `sdk-lsp` (name `"tests: sdk-lsp"`, the `' sdk-lsp '` `contains`, `run:
+   scripts/test-sections.sh run --profile ci sdk-lsp`, `timeout-minutes: 10`). Note the
+   `contains(' {0} ', ' sdk ')` match is space-delimited, so `sdk` does not match `sdk-lsp`.
+3. `core/tests/scripts/test_sections_scripts.rs`: `SECTIONS: [&str; 12]` (20) -> `[&str; 13]`
+   with `"sdk-lsp"` after `"sdk"`; test `list_prints_the_twelve_sections_in_run_order` (240) ->
+   `..._thirteen_...`; the "twelve" in the module doc (9) and the ignored test's doc and
+   `#[ignore]` reason (576, 581: "12 times") -> thirteen / 13. Add one assertion (B5'):
+   `filter sdk-lsp` prints exactly `package(g-mesh-plugin-sdk-lsp)`.
+4. `scripts/test-local.sh:49` `LIB_SECTIONS`: add ` sdk-lsp` after ` sdk`; comment 47-48 "the
+   plugin, sdk and wire crates' libs" -> "the plugin, sdk, sdk-lsp and wire crates' libs"
+   (sdk-lsp has lib tests: `config.rs` `tests`, `bridge/tests.rs`).
+5. `scripts/test-select.sh`, row inserted before the plugin row (178), after P6's
+   `PLUGIN_SECTIONS` loop:
+   ```bash
+   plugins/sdk-lsp/*)
+   	case "$narrow:$1" in
+   	1:plugins/sdk-lsp/Cargo.toml | :*) add sdk-lsp "${PLUGIN_SECTIONS[@]}" "${CORE[@]}" ;;
+   	*)
+   		add sdk-lsp "${PLUGIN_SECTIONS[@]}"
+   		for s in "${PLUGIN_SECTIONS[@]}"; do add "core-spawns-${s#plugin-}"; done
+   		;;
+   	esac
+   	;;
+   ```
+   (`plugins/sdk/*` at 162 does not match `plugins/sdk-lsp/...`: the glob needs the slash; an
+   sdk change stays `full`.) Header invariants (38-43), new bullet: "A change under
+   plugins/sdk-lsp/ selects `sdk-lsp`, every `plugin-<p>` section and every core section;
+   with `--narrow`, other than its Cargo.toml, `sdk-lsp`, every `plugin-<p>` and its
+   `core-spawns-<p>`."
+   - **Example:** CI form, `plugins/sdk-lsp/src/bridge/hover.rs` -> `core-it core-scripts
+     core-mcp core-daemon core-cli core-graph core-rest sdk-lsp plugin-typescript plugin-rust
+     plugin-python` (run order from `list`). `--narrow` -> `sdk-lsp plugin-typescript
+     plugin-rust plugin-python core-spawns-typescript core-spawns-rust core-spawns-python`.
+6. `docs/adr/0030-test-sections.md`: Decision (17-21) "12 named sections" -> 13, list gains
+   `sdk-lsp` after `sdk`; GM-539 amendment (79) add: "`plugins/sdk-lsp/` selects `sdk-lsp`,
+   the plugin sections and every core section (GM-713); the SDK itself stays `full`."
+7. Not edited: `scripts/test-plugin-spawns.txt` (the fake-lsp core test is already
+   `core-spawns-rust`), `test-sections-check.py` (reads the list).
+
+**Collisions with GM-712** (no design note yet; from its task text, S2 R-13):
+- `scripts/test-sections.sh` 39-51 (`SECTIONS`) and the `check` subcommand, which GM-712
+  extends to compare sections with `ci.yml` `tests:` steps. If GM-712 lands first, a missing
+  `"tests: sdk-lsp"` step fails `check` (good: a free guard); our insert is one line in the array.
+- `.github/workflows/ci.yml` 779-850 (per-section steps; GM-712 keeps them but may touch the
+  block) and its `check` step (773).
+- `core/tests/scripts/test_sections_scripts.rs` 20-33 (the array) and 240, 576-581; GM-712 S4
+  adds its "ci.yml/section mismatch fails" test there.
+- `scripts/test-select.sh` 138-150 (section loop) and 178-185 (plugin row), if R-13 derives
+  the plugin list there.
+- `scripts/cut-release.sh` 298-309: GM-712's `CRATE_BACKED_PLUGINS` (298) sits beside our
+  `PLUGIN_SHARED_CRATES` (306) edit; 246-250 `OTHER_WORKSPACE_MANIFESTS`.
+- `scripts/bundle-rust-plugin.sh:89` comment (2.2 step 10): GM-712 R-7 deletes this file;
+  after its merge, the comment edit goes to `scripts/bundle-cargo-plugin.sh` (or is dropped
+  if the comment did not survive).
+- `.github/workflows/release.yml:54` comment: also edited by R-24 later, not by GM-712 (its
+  release.yml lines are 585, 791, 822).
+
+### 6.3 Changes to the 2.2 edit map (R-28)
+
+- **New step 5a, ServerProfile (P1-P4):** `plugins/sdk-lsp/src/profile.rs` (P2's type);
+  `lib.rs` `mod profile; pub use profile::ServerProfile;`; `bridge.rs`: fields
+  `language_ids`/`quiescent_signal`/`client_watches_files` -> `profile`, delete builders
+  `language_ids`, `warm_up`, `quiescent_signal`, `client_watches_files`, add `with_profile`,
+  `profile`; readers in `ensure_client` (`self.profile.quiescent_status`,
+  `self.profile.client_watches_files`), `answer` (`self.profile.client_watches_files`,
+  `self.profile.language_ids`), and wherever S2 put `forward_watched`/`sync_documents`; doc links
+  (6.0 list) -> `ServerProfile::<field>` / `LspBridge::with_profile`; the `Budgets` doc
+  (bridge.rs 102-128) says `warm_up` is set through `ServerProfile::warm_up`.
+- **Step 7 (consumers) gains:** rust `semantic.rs`: `PROFILE`, `bridge`, `engine_with` calls
+  `bridge`; comment 129-137 moves onto `PROFILE`'s fields (it states the invariants); test 1202
+  per P3. typescript `semantic.rs`: `PROFILE`, `bridge`, `engine` calls it; test 273 per P3.
+  `rust/tests/semantic_runs_no_project_code.rs` 4 sites per P4. `sdk-lsp/tests/lsp_bridge.rs`:
+  10 builder sites (1 `language_ids`, 2 `quiescent_signal`, 7 `client_watches_files`) ->
+  `.with_profile(ServerProfile { .., ..ServerProfile::DEFAULT })`. python: no edit.
+- **Step 9 (selection):** replaced by 6.2 items 1-6 (was: `test-sections.sh:110` widened).
+- **Checks** add: `cargo test -p g-mesh-plugin-rust --lib semantic`, `-p g-mesh-plugin-typescript
+  --lib semantic`; `grep -rn "quiescent_signal()\|client_watches_files()\|\.language_ids(\|\.warm_up("
+  plugins` empty; `scripts/test-sections.sh list` prints 13 names.
+
+### 6.4 Behaviours to pin and controls (amends section 3)
+
+B4 and B5 change; P-rows are new. B1-B3, B6, B7 unchanged.
+
+| # | Behaviour | Test (where) | Control |
+|---|---|---|---|
+| B4' | `plugins/sdk-lsp/*` selects `sdk-lsp` + every `plugin-*` (+ their `core-spawns-*` with `--narrow`, + every core section without, and for `Cargo.toml` with `--narrow`); `plugins/sdk/*` still `full` | `test_select_scripts.rs`, both modes + `Cargo.toml` narrow | delete the `plugins/sdk-lsp/*` row |
+| B5' | Section `sdk-lsp` exists in run order after `sdk` and selects exactly the sdk-lsp package; the sections still partition the suite | `test_sections_scripts.rs` (`list`, `filter sdk-lsp`); `test-sections.sh check` in verify | delete the `sdk-lsp)` filter line |
+| P-a | `with_profile` applies every field: `warm_up` lands in `Budgets::warm_up`; `language_ids`, `quiescent_status`, `client_watches_files` reach the client/pass | new unit test in `bridge/tests.rs` (`with_profile(.. warm_up: Some(5 s) ..)` -> `budgets.warm_up == Some(5 s)`; `DEFAULT` leaves `None`) + the 3 rewritten sdk tests (`a_document_is_opened_under_the_language_id_its_extension_maps_to`, `only_a_signalled_bridge_asks_for_the_server_status`, `only_a_bridge_that_opts_in_claims_client_file_watching`) | `with_profile` returns `self` unchanged: the unit test and the 3 tests fail |
+| P-b | rust and typescript bridges carry their profiles (rust: quiescent + watches files; typescript: `LANGUAGE_IDS` + 120 s warm-up) | the two P3 tests | drop `.with_profile(PROFILE)` from both plugins' `bridge` (one patch, two test binaries; both must fail) |
+
+Controls: B1, B2, B3, B4', B5', B6, B7, P-a, P-b = 9, above the 6-8 default. Reason: D4 added an
+API change (two behaviours, P-a/P-b) to a task that already had seven. If that is too many,
+B5' can be left to verify's `test-sections.sh check` (it fails on a section-less package) and
+its control dropped. No new process/thread tests in the P-rows (the 3 sdk tests already run
+the fake server); B1/B2 keep their 5x repeats.
+
+### 6.5 Decisions for the owner
+
+1. P1: profile = the four code knobs, manifest knobs stay (Recommended) / all six in the
+   profile / all in the manifest.
+2. P2: `with_profile` builder, `new` unchanged (Recommended) / required constructor argument /
+   a `SemanticConfig` field.
+3. P3: plugin `bridge` fn + value tests (Recommended) / keep source-text pins.
+4. P6: derive the plugin sections in the `sdk-lsp` row (Recommended) / literal list as D8.
