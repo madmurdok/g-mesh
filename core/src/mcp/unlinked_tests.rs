@@ -9,15 +9,16 @@ use rusqlite::Connection;
 use super::*;
 use crate::daemon::bulk_index;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::queries::{self, upsert_edge, upsert_node};
+use crate::graph::queries;
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
+use crate::model::{EdgeRecord, PlaceholderTargetRecord};
 use crate::plugin_manifest::{read_manifest, Capabilities, DiscoveredPlugins};
 use crate::protocol::types::QualifiedPath;
 use crate::storage::connection::{open, project_dir};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::{EdgeRecord, PlaceholderTargetRecord};
+use crate::storage::write::{upsert_edge, upsert_node};
 
 const SHARED: &[(&str, &str)] = &[
     ("Cargo.toml", "[package]\nname = \"krate\"\nversion = \"0.1.0\"\n"),

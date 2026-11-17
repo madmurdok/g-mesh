@@ -1,8 +1,8 @@
 use super::*;
-use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::model::{EdgeRecord, NodeRecord};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::{EdgeRecord, NodeRecord};
+use crate::storage::write::{upsert_edge, upsert_node};
 
 /// The capability map every test in this module passes: empty, so
 /// `provenance::resolve` reads "no plugin here declares a semantic

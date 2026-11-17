@@ -25,6 +25,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::ingest::convert::{to_storage_diff, PathWarnings};
+use crate::model::Diff;
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeResponse, LinkedEdge, RequestId, ResolutionDelta,
@@ -33,7 +34,6 @@ use crate::protocol::types::{
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::schema;
-use crate::storage::write::Diff;
 
 /// Sends a `FileChanged` request (tagged with `request_id`) for `file_path`
 /// over `writer`, reads the plugin's `FileChangeResponse` off `reader`,
@@ -854,7 +854,7 @@ pub(crate) fn linked_edges(
 /// Deletes every edge with `source = 'semantic'` whose `fromId` is a node of
 /// `language` and whose id is not in `kept`, in one transaction, and returns
 /// how many went. Placeholder nodes the deleted edges pointed at stay, as
-/// every linked-away placeholder does (`graph::symbol_links`, "Why the
+/// every linked-away placeholder does (`link::symbol_links`, "Why the
 /// placeholder is kept").
 pub(crate) fn sweep_semantic_edges(
     conn: &mut rusqlite::Connection,
@@ -1087,7 +1087,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
 
     // Best-effort, like a failed semantic pass: a diff that is already
     // committed and linked is not undone by an optional layer on top of it.
-    store.store_vectors(embedding, &computed);
+    store.store_vectors(&embedding.vector_write(&computed));
     crate::log_timing!("rt_vectors id={}", timing_id(&request_id));
     Ok(RoundTrip {
         incomplete: response.incomplete,

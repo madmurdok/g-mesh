@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::graph::containers::container_id;
-use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
+use crate::model::{Diff, EdgeRecord, NodeRecord};
+use crate::storage::write::apply_diff;
 use g_mesh_wire::native_kind::RESOLVED_MODULE_NATIVE_KIND;
 
 fn file_id(path: &str) -> String {

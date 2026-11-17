@@ -60,7 +60,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::config::EmbeddingConfig;
 use crate::embedding::cache::{self, EmbeddingCache, Hash, OpenError};
@@ -69,9 +69,10 @@ use crate::embedding::model::{
     InferenceOptions, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
 use crate::embedding::rerank::Reranker;
-use crate::embedding::text::{node_text, EmbedInput};
-use crate::storage::vectors;
-use crate::storage::write::{Diff, NodeRecord};
+use crate::embedding::text::{node_text, EmbedInput, TextRule};
+use crate::model::Diff;
+use crate::storage::embed_row;
+use crate::storage::vectors::{self, VectorWrite};
 
 /// Turns one text into one vector. [`EmbeddingModel`] in production; a
 /// deterministic fake in tests that count inference calls.
@@ -336,6 +337,19 @@ impl EmbeddingPipeline {
     /// The `embeddingVersion` this pipeline tags every vector it stores with.
     pub(crate) fn embedding_version(&self) -> &str {
         &self.version
+    }
+
+    /// This pipeline's text rule, for `storage::language_swap::plan`.
+    pub fn text_rule(&self) -> TextRule<'_> {
+        TextRule { version: &self.version }
+    }
+
+    /// [`EmbeddingPipeline::store`] of `computed` as storage's
+    /// [`VectorWrite`] seam. It writes on whatever connection it is handed -
+    /// inside a swap, the swap's own transaction - and never opens or
+    /// commits one itself.
+    pub fn vector_write<'a>(&'a self, computed: &'a ComputedBatch) -> impl VectorWrite + 'a {
+        move |conn: &Connection| self.store(conn, computed)
     }
 
     /// Cheap check for whether the embedding backfill pass
@@ -857,46 +871,15 @@ impl ComputedBatch {
     }
 }
 
-impl<'a> From<&'a NodeRecord> for EmbedInput<'a> {
-    fn from(node: &'a NodeRecord) -> Self {
-        EmbedInput {
-            kind: &node.kind,
-            name: &node.name,
-            qualified_name: &node.qualified_name,
-            file_path: &node.file_path,
-            doc: node.doc_comment.as_deref(),
-            signature: node.signature.as_deref(),
-            generated: node.generated,
-        }
-    }
-}
-
 /// The text a node's *current* row would embed as, or `None` if it has none
 /// (or the node no longer exists at all) - [`EmbeddingPipeline::store`]'s own
 /// half of the GM-396 staleness check, re-deriving exactly what
 /// [`node_text`] would have produced had `compute` run against this row
 /// right now instead of whenever it actually ran.
 fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<String>> {
-    type Row = (String, String, String, String, Option<String>, Option<String>, bool);
-    let row: Option<Row> = conn
-        .query_row(
-            "SELECT kind, name, qualifiedName, filePath, docComment, signature, generated FROM nodes WHERE id = ?1",
-            [node_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
-        )
-        .optional()
-        .context("failed to read node for its embedding staleness check")?;
-    Ok(row.and_then(|(kind, name, qualified_name, file_path, doc, signature, generated)| {
-        node_text(&EmbedInput {
-            kind: &kind,
-            name: &name,
-            qualified_name: &qualified_name,
-            file_path: &file_path,
-            doc: doc.as_deref(),
-            signature: signature.as_deref(),
-            generated,
-        })
-    }))
+    let row =
+        embed_row::read(conn, node_id).context("failed to read node for its embedding staleness check")?;
+    Ok(row.and_then(|row| node_text(&EmbedInput::from_row(&row))))
 }
 
 /// Embeds one node's [`node_text`] and stores the result, or does nothing
@@ -1069,6 +1052,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::embedding::text::text_to_embed;
+    use crate::model::NodeRecord;
 
     /// A model directory whose `model.onnx` is a sparse file of `onnx_size`
     /// bytes: the weight check reads a length, never the bytes.
@@ -1189,7 +1173,7 @@ mod tests {
 
         let pipeline = EmbeddingPipeline::disabled();
         let diff = Diff {
-            upsert_nodes: vec![crate::storage::write::NodeRecord::new(
+            upsert_nodes: vec![crate::model::NodeRecord::new(
                 "n1",
                 "Function",
                 "foo",
@@ -1226,7 +1210,7 @@ mod tests {
 
         let pipeline = EmbeddingPipeline::disabled();
         let diff = Diff {
-            upsert_nodes: vec![crate::storage::write::NodeRecord::new(
+            upsert_nodes: vec![crate::model::NodeRecord::new(
                 "n1",
                 "Function",
                 "foo",
@@ -1379,8 +1363,8 @@ mod tests {
         cache_at, fake_batching_pipeline, fake_model_dir, fake_pipeline, fake_vector, Counters,
     };
 
-    fn documented(id: &str, doc: &str) -> crate::storage::write::NodeRecord {
-        let mut node = crate::storage::write::NodeRecord::new(id, "Function", id, id, "src/lib.rs", "rust");
+    fn documented(id: &str, doc: &str) -> crate::model::NodeRecord {
+        let mut node = crate::model::NodeRecord::new(id, "Function", id, id, "src/lib.rs", "rust");
         node.doc_comment = Some(doc.to_string());
         node.signature = Some(format!("fn {id}()"));
         node
@@ -2139,5 +2123,40 @@ mod tests {
         EmbeddingPipeline::disabled().store(&conn, &computed);
 
         assert_eq!(vector_count(&conn), 0, "a node that is generated now must get no vector");
+    }
+
+    /// `vector_write` is `store` on the connection it is handed, with no
+    /// transaction of its own: inside an outer transaction that rolls back,
+    /// its vector goes too, and inside one that commits, it stays. Its text
+    /// rule carries the pipeline's embedding version.
+    /// Control: have `vector_write` commit the connection's transaction after
+    /// `store` (`conn.execute_batch("COMMIT")`) - the vector survives the
+    /// rollback.
+    #[test]
+    fn vector_write_writes_inside_the_callers_transaction() {
+        use crate::storage::embed_row::NodeText;
+
+        crate::storage::vectors::register_extension();
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let pipeline = fake_pipeline(&model_dir, None, &Counters::default());
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+        insert_node(&conn, "hand", "Written by hand.", "fn hand()");
+        let diff = Diff { upsert_nodes: vec![documented("hand", "Written by hand.")], ..Default::default() };
+        let computed = pipeline.compute(&diff, &mut EmbedStats::default());
+        let write = pipeline.vector_write(&computed);
+
+        let tx = conn.transaction().unwrap();
+        write.write(&tx);
+        assert_eq!(vector_ids(&tx), vec!["hand"], "the write lands on the transaction");
+        tx.rollback().unwrap();
+        assert_eq!(vector_ids(&conn), Vec::<String>::new(), "and rolls back with it");
+
+        let tx = conn.transaction().unwrap();
+        write.write(&tx);
+        tx.commit().unwrap();
+        assert_eq!(vector_ids(&conn), vec!["hand"]);
+        assert_eq!(pipeline.text_rule().embedding_version(), pipeline.embedding_version());
     }
 }

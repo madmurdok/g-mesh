@@ -14,11 +14,13 @@ use serde::Serialize;
 
 use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, Direction};
+use crate::graph::pagination;
 use crate::graph::queries;
+use crate::graph::Direction;
+use crate::mcp::response_bound;
+use crate::model::NodeRecord;
 use crate::plugin_manifest::{Capabilities, MemberOverrides};
 use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
 
 use super::not_indexed::{self, NotIndexed};
 use super::overrides::{self, OverriddenMember, Overrides};
@@ -92,14 +94,14 @@ struct ReferencePage<'a> {
     /// Every file holding a reference to the anchor, with a per-file count,
     /// computed over the whole edge set rather than this page - see
     /// `pagination::tally_edge_files`. Present only when it says something
-    /// `results` doesn't already say (`pagination::tally_is_worth_sending`):
+    /// `results` doesn't already say (`response_bound::tally_is_worth_sending`):
     /// the page is incomplete, or its rows repeat files. Omitted entirely -
     /// not sent as an empty array - otherwise, so an exact narrow lookup's
     /// response is byte-for-byte what it was before this field existed.
     #[serde(skip_serializing_if = "Option::is_none")]
     files: Option<&'a [pagination::FileTally]>,
     /// Present only when `files` leaves files out, cut by its entry or byte
-    /// cap (`pagination::tally_edge_files_bounded`); absent, not `false`,
+    /// cap (`response_bound::tally_edge_files_bounded`); absent, not `false`,
     /// otherwise.
     #[serde(skip_serializing_if = "answer::is_false")]
     files_truncated: bool,
@@ -169,7 +171,7 @@ struct ReferenceDisclosures<'a> {
 /// Paginates the incoming `USAGE_EDGE_KINDS` edges for `anchor_id` and
 /// resolves each one to its referencing node, cut so that the response
 /// `response_len` measures for a candidate page fits
-/// `pagination::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
+/// `response_bound::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
 /// drive it with a small `page_size` without needing a page-size field on
 /// the public tool parameters.
 fn list_references(
@@ -217,7 +219,7 @@ fn list_references(
         });
     }
 
-    Ok(pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
+    Ok(response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
 }
 
 pub(crate) fn handle(
@@ -259,7 +261,7 @@ impl ReferenceParts<'_> {
         total: Option<usize>,
         send: bool,
     ) -> ReferencePage<'p> {
-        let files = pagination::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
+        let files = response_bound::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
             .then_some(self.tally.as_slice());
 
         // Every file this response names: rows, the tally, the unlinked and
@@ -397,7 +399,7 @@ pub(crate) fn handle_in_covered(
         });
     }
 
-    let (tally, tally_truncated) = pagination::tally_edge_files_bounded(
+    let (tally, tally_truncated) = response_bound::tally_edge_files_bounded(
         &conn,
         &anchor.id,
         Direction::Incoming,
@@ -428,9 +430,9 @@ pub(crate) fn handle_in_covered(
         page_size,
         params.cursor.as_deref(),
         |candidate| {
-            pagination::wire_len(&parts.response(
+            response_bound::wire_len(&parts.response(
                 candidate,
-                pagination::widest_total(candidate.has_more),
+                response_bound::widest_total(candidate.has_more),
                 false,
             ))
         },
@@ -450,9 +452,9 @@ pub(crate) fn handle_in_covered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::queries::{upsert_edge, upsert_node};
+    use crate::model::{EdgeRecord, NodeRecord};
     use crate::storage::schema;
-    use crate::storage::write::{EdgeRecord, NodeRecord};
+    use crate::storage::write::{upsert_edge, upsert_node};
 
     /// The capability map every test in this module passes: empty, so
     /// `provenance::resolve` reads "no plugin here declares a semantic

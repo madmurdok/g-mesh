@@ -18,15 +18,16 @@
 //! qualifies only when the anchor is not a member of a type, since a bare
 //! name never reaches a member. A key with no segments recorded (`keyPath`
 //! NULL) is treated as a one-segment key. Segments come from the plugin's
-//! paths (`storage::qualified_path`); no display string is split here.
+//! paths (`model::qualified_path`); no display string is split here.
 
 use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::graph::pagination::{self, FileTally};
+use crate::mcp::response_bound;
+use crate::model::qualified_path;
+use crate::model::NodeRecord;
 use crate::protocol::types::PathSegment;
-use crate::storage::qualified_path;
-use crate::storage::write::NodeRecord;
 use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 
 /// Ceiling on how many files the tally names, at ~40 bytes an entry.
@@ -88,7 +89,7 @@ impl CandidateTally {
         by_file.truncate(MAX_UNLINKED_FILE_TALLY);
         let mut files: Vec<FileTally> =
             by_file.into_iter().map(|(path, refs)| FileTally { path, refs }).collect();
-        let over_bytes = pagination::truncate_to_bytes(&mut files, MAX_UNLINKED_FILE_TALLY_BYTES);
+        let over_bytes = response_bound::truncate_to_bytes(&mut files, MAX_UNLINKED_FILE_TALLY_BYTES);
         let files_truncated = over_count || over_bytes;
         Some(Self { count, files, files_truncated, hint })
     }

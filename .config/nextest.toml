@@ -129,7 +129,7 @@ not (
     (binary_id(g-mesh) & test(=mcp::response_bound_tests::every_callee_page_fits_the_ceiling)) |
     (binary_id(g-mesh) & test(=mcp::response_bound_tests::paging_through_byte_cut_pages_returns_every_row_once)) |
     (binary_id(g-mesh) & test(=mcp::response_bound_tests::every_files_answer_fits_the_ceiling)) |
-    (binary_id(g-mesh) & test(=graph::symbol_links::tests::link_all_and_link_diff_agree_on_the_same_end_state)) |
+    (binary_id(g-mesh) & test(=link::symbol_links::tests::link_all_and_link_diff_agree_on_the_same_end_state)) |
     (binary_id(g-mesh) & test(=daemon::semantic::tests::an_interrupted_pass_for_one_language_is_retried_without_rerunning_the_other)) |
     (binary_id(g-mesh::it) & test(=serving_while_indexing::a_walk_that_outlasts_the_bootstrap_timeout_is_waited_out_rather_than_losing_the_client)) |
     (binary_id(g-mesh::it) & test(=plugin_memory_limit::the_generated_mcp_instructions_reflect_a_real_suspended_rust)) |

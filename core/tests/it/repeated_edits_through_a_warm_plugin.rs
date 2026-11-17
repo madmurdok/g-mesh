@@ -258,7 +258,7 @@ fn cross_file_edges_into(conn: &Connection, name: &str) -> i64 {
 ///
 /// With it off, the edit applies and the caller's edge is left dangling until
 /// `caller.ts` is itself reindexed, which is the lazy cross-file semantics
-/// `graph::imports::link_diff` documents. That edge is not asserted on here:
+/// `link::imports::link_diff` documents. That edge is not asserted on here:
 /// it is a consequence this test tolerates, not a guarantee it pins.
 #[test]
 fn renaming_then_deleting_a_symbol_another_file_calls_is_applied() {

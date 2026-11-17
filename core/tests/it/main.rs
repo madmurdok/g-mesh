@@ -59,6 +59,7 @@ mod layout;
 mod lazy_activation;
 mod log_line_atomic;
 mod mcp_e2e;
+mod module_boundaries;
 mod module_tree_refresh_rust;
 mod multi_project_front;
 mod named_glob_shadowing;

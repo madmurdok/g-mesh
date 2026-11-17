@@ -10,16 +10,17 @@ use rusqlite::Connection;
 
 use super::*;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::MAX_RESPONSE_BYTES;
 use crate::graph::queries;
 use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::response_bound::MAX_RESPONSE_BYTES;
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
+use crate::model::{Diff, EdgeRecord};
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::protocol::types::{PathSegment, QualifiedPath};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::{apply_diff, Diff, EdgeRecord};
+use crate::storage::write::apply_diff;
 
 /// `unlinked::MAX_UNLINKED_FILE_TALLY`, private to that module; the design
 /// doc's cap of 20 (§3).

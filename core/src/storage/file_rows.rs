@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::storage::write::Diff;
+use crate::model::Diff;
 
 /// What a `fileChanged` diff says about the file as a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

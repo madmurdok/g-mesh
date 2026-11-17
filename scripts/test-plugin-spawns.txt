@@ -53,6 +53,7 @@ it:layout                                                rust
 it:lazy_activation                                       typescript rust python go
 it:log_line_atomic                                       rust
 it:mcp_e2e                                               typescript rust python go
+it:module_boundaries                                     rust
 it:module_tree_refresh_rust                              rust
 it:multi_project_front                                   typescript rust python go
 it:named_glob_shadowing                                  rust
@@ -105,7 +106,7 @@ lib:daemon::plugin::tests                                typescript
 lib:mcp::member_name_collision_tests                     typescript rust python go
 lib:mcp::unlinked::tests                                 rust
 lib:mcp::instructions::tests                             none
-lib:graph::symbol_links::tests                           none
+lib:link::symbol_links::tests                            none
 lib:languages::tests                                     none
 lib:cli::status::tests                                   none
 lib:cli::agent_instructions                              none

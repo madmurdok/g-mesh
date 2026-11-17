@@ -101,6 +101,7 @@ use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
 use crate::ingest::staleness::{self, StalenessOutcome};
+use crate::model::Diff;
 use crate::paths::state_dir::StateDir;
 use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::project_walk::{extension_of, under_excluded_dir};
@@ -108,7 +109,6 @@ use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{self, IndexStore, Unit};
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
-use crate::storage::write::Diff;
 
 /// The generation string an index is stamped with, and the thing
 /// `storage::schema::ensure_current` compares: core's hand-maintained pipeline
@@ -117,7 +117,7 @@ use crate::storage::write::Diff;
 ///
 /// Both halves have to be in it. The constant alone misses every plugin-side
 /// change (the failure task 116 fixes); the plugin half alone would miss every
-/// change in `graph::imports` / `graph::symbol_links`, which run in core and
+/// change in `link::imports` / `link::symbol_links`, which run in core and
 /// leave every plugin's bytes untouched.
 ///
 /// # Why every discovered plugin, and not just the one that was spawned
