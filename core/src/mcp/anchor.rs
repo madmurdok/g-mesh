@@ -20,7 +20,6 @@
 //! re-asking by `qualifiedName` would not: the same qualifiedName can name
 //! two different declarations (see `DefinitionCandidate::id`).
 
-use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -30,14 +29,15 @@ use crate::graph::queries;
 use crate::model::NodeRecord;
 
 use super::find_definition;
-use super::tool_result::{error, internal_error};
+use super::query::Redirect;
+use super::tool_result::internal_error;
 use super::SymbolQueryParams;
 
-/// `Ok(Ok(node))`: walk it. `Ok(Err(result))`: a finished response - candidate
-/// page or tool-level error - to hand straight back unchanged. The outer
+/// `Ok(Ok(node))`: walk it. `Ok(Err(redirect))`: a finished answer - candidate
+/// page or tool-level refusal - to hand straight back unchanged. The outer
 /// `Err` stays reserved for genuine protocol-level failures, as everywhere
 /// else in this module tree.
-pub(super) type Anchor = Result<Result<find_definition::Resolved, CallToolResult>, ErrorData>;
+pub(super) type Anchor = Result<Result<find_definition::Resolved, Redirect>, ErrorData>;
 
 /// What `symbol_name`/`symbol_id` resolved to, echoed back on every response
 /// of the four tools built on [`resolve`] (`find_references`, `find_callers`,
@@ -62,7 +62,7 @@ pub(super) type Anchor = Result<Result<find_definition::Resolved, CallToolResult
 /// pay full `DefinitionNode` bytes on every page of every one of the four
 /// highest-traffic tools for information most callers of this echo do not
 /// need.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AnchorInfo {
     pub(super) id: String,
@@ -128,10 +128,12 @@ pub(super) fn resolve(
         (None, Some(name)) => {
             find_definition::resolve_symbol_name(conn, semantic, name, params.cursor.as_deref(), None)
         }
-        (Some(_), Some(_)) => error("g-mesh: give either `symbol_id` or `symbol_name`, not both").map(Err),
-        (None, None) => {
-            error("g-mesh: give either `symbol_id`, or `symbol_name` to have it resolved by name").map(Err)
+        (Some(_), Some(_)) => {
+            Ok(Err(Redirect::refused("g-mesh: give either `symbol_id` or `symbol_name`, not both")))
         }
+        (None, None) => Ok(Err(Redirect::refused(
+            "g-mesh: give either `symbol_id`, or `symbol_name` to have it resolved by name",
+        ))),
     }
 }
 
@@ -158,13 +160,14 @@ pub(super) fn by_id(conn: &Connection, symbol_id: &str) -> Anchor {
         Some(node) => {
             Ok(Ok(find_definition::Resolved { node, by: find_definition::ResolvedBy::Id, queried_as: None }))
         }
-        None => error(format!("g-mesh: no symbol with id '{symbol_id}' found")).map(Err),
+        None => Ok(Err(Redirect::refused(format!("g-mesh: no symbol with id '{symbol_id}' found")))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::query::test_support::Rendered;
     use crate::storage::schema;
     use crate::storage::write::upsert_node;
 
@@ -175,7 +178,8 @@ mod tests {
         conn
     }
 
-    fn error_text(result: &CallToolResult) -> String {
+    fn error_text(result: &impl Rendered) -> String {
+        let result = &result.rendered();
         assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),
@@ -186,7 +190,7 @@ mod tests {
     /// `Result::unwrap`/`unwrap_err` are unavailable here: `NodeRecord` is
     /// not `Debug`, and making it so for a test's sake is not this change's
     /// business.
-    fn expect_finished(anchor: Anchor) -> CallToolResult {
+    fn expect_finished(anchor: Anchor) -> Redirect {
         match anchor.expect("resolution must not fail at the protocol level") {
             Ok(resolved) => {
                 panic!("expected a finished result, got the resolved node {}", resolved.node.id)
@@ -204,7 +208,7 @@ mod tests {
     fn expect_resolved(anchor: Anchor) -> find_definition::Resolved {
         match anchor.expect("resolution must not fail at the protocol level") {
             Ok(resolved) => resolved,
-            Err(result) => panic!("expected a resolved node, got {:?}", result.content),
+            Err(result) => panic!("expected a resolved node, got {:?}", result.rendered().content),
         }
     }
 

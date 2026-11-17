@@ -1,5 +1,6 @@
 use super::*;
 use crate::mcp::context::QueryCtx;
+use crate::mcp::query::test_support::Rendered;
 use crate::mcp::response_bound;
 use crate::mcp::PathCoverage;
 use crate::model::{Diff, EdgeRecord, NodeRecord};
@@ -23,17 +24,28 @@ fn ts_entry_points() -> Vec<String> {
 /// see [`ts_entry_points`]. A test exercising a different declared set
 /// (a fake Rust manifest, an empty one) calls `super::handle` directly
 /// instead of this wrapper.
-fn handle(conn: &Arc<IndexStore>, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
+fn handle(
+    conn: &Arc<IndexStore>,
+    params: GetDependenciesParams,
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     super::handle(&QueryCtx { entry_points: ts_entry_points().to_vec(), ..QueryCtx::for_test(conn) }, params)
 }
 
 /// [`handle`]'s own shadow, for [`super::from_file`].
-fn from_file(conn: &Connection, file_path: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+fn from_file(
+    conn: &Connection,
+    file_path: &str,
+    shape: &WalkShape,
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     super::from_file(conn, &ts_entry_points(), file_path, shape)
 }
 
 /// [`handle`]'s own shadow, for [`super::from_module`].
-fn from_module(conn: &Connection, module_id: &str, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+fn from_module(
+    conn: &Connection,
+    module_id: &str,
+    shape: &WalkShape,
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     super::from_module(conn, &ts_entry_points(), module_id, shape)
 }
 
@@ -49,7 +61,8 @@ fn setup() -> Connection {
     conn
 }
 
-fn json_body(result: &CallToolResult) -> serde_json::Value {
+fn json_body(result: &impl Rendered) -> serde_json::Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -57,7 +70,8 @@ fn json_body(result: &CallToolResult) -> serde_json::Value {
     }
 }
 
-fn error_text(result: &CallToolResult) -> String {
+fn error_text(result: &impl Rendered) -> String {
+    let result = &result.rendered();
     assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => text.text.clone(),
@@ -1398,7 +1412,7 @@ fn covered(
     conn: Connection,
     coverage: Option<&PathCoverage>,
     params: GetDependenciesParams,
-) -> CallToolResult {
+) -> ToolAnswer<DependencyWalk> {
     super::handle(
         &QueryCtx {
             entry_points: ts_entry_points().to_vec(),

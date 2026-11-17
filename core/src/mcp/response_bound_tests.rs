@@ -9,13 +9,13 @@ use crate::mcp::context::QueryCtx;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
 use super::unlinked::CandidateTally;
 use super::{find_callers_callees, find_implementations, find_references};
 use super::{Answer, FindImplementationsParams, SymbolQueryParams};
 use crate::graph::pagination::decode_cursor;
+use crate::mcp::query::test_support::Rendered;
 use crate::mcp::response_bound::{self, EXCLUDED_TALLY_MAX_BYTES, FILE_TALLY_MAX_BYTES, MAX_RESPONSE_BYTES};
 use crate::model::{Diff, EdgeRecord, NodeRecord};
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
@@ -148,7 +148,8 @@ fn capabilities(pending: bool) -> HashMap<String, Capabilities> {
     )])
 }
 
-fn body(result: &CallToolResult) -> (serde_json::Value, usize) {
+fn body(result: &impl Rendered) -> (serde_json::Value, usize) {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => (serde_json::from_str(&text.text).unwrap(), text.text.len()),
@@ -175,18 +176,26 @@ fn ask(
         ..Default::default()
     };
     let result = match tool {
-        Tool::Callers => ctx.resolve_lazily(find_callers_callees::handle_callers, params),
-        Tool::Callees => ctx.resolve_lazily(find_callers_callees::handle_callees, params),
-        Tool::References => ctx.resolve_lazily(find_references::handle, params),
-        Tool::Implementations => ctx.resolve_lazily(
-            find_implementations::dispatch,
-            FindImplementationsParams {
-                symbol_id: Some("t".into()),
-                limit: Some(limit),
-                cursor,
-                ..Default::default()
-            },
-        ),
+        Tool::Callers => {
+            ctx.resolve_lazily(find_callers_callees::handle_callers, params).map(|answer| answer.rendered())
+        }
+        Tool::Callees => {
+            ctx.resolve_lazily(find_callers_callees::handle_callees, params).map(|answer| answer.rendered())
+        }
+        Tool::References => {
+            ctx.resolve_lazily(find_references::handle, params).map(|answer| answer.rendered())
+        }
+        Tool::Implementations => ctx
+            .resolve_lazily(
+                find_implementations::dispatch,
+                FindImplementationsParams {
+                    symbol_id: Some("t".into()),
+                    limit: Some(limit),
+                    cursor,
+                    ..Default::default()
+                },
+            )
+            .map(|answer| answer.rendered()),
     };
     body(&result.unwrap())
 }

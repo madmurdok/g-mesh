@@ -11,7 +11,6 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use anyhow::Result;
-use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -22,6 +21,7 @@ use crate::embedding::pipeline::Embedder;
 use crate::embedding::EmbeddingPipeline;
 use crate::indexing_status::{IndexingStatus, Phase};
 use crate::mcp::host_fake::FakeHost;
+use crate::mcp::query::test_support::Rendered;
 use crate::mcp::McpHost;
 use crate::model::NodeRecord;
 use crate::plugin_manifest::{DiscoveredPlugins, NonSymbolShapes, PluginManifest};
@@ -88,7 +88,8 @@ fn server_with(
     GMeshMcpServer::new(store, host, indexing, embedding)
 }
 
-fn body(result: &CallToolResult) -> Value {
+fn body(result: &impl Rendered) -> Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "{:?}", result.content);
     let text = &result.content[0].as_text().expect("text content").text;
     serde_json::from_str(text).expect("a JSON body")

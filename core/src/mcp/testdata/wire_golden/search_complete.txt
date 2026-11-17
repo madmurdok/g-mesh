@@ -1,0 +1,3 @@
+isError: Some(false)
+--- block 0 ---
+{"results":[{"symbolId":"n0","qualifiedName":"n0","kind":"Function","filePath":"a.ts","startLine":1,"startCol":0,"score":#},{"symbolId":"n1","qualifiedName":"n1","kind":"Function","filePath":"a.ts","startLine":1,"startCol":0,"score":#},{"symbolId":"n2","qualifiedName":"n2","kind":"Function","filePath":"a.ts","startLine":1,"startCol":0,"score":#}],"hasMore":false,"nextCursor":null,"lowSimilarity":"Every row scored low for its language, so none is a confident match. The top row may still be right: check it with one read, and if it is not, fall back to a structural tool or grep rather than rewording the query."}

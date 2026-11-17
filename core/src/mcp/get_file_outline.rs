@@ -5,7 +5,6 @@
 //! ordered by source position (`graph::pagination::paginate_defines`)
 //! instead of the resolved/locality rule the symbol-anchored tools use.
 
-use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -17,7 +16,8 @@ use crate::model::NodeRecord;
 
 use super::context::QueryCtx;
 use super::not_indexed;
-use super::tool_result::{internal_error, success};
+use super::query::{ToolAnswer, WirePage};
+use super::tool_result::internal_error;
 use super::{GetFileOutlineParams, OutlineDetail};
 
 /// One symbol the file declares. No `file_path` field - every entry in this
@@ -28,7 +28,7 @@ use super::{GetFileOutlineParams, OutlineDetail};
 /// symbol; the `Option` fields are filled by a full render alone
 /// (`detail: "full"`) and skipped otherwise, so a full row is byte-identical
 /// to the row shape before GM-523, `"signature": null` included.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct OutlineSymbol {
     symbol_id: String,
@@ -88,19 +88,20 @@ fn render(n: NodeRecord, detail: OutlineDetail) -> OutlineSymbol {
 
 /// The response body, serialized: `Page<T>` itself isn't `Serialize` since
 /// it's shared by every list-shaped tool and none of them agree on an item
-/// type. Borrowed, so the byte cut can measure a candidate page without
-/// copying its rows.
+/// type.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OutlinePage<'a> {
-    results: &'a [OutlineSymbol],
+pub(crate) struct OutlinePage {
+    results: Vec<OutlineSymbol>,
     /// The file's whole row count, present only when `has_more`: what is
     /// left to page through, as on `find_references`.
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<usize>,
     has_more: bool,
-    next_cursor: Option<&'a str>,
+    next_cursor: Option<String>,
 }
+
+impl WirePage for OutlinePage {}
 
 /// One outline page, cut to its byte budget, with its `total`.
 struct Outline {
@@ -109,12 +110,12 @@ struct Outline {
 }
 
 impl Outline {
-    fn body(&self) -> OutlinePage<'_> {
+    fn body(self) -> OutlinePage {
         OutlinePage {
-            results: &self.page.results,
+            results: self.page.results,
             total: self.total,
             has_more: self.page.has_more,
-            next_cursor: self.page.next_cursor.as_deref(),
+            next_cursor: self.page.next_cursor,
         }
     }
 }
@@ -138,10 +139,10 @@ fn list_outline(
         |n| render(n, detail),
         |results, has_more, next_cursor| {
             response_bound::wire_len(&OutlinePage {
-                results,
+                results: results.to_vec(),
                 total: response_bound::widest_total(has_more),
                 has_more,
-                next_cursor,
+                next_cursor: next_cursor.map(str::to_owned),
             })
         },
         max_bytes,
@@ -153,7 +154,10 @@ fn list_outline(
 /// `ctx.coverage` says whether the path's language is indexed at all: a miss
 /// on a path in an absent or failed language is refused with
 /// [`not_indexed::miss`]'s structured reason instead of the bare message.
-pub(super) fn handle(ctx: &QueryCtx, params: GetFileOutlineParams) -> Result<CallToolResult, ErrorData> {
+pub(super) fn handle(
+    ctx: &QueryCtx,
+    params: GetFileOutlineParams,
+) -> Result<ToolAnswer<OutlinePage>, ErrorData> {
     let coverage = ctx.coverage.as_ref();
     let conn = ctx.store.read();
 
@@ -167,6 +171,7 @@ pub(super) fn handle(ctx: &QueryCtx, params: GetFileOutlineParams) -> Result<Cal
                 coverage,
                 format!("g-mesh: no file '{}' found in the index", params.file_path),
             )
+            .map(ToolAnswer::Refused)
         }
     };
 
@@ -184,12 +189,13 @@ pub(super) fn handle(ctx: &QueryCtx, params: GetFileOutlineParams) -> Result<Cal
     )
     .map_err(|e| internal_error("failed to list file outline", e))?;
 
-    success(&outline.body())
+    Ok(ToolAnswer::Page(outline.body()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::query::test_support::Rendered;
     use crate::mcp::PathCoverage;
     use crate::model::EdgeRecord;
     use crate::storage::index_store::IndexStore;
@@ -204,7 +210,8 @@ mod tests {
         conn
     }
 
-    fn json_body(result: &CallToolResult) -> serde_json::Value {
+    fn json_body(result: &impl Rendered) -> serde_json::Value {
+        let result = &result.rendered();
         assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -212,7 +219,8 @@ mod tests {
         }
     }
 
-    fn error_text(result: &CallToolResult) -> String {
+    fn error_text(result: &impl Rendered) -> String {
+        let result = &result.rendered();
         assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),
@@ -453,7 +461,7 @@ mod tests {
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), cursor, limit, detail };
         let result = handle(&QueryCtx::for_test(store), params).unwrap();
         let body = json_body(&result);
-        let text = match &result.content[0] {
+        let text = match &result.rendered().content[0] {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),
             other => panic!("expected text content, got {other:?}"),
         };
@@ -649,7 +657,11 @@ mod tests {
 
     use crate::mcp::not_indexed::test_support::*;
 
-    fn outline_of(conn: Connection, coverage: Option<&PathCoverage>, file_path: &str) -> CallToolResult {
+    fn outline_of(
+        conn: Connection,
+        coverage: Option<&PathCoverage>,
+        file_path: &str,
+    ) -> ToolAnswer<OutlinePage> {
         let params = GetFileOutlineParams { file_path: file_path.to_string(), ..Default::default() };
         handle(
             &QueryCtx { coverage: coverage.cloned(), ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn))) },

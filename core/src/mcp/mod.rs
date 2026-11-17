@@ -59,6 +59,7 @@ mod progress;
 #[cfg(test)]
 mod progress_tests;
 mod provenance;
+pub(crate) mod query;
 pub(crate) mod query_shapes;
 pub(crate) mod response_bound;
 #[cfg(test)]
@@ -82,6 +83,8 @@ mod tool_result;
 mod tools_list_tests;
 mod unlinked;
 mod untyped;
+#[cfg(test)]
+mod wire_golden_tests;
 
 pub use self::host::{Activity, McpHost, PathCoverage};
 
@@ -173,10 +176,15 @@ fn human_duration(elapsed: Duration) -> String {
 /// A failed walk is a tool error carrying its message, never an answer read
 /// off an empty or partial graph; the next call retries
 /// (`IndexingStatus::request_activation`).
-fn walk_failed(message: &str) -> CallToolResult {
-    CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+fn walk_failed(message: &str) -> query::Refusal {
+    query::Refusal::Text(format!(
         "g-mesh could not build this project's index: {message}. The next tool call retries the build."
-    ))])
+    ))
+}
+
+/// Sends an answer a tool gave before it ran.
+fn render_early(early: query::Refusal) -> Result<CallToolResult, ErrorData> {
+    response_bound::render(&query::Redirect::Refused(early))
 }
 
 /// Serves one accepted connection as an MCP session until the peer
@@ -264,7 +272,7 @@ impl GMeshMcpServer {
         ctx: &RequestContext<RoleServer>,
         tool: &str,
         need: Need,
-    ) -> Result<Option<CallToolResult>, ErrorData> {
+    ) -> Result<Option<query::Refusal>, ErrorData> {
         // Taken before the indexing wait, so the replay's heartbeat continues
         // the wait's `progress` values and stays strictly increasing.
         let call_started = Instant::now();
@@ -441,7 +449,7 @@ impl GMeshMcpServer {
         ctx: &RequestContext<RoleServer>,
         tool: &str,
         need: Need,
-    ) -> Result<Option<CallToolResult>, ErrorData> {
+    ) -> Result<Option<query::Refusal>, ErrorData> {
         let started = Instant::now();
         let cap = crate::knobs::millis_lenient(&crate::knobs::INDEX_WAIT_CAP_MS, DEFAULT_INDEX_WAIT_CAP);
         // `0` is "no cap": `checked_add` failing (a cap too large to be a
@@ -454,15 +462,13 @@ impl GMeshMcpServer {
             // D7: the cap. No part of the question is answered - no rows,
             // nothing that could be read as a result - only why, and that
             // calling again is the remedy.
-            WaitOutcome::TimedOut => {
-                Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
-                    "g-mesh: the index for {} is still being built ({}; this call waited {}). No answer was \
+            WaitOutcome::TimedOut => Some(query::Refusal::Text(format!(
+                "g-mesh: the index for {} is still being built ({}; this call waited {}). No answer was \
                  computed - call this tool again; the index keeps building in the background.",
-                    self.host.project_root().display(),
-                    self.indexing.progress_detail(),
-                    human_duration(started.elapsed())
-                ))]))
-            }
+                self.host.project_root().display(),
+                self.indexing.progress_detail(),
+                human_duration(started.elapsed())
+            ))),
             WaitOutcome::Failed(message) => Some(walk_failed(&message)),
         })
     }
@@ -528,7 +534,7 @@ impl GMeshMcpServer {
     async fn wait_for_embeddings(
         &self,
         ctx: &RequestContext<RoleServer>,
-    ) -> Result<Result<Option<search_code::Coverage>, CallToolResult>, ErrorData> {
+    ) -> Result<Result<Option<search_code::Coverage>, query::Refusal>, ErrorData> {
         let started = Instant::now();
         let spent = self.indexing.embedding_wait_spent();
         let bound = if spent {
@@ -552,14 +558,13 @@ impl GMeshMcpServer {
                 }
                 let (embedded, total) = self.indexing.embed_progress();
                 let phase = self.indexing.phase();
-                search_code::Coverage::partial(
+                Ok(search_code::Coverage::partial(
                     &phase,
                     embedded,
                     total,
                     (!spent).then(|| started.elapsed()),
                     self.host.project_root(),
-                )
-                .map_or(Ok(None), |coverage| Ok(Some(coverage)))
+                ))
             }
         })
     }
@@ -664,15 +669,15 @@ impl GMeshMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let call_started = Instant::now();
         if let Some(early) = self.prepare(&ctx, "find_definition", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
         let params = params.0;
-        self.query_ctx(None, params.file_path.as_deref())
-            .resolve_lazily_off_worker(find_definition::handle, params)
-            .await
+        let answer =
+            query::definition_off_worker(self.query_ctx(None, params.file_path.as_deref()), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -685,12 +690,12 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "find_references", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let params = params.0;
-        self.query_ctx(params.file_paths.as_deref(), None)
-            .resolve_lazily_off_worker(find_references::handle, params)
-            .await
+        let answer =
+            query::references_off_worker(self.query_ctx(params.file_paths.as_deref(), None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -700,12 +705,12 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "find_callers", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let params = params.0;
-        self.query_ctx(params.file_paths.as_deref(), None)
-            .resolve_lazily_off_worker(find_callers_callees::handle_callers, params)
-            .await
+        let answer =
+            query::callers_off_worker(self.query_ctx(params.file_paths.as_deref(), None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -715,12 +720,12 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "find_callees", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let params = params.0;
-        self.query_ctx(params.file_paths.as_deref(), None)
-            .resolve_lazily_off_worker(find_callers_callees::handle_callees, params)
-            .await
+        let answer =
+            query::callees_off_worker(self.query_ctx(params.file_paths.as_deref(), None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -733,14 +738,13 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "find_implementations", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let params = params.0;
         // `transitive` ignores `file_paths`, so it names nothing about them.
         let file_paths = if params.transitive.unwrap_or(false) { None } else { params.file_paths.as_deref() };
-        self.query_ctx(file_paths, None)
-            .resolve_lazily_off_worker(find_implementations::dispatch, params)
-            .await
+        let answer = query::implementations_off_worker(self.query_ctx(file_paths, None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -754,10 +758,11 @@ impl GMeshMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let call_started = Instant::now();
         if let Some(early) = self.prepare(&ctx, "get_file_outline", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
-        get_file_outline::handle(&self.query_ctx(None, Some(&params.0.file_path)), params.0)
+        let answer = query::outline(&self.query_ctx(None, Some(&params.0.file_path)), params.0)?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -771,12 +776,13 @@ impl GMeshMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let call_started = Instant::now();
         if let Some(early) = self.prepare(&ctx, "get_dependencies", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "get_dependencies", call_started, file_path).await;
         }
-        get_dependencies::handle(&self.query_ctx(None, params.0.file_path.as_deref()), params.0)
+        let answer = query::dependencies(&self.query_ctx(None, params.0.file_path.as_deref()), params.0)?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -789,13 +795,14 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "search_code", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let coverage = match self.wait_for_embeddings(&ctx).await? {
             Ok(coverage) => coverage,
-            Err(early) => return Ok(early),
+            Err(early) => return render_early(early),
         };
-        search_code::handle_off_worker(self.query_ctx(None, None), params.0, coverage).await
+        let answer = query::search_off_worker(self.query_ctx(None, None), params.0, coverage).await?;
+        response_bound::render(&answer)
     }
 }
 

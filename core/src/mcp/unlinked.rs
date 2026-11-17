@@ -49,7 +49,7 @@ const UNLINKED_USAGES_HINT: &str =
 /// (`super::untyped`), which differ only in what they count and in `hint`.
 /// Absent from a response, not zero, when there is no candidate: most anchors
 /// have none, and they must not grow a byte to say so.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CandidateTally {
     /// Every candidate, uncapped. Its unit is the field's: a usage edge for
