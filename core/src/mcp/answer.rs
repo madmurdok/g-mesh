@@ -10,7 +10,9 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::graph::pagination::{self, Direction, FileTally};
+use crate::graph::pagination::{self, FileTally};
+use crate::graph::Direction;
+use crate::mcp::response_bound;
 
 use super::tool_result::success;
 use super::{anchor, Answer};
@@ -43,7 +45,7 @@ struct Summary<'a, D: Serialize> {
 }
 
 /// The [`Summary`] for `counted`, with `files` cut to what fits
-/// `pagination::MAX_RESPONSE_BYTES` beside everything else the response
+/// `response_bound::MAX_RESPONSE_BYTES` beside everything else the response
 /// carries. `tail(files, send)` returns the hint and disclosures for a
 /// response naming `files`; `send` is false while candidates are measured and
 /// true for the one sent, so a once-per-session hint is spent only there.
@@ -54,9 +56,9 @@ pub(super) fn respond<D: Serialize>(
 ) -> Result<CallToolResult, ErrorData> {
     let mut build = |budget: usize, send: bool| {
         let mut files = counted.files.clone();
-        let cut = files.as_mut().is_some_and(|files| pagination::truncate_to_bytes(files, budget));
+        let cut = files.as_mut().is_some_and(|files| response_bound::truncate_to_bytes(files, budget));
         let (hint, disclosures) = tail(files.as_deref(), send);
-        let bytes = pagination::wire_len(&Summary {
+        let bytes = response_bound::wire_len(&Summary {
             anchor,
             total: counted.total,
             unresolved: counted.unresolved,
@@ -67,9 +69,9 @@ pub(super) fn respond<D: Serialize>(
         });
         (files, cut, hint, disclosures, bytes)
     };
-    let budget = pagination::fit_budget(|budget| {
+    let budget = response_bound::fit_budget(|budget| {
         let (files, _, _, _, bytes) = build(budget, false);
-        (files.as_deref().map_or(0, pagination::wire_len), bytes)
+        (files.as_deref().map_or(0, response_bound::wire_len), bytes)
     });
     let (files, cut, hint, disclosures, _) = build(budget, true);
     success(&Summary {

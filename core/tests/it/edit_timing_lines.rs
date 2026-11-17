@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon;
 use g_mesh::daemon::identity::project_hash;
 use g_mesh::log::{TIMING_ENV, TIMING_PREFIX};
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::paths::HOME_ENV;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
@@ -140,7 +141,7 @@ impl Harness {
             )
             .await
             .expect("the activating call failed");
-        let phase = daemon::phase_path_in(&self.state_dir());
+        let phase = StateDir::at(self.state_dir()).phase_file();
         tokio::task::spawn_blocking(move || {
             common::wait_for("index.phase to read \"ready\"", common::startup_timeout(), || {
                 fs::read_to_string(&phase).is_ok_and(|text| text.trim() == "ready")
@@ -188,8 +189,8 @@ impl Harness {
     fn stop_daemon(&self) {
         let state = self.state_dir();
         for path in [
-            daemon::pid_path_in(&state),
-            daemon::plugin_pid_path_in(&state),
+            StateDir::at(&state).pid_file(),
+            StateDir::at(&state).plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE),
             state.join("plugin-typescript.pid"),
         ] {
             common::kill_pid_file(&path);

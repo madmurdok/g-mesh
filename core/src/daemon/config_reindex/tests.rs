@@ -13,12 +13,13 @@ use crate::ingest::select::{
     indexed_file_count, indexed_files_of, indexed_importers, reads, scan_imports, select_affected,
     select_with,
 };
+use crate::model::{Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 use crate::plugin_manifest::discover;
 use crate::protocol::types::{
     EdgeKind, Matcher, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
 };
 use crate::protocol::types::{ImportMatch, ImportSelector, PathScope, TargetScopeKind};
-use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
+use crate::storage::write::apply_diff;
 use crate::test_plugin;
 
 // -------------------------------------------------------------------------

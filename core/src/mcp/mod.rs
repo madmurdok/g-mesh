@@ -27,7 +27,7 @@ use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::registry::{PathCoverage, PluginRegistry};
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
-use crate::graph::pagination::Direction;
+use crate::graph::Direction;
 use crate::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::ipc::AsyncStream;
 use crate::plugin_manifest::Capabilities;
@@ -54,6 +54,7 @@ mod not_indexed;
 mod overrides;
 mod provenance;
 pub(crate) mod query_shapes;
+pub(crate) mod response_bound;
 #[cfg(test)]
 mod response_bound_tests;
 mod search_code;

@@ -1,8 +1,10 @@
 use super::*;
-use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::mcp::response_bound;
+use crate::model::{Diff, EdgeRecord, NodeRecord};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
+use crate::storage::write;
+use crate::storage::write::{upsert_edge, upsert_node};
 
 /// What a real daemon feeds `handle`/`from_file`/`from_module`/
 /// `no_file_message` in the bundled, TS-only setup: the bundled plugin's
@@ -361,7 +363,7 @@ fn a_fanout_cut_reports_max_fanout_and_hands_back_no_continuation_field() {
 /// token it hands back continues it exactly where it left off.
 ///
 /// `DEFAULT_EXPLORATION_BUDGET` rows (5000) of `DependencyNode` JSON is
-/// nowhere near `pagination::MAX_RESPONSE_BYTES` (20,000 bytes), so a
+/// nowhere near `response_bound::MAX_RESPONSE_BYTES` (20,000 bytes), so a
 /// walk wide enough to hit the exploration budget always earns its own,
 /// stricter `responseSize` cut before `explorationBudget` is ever visible
 /// on the wire - see `bound_walk`'s doc comment. That row-count-scale
@@ -481,7 +483,7 @@ fn a_wide_fan_in_too_big_for_one_response_truncates_with_a_resume_token_instead_
     assert_eq!(body["hint"].as_str(), session_hints::truncated_by("responseSize"));
     let raw_len = serde_json::to_vec(results).unwrap().len();
     assert!(
-        raw_len <= pagination::MAX_RESPONSE_BYTES,
+        raw_len <= response_bound::MAX_RESPONSE_BYTES,
         "the truncated page itself must respect the budget: {raw_len}"
     );
 
@@ -827,8 +829,8 @@ fn an_exact_file_anchor_reports_no_substitution() {
 
 // -----------------------------------------------------------------
 // Containers (GM-267): `File -IMPORTS-> container` edges, walked and
-// anchored on. Built directly at the storage layer - `graph::imports`'s
-// own tests (`graph::imports::tests`) cover the *linking* of a
+// anchored on. Built directly at the storage layer - `link::imports`'s
+// own tests (`link::imports::tests`) cover the *linking* of a
 // container-scoped placeholder onto one of these edges; this module
 // tests the walk and the anchor resolution once the edge exists, exactly
 // the split the file-import tests above already follow (`imports` builds
@@ -850,7 +852,7 @@ fn materialize_container(conn: &mut Connection, language: &str, key: &str) -> St
 }
 
 /// `from` (a File) imports the container at `container_node_id`,
-/// directly - the walk-time shape `graph::imports` produces after
+/// directly - the walk-time shape `link::imports` produces after
 /// linking a container-scoped placeholder, built without the linker for
 /// the same reason [`imports`] builds a file-to-file edge directly.
 fn imports_container(conn: &mut Connection, from: &str, container_node_id: &str) {
@@ -980,7 +982,7 @@ fn a_container_key_ambiguous_across_languages_is_refused_with_the_languages_name
 
 /// Decision 6: two containers with the storage-level `filePath = ''` in
 /// common must not collapse into a single result row - a walk-level
-/// version of `graph::imports::tests::two_containers_imported_by_the_
+/// version of `link::imports::tests::two_containers_imported_by_the_
 /// same_file_both_link_independently`, at the layer (`ReachedNode`/
 /// `DependencyNode`) where a `filePath`-keyed dedup would actually bite
 /// if one existed. `traversal::traverse` dedups by node id

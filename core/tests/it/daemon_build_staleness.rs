@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use g_mesh::daemon::{self, build_stamp};
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -88,21 +89,27 @@ impl Project {
     }
 
     fn build_stamp_path(&self) -> PathBuf {
-        daemon::build_stamp_path(self.root()).expect("failed to resolve the build stamp path")
+        StateDir::of(self.root())
+            .map(|sd| sd.build_stamp_file())
+            .expect("failed to resolve the build stamp path")
     }
 
     /// The pid of the daemon currently serving this project - the answer to
     /// "which process answered that call?", and the thing every assertion
     /// here ultimately turns on.
     fn daemon_pid(&self) -> u32 {
-        let path = daemon::pid_path(self.root()).expect("failed to resolve the pid file path");
+        let path =
+            StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path");
         daemon::read_pid_file(&path).unwrap_or_else(|| panic!("no daemon pid recorded at {}", path.display()))
     }
 }
 
 impl Drop for Project {
     fn drop(&mut self) {
-        for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ] {
             let Ok(path) = path else { continue };
             if let Some(pid) = daemon::read_pid_file(&path) {
                 common::kill_and_wait(pid);

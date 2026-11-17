@@ -3,11 +3,11 @@
 
 use std::collections::HashSet;
 
+use crate::model::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 use crate::protocol::types::{
     FileChangeDiff, PathError, PlaceholderTarget, QualifiedPath, SourceTier, TargetKey, TargetScope,
     Visibility, WireEdge, WireNode,
 };
-use crate::storage::write::{DeclarationRecord, Diff, EdgeRecord, NodeRecord, PlaceholderTargetRecord};
 
 /// Converts the wire-level diff (nested `range: {start, end}`) into the
 /// storage layer's flat `start_line`/`start_col`/`end_line`/`end_col`
@@ -100,13 +100,13 @@ pub(crate) fn to_node_record(node: WireNode, warnings: &mut PathWarnings) -> Nod
         // The read-side mirror of the database's `GENERATED ALWAYS exported`
         // column - see `NodeRecord.exported`'s own doc comment for why this
         // still has to be set correctly here even though `apply_diff` never
-        // writes it: `graph::symbol_links::link_diff` filters this very
+        // writes it: `link::symbol_links::link_diff` filters this very
         // `Diff` in memory, before anything is read back from storage.
         exported: matches!(node.visibility, Visibility::Public),
         visibility,
         visibility_container,
         container: node.container,
-        // Carried through to `apply_diff`, where `graph::containers` stores it
+        // Carried through to `apply_diff`, where `storage::containers` stores it
         // on the container's `containers.parentKey` - it describes the
         // container, not this member, so it has no `nodes` column of its own.
         container_parent: node.container_parent,

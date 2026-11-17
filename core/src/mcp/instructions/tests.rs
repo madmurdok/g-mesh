@@ -592,14 +592,14 @@ use rusqlite::Connection;
 use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::registry::PluginRegistry;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::queries::upsert_node;
 use crate::indexing_status::{IndexingStatus, Phase};
 use crate::languages::{self, CATALOGUE};
 use crate::mcp::GMeshMcpServer;
+use crate::model::NodeRecord;
 use crate::plugin_manifest::{discover, DiscoveredPlugins};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::NodeRecord;
+use crate::storage::write::upsert_node;
 
 /// The generic "unsupported" sentence (ADR 0022, section 3): said once,
 /// naming no catalogue.

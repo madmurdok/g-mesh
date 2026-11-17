@@ -24,7 +24,7 @@
 use rusqlite::Connection;
 
 use super::unlinked::{self, CandidateTally};
-use crate::storage::write::NodeRecord;
+use crate::model::NodeRecord;
 
 /// Calls named like a method, made through an untyped receiver, that may
 /// reach the anchor. `count` is the number of calling functions, not of call

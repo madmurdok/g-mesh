@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -87,7 +88,10 @@ impl Project {
     /// after this returns cannot race a not-yet-dead process for
     /// `daemon.lock`.
     fn stop(&self) {
-        for path in [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())] {
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ] {
             let Ok(path) = path else { continue };
             if let Some(pid) = daemon::read_pid_file(&path) {
                 // Stopped twice over on the last phase (here, then again from
@@ -99,7 +103,7 @@ impl Project {
         // The socket file outlives the process it belonged to; leaving it
         // would only prove that the shim handles a stale one, which is not
         // this test's subject.
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
     }

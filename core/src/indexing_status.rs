@@ -195,7 +195,7 @@ struct ProgressFile {
 /// updates. Phase transitions and stage boundaries write regardless.
 const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The progress counters as `daemon::progress_path_in`'s file holds them -
+/// The progress counters as `StateDir::progress_file`'s file holds them -
 /// what `cli::status` renders per stage.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

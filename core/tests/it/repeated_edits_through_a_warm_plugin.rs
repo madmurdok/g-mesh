@@ -43,9 +43,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use g_mesh::daemon;
 use g_mesh::daemon::plugin::PluginProcess;
 use g_mesh::embedding::EmbeddingPipeline;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::{self, project_dir};
 use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
@@ -93,18 +93,20 @@ impl Project {
     /// file, the legacy single plugin pid file, and the registry's
     /// per-language one for the bundled plugin.
     fn stop(&self) {
-        let mut pid_files: Vec<PathBuf> =
-            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())]
-                .into_iter()
-                .flatten()
-                .collect();
+        let mut pid_files: Vec<PathBuf> = [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if let Ok(state) = project_dir(self.root()) {
             pid_files.push(state.join("plugin-typescript.pid"));
         }
         for path in pid_files {
             common::kill_pid_file(&path);
         }
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
     }
@@ -256,7 +258,7 @@ fn cross_file_edges_into(conn: &Connection, name: &str) -> i64 {
 ///
 /// With it off, the edit applies and the caller's edge is left dangling until
 /// `caller.ts` is itself reindexed, which is the lazy cross-file semantics
-/// `graph::imports::link_diff` documents. That edge is not asserted on here:
+/// `link::imports::link_diff` documents. That edge is not asserted on here:
 /// it is a consequence this test tolerates, not a guarantee it pins.
 #[test]
 fn renaming_then_deleting_a_symbol_another_file_calls_is_applied() {

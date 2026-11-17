@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::service::RunningService;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -138,11 +139,13 @@ impl Harness {
     }
 
     fn stop_daemon(&self) {
-        let mut pid_files: Vec<PathBuf> =
-            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())]
-                .into_iter()
-                .flatten()
-                .collect();
+        let mut pid_files: Vec<PathBuf> = [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if let Ok(state) = project_dir(self.root()) {
             pid_files.push(state.join("plugin-typescript.pid"));
         }
@@ -155,7 +158,7 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         self.stop_daemon();
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
         if let Ok(state) = project_dir(self.root()) {

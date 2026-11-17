@@ -1018,8 +1018,8 @@ fn supervise_exit_leaves_no_state_file_behind(orphan: bool) {
     );
     let core = CoreActivity::new();
     let indexing = IndexingStatus::structural();
-    indexing.attach_phase_file(crate::daemon::phase_path_in(state_dir));
-    indexing.attach_progress_file_every(crate::daemon::progress_path_in(state_dir), Duration::ZERO);
+    indexing.attach_phase_file(StateDir::at(state_dir).phase_file());
+    indexing.attach_progress_file_every(StateDir::at(state_dir).progress_file(), Duration::ZERO);
 
     let stop = Arc::new(AtomicBool::new(false));
     let writer = {

@@ -16,6 +16,7 @@ use std::process::{Command as StdCommand, Output};
 use g_mesh::daemon;
 use g_mesh::daemon::bulk_index::ABSENT_COUNT_OFF_ENV;
 use g_mesh::languages::LanguageOutcome;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use g_mesh::storage::schema;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
@@ -86,10 +87,10 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        if let Ok(path) = daemon::pid_path(self.root()) {
+        if let Ok(path) = StateDir::of(self.root()).map(|sd| sd.pid_file()) {
             common::kill_pid_file(&path);
         }
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
         if let Ok(state) = project_dir(self.root()) {
@@ -288,7 +289,10 @@ async fn the_daemon_answers_for_the_other_language_when_one_plugin_binary_is_mis
     assert!(answer.contains("src/lib.rs"), "the rust symbol must be found: {answer}");
     client.cancel().await.expect("failed to shut the first client down");
 
-    assert!(daemon::is_listening(project.root()).unwrap(), "the daemon keeps serving");
+    assert!(
+        StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap(),
+        "the daemon keeps serving"
+    );
     let second = ().serve(shim(project.root(), plugins.path())).await.expect("a second session must connect");
     let instructions = second.peer_info().and_then(|info| info.instructions.clone()).unwrap_or_default();
     assert!(!instructions.is_empty(), "the instructions read path must answer after a partial walk");
@@ -410,7 +414,7 @@ fn start_daemon(project: &Project, plugins: &Path) -> std::process::Child {
         .spawn()
         .expect("failed to spawn the daemon");
     common::wait_for("the daemon to listen", common::startup_timeout(), || {
-        daemon::is_listening(project.root()).unwrap_or(false)
+        StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap_or(false)
     });
     child
 }
@@ -486,9 +490,10 @@ fn a_failed_language_is_not_routed_by_the_watcher_before_the_first_tool_call() {
     }
 
     assert!(!has_node(&project, "added_python_symbol"), "a language recorded as failed must not be routed");
-    let phase = std::fs::read_to_string(daemon::phase_path_in(
-        &project_dir(project.root()).expect("failed to resolve the state directory"),
-    ))
+    let phase = std::fs::read_to_string(
+        StateDir::at(project_dir(project.root()).expect("failed to resolve the state directory"))
+            .phase_file(),
+    )
     .expect("failed to read the phase file");
     assert_eq!(phase.trim(), "structural", "no tool call may have activated the daemon");
     let _ = daemon_process.kill();
@@ -604,7 +609,7 @@ fn the_daemons_log_line_for_a_failed_language_is_its_whole_chain_on_one_line() {
         .spawn()
         .expect("failed to spawn the daemon");
     common::wait_for("the daemon to listen", common::startup_timeout(), || {
-        daemon::is_listening(project.root()).unwrap_or(false)
+        StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap_or(false)
     });
     // The log line is written before the phase leaves `indexing`.
     common::wait_until_phase(project.root(), "ready");

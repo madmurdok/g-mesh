@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, RoleClient, RunningService};
@@ -66,7 +67,7 @@ impl Folder {
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     async fn connect(&self, front_idle_ms: Option<u64>) -> RunningService<RoleClient, ()> {
@@ -119,13 +120,19 @@ impl Drop for Folder {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755));
             }
-            for path in [daemon::pid_path(&dir), daemon::plugin_pid_path(&dir)].into_iter().flatten() {
+            for path in [
+                StateDir::of(&dir).map(|sd| sd.pid_file()),
+                StateDir::of(&dir).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 common::kill_pid_file(&path);
             }
-            for (_, plugin_pid) in daemon::registry::discovered_pid_files(&state) {
+            for (_, plugin_pid) in StateDir::at(&state).plugin_pid_files() {
                 common::kill_pid_file(&plugin_pid);
             }
-            if let Ok(endpoint) = daemon::endpoint(&dir) {
+            if let Ok(endpoint) = StateDir::of(&dir).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
                 endpoint.clear_stale();
             }
             let _ = std::fs::remove_dir_all(state);
@@ -206,7 +213,7 @@ async fn a_folder_of_projects_is_served_by_the_front() {
     common::wait_until_phase(folder.root(), "front");
     let state = folder.state_dir();
     assert!(!state.join("index.db").exists(), "a front must never create the folder's index.db");
-    let plugin_pid_files = daemon::registry::discovered_pid_files(&state);
+    let plugin_pid_files = StateDir::at(&state).plugin_pid_files();
     assert!(plugin_pid_files.is_empty(), "a front spawns no plugin: {plugin_pid_files:?}");
 
     client.cancel().await.expect("failed to shut the client down");
@@ -218,12 +225,12 @@ async fn an_idle_front_exits_after_its_own_short_timeout() {
     let client = folder.connect(Some(500)).await;
     let pid_file = folder.pid_file();
     assert!(pid_file.exists(), "the front must publish its pid file before answering initialize");
-    assert_eq!(daemon::read_phase_in(&folder.state_dir()).as_deref(), Some("front"));
+    assert_eq!(StateDir::at(folder.state_dir()).read_phase().as_deref(), Some("front"));
 
     client.cancel().await.expect("failed to shut the client down");
 
     common::wait_for("the idle front to exit", common::startup_timeout(), || !pid_file.exists());
-    assert!(daemon::read_phase_in(&folder.state_dir()).is_none(), "the phase file goes with the front");
+    assert!(StateDir::at(folder.state_dir()).read_phase().is_none(), "the phase file goes with the front");
 }
 
 // ---- Slice 5 (GM-399 S3): the session switch in the shim ----
@@ -657,7 +664,7 @@ async fn reindexing_one_project_leaves_the_front_and_other_projects_alone() {
     assert_eq!(outline_names(&b_before), Some(vec!["b".to_string()]), "{}", text_of(&b_before));
 
     let pid_of = |dir: &Path| {
-        daemon::read_pid_file(&daemon::pid_path(dir).unwrap())
+        daemon::read_pid_file(&StateDir::of(dir).map(|sd| sd.pid_file()).unwrap())
             .unwrap_or_else(|| panic!("{} has no daemon pid", dir.display()))
     };
     let (front, a, b) = (pid_of(folder.root()), pid_of(&folder.sub("a")), pid_of(&folder.sub("b")));

@@ -17,11 +17,13 @@ use serde::Serialize;
 
 use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, Direction};
+use crate::graph::pagination;
 use crate::graph::queries;
+use crate::graph::Direction;
+use crate::mcp::response_bound;
+use crate::model::NodeRecord;
 use crate::plugin_manifest::{Capabilities, MemberOverrides};
 use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
 
 use super::not_indexed::{self, NotIndexed};
 use super::overrides::{self, OverriddenMember, Overrides};
@@ -44,7 +46,7 @@ struct CallSite {
     /// The edge's position in `paginate_edges`' order. Carried through so
     /// `handle_callers`/`handle_callees` can rebuild a resumable cursor if
     /// the enriched page needs further truncation to fit
-    /// `pagination::MAX_RESPONSE_BYTES`.
+    /// `response_bound::MAX_RESPONSE_BYTES`.
     rank: pagination::EdgeRank,
 }
 
@@ -192,7 +194,7 @@ struct CallerPage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     files: Option<&'a [pagination::FileTally]>,
     /// Present only when `files` leaves files out, cut by its entry or byte
-    /// cap (`pagination::tally_edge_files_bounded`); absent, not `false`,
+    /// cap (`response_bound::tally_edge_files_bounded`); absent, not `false`,
     /// otherwise.
     #[serde(skip_serializing_if = "answer::is_false")]
     files_truncated: bool,
@@ -273,8 +275,8 @@ struct CallerPage<'a> {
 /// full coverage"* - and the answer it then wrote was a file list.
 ///
 /// So `files` carries the names, at ~40 bytes an entry against a reference
-/// row's ~260, capped by `pagination::MAX_EXCLUDED_FILE_TALLY` entries and
-/// `pagination::EXCLUDED_TALLY_MAX_BYTES` bytes. `count` stays
+/// row's ~260, capped by `response_bound::MAX_EXCLUDED_FILE_TALLY` entries and
+/// `response_bound::EXCLUDED_TALLY_MAX_BYTES` bytes. `count` stays
 /// exact and uncapped even when the tally is cut, since understating the gap
 /// is the one thing this field must never do; `files_truncated` says so
 /// explicitly rather than leaving the caller to notice that the tally sums to
@@ -289,8 +291,8 @@ struct ExcludedReferences {
     count: usize,
     /// The files holding one of the excluded usages that the rest of the
     /// response does not already name, highest count first, capped at
-    /// `pagination::MAX_EXCLUDED_FILE_TALLY` before that filtering and at
-    /// `pagination::EXCLUDED_TALLY_MAX_BYTES` after it. Every file holding an
+    /// `response_bound::MAX_EXCLUDED_FILE_TALLY` before that filtering and at
+    /// `response_bound::EXCLUDED_TALLY_MAX_BYTES` after it. Every file holding an
     /// excluded usage is named once somewhere in the response, up to those
     /// caps. Absent when empty, and always on `answer: "count"`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -348,21 +350,21 @@ fn excluded_references(
         direction,
         &["REFERENCES"],
         file_paths,
-        pagination::MAX_EXCLUDED_FILE_TALLY,
+        response_bound::MAX_EXCLUDED_FILE_TALLY,
     )
     .unwrap_or_default();
-    let files_truncated = files.len() >= pagination::MAX_EXCLUDED_FILE_TALLY;
+    let files_truncated = files.len() >= response_bound::MAX_EXCLUDED_FILE_TALLY;
     Some(ExcludedReferences { count, files, files_truncated, hint: EXCLUDED_REFERENCES_HINT })
 }
 
 impl ExcludedReferences {
     /// This disclosure for a response that already names `named`: those
     /// files dropped from `files`, and the rest capped at
-    /// `pagination::EXCLUDED_TALLY_MAX_BYTES`.
+    /// `response_bound::EXCLUDED_TALLY_MAX_BYTES`.
     fn naming_only_new(&self, named: &HashSet<&str>) -> ExcludedReferences {
         let mut files: Vec<pagination::FileTally> =
             self.files.iter().filter(|tally| !named.contains(tally.path.as_str())).cloned().collect();
-        let cut = pagination::truncate_to_bytes(&mut files, pagination::EXCLUDED_TALLY_MAX_BYTES);
+        let cut = response_bound::truncate_to_bytes(&mut files, response_bound::EXCLUDED_TALLY_MAX_BYTES);
         ExcludedReferences { files, files_truncated: self.files_truncated || cut, ..self.clone() }
     }
 }
@@ -483,7 +485,7 @@ impl CallerParts<'_> {
         total: Option<usize>,
         send: bool,
     ) -> CallerPage<'p> {
-        let files = pagination::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
+        let files = response_bound::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
             .then_some(self.tally.as_slice());
         let named: HashSet<&str> = page
             .results
@@ -636,9 +638,14 @@ pub(crate) fn handle_callers_in_covered(
         params.cursor.as_deref(),
     )
     .map_err(|e| internal_error("failed to find callers", e))?;
-    let (tally, tally_truncated) =
-        pagination::tally_edge_files_bounded(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
-            .map_err(|e| internal_error("failed to tally calling files", e))?;
+    let (tally, tally_truncated) = response_bound::tally_edge_files_bounded(
+        &conn,
+        &anchor.id,
+        Direction::Incoming,
+        &["CALLS"],
+        &file_paths,
+    )
+    .map_err(|e| internal_error("failed to tally calling files", e))?;
     let parts = CallerParts {
         conn: &conn,
         anchor: &anchor,
@@ -663,9 +670,14 @@ pub(crate) fn handle_callers_in_covered(
             pagination::EdgeRow { item: CallerSite::from(site), rank }
         })
         .collect();
-    let bounded = pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
-        pagination::wire_len(&parts.response(candidate, pagination::widest_total(candidate.has_more), false))
-    });
+    let bounded =
+        response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
+            response_bound::wire_len(&parts.response(
+                candidate,
+                response_bound::widest_total(candidate.has_more),
+                false,
+            ))
+        });
     let total = bounded
         .has_more
         .then(|| pagination::count_edges(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths))
@@ -837,9 +849,14 @@ pub(crate) fn handle_callees_in_covered(
             pagination::EdgeRow { item: CalleeSite::from(site), rank }
         })
         .collect();
-    let bounded = pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
-        pagination::wire_len(&parts.response(candidate, pagination::widest_total(candidate.has_more), false))
-    });
+    let bounded =
+        response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
+            response_bound::wire_len(&parts.response(
+                candidate,
+                response_bound::widest_total(candidate.has_more),
+                false,
+            ))
+        });
     let total = bounded
         .has_more
         .then(|| pagination::count_edges(&conn, &anchor.id, Direction::Outgoing, &["CALLS"], &file_paths))
@@ -852,9 +869,9 @@ pub(crate) fn handle_callees_in_covered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::queries::{upsert_edge, upsert_node};
+    use crate::model::EdgeRecord;
     use crate::storage::schema;
-    use crate::storage::write::EdgeRecord;
+    use crate::storage::write::{upsert_edge, upsert_node};
 
     /// The capability map every test in this module passes: empty, so
     /// `provenance::resolve` reads "no plugin here declares a semantic
@@ -1240,7 +1257,7 @@ mod tests {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
             .unwrap();
-        let over = pagination::MAX_EXCLUDED_FILE_TALLY + 3;
+        let over = response_bound::MAX_EXCLUDED_FILE_TALLY + 3;
         for i in 0..over {
             let id = format!("spec{i}");
             let path = format!("spec{i}.test.rs");
@@ -1268,7 +1285,7 @@ mod tests {
         assert_eq!(body["excludedReferences"]["count"], over, "the count stays whole");
         assert_eq!(
             body["excludedReferences"]["files"].as_array().unwrap().len(),
-            pagination::MAX_EXCLUDED_FILE_TALLY,
+            response_bound::MAX_EXCLUDED_FILE_TALLY,
             "the tally, and only the tally, is what the cap cuts",
         );
         assert_eq!(body["excludedReferences"]["filesTruncated"], true);

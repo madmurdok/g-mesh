@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::ipc;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
@@ -61,7 +62,9 @@ impl Project {
     }
 
     fn endpoint(&self) -> ipc::Endpoint {
-        daemon::endpoint(self.root()).expect("failed to resolve the daemon endpoint")
+        StateDir::of(self.root())
+            .and_then(|sd| g_mesh::control::lock::endpoint(&sd))
+            .expect("failed to resolve the daemon endpoint")
     }
 
     /// Whether anything is answering on this project's endpoint. Replaces
@@ -69,11 +72,13 @@ impl Project {
     /// Unix and the only form of it that exists on Windows, where a pipe name
     /// has no filesystem presence at all.
     fn is_listening(&self) -> bool {
-        daemon::is_listening(self.root()).expect("failed to probe the daemon endpoint")
+        StateDir::of(self.root())
+            .and_then(|sd| g_mesh::control::lock::is_listening(&sd))
+            .expect("failed to probe the daemon endpoint")
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     fn daemon_pid(&self) -> u32 {

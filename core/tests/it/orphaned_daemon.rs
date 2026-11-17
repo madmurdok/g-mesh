@@ -12,7 +12,7 @@
 //!
 //! # Why every path is captured before anything is deleted
 //!
-//! `daemon::pid_path`/`socket_path`/`endpoint` all resolve through
+//! `StateDir::of` and the endpoint derived from it resolve through
 //! `project_hash`, which canonicalizes the root - and canonicalizing a
 //! directory that has just been deleted fails. So a test that deleted the root
 //! first and then asked where the pid file was would fail on its own
@@ -35,6 +35,7 @@ use std::time::Duration;
 use g_mesh::daemon;
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, PLUGIN_IDLE_ENV};
 use g_mesh::daemon::manifest;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::shim::DAEMON_LOG_FILE;
 use g_mesh::storage::connection::project_dir;
 
@@ -125,11 +126,11 @@ impl Project {
     }
 
     fn core_pid_file(&self) -> PathBuf {
-        daemon::pid_path_in(&self.state_dir)
+        StateDir::at(&self.state_dir).pid_file()
     }
 
     fn plugin_pid_file(&self) -> PathBuf {
-        daemon::plugin_pid_path_in(&self.state_dir)
+        StateDir::at(&self.state_dir).plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)
     }
 }
 
@@ -137,7 +138,7 @@ impl Drop for Project {
     fn drop(&mut self) {
         // Every plugin that is still recorded, before the state directory that
         // records it goes: a leaked node process would outlive the whole suite.
-        for (_, path) in daemon::registry::discovered_pid_files(&self.state_dir) {
+        for (_, path) in StateDir::at(&self.state_dir).plugin_pid_files() {
             common::kill_pid_file(&path);
         }
         common::kill_pid_file(&self.core_pid_file());
@@ -268,9 +269,9 @@ fn assert_released_everything(project: &Project, daemon_process: &mut Daemon, pl
     let mut leftovers = vec![
         project.core_pid_file(),
         project.plugin_pid_file(),
-        daemon::build_stamp_path_in(&project.state_dir),
+        StateDir::at(&project.state_dir).build_stamp_file(),
     ];
-    // Spelled out rather than taken from `daemon::socket_path`, which resolves
+    // Spelled out rather than taken from `StateDir::of(root).socket_file()`, which resolves
     // through the root this test has just deleted; the constant behind it is
     // private to `daemon`, so this is the one place the name is repeated.
     #[cfg(unix)]
@@ -391,7 +392,9 @@ const HOLD_PAST_RELEASE: Duration = Duration::from_secs(1);
 #[test]
 fn a_purge_that_finds_the_bootstrap_lock_held_waits_for_it() {
     let mut project = Project::new();
-    let lock_path = daemon::lock_path(project.root()).expect("failed to resolve the bootstrap lock");
+    let lock_path = StateDir::of(project.root())
+        .map(|sd| sd.bootstrap_lock_file())
+        .expect("failed to resolve the bootstrap lock");
     let mut daemon_process = Daemon::spawn(Path::new(BIN), project.root());
     let _plugin_pid = wait_until_fully_up(&project);
     let lock = std::fs::File::options()
@@ -646,7 +649,9 @@ fn a_daemon_whose_project_root_still_exists_is_left_alone() {
         "a daemon whose project root and executable both exist must not stop itself"
     );
     assert!(
-        daemon::is_listening(project.root()).expect("the endpoint must be resolvable"),
+        StateDir::of(project.root())
+            .and_then(|sd| g_mesh::control::lock::is_listening(&sd))
+            .expect("the endpoint must be resolvable"),
         "and must still be serving its endpoint"
     );
     assert_eq!(

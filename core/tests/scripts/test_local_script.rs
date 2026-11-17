@@ -603,8 +603,8 @@ const HEAVY_JUNIT: &str = r#"<testsuites><testsuite name="g-mesh">
 <testcase classname="g-mesh" name="unlisted::slow" time="15.0"/>
 <testcase classname="g-mesh" name="unlisted::at_threshold" time="10.0"/>
 <testcase classname="g-mesh" name="unlisted::fast" time="9.9"/>
-<testcase classname="g-mesh" name="graph::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence" time="300.0"/>
-<testcase classname="g-mesh" name="graph::containers::tests::bulk_batch_boundaries_do_not_change_the_result" time="60.0"/>
+<testcase classname="g-mesh" name="storage::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence" time="300.0"/>
+<testcase classname="g-mesh" name="storage::containers::tests::bulk_batch_boundaries_do_not_change_the_result" time="60.0"/>
 </testsuite></testsuites>
 "#;
 

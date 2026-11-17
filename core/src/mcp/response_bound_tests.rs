@@ -16,12 +16,14 @@ use super::unlinked::CandidateTally;
 use super::{find_callers_callees, find_implementations, find_references};
 use super::{Answer, FindImplementationsParams, SymbolQueryParams};
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, EXCLUDED_TALLY_MAX_BYTES, FILE_TALLY_MAX_BYTES, MAX_RESPONSE_BYTES};
+use crate::graph::pagination::decode_cursor;
 use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::response_bound::{self, EXCLUDED_TALLY_MAX_BYTES, FILE_TALLY_MAX_BYTES, MAX_RESPONSE_BYTES};
+use crate::model::{Diff, EdgeRecord, NodeRecord};
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
+use crate::storage::write::apply_diff;
 
 /// `provenance::PENDING_FILES_MAX_BYTES`.
 const PENDING_FILES_MAX_BYTES: usize = 1_500;
@@ -507,7 +509,7 @@ fn fit_budget_finds_the_budget_at_which_the_whole_fits() {
         let part = budget.min(30_000);
         (part, part + 5_000)
     };
-    let budget = pagination::fit_budget(measure);
+    let budget = response_bound::fit_budget(measure);
     assert_eq!(budget, MAX_RESPONSE_BYTES - 5_000);
     assert!(measure(budget).1 <= MAX_RESPONSE_BYTES);
 }
@@ -519,9 +521,145 @@ fn fit_budget_finds_the_budget_at_which_the_whole_fits() {
 #[test]
 fn fit_budget_stops_at_a_part_that_no_longer_shrinks() {
     let mut rounds = 0;
-    pagination::fit_budget(|_| {
+    response_bound::fit_budget(|_| {
         rounds += 1;
         (1_000, MAX_RESPONSE_BYTES + 10)
     });
     assert!(rounds <= 2, "{rounds} rounds");
+}
+
+/// The byte cut of a bare page (`bound_page`).
+mod bound_page {
+    use super::*;
+    use crate::graph::pagination::{EdgeRank, EdgeRow, Page};
+    use crate::mcp::response_bound::bound_page;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct Item {
+        id: String,
+        blob: String,
+    }
+
+    fn rank(edge_id: String, resolved: bool) -> EdgeRank {
+        EdgeRank { resolved, locality: 0, file_row: 0, file_path: String::new(), start_line: 0, id: edge_id }
+    }
+
+    fn edge_row(id: &str, blob_len: usize) -> EdgeRow<Item> {
+        EdgeRow {
+            item: Item { id: id.to_string(), blob: "x".repeat(blob_len) },
+            rank: rank(format!("e_{id}"), true),
+        }
+    }
+
+    fn edge_row_resolved(id: &str, resolved: bool) -> EdgeRow<Item> {
+        EdgeRow {
+            item: Item { id: id.to_string(), blob: String::new() },
+            rank: rank(format!("e_{id}"), resolved),
+        }
+    }
+
+    #[test]
+    fn a_page_that_already_fits_the_byte_budget_is_returned_completely_unchanged() {
+        let rows = vec![edge_row("a", 10), edge_row("b", 10)];
+        let page = bound_page(rows, true, Some("upstream-cursor".to_string()));
+
+        assert_eq!(page.results.len(), 2);
+        assert_eq!(page.results[0].id, "a");
+        assert_eq!(page.results[1].id, "b");
+        assert!(page.has_more, "has_more must pass through untouched when nothing needed truncating");
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some("upstream-cursor"),
+            "an upstream cursor must not be replaced just because bound_page ran"
+        );
+    }
+
+    #[test]
+    fn an_oversized_page_truncates_to_the_longest_prefix_that_fits_the_budget() {
+        // Each row's blob is ~1000 bytes: comfortably under budget alone, but
+        // 30 of them together blow past MAX_RESPONSE_BYTES (20,000).
+        let rows: Vec<EdgeRow<Item>> = (0..30).map(|i| edge_row(&format!("n{i:02}"), 1000)).collect();
+        let page = bound_page(rows, false, None);
+
+        assert!(page.results.len() < 30, "the full 30 rows must not fit in one page: {}", page.results.len());
+        assert!(!page.results.is_empty());
+        assert!(page.has_more, "a byte-truncated page must always report more");
+        let cursor = page.next_cursor.expect("a byte-truncated page must carry a resumable cursor");
+
+        let raw = serde_json::to_vec(&page.results).unwrap();
+        assert!(
+            raw.len() <= MAX_RESPONSE_BYTES,
+            "the truncated page itself must respect the budget: {}",
+            raw.len()
+        );
+
+        // The cursor must resume right after the last row actually returned,
+        // not an arbitrary or off-by-one boundary.
+        let last_included = page.results.last().unwrap().id.clone();
+        let decoded: EdgeRank = decode_cursor(&cursor).unwrap();
+        assert_eq!(decoded.id, format!("e_{last_included}"));
+    }
+
+    #[test]
+    fn a_single_row_that_alone_exceeds_the_budget_is_still_returned_rather_than_an_empty_page() {
+        let rows = vec![edge_row("huge", MAX_RESPONSE_BYTES + 1000)];
+        let page = bound_page(rows, false, None);
+
+        assert_eq!(page.results.len(), 1, "at least one row must survive even if it alone busts the budget");
+        assert!(page.has_more, "an oversized single row is still a truncation, not a complete page");
+        assert!(page.next_cursor.is_some());
+    }
+
+    #[test]
+    fn an_empty_page_is_returned_unchanged_regardless_of_has_more() {
+        let page: Page<Item> = bound_page(Vec::new(), false, None);
+        assert!(page.results.is_empty());
+        assert!(!page.has_more);
+        assert!(page.next_cursor.is_none());
+        assert!(!page.all_unresolved, "an empty page has nothing to be suspicious of");
+    }
+
+    #[test]
+    fn a_page_where_every_row_is_unresolved_is_flagged_all_unresolved() {
+        let rows = vec![edge_row_resolved("a", false), edge_row_resolved("b", false)];
+        let page = bound_page(rows, false, None);
+        assert!(page.all_unresolved, "every row unresolved must set the marker");
+    }
+
+    #[test]
+    fn a_page_with_at_least_one_resolved_row_is_not_flagged_even_if_most_rows_are_unresolved() {
+        let rows = vec![
+            edge_row_resolved("resolved", true),
+            edge_row_resolved("b", false),
+            edge_row_resolved("c", false),
+            edge_row_resolved("d", false),
+        ];
+        let page = bound_page(rows, false, None);
+        assert!(!page.all_unresolved, "a single resolved row must be enough to clear the marker");
+    }
+
+    #[test]
+    fn an_empty_result_set_is_never_flagged_all_unresolved() {
+        let page: Page<Item> = bound_page(Vec::new(), false, None);
+        assert!(!page.all_unresolved, "nothing to be suspicious of when there are no rows at all");
+    }
+
+    #[test]
+    fn all_unresolved_reflects_the_truncated_prefix_actually_returned() {
+        // Every row is unresolved and, individually, blows the byte budget -
+        // forcing bound_page down its truncation path. The marker must still
+        // come out true: truncation cuts the tail, but resolved:true rows
+        // always sort first, so a cut prefix can only ever contain a subset
+        // of an already-all-unresolved set.
+        let rows: Vec<EdgeRow<Item>> = (0..5)
+            .map(|i| EdgeRow {
+                item: Item { id: format!("n{i}"), blob: "x".repeat(MAX_RESPONSE_BYTES / 3) },
+                rank: rank(format!("e_n{i}"), false),
+            })
+            .collect();
+        let page = bound_page(rows, false, None);
+        assert!(page.results.len() < 5, "must actually have truncated for this test to prove anything");
+        assert!(page.all_unresolved);
+    }
 }

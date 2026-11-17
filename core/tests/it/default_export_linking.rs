@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -106,7 +106,7 @@ impl Project {
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     /// `(kind, source, resolved)` of every *usage* edge landing on the `Foo`

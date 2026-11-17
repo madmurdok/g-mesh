@@ -105,8 +105,8 @@ section_filter() {
 	core-mcp) echo 'package(g-mesh) & kind(lib) & test(/^mcp::/)' ;;
 	core-daemon) echo 'package(g-mesh) & kind(lib) & test(/^daemon::/)' ;;
 	core-cli) echo 'package(g-mesh) & kind(lib) & test(/^cli::/)' ;;
-	core-graph) echo 'package(g-mesh) & kind(lib) & test(/^graph::/)' ;;
-	core-rest) echo 'package(g-mesh) & (kind(bin) | (kind(lib) & !test(/^(mcp|daemon|cli|graph)::/)))' ;;
+	core-graph) echo 'package(g-mesh) & kind(lib) & test(/^(graph|link)::/)' ;;
+	core-rest) echo 'package(g-mesh) & (kind(bin) | (kind(lib) & !test(/^(mcp|daemon|cli|graph|link)::/)))' ;;
 	sdk) echo 'package(g-mesh-plugin-sdk)' ;;
 	plugin-typescript) echo 'package(g-mesh-plugin-typescript)' ;;
 	plugin-rust) echo 'package(g-mesh-plugin-rust)' ;;

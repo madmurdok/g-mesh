@@ -19,7 +19,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::protocol::types::CURRENT_PROTOCOL_VERSION;
 use g_mesh::storage::connection::project_dir;
 
@@ -145,7 +145,7 @@ fn two_plugins_claiming_the_same_extension_fails_daemon_startup_with_a_clear_err
     // decided by the bind alone - see that function's own doc comment) that
     // other startup failures can still leave a socket *file* behind.
     assert!(
-        !daemon::is_listening(project.root()).unwrap(),
+        !StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap(),
         "a daemon that failed to start must not be answering connections"
     );
 }

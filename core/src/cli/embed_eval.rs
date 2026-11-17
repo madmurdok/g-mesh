@@ -54,6 +54,7 @@ use crate::embedding::model::{
     ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
 use crate::embedding::text::{full_text, is_noise, text_to_embed, EmbedInput};
+use crate::storage::embed_row::EmbedRow;
 
 use config::{Arm, ContextForm, CorporaFile, EmbedFilter, Role, TextForm, Variant, VariantsFile};
 use metrics::{Bound, Floors, Outcome, KEPT_HITS};
@@ -293,15 +294,21 @@ impl Node {
     fn filtered(&self, filter: EmbedFilter) -> bool {
         match filter {
             EmbedFilter::None => false,
-            EmbedFilter::Noise => is_noise(&EmbedInput {
-                kind: &self.kind,
-                name: &self.name,
-                qualified_name: &self.qualified_name,
-                file_path: &self.file_path,
-                doc: self.doc.as_deref(),
-                signature: self.signature.as_deref(),
-                generated: false,
-            }),
+            EmbedFilter::Noise => is_noise(&EmbedInput::from_row(&self.embed_row())),
+        }
+    }
+
+    /// This node as an [`EmbedRow`]; a snapshot may predate `generated`, so
+    /// it is `false`.
+    fn embed_row(&self) -> EmbedRow {
+        EmbedRow {
+            kind: self.kind.clone(),
+            name: self.name.clone(),
+            qualified_name: self.qualified_name.clone(),
+            file_path: self.file_path.clone(),
+            doc: self.doc.clone(),
+            signature: self.signature.clone(),
+            generated: false,
         }
     }
 

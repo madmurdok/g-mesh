@@ -5,8 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// The edges whose removal broke core's large module cycle.
-const REMOVED_EDGES: [&str; 8] = [
+/// The edges whose removal broke core's large module cycle and the
+/// `storage`/`graph`/`embedding` cycle: storage reaches graph and embedding
+/// only through the `model` leaf, the `link` module and the vector seams.
+const REMOVED_EDGES: [&str; 15] = [
     "project_walk->watcher",
     "protocol->graph",
     "shim->mcp",
@@ -15,6 +17,13 @@ const REMOVED_EDGES: [&str; 8] = [
     "storage->daemon",
     "config->storage",
     "embedding->daemon",
+    "storage->graph",
+    "storage->embedding",
+    "graph->storage",
+    "link->storage",
+    "model->storage",
+    "model->graph",
+    "plugin_manifest->graph",
 ];
 
 /// GM-707: `watcher` keeps only the event source and `ingest` sits below

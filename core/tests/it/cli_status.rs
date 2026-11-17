@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use g_mesh::config::{self, CleanupConfig, GlobalConfig};
 use g_mesh::daemon;
 use g_mesh::daemon::{manifest, registry};
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
@@ -89,11 +90,13 @@ impl Project {
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     fn plugin_pid_file(&self) -> PathBuf {
-        daemon::plugin_pid_path(self.root()).expect("failed to resolve the plugin pid file path")
+        StateDir::of(self.root())
+            .map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE))
+            .expect("failed to resolve the plugin pid file path")
     }
 
     fn recorded_pid(&self, path: &Path) -> u32 {
@@ -300,12 +303,17 @@ fn status_does_not_show_a_dead_daemons_leftover_phase_and_progress_as_live() {
     let dead_pid = exited.id();
     exited.wait().expect("failed to wait for the short-lived process");
     daemon::write_pid_file(&project.pid_file(), dead_pid);
-    std::fs::write(daemon::phase_path_in(&state_dir), "embedding\n").expect("failed to write index.phase");
+    std::fs::write(StateDir::at(&state_dir).phase_file(), "embedding\n")
+        .expect("failed to write index.phase");
     let progress = format!(
         r#"{{"pid":{dead_pid},"updatedAtMs":0,"phase":"embedding","walk":{{"languagesDone":1,"languagesTotal":1,"currentLanguage":null,"items":10}},"semantic":{{"languagesDone":1,"languagesTotal":1,"currentLanguage":null}},"embeddings":{{"done":50,"total":200}}}}"#
     );
-    std::fs::write(daemon::progress_path_in(&state_dir), progress).expect("failed to write index.progress");
-    assert!(daemon::read_progress_in(&state_dir).is_some(), "the fixture must parse as a progress snapshot");
+    std::fs::write(StateDir::at(&state_dir).progress_file(), progress)
+        .expect("failed to write index.progress");
+    assert!(
+        g_mesh::indexing_status::read_progress(&StateDir::at(&state_dir)).is_some(),
+        "the fixture must parse as a progress snapshot"
+    );
 
     let status = project.status();
 
@@ -375,7 +383,7 @@ fn status_in_a_front_served_folder_prints_the_front_line_and_no_coverage() {
         std::fs::create_dir_all(project.root().join(repo)).expect("failed to create a candidate repo");
     }
     let mut daemon_process = spawn_daemon(project.root());
-    let phase_file = daemon::phase_path_in(&project.state_dir());
+    let phase_file = StateDir::at(project.state_dir()).phase_file();
     wait_for("the front to publish its phase", || {
         std::fs::read_to_string(&phase_file).map(|phase| phase.trim() == "front").unwrap_or(false)
     });
@@ -532,7 +540,7 @@ fn status_ignores_a_dead_daemons_leftover_rerank_outcome() {
     exited.wait().expect("failed to wait for the short-lived process");
     daemon::write_pid_file(&project.pid_file(), dead_pid);
     std::fs::write(
-        daemon::rerank_outcome_path_in(&state_dir),
+        StateDir::at(&state_dir).rerank_outcome_file(),
         format!(r#"{{"pid":{dead_pid},"outcome":"absent","dir":"/models/rerank"}}"#),
     )
     .expect("failed to write rerank.outcome");
@@ -546,7 +554,7 @@ fn status_ignores_a_dead_daemons_leftover_rerank_outcome() {
 /// A daemon clears a leftover outcome when it starts; while it runs,
 /// `status` reports the outcome its pid wrote.
 ///
-/// *Control:* drop the `remove_file(rerank_outcome_path_in(..))` from
+/// *Control:* drop the `remove_file(state.rerank_outcome_file())` from
 /// `daemon::run` -> the planted leftover is never cleared and the wait
 /// times out.
 #[test]
@@ -554,7 +562,7 @@ fn status_reports_the_live_daemons_rerank_outcome_and_the_daemon_clears_it() {
     let project = Project::new();
     let state_dir = project.state_dir();
     std::fs::create_dir_all(&state_dir).expect("failed to create the state directory");
-    let outcome_file = daemon::rerank_outcome_path_in(&state_dir);
+    let outcome_file = StateDir::at(&state_dir).rerank_outcome_file();
     std::fs::write(&outcome_file, r#"{"pid":1,"outcome":"loaded","dir":null}"#)
         .expect("failed to plant a leftover rerank.outcome");
 

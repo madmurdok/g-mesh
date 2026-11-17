@@ -31,6 +31,22 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+/// Writes a batch of vectors onto `conn`. The per-language swap calls it on
+/// its own transaction, after the row upserts and before the bookkeeping, so
+/// the vectors commit or roll back with the rows they describe: an
+/// implementation must write through the connection it is given and never
+/// open, commit or release a transaction or savepoint of its own.
+/// Best-effort, like `EmbeddingPipeline::store`, which logs its own errors.
+pub trait VectorWrite {
+    fn write(&self, conn: &Connection);
+}
+
+impl<F: Fn(&Connection)> VectorWrite for F {
+    fn write(&self, conn: &Connection) {
+        self(conn)
+    }
+}
+
 /// Registers the sqlite-vec extension with SQLite's process-wide
 /// auto-extension hook. Idempotent - guarded by [`std::sync::Once`] so
 /// calling it from every place that opens a connection (the daemon's real
