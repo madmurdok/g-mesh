@@ -206,4 +206,5 @@ tempfile = "3"
 # The `ep-coreml` ONNX Runtime log test asks the installed subscriber which
 # targets and levels it lets through.
 tracing = "0.1"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+# `test-util`: the heartbeat tests run on tokio's paused clock.
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "test-util"] }

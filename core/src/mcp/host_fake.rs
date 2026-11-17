@@ -34,6 +34,16 @@ impl FakeHost {
             requests: AtomicUsize::new(0),
         }
     }
+
+    /// Queues `files` changes for the next `replay_pending` to drain.
+    pub(crate) fn queue(&self, files: usize) {
+        self.pending.fetch_add(files, Ordering::SeqCst);
+    }
+
+    /// How many times `Activity::request` has run.
+    pub(crate) fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
 }
 
 impl Activity for FakeHost {

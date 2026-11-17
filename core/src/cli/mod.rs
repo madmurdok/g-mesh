@@ -804,4 +804,34 @@ mod tests {
         let status: anyhow::Error = ExitStatus { code: 2, message: "partial".to_string() }.into();
         assert_eq!(exit_code(&status.context("while running init")), 2);
     }
+
+    /// `debug-embed-eval` exists only in a build with the `embed-eval`
+    /// feature: the default build rejects it as an unknown subcommand.
+    #[test]
+    fn debug_embed_eval_exists_only_with_the_embed_eval_feature() {
+        let err = parse(&["debug-embed-eval", "--help"]).expect_err("`--help` or an unknown subcommand");
+        if cfg!(feature = "embed-eval") {
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp, "{err}");
+        } else {
+            assert_eq!(err.kind(), ErrorKind::InvalidSubcommand, "{err}");
+        }
+    }
+
+    /// The feature is off by default, and `ep-coreml` (which times the eval
+    /// on CoreML) turns it on.
+    #[test]
+    fn embed_eval_is_off_by_default_and_ep_coreml_implies_it() {
+        let manifest: toml::Value = toml::from_str(include_str!("../../Cargo.toml")).unwrap();
+        let features = manifest["features"].as_table().expect("a [features] table");
+        let enables = |feature: &str| -> Vec<&str> {
+            features
+                .get(feature)
+                .and_then(toml::Value::as_array)
+                .map(|list| list.iter().filter_map(toml::Value::as_str).collect())
+                .unwrap_or_default()
+        };
+        assert!(features.contains_key("embed-eval"), "{features:?}");
+        assert!(!enables("default").contains(&"embed-eval"), "{features:?}");
+        assert!(enables("ep-coreml").contains(&"embed-eval"), "{features:?}");
+    }
 }

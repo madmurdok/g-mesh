@@ -48,12 +48,16 @@ mod get_file_outline;
 mod host;
 #[cfg(test)]
 mod host_fake;
+#[cfg(test)]
+mod host_tests;
 mod instructions;
 #[cfg(test)]
 mod member_name_collision_tests;
 mod not_indexed;
 mod overrides;
 mod progress;
+#[cfg(test)]
+mod progress_tests;
 mod provenance;
 pub(crate) mod query_shapes;
 pub(crate) mod response_bound;
