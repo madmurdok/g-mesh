@@ -17,6 +17,7 @@ use crate::model::NodeRecord;
 
 use super::context::QueryCtx;
 use super::not_indexed;
+use super::query::Redirect;
 use super::tool_result::{internal_error, success};
 use super::{GetFileOutlineParams, OutlineDetail};
 
@@ -167,6 +168,7 @@ pub(super) fn handle(ctx: &QueryCtx, params: GetFileOutlineParams) -> Result<Cal
                 coverage,
                 format!("g-mesh: no file '{}' found in the index", params.file_path),
             )
+            .and_then(|refusal| response_bound::render(&Redirect::Refused(refusal)))
         }
     };
 

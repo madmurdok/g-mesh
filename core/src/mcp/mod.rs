@@ -59,6 +59,7 @@ mod progress;
 #[cfg(test)]
 mod progress_tests;
 mod provenance;
+pub(crate) mod query;
 pub(crate) mod query_shapes;
 pub(crate) mod response_bound;
 #[cfg(test)]
@@ -682,9 +683,9 @@ impl GMeshMcpServer {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
         let params = params.0;
-        self.query_ctx(None, params.file_path.as_deref())
-            .resolve_lazily_off_worker(find_definition::handle, params)
-            .await
+        let answer =
+            query::definition_off_worker(self.query_ctx(None, params.file_path.as_deref()), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -700,9 +701,9 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let params = params.0;
-        self.query_ctx(params.file_paths.as_deref(), None)
-            .resolve_lazily_off_worker(find_references::handle, params)
-            .await
+        let answer =
+            query::references_off_worker(self.query_ctx(params.file_paths.as_deref(), None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -715,9 +716,9 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let params = params.0;
-        self.query_ctx(params.file_paths.as_deref(), None)
-            .resolve_lazily_off_worker(find_callers_callees::handle_callers, params)
-            .await
+        let answer =
+            query::callers_off_worker(self.query_ctx(params.file_paths.as_deref(), None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -730,9 +731,9 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         let params = params.0;
-        self.query_ctx(params.file_paths.as_deref(), None)
-            .resolve_lazily_off_worker(find_callers_callees::handle_callees, params)
-            .await
+        let answer =
+            query::callees_off_worker(self.query_ctx(params.file_paths.as_deref(), None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -750,9 +751,8 @@ impl GMeshMcpServer {
         let params = params.0;
         // `transitive` ignores `file_paths`, so it names nothing about them.
         let file_paths = if params.transitive.unwrap_or(false) { None } else { params.file_paths.as_deref() };
-        self.query_ctx(file_paths, None)
-            .resolve_lazily_off_worker(find_implementations::dispatch, params)
-            .await
+        let answer = query::implementations_off_worker(self.query_ctx(file_paths, None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(

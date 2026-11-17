@@ -30,6 +30,7 @@ use crate::embedding::model::EMBEDDING_DIM;
 use crate::embedding::pipeline::test_support::{fake_pipeline, Counters};
 use crate::graph::Direction;
 use crate::indexing_status::Phase;
+use crate::mcp::query::test_support::Rendered;
 use crate::model::{EdgeRecord, NodeRecord};
 use crate::protocol::types::Position;
 use crate::storage::index_store::IndexStore;
@@ -40,7 +41,8 @@ use crate::storage::write::{upsert_edge, upsert_node};
 const UPDATE_ENV: &str = "G_MESH_UPDATE_WIRE_GOLDEN";
 
 /// `isError`, then every content block's text in order.
-fn render(result: &CallToolResult) -> String {
+fn render(result: &impl Rendered) -> String {
+    let result = &result.rendered();
     let mut out = format!("isError: {:?}\n", result.is_error);
     for (i, block) in result.content.iter().enumerate() {
         match block {
@@ -52,7 +54,7 @@ fn render(result: &CallToolResult) -> String {
 }
 
 /// Compares `result`'s rendering with `testdata/wire_golden/<shape>.txt`.
-fn assert_wire(shape: &str, result: &CallToolResult) {
+fn assert_wire(shape: &str, result: &impl Rendered) {
     let actual = render(result);
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/mcp/testdata/wire_golden")

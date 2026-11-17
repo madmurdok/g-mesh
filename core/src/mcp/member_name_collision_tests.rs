@@ -13,9 +13,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rmcp::model::CallToolResult;
-
 use crate::daemon::bulk_index;
+use crate::mcp::query::test_support::Rendered;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
 use crate::plugin_manifest::{read_manifest, DiscoveredPlugins};
 use crate::storage::connection::{open, project_dir};
@@ -151,7 +150,8 @@ impl Drop for Walked {
     }
 }
 
-fn json_body(result: &CallToolResult) -> serde_json::Value {
+fn json_body(result: &impl Rendered) -> serde_json::Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),

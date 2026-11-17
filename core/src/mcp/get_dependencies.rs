@@ -24,6 +24,7 @@ use crate::model::NodeRecord;
 
 use super::context::QueryCtx;
 use super::not_indexed;
+use super::query::Redirect;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{error, internal_error, success};
 use super::GetDependenciesParams;
@@ -804,6 +805,7 @@ pub(crate) fn handle(ctx: &QueryCtx, params: GetDependenciesParams) -> Result<Ca
         (None, Some(file_path), None) => match coverage {
             Some(coverage) if uncovered_miss(&conn, &file_path)? => {
                 not_indexed::miss(&conn, Some(coverage), format!("g-mesh: no file '{file_path}' found in the index"))
+                    .and_then(|refusal| response_bound::render(&Redirect::Refused(refusal)))
             }
             _ => from_file(&conn, entry_points, &file_path, &shape),
         },

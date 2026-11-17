@@ -4,6 +4,8 @@
 //! `graph::pagination`'s.
 
 use anyhow::Result;
+use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -12,6 +14,9 @@ use crate::graph::pagination::{
 };
 use crate::graph::Direction;
 use crate::model::NodeRecord;
+
+use super::not_indexed;
+use super::query::{Refusal, ToolAnswer, WirePage};
 
 /// Ceiling on a single MCP tool response body, in serialized-JSON bytes of
 /// the whole response: rows, tallies, hints and every other field.
@@ -105,6 +110,31 @@ pub fn bound_page<T: Serialize>(
 /// Serialized JSON length of `value`, the unit every byte budget here is in.
 pub fn wire_len<T: Serialize + ?Sized>(value: &T) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// The one place a tool answer becomes bytes. [`wire_len`] measures the same
+/// serialization: `ContentBlock::json` is compact `serde_json::to_string`.
+pub(crate) fn render<P: WirePage>(answer: &ToolAnswer<P>) -> Result<CallToolResult, ErrorData> {
+    fn json<T: Serialize>(value: &T) -> Result<ContentBlock, ErrorData> {
+        ContentBlock::json(value)
+    }
+    Ok(match answer {
+        ToolAnswer::Page(page) => {
+            let mut blocks = Vec::with_capacity(2);
+            if let Some(note) = page.lead_note() {
+                blocks.push(ContentBlock::text(note.to_owned()));
+            }
+            blocks.push(json(page)?);
+            CallToolResult::success(blocks)
+        }
+        ToolAnswer::Candidates(candidates) => CallToolResult::success(vec![json(candidates)?]),
+        ToolAnswer::Refused(Refusal::Text(message)) => {
+            CallToolResult::error(vec![ContentBlock::text(message.clone())])
+        }
+        ToolAnswer::Refused(Refusal::NotIndexed { error, not_indexed }) => {
+            CallToolResult::error(vec![json(&not_indexed::Refusal { error, not_indexed })?])
+        }
+    })
 }
 
 /// The largest byte budget for a response's one growable part (its rows, or

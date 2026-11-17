@@ -9,7 +9,6 @@
 use std::collections::HashSet;
 
 use anyhow::Context;
-use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -21,11 +20,13 @@ use crate::mcp::response_bound;
 use crate::model::NodeRecord;
 use crate::plugin_manifest::MemberOverrides;
 
+use super::answer::EdgeAnswer;
 use super::context::QueryCtx;
 use super::not_indexed::{self, NotIndexed};
 use super::overrides::{self, OverriddenMember, Overrides};
+use super::query::ToolAnswer;
 use super::session_hints::{self, HintKey, SessionHints};
-use super::tool_result::{internal_error, success};
+use super::tool_result::internal_error;
 use super::unlinked::{self, UnlinkedUsages};
 use super::untyped::{self, UntypedReceiverCalls};
 use super::{anchor, answer, find_definition, provenance, Answer, SymbolQueryParams};
@@ -171,12 +172,12 @@ impl From<CallSite> for CalleeSite {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CallerPage<'a> {
+pub(crate) struct CallerPage {
     /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
     /// so a caller asking about usages "elsewhere" doesn't need a separate
     /// `find_definition` call just to learn the anchor's own file/line.
-    anchor: &'a anchor::AnchorInfo,
-    results: &'a [CallerSite],
+    anchor: anchor::AnchorInfo,
+    results: Vec<CallerSite>,
     /// Every file holding a call to the anchor, with a per-file count, over
     /// the whole edge set rather than this page - see
     /// `pagination::tally_edge_files`, and `find_references`' identically
@@ -188,7 +189,7 @@ struct CallerPage<'a> {
     /// change, a removal - all run *inbound*, so a callee-side tally would be
     /// payload on every response for a question the tool never gets.
     #[serde(skip_serializing_if = "Option::is_none")]
-    files: Option<&'a [pagination::FileTally]>,
+    files: Option<Vec<pagination::FileTally>>,
     /// Present only when `files` leaves files out, cut by its entry or byte
     /// cap (`response_bound::tally_edge_files_bounded`); absent, not `false`,
     /// otherwise.
@@ -199,7 +200,7 @@ struct CallerPage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<usize>,
     has_more: bool,
-    next_cursor: Option<&'a str>,
+    next_cursor: Option<String>,
     /// See `Page::all_unresolved` - true when every caller in `results` came
     /// from an edge the linker couldn't confirm.
     all_unresolved: bool,
@@ -214,17 +215,17 @@ struct CallerPage<'a> {
     /// See [`UnlinkedUsages`] - calls that may target the anchor but that the
     /// linker left on a placeholder. Absent when there is no candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
-    unlinked_usages: Option<&'a UnlinkedUsages>,
+    unlinked_usages: Option<UnlinkedUsages>,
     /// See [`UntypedReceiverCalls`] - functions calling a method of the
     /// anchor's name through a receiver whose type was not inferred, with no
     /// edge to the anchor yet. Absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
+    untyped_receiver_calls: Option<UntypedReceiverCalls>,
     /// See [`Overrides`] - the base members the anchor overrides or
     /// implements, whose caller pages hold the calls made through a
     /// base-typed receiver. Absent (not `[]`) when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    overrides: Option<&'a [OverriddenMember]>,
+    overrides: Option<Vec<OverriddenMember>>,
     /// Present only when `overrides` was cut to its row cap.
     #[serde(skip_serializing_if = "answer::is_false")]
     overrides_truncated: bool,
@@ -238,8 +239,8 @@ struct CallerPage<'a> {
     /// See `super::not_indexed::group` - the `file_paths` entries in a
     /// language with no indexed files (plugin absent or failed), one entry
     /// per language. Absent when the filter is omitted or fully covered.
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    not_indexed: &'a [NotIndexed],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    not_indexed: Vec<NotIndexed>,
 }
 
 /// What a `CALLS` walk left behind, disclosed at the response level.
@@ -367,16 +368,16 @@ impl ExcludedReferences {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CalleePage<'a> {
+pub(crate) struct CalleePage {
     /// See `anchor::AnchorInfo`, same rationale as `CallerPage`'s own field.
-    anchor: &'a anchor::AnchorInfo,
-    results: &'a [CalleeSite],
+    anchor: anchor::AnchorInfo,
+    results: Vec<CalleeSite>,
     /// Exact number of callees over the whole set. Present only when
     /// `has_more`: on a complete page it is `results.len()`.
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<usize>,
     has_more: bool,
-    next_cursor: Option<&'a str>,
+    next_cursor: Option<String>,
     /// See `Page::all_unresolved` - true when every callee in `results` came
     /// from an edge the linker couldn't confirm.
     all_unresolved: bool,
@@ -399,42 +400,48 @@ struct CalleePage<'a> {
     /// See `super::not_indexed::group` - the `file_paths` entries in a
     /// language with no indexed files (plugin absent or failed), one entry
     /// per language. Absent when the filter is omitted or fully covered.
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    not_indexed: &'a [NotIndexed],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    not_indexed: Vec<NotIndexed>,
 }
 
 /// The response-level disclosures of [`CallerPage`], carried unchanged by the
 /// non-row answers (`answer::Summary`).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CallerDisclosures<'a> {
+pub(crate) struct CallerDisclosures {
     #[serde(skip_serializing_if = "Option::is_none")]
     excluded_references: Option<ExcludedReferences>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    unlinked_usages: Option<&'a UnlinkedUsages>,
+    unlinked_usages: Option<UnlinkedUsages>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
+    untyped_receiver_calls: Option<UntypedReceiverCalls>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    overrides: Option<&'a [OverriddenMember]>,
+    overrides: Option<Vec<OverriddenMember>>,
     #[serde(skip_serializing_if = "answer::is_false")]
     overrides_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    not_indexed: &'a [NotIndexed],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    not_indexed: Vec<NotIndexed>,
 }
 
 /// The response-level disclosures of [`CalleePage`], as [`CallerDisclosures`].
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CalleeDisclosures<'a> {
+pub(crate) struct CalleeDisclosures {
     #[serde(skip_serializing_if = "Option::is_none")]
     excluded_references: Option<ExcludedReferences>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    not_indexed: &'a [NotIndexed],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    not_indexed: Vec<NotIndexed>,
 }
+
+/// What `find_callers` answers: rows, or a `files`/`count` summary.
+pub(crate) type CallersAnswer = EdgeAnswer<CallerPage, CallerDisclosures>;
+
+/// What `find_callees` answers: rows, or a `files`/`count` summary.
+pub(crate) type CalleesAnswer = EdgeAnswer<CalleePage, CalleeDisclosures>;
 
 /// Every path an excluded-references tally names, for `touched` sets.
 fn excluded_paths(excluded: &Option<ExcludedReferences>) -> impl Iterator<Item = &str> {
@@ -462,12 +469,7 @@ struct CallerParts<'a> {
 impl CallerParts<'_> {
     /// The response for `page`. `send` spends once-per-session hints; without
     /// it they are only peeked, for measuring.
-    fn response<'p>(
-        &'p self,
-        page: &'p pagination::Page<CallerSite>,
-        total: Option<usize>,
-        send: bool,
-    ) -> CallerPage<'p> {
+    fn response(&self, page: &pagination::Page<CallerSite>, total: Option<usize>, send: bool) -> CallerPage {
         let files = response_bound::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
             .then_some(self.tally.as_slice());
         let named: HashSet<&str> = page
@@ -510,22 +512,22 @@ impl CallerParts<'_> {
         ]);
 
         CallerPage {
-            anchor: &self.anchor_info,
-            results: &page.results,
-            files,
+            anchor: self.anchor_info.clone(),
+            results: page.results.clone(),
+            files: files.map(<[_]>::to_vec),
             files_truncated: files.is_some() && self.tally_truncated,
             total,
             has_more: page.has_more,
-            next_cursor: page.next_cursor.as_deref(),
+            next_cursor: page.next_cursor.clone(),
             all_unresolved: page.all_unresolved,
             hint,
             excluded_references: excluded,
-            unlinked_usages: self.unlinked.as_ref(),
-            untyped_receiver_calls: self.untyped.as_ref(),
-            overrides: self.overrides.as_ref().map(|found| found.members.as_slice()),
+            unlinked_usages: self.unlinked.clone(),
+            untyped_receiver_calls: self.untyped.clone(),
+            overrides: self.overrides.as_ref().map(|found| found.members.clone()),
             overrides_truncated: self.overrides.as_ref().is_some_and(|found| found.truncated),
             provenance,
-            not_indexed: self.not_indexed,
+            not_indexed: self.not_indexed.to_vec(),
         }
     }
 }
@@ -538,13 +540,13 @@ pub(crate) fn handle_callers(
     ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
     params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<CallersAnswer>, ErrorData> {
     let QueryCtx { store, capabilities, hints, uncovered, .. } = ctx;
     let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, semantic, &params)? {
         Ok(resolved) => resolved,
-        Err(finished) => return Ok(finished),
+        Err(finished) => return Ok(finished.widen()),
     };
     // Destructured here so everything below still reads the node directly,
     // while `resolved.by` stays available for the response's `resolvedBy`.
@@ -570,7 +572,7 @@ pub(crate) fn handle_callers(
     let counted = answer::count(&conn, answer, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
         .map_err(|e| internal_error("failed to count callers", e))?;
     if let Some(counted) = counted {
-        return answer::respond(&anchor_info, &counted, |files, send| {
+        return Ok(ToolAnswer::Page(answer::respond(&anchor_info, &counted, |files, send| {
             let named: HashSet<&str> = files.into_iter().flatten().map(|tally| tally.path.as_str()).collect();
             let excluded = excluded.as_ref().map(|excluded| excluded.naming_only_new(&named));
             let touched = named
@@ -588,15 +590,15 @@ pub(crate) fn handle_callers(
             ]);
             let disclosures = CallerDisclosures {
                 excluded_references: excluded,
-                unlinked_usages: unlinked.as_ref(),
-                untyped_receiver_calls: untyped.as_ref(),
-                overrides: overrides.as_ref().map(|found| found.members.as_slice()),
+                unlinked_usages: unlinked.clone(),
+                untyped_receiver_calls: untyped.clone(),
+                overrides: overrides.as_ref().map(|found| found.members.clone()),
                 overrides_truncated: overrides.as_ref().is_some_and(|found| found.truncated),
                 provenance,
-                not_indexed: &not_indexed,
+                not_indexed: not_indexed.clone(),
             };
             (hint, disclosures)
-        });
+        })));
     }
 
     let page = list_calls(
@@ -655,7 +657,7 @@ pub(crate) fn handle_callers(
         .transpose()
         .map_err(|e| internal_error("failed to count callers", e))?;
 
-    success(&parts.response(&bounded, total, true))
+    Ok(ToolAnswer::Page(EdgeAnswer::Rows(parts.response(&bounded, total, true))))
 }
 
 /// Everything a callee page carries besides its rows; see [`CallerParts`].
@@ -672,12 +674,7 @@ struct CalleeParts<'a> {
 
 impl CalleeParts<'_> {
     /// The response for `page`, as [`CallerParts::response`].
-    fn response<'p>(
-        &'p self,
-        page: &'p pagination::Page<CalleeSite>,
-        total: Option<usize>,
-        send: bool,
-    ) -> CalleePage<'p> {
+    fn response(&self, page: &pagination::Page<CalleeSite>, total: Option<usize>, send: bool) -> CalleePage {
         let named: HashSet<&str> = page.results.iter().map(|row| row.file_path.as_str()).collect();
         let excluded = self.excluded.as_ref().map(|excluded| excluded.naming_only_new(&named));
 
@@ -702,16 +699,16 @@ impl CalleeParts<'_> {
         ]);
 
         CalleePage {
-            anchor: &self.anchor_info,
-            results: &page.results,
+            anchor: self.anchor_info.clone(),
+            results: page.results.clone(),
             total,
             has_more: page.has_more,
-            next_cursor: page.next_cursor.as_deref(),
+            next_cursor: page.next_cursor.clone(),
             all_unresolved: page.all_unresolved,
             hint,
             excluded_references: excluded,
             provenance,
-            not_indexed: self.not_indexed,
+            not_indexed: self.not_indexed.to_vec(),
         }
     }
 }
@@ -722,13 +719,13 @@ pub(crate) fn handle_callees(
     ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
     params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<CalleesAnswer>, ErrorData> {
     let QueryCtx { store, capabilities, hints, uncovered, .. } = ctx;
     let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, semantic, &params)? {
         Ok(resolved) => resolved,
-        Err(finished) => return Ok(finished),
+        Err(finished) => return Ok(finished.widen()),
     };
     // Destructured here so everything below still reads the node directly,
     // while `resolved.by` stays available for the response's `resolvedBy`.
@@ -748,7 +745,7 @@ pub(crate) fn handle_callees(
     let counted = answer::count(&conn, answer, &anchor.id, Direction::Outgoing, &["CALLS"], &file_paths)
         .map_err(|e| internal_error("failed to count callees", e))?;
     if let Some(counted) = counted {
-        return answer::respond(&anchor_info, &counted, |files, send| {
+        return Ok(ToolAnswer::Page(answer::respond(&anchor_info, &counted, |files, send| {
             let named: HashSet<&str> = files.into_iter().flatten().map(|tally| tally.path.as_str()).collect();
             let excluded = excluded.as_ref().map(|excluded| excluded.naming_only_new(&named));
             let touched = named.iter().copied().chain(excluded_paths(&excluded));
@@ -757,8 +754,15 @@ pub(crate) fn handle_callees(
                 hint,
                 hints.offer(send, provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
             ]);
-            (hint, CalleeDisclosures { excluded_references: excluded, provenance, not_indexed: &not_indexed })
-        });
+            (
+                hint,
+                CalleeDisclosures {
+                    excluded_references: excluded,
+                    provenance,
+                    not_indexed: not_indexed.clone(),
+                },
+            )
+        })));
     }
 
     let page = list_calls(
@@ -804,12 +808,13 @@ pub(crate) fn handle_callees(
         .transpose()
         .map_err(|e| internal_error("failed to count callees", e))?;
 
-    success(&parts.response(&bounded, total, true))
+    Ok(ToolAnswer::Page(EdgeAnswer::Rows(parts.response(&bounded, total, true))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::query::test_support::Rendered;
     use crate::mcp::PathCoverage;
     use crate::model::EdgeRecord;
     use crate::plugin_manifest::Capabilities;
@@ -836,7 +841,8 @@ mod tests {
         conn
     }
 
-    fn json_body(result: &CallToolResult) -> serde_json::Value {
+    fn json_body(result: &impl Rendered) -> serde_json::Value {
+        let result = &result.rendered();
         assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -844,7 +850,8 @@ mod tests {
         }
     }
 
-    fn error_text(result: &CallToolResult) -> String {
+    fn error_text(result: &impl Rendered) -> String {
+        let result = &result.rendered();
         assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),

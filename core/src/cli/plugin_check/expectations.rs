@@ -627,10 +627,12 @@ use crate::cli::plugin_check::report::{CheckResult, Outcome};
 use crate::graph::pagination;
 use crate::graph::Direction;
 use crate::mcp::context::QueryCtx;
+use crate::mcp::query::{self, ToolAnswer, WirePage};
+use crate::mcp::response_bound;
 use crate::mcp::session_hints::SessionHints;
 use crate::mcp::{
-    find_callers_callees, find_definition, find_implementations, find_references, get_dependencies,
-    FindDefinitionParams, FindImplementationsParams, GetDependenciesParams, SymbolQueryParams,
+    get_dependencies, FindDefinitionParams, FindImplementationsParams, GetDependenciesParams,
+    SymbolQueryParams,
 };
 
 /// The whole `--expect` file. Every list defaults to empty, so a fixture
@@ -1045,15 +1047,13 @@ impl SymbolTool {
     /// is not a second, weaker path into that module.
     fn call(&self, ctx: &EvalContext, params: SymbolQueryParams) -> Result<ToolOutcome, String> {
         let result = match self {
-            SymbolTool::Callers => {
-                ctx.query_ctx().resolve_lazily(find_callers_callees::handle_callers, params)
-            }
-            SymbolTool::References => ctx.query_ctx().resolve_lazily(find_references::handle, params),
+            SymbolTool::Callers => rendered(query::callers(&ctx.query_ctx(), params)),
+            SymbolTool::References => rendered(query::references(&ctx.query_ctx(), params)),
             SymbolTool::Implementations => {
                 let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: _ } =
                     params;
-                ctx.query_ctx().resolve_lazily(
-                    find_implementations::dispatch,
+                rendered(query::implementations(
+                    &ctx.query_ctx(),
                     FindImplementationsParams {
                         symbol_id,
                         symbol_name,
@@ -1064,7 +1064,7 @@ impl SymbolTool {
                         max_depth: None,
                         resume_token: None,
                     },
-                )
+                ))
             }
         };
         tool_outcome(result)
@@ -1076,7 +1076,7 @@ impl SymbolTool {
 /// through the same parameters.
 fn call_definition(ctx: &EvalContext, symbol_name: String) -> Result<ToolOutcome, String> {
     let params = FindDefinitionParams { symbol_name: Some(symbol_name), ..definition_params() };
-    tool_outcome(ctx.query_ctx().resolve_lazily(find_definition::handle, params))
+    tool_outcome(rendered(query::definition(&ctx.query_ctx(), params)))
 }
 
 /// Every `find_definition` call here addresses one symbol and wants no source.
@@ -1520,8 +1520,8 @@ fn resolve_definition(ctx: &EvalContext, symbol: &str, narrowing: Narrowing) -> 
         candidate.get("id").and_then(Value::as_str).unwrap_or_default().to_string()
     };
     let retry = FindDefinitionParams { symbol_id: Some(candidate_id), ..definition_params() };
-    let retried = tool_json(tool_outcome(ctx.query_ctx().resolve_lazily(find_definition::handle, retry)))
-        .map_err(|e| vec![e])?;
+    let retried =
+        tool_json(tool_outcome(rendered(query::definition(&ctx.query_ctx(), retry)))).map_err(|e| vec![e])?;
     if is_candidate_page(&retried) {
         return Err(vec![
             "re-querying find_definition by the disambiguated candidate's own id still returned a candidate \
@@ -1786,6 +1786,11 @@ enum ToolOutcome {
     /// JSON ("g-mesh: no symbol named 'X' found", GM-367's import-only
     /// message, a bad parameter combination).
     Refusal(String),
+}
+
+/// A typed answer as the server sends it.
+fn rendered<P: WirePage>(answer: Result<ToolAnswer<P>, ErrorData>) -> Result<CallToolResult, ErrorData> {
+    answer.and_then(|answer| response_bound::render(&answer))
 }
 
 /// Extracts an MCP tool's answer, keeping [`ToolOutcome`]'s distinction:
