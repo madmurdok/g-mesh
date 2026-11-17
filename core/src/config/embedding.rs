@@ -162,6 +162,119 @@ mod tests {
         assert!(!switched_off(None));
     }
 
+    const CACHE_LINE: &str = "- using the embedding cache's defaults";
+    const RERANK_LINE: &str = "- the rerank keeps its default (on)";
+
+    /// `resolve` over `env` (name, value) pairs and `global`, returning the
+    /// switches, the lines logged and how many times `global` ran.
+    fn run(
+        env: &[(&str, &str)],
+        wants_cache: bool,
+        global: Result<GlobalConfig>,
+    ) -> (Switches, Vec<String>, usize) {
+        let lookup =
+            |name: &str| env.iter().find(|(key, _)| *key == name).map(|(_, value)| OsString::from(value));
+        let reads = std::cell::Cell::new(0);
+        let mut lines = Vec::new();
+        let switches = resolve(
+            lookup,
+            wants_cache,
+            || {
+                reads.set(reads.get() + 1);
+                global
+            },
+            |line| lines.push(line.to_string()),
+        );
+        (switches, lines, reads.get())
+    }
+
+    fn file(cache_enabled: bool, max_size_mb: u64, rerank_enabled: bool) -> Result<GlobalConfig> {
+        Ok(GlobalConfig {
+            embedding_cache: super::super::EmbeddingCacheConfig { enabled: cache_enabled, max_size_mb },
+            rerank: super::super::RerankConfig { enabled: rerank_enabled },
+            ..GlobalConfig::default()
+        })
+    }
+
+    fn broken() -> Result<GlobalConfig> {
+        Err(anyhow::anyhow!("expected `=` at line 1"))
+    }
+
+    #[test]
+    fn with_no_switch_the_file_decides_each_part() {
+        let (switches, lines, reads) = run(&[], true, file(true, 64, true));
+        assert_eq!(switches, Switches { cache_max_size_mb: Some(64), rerank: true });
+        assert_eq!((lines.len(), reads), (0, 1));
+
+        let (switches, _, _) = run(&[], true, file(false, 64, true));
+        assert_eq!(switches, Switches { cache_max_size_mb: None, rerank: true }, "file turns the cache off");
+
+        let (switches, _, _) = run(&[], true, file(true, 64, false));
+        assert_eq!(
+            switches,
+            Switches { cache_max_size_mb: Some(64), rerank: false },
+            "file turns the rerank off"
+        );
+    }
+
+    #[test]
+    fn an_environment_off_beats_a_file_that_enables_the_part() {
+        let (switches, _, _) = run(&[(CACHE_ENV, "off")], true, file(true, 64, true));
+        assert_eq!(switches, Switches { cache_max_size_mb: None, rerank: true });
+
+        let (switches, _, _) = run(&[(RERANK_ENV, "OFF")], true, file(true, 64, true));
+        assert_eq!(switches, Switches { cache_max_size_mb: Some(64), rerank: false });
+    }
+
+    #[test]
+    fn both_parts_switched_off_by_the_environment_never_read_the_file() {
+        let (switches, lines, reads) = run(&[(CACHE_ENV, "off"), (RERANK_ENV, "off")], true, broken());
+        assert_eq!(switches, Switches { cache_max_size_mb: None, rerank: false });
+        assert_eq!((lines.len(), reads), (0, 0));
+    }
+
+    #[test]
+    fn a_broken_file_gives_the_defaults_and_one_line_per_part_that_needed_it() {
+        let (switches, lines, reads) = run(&[], true, broken());
+        let defaults = GlobalConfig::default();
+        assert_eq!(
+            switches,
+            Switches { cache_max_size_mb: Some(defaults.embedding_cache.max_size_mb), rerank: true }
+        );
+        assert_eq!(reads, 1);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("g-mesh: failed to read the global config (")
+                && lines[0].ends_with(CACHE_LINE)
+        );
+        assert!(
+            lines[1].starts_with("g-mesh: failed to read the global config (")
+                && lines[1].ends_with(RERANK_LINE)
+        );
+        assert!(lines.iter().all(|line| line.contains("expected `=` at line 1")), "{lines:?}");
+
+        let (_, lines, _) = run(&[(CACHE_ENV, "off")], true, broken());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with(RERANK_LINE));
+
+        let (_, lines, _) = run(&[(RERANK_ENV, "off")], true, broken());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with(CACHE_LINE));
+    }
+
+    /// `g-mesh status` resolves the rerank alone: no cache, no cache line,
+    /// whatever the cache's switch says.
+    #[test]
+    fn without_the_cache_only_the_rerank_is_resolved_and_logged() {
+        let (switches, lines, _) = run(&[], false, broken());
+        assert_eq!(switches, Switches { cache_max_size_mb: None, rerank: true });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with(RERANK_LINE));
+
+        let (switches, _, _) = run(&[], false, file(true, 64, true));
+        assert_eq!(switches, Switches { cache_max_size_mb: None, rerank: true });
+    }
+
     /// An explicit directory wins over both the env override and the home
     /// default - the `--dir` argument of `g-mesh model fetch` relies on this,
     /// and so does anyone who set `G_MESH_MODEL_DIR` and then asked for a

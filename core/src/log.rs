@@ -138,6 +138,24 @@ pub fn write_timing(args: std::fmt::Arguments<'_>) {
 }
 
 #[cfg(test)]
+mod role_tests {
+    use super::{prefix_for, role, role_prefix, Role};
+
+    #[test]
+    fn the_daemon_and_cli_prefixes() {
+        assert_eq!(prefix_for(Role::Daemon), "g-mesh daemon: ");
+        assert_eq!(prefix_for(Role::Cli), "g-mesh: ");
+    }
+
+    /// No test calls `set_role`, so this binary's role is the unset one.
+    #[test]
+    fn an_unset_role_is_the_cli() {
+        assert_eq!(role(), Role::Cli);
+        assert_eq!(role_prefix(), "g-mesh: ");
+    }
+}
+
+#[cfg(test)]
 mod timing_tests {
     use std::ffi::OsStr;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};

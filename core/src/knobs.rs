@@ -377,6 +377,50 @@ mod tests {
     }
 
     #[test]
+    fn millis_follows_its_zero_rule_and_falls_back_on_unset_or_bad_values() {
+        let default = Duration::from_secs(30);
+        let cases: [(Option<&str>, ZeroIs, Option<Duration>); 10] = [
+            (None, ZeroIs::Off, Some(default)),
+            (None, ZeroIs::Default, Some(default)),
+            (Some("0"), ZeroIs::Off, None),
+            (Some(" 0 "), ZeroIs::Off, None),
+            (Some("0"), ZeroIs::Default, Some(default)),
+            (Some(" 250 "), ZeroIs::Off, Some(Duration::from_millis(250))),
+            (Some("250"), ZeroIs::Default, Some(Duration::from_millis(250))),
+            (Some("10 minutes"), ZeroIs::Off, Some(default)),
+            (Some("-1"), ZeroIs::Default, Some(default)),
+            (Some(""), ZeroIs::Off, Some(default)),
+        ];
+        for (raw, zero, expected) in cases {
+            assert_eq!(millis_from(raw, "G_MESH_X_MS", zero, default), expected, "{raw:?} under {zero:?}");
+        }
+    }
+
+    /// The rule `parsed` and `millis_lenient` read with: `0` is a value, not
+    /// a fallback.
+    #[test]
+    fn parsed_reads_a_trimmed_value_and_nothing_else() {
+        assert_eq!(parsed_from::<u64>(Some("0")), Some(0));
+        assert_eq!(parsed_from::<u64>(Some(" 1500 ")), Some(1500));
+        assert_eq!(parsed_from::<u64>(Some("abc")), None);
+        assert_eq!(parsed_from::<u64>(Some("")), None);
+        assert_eq!(parsed_from::<u64>(None), None);
+    }
+
+    #[test]
+    fn off_and_flag_rules() {
+        assert!(is_off(Some(OsStr::new("off"))));
+        assert!(is_off(Some(OsStr::new("Off"))));
+        assert!(!is_off(Some(OsStr::new(""))));
+        assert!(!is_off(Some(OsStr::new("0"))));
+        assert!(!is_off(None));
+        assert!(flag_from(Some(OsStr::new("0"))));
+        assert!(flag_from(Some(OsStr::new("off"))));
+        assert!(!flag_from(Some(OsStr::new(""))));
+        assert!(!flag_from(None));
+    }
+
+    #[test]
     fn every_env_read_goes_through_the_knob_table() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();

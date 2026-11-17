@@ -1440,6 +1440,25 @@ mod tests {
         assert_eq!(vector_count(&conn), 0, "nothing is stored under {}", pinned.embedding_version());
     }
 
+    /// `load` opens the cache its settings name at the first `compute`, and
+    /// creates no cache file for `None`. The weights are stand-ins, so the
+    /// model itself never loads; the cache is opened before that is tried.
+    #[test]
+    fn load_creates_a_cache_file_only_when_its_settings_name_one() {
+        for wants_cache in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let model_dir = fake_model_dir(&dir.path().join("model"), "weights v1");
+            let settings = cache_at(dir.path());
+            let pipeline = EmbeddingPipeline::load(EmbeddingSettings {
+                model: model_at("a-custom-model", &model_dir),
+                cache: wants_cache.then(|| settings.clone()),
+                rerank: RerankSettings { enabled: false, model_dir: Ok(dir.path().join("rerank")) },
+            });
+            pipeline.compute(&diff_of(1), &mut EmbedStats::default());
+            assert_eq!(settings.path.exists(), wants_cache, "cache file with settings.cache = {wants_cache}");
+        }
+    }
+
     /// Same texts under a second fingerprint: nothing is shared.
     ///
     /// Control: drop the fingerprint from the key (e.g. make
