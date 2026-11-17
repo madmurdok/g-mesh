@@ -1781,6 +1781,210 @@ mod tests {
         assert!(!diff.delete_node_ids.is_empty(), "a deletion: {diff:#?}");
         assert_eq!(session.index.paths(), vec![RelPath::new("real/a.toy")], "the alias entry went");
     }
+    // --- control frames that do not decode -------------------------------
+
+    /// Hands `session` one frame and returns the response it wrote, if any.
+    fn exchange(session: &mut Session<'_, Declares>, frame: serde_json::Value) -> Option<serde_json::Value> {
+        let mut out = Vec::new();
+        session.handle(frame.to_string().as_bytes(), &mut out).unwrap();
+        if out.is_empty() {
+            return None;
+        }
+        let written = String::from_utf8(out).unwrap();
+        let (_, body) = written.split_once("\r\n\r\n").expect("one framed response");
+        Some(serde_json::from_str(body).unwrap())
+    }
+
+    /// Asserts `response` is the JSON-RPC "Invalid params" error for `id`.
+    fn assert_invalid_params(response: Option<serde_json::Value>, id: serde_json::Value) {
+        let response = response.expect("a request whose params do not decode is answered");
+        let error: g_mesh_wire::ControlErrorResponse = serde_json::from_value(response.clone())
+            .unwrap_or_else(|err| panic!("{response} is not an error answer: {err}"));
+        assert_eq!(error.error.code, g_mesh_wire::INVALID_PARAMS, "{response}");
+        assert_eq!(response["id"], id);
+        assert!(response.get("result").is_none(), "{response}");
+    }
+
+    /// A `semanticPass` whose `filePaths` holds no valid entry is answered
+    /// with `-32602`, and the engine is never asked: it is not a
+    /// whole-project pass. As a notification nothing is written.
+    ///
+    /// Control: answer `BadParams` with an empty diff instead of
+    /// `ControlErrorResponse` in `Session::handle` -> no `error` object.
+    #[test]
+    fn a_pass_whose_file_paths_are_all_malformed_is_an_error_answer_not_a_whole_project_pass() {
+        let project = Project::new("all-bad", &[("a.toy", "a v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        let answered = exchange(
+            &mut session,
+            serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": 3, "method": "semanticPass", "params": { "filePaths": [5] } }),
+        );
+        assert_invalid_params(answered, serde_json::json!(3));
+
+        let notified = exchange(
+            &mut session,
+            serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "method": "semanticPass", "params": { "filePaths": [5] } }),
+        );
+        assert_eq!(notified, None, "without an id there is nothing to answer");
+        let passes = seen.lock().unwrap();
+        assert!(passes.is_empty(), "the engine ran a pass: {passes:?}");
+    }
+
+    /// A required `filePath` missing or mistyped is answered with `-32602`
+    /// when the frame has an id, and with nothing when it has none.
+    ///
+    /// Control: `return Ok(())` for every `BadParams` in `Session::handle`
+    /// -> the request is not answered.
+    #[test]
+    fn a_missing_or_mistyped_file_path_is_an_error_answer_only_with_an_id() {
+        let project = Project::new("no-path", &[("a.toy", "a v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        for method in ["fileChanged", "workspaceChanged", "resolutionChanged"] {
+            for params in [serde_json::json!({}), serde_json::json!({ "filePath": 5 })] {
+                let answered = exchange(
+                    &mut session,
+                    serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": "q", "method": method, "params": params }),
+                );
+                assert_invalid_params(answered, serde_json::json!("q"));
+                let notified = exchange(
+                    &mut session,
+                    serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "method": method, "params": params }),
+                );
+                assert_eq!(notified, None, "{method} {params} as a notification");
+            }
+        }
+        assert!(session.index.paths().is_empty(), "nothing was extracted: {:?}", session.index.paths());
+    }
+
+    /// A frame whose id is neither an integer nor a string is not answered,
+    /// however valid the rest of it is. `ControlRequest::parse`'s tests pin
+    /// the `BadId` decode this rests on.
+    #[test]
+    fn a_frame_with_an_unusable_id_is_not_answered() {
+        let project = Project::new("bad-id", &[("a.toy", "a v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        for id in [serde_json::json!({ "n": 1 }), serde_json::json!(1.5)] {
+            for (method, params) in [
+                ("fileChanged", serde_json::json!({ "filePath": "a.toy" })),
+                ("status", serde_json::json!({})),
+            ] {
+                let written = exchange(
+                    &mut session,
+                    serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "method": method, "params": params }),
+                );
+                assert_eq!(written, None, "{method} with id {id}");
+            }
+        }
+    }
+
+    /// An unknown method is acknowledged whatever `params` holds, and so are
+    /// `status` and `prepareSemanticPass`, which read no params.
+    ///
+    /// Control: drop the `Some(_) if !reads_params` arm in
+    /// `ControlRequest::parse` -> `status` with `params: "x"` gets an error
+    /// answer.
+    #[test]
+    fn an_unknown_or_param_less_method_is_acknowledged_whatever_params_holds() {
+        let project = Project::new("ack-any", &[("a.toy", "a v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        for method in ["fromTheFuture", "status", "prepareSemanticPass"] {
+            for params in [serde_json::json!({ "a": 1 }), serde_json::json!([1]), serde_json::json!("x")] {
+                let response = exchange(
+                    &mut session,
+                    serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": 2, "method": method, "params": params }),
+                )
+                .unwrap_or_else(|| panic!("{method} {params} was not answered"));
+                let ack: g_mesh_wire::AckResponse = serde_json::from_value(response.clone())
+                    .unwrap_or_else(|err| panic!("{method} {params}: {response} is not an ack: {err}"));
+                assert_eq!(ack, g_mesh_wire::AckResponse::new(RequestId::Number(2)));
+            }
+        }
+    }
+
+    /// A pass's malformed `filePaths` and `linkedEdges` entries cost
+    /// themselves: the pass runs with the valid ones and is answered.
+    ///
+    /// Control: decode the lists strictly in `keep_valid_entries` (fail on
+    /// the first bad entry) -> an error answer and no pass.
+    #[test]
+    fn a_passes_malformed_entries_cost_themselves() {
+        let project = Project::new("bad-entries", &[("a.toy", "a v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        let factory: crate::semantic::SemanticEngineFactory = Box::new(move |_root| {
+            Ok(Box::new(LinkRecording { seen: std::sync::Arc::clone(&recorded) })
+                as Box<dyn crate::semantic::SemanticEngine>)
+        });
+        let mut session = Session {
+            extractor: &Declares,
+            spec: &spec,
+            root: project.0.clone(),
+            root_real: std::fs::canonicalize(&project.0).ok(),
+            project: None,
+            index: SdkIndex::new(),
+            engine: LazyEngine::new("toy", Some(factory)),
+            project_hydrated: false,
+        };
+
+        let result = request(
+            &mut session,
+            "semanticPass",
+            serde_json::json!({
+                "filePaths": [5, "a.toy"],
+                "linkedEdges": [{ "edgeId": "y" }, { "edgeId": "x", "toId": "d" }],
+            }),
+        );
+
+        assert!(result.is_object(), "the pass is answered with a diff: {result}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(Some("d".to_string()), None)],
+            "x linked, the bad y entry dropped"
+        );
+    }
+
+    /// A `fileChanged` answer and a complete pass's answer decode as
+    /// `FileChangeResponse` and carry no `incomplete` key: absent means false.
+    ///
+    /// Control: drop `skip_serializing_if = "is_false"` from
+    /// `FileChangeResponse::incomplete` -> `"incomplete": false` is written.
+    #[test]
+    fn a_complete_answer_does_not_write_incomplete() {
+        let project = Project::new("no-incomplete", &[("a.toy", "a v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        for (method, params) in [
+            ("fileChanged", serde_json::json!({ "filePath": "a.toy" })),
+            ("semanticPass", serde_json::json!({ "filePaths": [] })),
+            ("semanticPass", serde_json::json!({ "filePaths": ["a.toy"] })),
+        ] {
+            let response = exchange(
+                &mut session,
+                serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": 1, "method": method, "params": params }),
+            )
+            .unwrap_or_else(|| panic!("{method} {params} was not answered"));
+            assert!(response.get("incomplete").is_none(), "{method} {params}: {response}");
+            assert!(response.get("incompleteReason").is_none(), "{method} {params}: {response}");
+            serde_json::from_value::<g_mesh_wire::FileChangeResponse>(response.clone()).unwrap_or_else(
+                |err| panic!("{method} {params}: {response} is not a FileChangeResponse: {err}"),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

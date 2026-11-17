@@ -2212,3 +2212,215 @@ mod tests {
         assert_eq!(serde_json::from_str::<PlaceholderTarget>(&json).unwrap(), set);
     }
 }
+
+#[cfg(test)]
+mod control_request_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(frame: serde_json::Value) -> ControlRequest {
+        ControlRequest::parse(frame.to_string().as_bytes()).expect("the frame is JSON")
+    }
+
+    fn bad_params(request: &ControlRequest) -> &str {
+        match &request.message {
+            Err(ControlDecodeError::BadParams(reason)) => reason,
+            other => panic!("expected BadParams, got {other:?}"),
+        }
+    }
+
+    /// A malformed list entry costs itself: the valid entries decode, and
+    /// each dropped one is named by its index.
+    ///
+    /// Control: decode the lists strictly (make `keep_valid_entries` return
+    /// `Ok(())` without filtering) -> the message is `BadParams`.
+    #[test]
+    fn a_malformed_list_entry_is_dropped_and_named() {
+        let created =
+            parse(json!({ "id": 4, "method": "filesCreated", "params": { "filePaths": [5, "b.toy"] } }));
+        assert_eq!(created.message, Ok(ControlMessage::FilesCreated { file_paths: vec!["b.toy".into()] }));
+        assert_eq!(created.dropped, ["filePaths[0]"]);
+
+        let pass = parse(json!({
+            "id": 5,
+            "method": "semanticPass",
+            "params": {
+                "filePaths": ["a.toy", null, "c.toy"],
+                "linkedEdges": [{ "edgeId": "x" }, { "edgeId": "y", "toId": "d" }],
+            },
+        }));
+        assert_eq!(
+            pass.message,
+            Ok(ControlMessage::SemanticPass {
+                file_paths: vec!["a.toy".into(), "c.toy".into()],
+                linked_edges: vec![LinkedEdge { edge_id: "y".into(), to_id: "d".into() }],
+                budget_ms: None,
+            })
+        );
+        assert_eq!(pass.dropped, ["filePaths[1]", "linkedEdges[0]"]);
+    }
+
+    /// A non-empty list with no valid entry is `BadParams`; for
+    /// `semanticPass.filePaths` an empty list would mean the whole project.
+    /// An empty list as sent is still valid.
+    ///
+    /// Control: drop the `kept.is_empty()` -> `BadParams` check in
+    /// `keep_valid_entries` -> each case decodes with an empty list.
+    #[test]
+    fn a_non_empty_list_with_no_valid_entry_is_bad_params() {
+        let cases = [
+            ("filesCreated", json!({ "filePaths": [5] }), "filePaths"),
+            ("semanticPass", json!({ "filePaths": [5, false] }), "filePaths"),
+            (
+                "semanticPass",
+                json!({ "filePaths": ["a.toy"], "linkedEdges": [{ "toId": "d" }] }),
+                "linkedEdges",
+            ),
+        ];
+        for (method, params, key) in cases {
+            let request = parse(json!({ "id": 3, "method": method, "params": params }));
+            assert!(bad_params(&request).contains(key), "{method} {key}: {request:?}");
+            assert_eq!(request.id, Some(RequestId::Number(3)), "the error answer needs the id");
+        }
+
+        let whole = parse(json!({ "id": 3, "method": "semanticPass", "params": { "filePaths": [] } }));
+        assert_eq!(
+            whole.message,
+            Ok(ControlMessage::SemanticPass {
+                file_paths: Vec::new(),
+                linked_edges: Vec::new(),
+                budget_ms: None
+            })
+        );
+        assert!(whole.dropped.is_empty());
+    }
+
+    /// A mistyped optional scalar decodes as absent and is named; a null one
+    /// is absent and not named.
+    ///
+    /// Control: make `drop_mistyped` leave a mistyped value in place -> the
+    /// typed decode fails with `BadParams`.
+    #[test]
+    fn a_mistyped_optional_scalar_reads_as_absent_and_is_named() {
+        let changed = parse(
+            json!({ "id": 1, "method": "fileChanged", "params": { "filePath": "a.toy", "reextract": "yes" } }),
+        );
+        assert_eq!(
+            changed.message,
+            Ok(ControlMessage::FileChanged { file_path: "a.toy".into(), reextract: false })
+        );
+        assert_eq!(changed.dropped, ["reextract"]);
+
+        let pass = parse(
+            json!({ "id": 1, "method": "semanticPass", "params": { "filePaths": ["a.toy"], "budgetMs": -1 } }),
+        );
+        assert_eq!(
+            pass.message,
+            Ok(ControlMessage::SemanticPass {
+                file_paths: vec!["a.toy".into()],
+                linked_edges: Vec::new(),
+                budget_ms: None
+            })
+        );
+        assert_eq!(pass.dropped, ["budgetMs"]);
+
+        let resolution = parse(json!({
+            "id": 1, "method": "resolutionChanged", "params": { "filePath": "cfg.json", "previousFacts": 7 }
+        }));
+        assert_eq!(
+            resolution.message,
+            Ok(ControlMessage::ResolutionChanged { file_path: "cfg.json".into(), previous_facts: None })
+        );
+        assert_eq!(resolution.dropped, ["previousFacts"]);
+
+        let null = parse(
+            json!({ "id": 1, "method": "fileChanged", "params": { "filePath": "a.toy", "reextract": null } }),
+        );
+        assert_eq!(
+            null.message,
+            Ok(ControlMessage::FileChanged { file_path: "a.toy".into(), reextract: false })
+        );
+        assert!(null.dropped.is_empty(), "null is absent, not malformed");
+    }
+
+    /// A missing or mistyped required `filePath` is `BadParams`, the id kept.
+    #[test]
+    fn a_missing_or_mistyped_required_file_path_is_bad_params() {
+        for method in ["fileChanged", "workspaceChanged", "resolutionChanged"] {
+            let missing = parse(json!({ "id": "r-1", "method": method, "params": {} }));
+            assert!(bad_params(&missing).contains("filePath"), "{method}: {missing:?}");
+            assert_eq!(missing.id, Some(RequestId::String("r-1".into())));
+            let mistyped = parse(json!({ "id": "r-1", "method": method, "params": { "filePath": 5 } }));
+            bad_params(&mistyped);
+            assert_eq!(mistyped.id, Some(RequestId::String("r-1".into())));
+            let no_params = parse(json!({ "id": 2, "method": method }));
+            bad_params(&no_params);
+        }
+    }
+
+    /// An id that is neither an integer nor a string is `BadId` and carries no
+    /// id; an integer or a string id is kept.
+    ///
+    /// Control: map a failed `RequestId` decode to `None` instead of
+    /// returning `BadId` -> the frame decodes as a notification.
+    #[test]
+    fn an_id_that_is_neither_an_integer_nor_a_string_is_bad_id() {
+        for id in [json!({ "n": 1 }), json!(1.5), json!(true), json!([1])] {
+            let request = parse(json!({ "id": id, "method": "status" }));
+            assert_eq!(request.message, Err(ControlDecodeError::BadId), "id {id}");
+            assert_eq!(request.id, None, "id {id}");
+        }
+        assert_eq!(parse(json!({ "id": 9, "method": "status" })).id, Some(RequestId::Number(9)));
+        assert_eq!(parse(json!({ "id": "s", "method": "status" })).id, Some(RequestId::String("s".into())));
+        assert_eq!(parse(json!({ "id": null, "method": "status" })).id, None);
+    }
+
+    /// An unknown or absent method is `UnknownMethod` whatever `params` holds,
+    /// with the id kept so it can be acknowledged; a known method that reads
+    /// no params decodes whatever `params` holds; one that reads params
+    /// rejects a non-object.
+    ///
+    /// Control: drop the `Some(_) if !reads_params` arm of the `params`
+    /// match -> `status` with `params: [1]` is `BadParams`.
+    #[test]
+    fn methods_are_judged_by_name_before_params() {
+        for params in [json!({ "a": 1 }), json!([1]), json!("x"), json!(3)] {
+            let unknown = parse(json!({ "id": 6, "method": "fromTheFuture", "params": params }));
+            assert_eq!(unknown.message, Err(ControlDecodeError::UnknownMethod), "params {params}");
+            assert_eq!(unknown.id, Some(RequestId::Number(6)));
+            assert_eq!(unknown.method, "fromTheFuture");
+
+            let status = parse(json!({ "id": 6, "method": "status", "params": params }));
+            assert_eq!(status.message, Ok(ControlMessage::Status), "params {params}");
+            let prepare = parse(json!({ "method": "prepareSemanticPass", "params": params }));
+            assert_eq!(prepare.message, Ok(ControlMessage::PrepareSemanticPass), "params {params}");
+        }
+        let methodless = parse(json!({ "id": 6 }));
+        assert_eq!(methodless.message, Err(ControlDecodeError::UnknownMethod));
+        assert_eq!(methodless.method, "");
+
+        let not_an_object = parse(json!({ "id": 6, "method": "fileChanged", "params": ["a.toy"] }));
+        assert_eq!(bad_params(&not_an_object), "params is not an object");
+
+        assert_eq!(ControlRequest::parse(b"{not json"), Err(NotJson));
+        assert_eq!(parse(json!([1, 2])).message, Err(ControlDecodeError::UnknownMethod));
+    }
+
+    /// The bulk trailer omits `watchPaths` when empty and rejects an unknown
+    /// key, so no node or edge line decodes as one.
+    ///
+    /// Control: drop `skip_serializing_if` from `watch_paths` -> the empty
+    /// trailer gains `"watchPaths":[]`.
+    #[test]
+    fn the_bulk_trailer_omits_empty_watch_paths_and_rejects_unknown_keys() {
+        let bare = ResolutionFactsTrailer { resolution_facts: "f".into(), watch_paths: Vec::new() };
+        assert_eq!(serde_json::to_string(&bare).unwrap(), r#"{"resolutionFacts":"f"}"#);
+        let watched =
+            ResolutionFactsTrailer { resolution_facts: "f".into(), watch_paths: vec!["a.json".into()] };
+        assert_eq!(
+            serde_json::to_string(&watched).unwrap(),
+            r#"{"resolutionFacts":"f","watchPaths":["a.json"]}"#
+        );
+        assert!(serde_json::from_str::<ResolutionFactsTrailer>(r#"{"resolutionFacts":"f","y":1}"#).is_err());
+    }
+}
