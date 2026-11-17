@@ -4,16 +4,14 @@
 //!
 //! # What "the same handler code" means here
 //!
-//! Every expectation is answered by literally calling an MCP tool's own
-//! handler function - [`find_callers_callees::handle_callers`],
-//! [`find_references::handle`], [`find_implementations::dispatch`],
-//! [`get_dependencies::handle`], [`find_definition::handle`] - the exact
-//! functions `mcp::mod`'s `#[tool]` methods call, given the exact parameter
-//! structs a real MCP client would send. This module never re-walks an edge
-//! or re-runs a query of its own: it drives those five functions and reads
-//! back their *wire JSON*, the same bytes a client would receive
-//! (`rmcp::model::CallToolResult`'s `ContentBlock::Text`). That is also why
-//! ambiguity is answered for free rather than needing its own code path: an
+//! Every expectation is answered by calling the same `mcp::query` function
+//! the server's `#[tool]` methods call - `callers`, `references`,
+//! `implementations`, `dependencies`, `definition` - given the exact
+//! parameter structs a real MCP client would send. This module never
+//! re-walks an edge or re-runs a query of its own: it drives those five
+//! functions and reads back their typed answers, serialized as a client sees
+//! them. That is also why ambiguity is answered for free rather than
+//! needing its own code path: an
 //! ambiguous `symbol_name` already makes four of these five handlers return
 //! `find_definition`'s own ranked candidate page in place of their usual
 //! result (`mcp::anchor`'s module doc), and this module only has to
@@ -341,7 +339,7 @@
 //!
 //! **What a `[[refusal]]` must not accept**, which is the whole of its
 //! value. It passes on exactly one shape - a *tool-level* refusal
-//! (`CallToolResult` with `is_error: true`) whose text carries every phrase
+//! (`ToolAnswer::Refused`) whose text carries every phrase
 //! in `contains` - and fails on all four of the others:
 //!
 //! - **A protocol-level failure** - `ErrorData`, i.e. the outer `Err` that
@@ -618,22 +616,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
 use crate::graph::pagination;
 use crate::graph::Direction;
 use crate::mcp::context::QueryCtx;
-use crate::mcp::query::{self, ToolAnswer, WirePage};
-use crate::mcp::response_bound;
+use crate::mcp::query::{self, ToolAnswer};
 use crate::mcp::session_hints::SessionHints;
-use crate::mcp::{
-    get_dependencies, FindDefinitionParams, FindImplementationsParams, GetDependenciesParams,
-    SymbolQueryParams,
-};
+use crate::mcp::{FindDefinitionParams, FindImplementationsParams, GetDependenciesParams, SymbolQueryParams};
 
 /// The whole `--expect` file. Every list defaults to empty, so a fixture
 /// that only cares about, say, `[[callers]]` never has to spell out the
@@ -1046,13 +1039,13 @@ impl SymbolTool {
     /// says defers *entirely* to the unmodified single-hop `handle`, so this
     /// is not a second, weaker path into that module.
     fn call(&self, ctx: &EvalContext, params: SymbolQueryParams) -> Result<ToolOutcome, String> {
-        let result = match self {
-            SymbolTool::Callers => rendered(query::callers(&ctx.query_ctx(), params)),
-            SymbolTool::References => rendered(query::references(&ctx.query_ctx(), params)),
+        match self {
+            SymbolTool::Callers => tool_outcome(query::callers(&ctx.query_ctx(), params)),
+            SymbolTool::References => tool_outcome(query::references(&ctx.query_ctx(), params)),
             SymbolTool::Implementations => {
                 let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: _ } =
                     params;
-                rendered(query::implementations(
+                tool_outcome(query::implementations(
                     &ctx.query_ctx(),
                     FindImplementationsParams {
                         symbol_id,
@@ -1066,8 +1059,7 @@ impl SymbolTool {
                     },
                 ))
             }
-        };
-        tool_outcome(result)
+        }
     }
 }
 
@@ -1076,7 +1068,7 @@ impl SymbolTool {
 /// through the same parameters.
 fn call_definition(ctx: &EvalContext, symbol_name: String) -> Result<ToolOutcome, String> {
     let params = FindDefinitionParams { symbol_name: Some(symbol_name), ..definition_params() };
-    tool_outcome(rendered(query::definition(&ctx.query_ctx(), params)))
+    tool_outcome(query::definition(&ctx.query_ctx(), params))
 }
 
 /// Every `find_definition` call here addresses one symbol and wants no source.
@@ -1239,7 +1231,7 @@ fn dependency_walk(ctx: &EvalContext, file: &str, direction: Direction) -> Resul
         max_fanout: Some(pagination::MAX_PAGE_SIZE as u32),
         resume_token: None,
     };
-    tool_json(tool_outcome(get_dependencies::handle(&ctx.query_ctx(), params)))
+    tool_json(tool_outcome(query::dependencies(&ctx.query_ctx(), params)))
 }
 
 /// The set comparison both walk categories share, with decision 8's
@@ -1520,8 +1512,7 @@ fn resolve_definition(ctx: &EvalContext, symbol: &str, narrowing: Narrowing) -> 
         candidate.get("id").and_then(Value::as_str).unwrap_or_default().to_string()
     };
     let retry = FindDefinitionParams { symbol_id: Some(candidate_id), ..definition_params() };
-    let retried =
-        tool_json(tool_outcome(rendered(query::definition(&ctx.query_ctx(), retry)))).map_err(|e| vec![e])?;
+    let retried = tool_json(tool_outcome(query::definition(&ctx.query_ctx(), retry))).map_err(|e| vec![e])?;
     if is_candidate_page(&retried) {
         return Err(vec![
             "re-querying find_definition by the disambiguated candidate's own id still returned a candidate \
@@ -1779,35 +1770,26 @@ fn candidate_lines(value: &Value) -> Vec<String> {
 /// that is not JSON). Those are never a refusal, whatever they say.
 #[derive(Debug)]
 enum ToolOutcome {
-    /// `is_error` unset or false: the parsed wire JSON. May still be a
-    /// candidate page - [`is_candidate_page`] is a separate question.
+    /// A page or a candidate list, as the JSON a client would read. May still
+    /// be a candidate page - [`is_candidate_page`] is a separate question.
     Answer(Value),
-    /// `is_error: true`: a tool-level refusal, carrying prose rather than
-    /// JSON ("g-mesh: no symbol named 'X' found", GM-367's import-only
+    /// A tool-level refusal, carrying prose rather than JSON ("g-mesh: no symbol named 'X' found", GM-367's import-only
     /// message, a bad parameter combination).
     Refusal(String),
 }
 
-/// A typed answer as the server sends it.
-fn rendered<P: WirePage>(answer: Result<ToolAnswer<P>, ErrorData>) -> Result<CallToolResult, ErrorData> {
-    answer.and_then(|answer| response_bound::render(&answer))
-}
-
-/// Extracts an MCP tool's answer, keeping [`ToolOutcome`]'s distinction:
-/// `ErrorData` and an unusable body stay `Err`, `is_error: true` becomes
-/// `Refusal` with the prose it carried, and anything else is parsed as JSON.
-fn tool_outcome(result: Result<CallToolResult, ErrorData>) -> Result<ToolOutcome, String> {
-    let result = result.map_err(|e| e.to_string())?;
-    let text = match result.content.first() {
-        Some(ContentBlock::Text(text)) => text.text.clone(),
-        other => return Err(format!("tool returned no text content: {other:?}")),
+/// Extracts a tool's typed answer, keeping [`ToolOutcome`]'s distinction:
+/// `ErrorData` and a page that does not serialize stay `Err`, a refusal
+/// becomes `Refusal` with its message, and a page or a candidate list becomes
+/// `Answer` with the value a client would parse from the wire.
+fn tool_outcome<P: Serialize>(result: Result<ToolAnswer<P>, ErrorData>) -> Result<ToolOutcome, String> {
+    let answer = result.map_err(|e| e.to_string())?;
+    let value = match &answer {
+        ToolAnswer::Refused(refusal) => return Ok(ToolOutcome::Refusal(refusal.message().to_owned())),
+        ToolAnswer::Page(page) => serde_json::to_value(page),
+        ToolAnswer::Candidates(candidates) => serde_json::to_value(candidates),
     };
-    if result.is_error == Some(true) {
-        return Ok(ToolOutcome::Refusal(text));
-    }
-    serde_json::from_str(&text)
-        .map(ToolOutcome::Answer)
-        .map_err(|e| format!("tool returned content that is not JSON: {e}"))
+    value.map(ToolOutcome::Answer).map_err(|e| format!("tool answer does not serialize: {e}"))
 }
 
 /// The view every category except `[[refusal]]` wants: a refusal is simply a

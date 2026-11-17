@@ -560,7 +560,7 @@ fn search_partial_note_then_page() {
         Path::new("/wire-golden/project"),
     );
     let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
-    let result = search_code::handle(&ctx, params, coverage.as_ref()).unwrap();
+    let result = search_code::handle(&ctx, params, coverage.as_ref()).unwrap().rendered();
     assert_wire("search_partial", &mask_scores(result));
 }
 
@@ -568,7 +568,7 @@ fn search_partial_note_then_page() {
 fn search_complete_page() {
     let (_dir, ctx) = search_ctx(3);
     let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
-    let result = search_code::handle(&ctx, params, None).unwrap();
+    let result = search_code::handle(&ctx, params, None).unwrap().rendered();
     assert_wire("search_complete", &mask_scores(result));
 }
 

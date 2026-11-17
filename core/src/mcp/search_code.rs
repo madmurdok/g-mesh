@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use base64::prelude::{Engine, BASE64_STANDARD};
-use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -29,9 +28,10 @@ use crate::indexing_status::Phase;
 use crate::storage::vectors;
 
 use super::context::QueryCtx;
+use super::query::{ToolAnswer, WirePage};
 use super::session_hints::{self, HintKey, SessionHints};
 use super::similarity;
-use super::tool_result::{error, internal_error, success};
+use super::tool_result::internal_error;
 use super::{human_duration, SearchCodeParams};
 
 /// One matched symbol, ranked by relevance to the query.
@@ -108,7 +108,7 @@ impl SearchResult {
 /// position for the same reason).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SearchPage {
+pub(crate) struct SearchPage {
     results: Vec<SearchResult>,
     has_more: bool,
     next_cursor: Option<String>,
@@ -137,6 +137,25 @@ struct SearchPage {
     partial: Option<PartialCounts>,
 }
 
+/// What `search_code` answers: the page, led by a prose note while
+/// embeddings are owed. Serialized as the page alone.
+pub(crate) struct SearchAnswer {
+    note: Option<String>,
+    page: SearchPage,
+}
+
+impl Serialize for SearchAnswer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.page.serialize(serializer)
+    }
+}
+
+impl WirePage for SearchAnswer {
+    fn lead_note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+}
+
 /// `IndexingStatus::embed_progress` at the moment the page was ranked.
 #[derive(Serialize)]
 struct PartialCounts {
@@ -157,7 +176,7 @@ enum PassState {
 
 /// Why a `search_code` page is partial: the embedding pass had not finished
 /// when the call's bounded wait ran out.
-pub(super) struct Coverage {
+pub(crate) struct Coverage {
     state: PassState,
     embedded: u64,
     total: u64,
@@ -276,7 +295,7 @@ pub(super) async fn handle_off_worker(
     ctx: QueryCtx,
     params: SearchCodeParams,
     coverage: Option<Coverage>,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<SearchAnswer>, ErrorData> {
     tokio::task::spawn_blocking(move || handle(&ctx, params, coverage.as_ref()))
         .await
         .map_err(|e| internal_error("search_code task failed", e.into()))?
@@ -296,15 +315,15 @@ pub(super) fn handle(
     ctx: &QueryCtx,
     params: SearchCodeParams,
     coverage: Option<&Coverage>,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<SearchAnswer>, ErrorData> {
     let QueryCtx { store, embedding, shapes, hints, .. } = ctx;
     let project_root = Some(ctx.project_root.as_path()).filter(|root| !root.as_os_str().is_empty());
     let Some(query_vector) = embedding.embed_query(&params.query) else {
-        return error(
+        return Ok(ToolAnswer::refused(
             "g-mesh: semantic search is not available for this project - no embedding model \
              is loaded. Run `g-mesh model fetch` and restart the daemon, or use the \
              structural tools (find_references, find_definition, ...) instead.",
-        );
+        ));
     };
 
     let conn = store.read();
@@ -317,11 +336,11 @@ pub(super) fn handle(
     };
     let cursor = match partial_cursor_in {
         Some((issued, _)) if issued != stored => {
-            return error(format!(
+            return Ok(ToolAnswer::refused(format!(
                 "g-mesh: this cursor came from a page ranked while the embedding pass was still running \
                  ({issued} symbols embedded then, {stored} now), so its continuation would rank a different \
                  set. Call search_code again without `cursor`."
-            ));
+            )));
         }
         Some((_, inner)) => Some(inner),
         None => params.cursor.as_deref(),
@@ -379,13 +398,8 @@ pub(super) fn handle(
         hint,
         partial: coverage.map(|c| PartialCounts { embedded: c.embedded, total: c.total }),
     };
-    match coverage {
-        None => success(&body),
-        Some(coverage) => Ok(CallToolResult::success(vec![
-            ContentBlock::text(coverage.note(stored)),
-            ContentBlock::json(&body)?,
-        ])),
-    }
+    let note = coverage.map(|coverage| coverage.note(stored));
+    Ok(ToolAnswer::Page(SearchAnswer { note, page: body }))
 }
 
 /// A page ready to answer with, and the rows its verdict is judged on when
@@ -622,6 +636,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::mcp::query::test_support::Rendered;
     use crate::mcp::query_shapes::QueryShapes;
     use crate::storage::index_store::IndexStore;
     use crate::storage::schema;
@@ -643,7 +658,8 @@ mod tests {
         .unwrap();
     }
 
-    fn json_body(result: &CallToolResult) -> serde_json::Value {
+    fn json_body(result: &impl Rendered) -> serde_json::Value {
+        let result = &result.rendered();
         assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -651,7 +667,8 @@ mod tests {
         }
     }
 
-    fn error_text(result: &CallToolResult) -> String {
+    fn error_text(result: &impl Rendered) -> String {
+        let result = &result.rendered();
         assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),

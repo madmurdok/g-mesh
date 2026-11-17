@@ -478,21 +478,21 @@ fn skip_or_eval_skips_only_the_semantic_tier_entries() {
 /// zero-element branch was unreachable. [`tool_outcome`] keeps them apart.
 #[test]
 fn a_tool_level_refusal_is_a_refusal_and_a_protocol_error_is_not() {
-    let refusal = CallToolResult::error(vec![ContentBlock::text("g-mesh: no symbol named 'x' found")]);
+    let refusal = ToolAnswer::<Value>::refused("g-mesh: no symbol named 'x' found");
     let Ok(ToolOutcome::Refusal(text)) = tool_outcome(Ok(refusal)) else {
-        panic!("is_error: true must be a Refusal, not an Err");
+        panic!("a refused answer must be a Refusal, not an Err");
     };
     assert_eq!(text, "g-mesh: no symbol named 'x' found");
 
-    let answer = CallToolResult::success(vec![ContentBlock::text("{\"results\":[]}")]);
+    let answer = ToolAnswer::Page(serde_json::json!({ "results": [] }));
     let Ok(ToolOutcome::Answer(value)) = tool_outcome(Ok(answer)) else {
-        panic!("a successful result must parse as an Answer");
+        panic!("a page must be an Answer");
     };
     assert!(value.get("results").is_some(), "{value}");
 
     // The arm an entry must never accept: the handler never produced a
     // result at all.
-    let protocol: Result<CallToolResult, ErrorData> =
+    let protocol: Result<ToolAnswer<Value>, ErrorData> =
         Err(ErrorData::internal_error("g-mesh: the index is gone".to_string(), None));
     assert!(tool_outcome(protocol).is_err(), "a protocol-level failure must stay an Err");
 }
@@ -501,7 +501,7 @@ fn a_tool_level_refusal_is_a_refusal_and_a_protocol_error_is_not() {
 /// a refusal is still exactly the `Err(text)` they have always reported.
 #[test]
 fn tool_json_still_reports_a_refusal_as_a_plain_error_string() {
-    let refusal = CallToolResult::error(vec![ContentBlock::text("g-mesh: nope")]);
+    let refusal = ToolAnswer::<Value>::refused("g-mesh: nope");
     assert_eq!(tool_json(tool_outcome(Ok(refusal))), Err("g-mesh: nope".to_string()));
 }
 

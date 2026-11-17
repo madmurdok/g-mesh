@@ -10,8 +10,14 @@ use super::find_callers_callees::{self, CalleesAnswer, CallersAnswer};
 use super::find_definition::{self, CandidatePage, DefinitionNode, FileNamePage};
 use super::find_implementations::{self, ImplementationAnswer};
 use super::find_references::{self, ReferencesAnswer};
+use super::get_dependencies::{self, DependencyWalk};
+use super::get_file_outline::{self, OutlinePage};
 use super::not_indexed::NotIndexed;
-use super::{FindDefinitionParams, FindImplementationsParams, SymbolQueryParams};
+use super::search_code::{self, Coverage, SearchAnswer};
+use super::{
+    FindDefinitionParams, FindImplementationsParams, GetDependenciesParams, GetFileOutlineParams,
+    SearchCodeParams, SymbolQueryParams,
+};
 
 /// What one tool call answers, before it becomes bytes.
 pub(crate) enum ToolAnswer<P> {
@@ -71,6 +77,16 @@ pub(crate) enum Refusal {
     NotIndexed { error: String, not_indexed: NotIndexed },
 }
 
+impl Refusal {
+    /// The refusal as prose. For `NotIndexed`, the error sentence without the
+    /// JSON body the wire carries.
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Refusal::Text(message) | Refusal::NotIndexed { error: message, .. } => message,
+        }
+    }
+}
+
 /// A page `render` can send. Its bytes are its `Serialize` output.
 pub(crate) trait WirePage: Serialize {
     /// A prose note sent in its own content block before the page. Default:
@@ -109,6 +125,20 @@ pub(crate) fn implementations(
     ctx.resolve_lazily(find_implementations::dispatch, params)
 }
 
+pub(crate) fn dependencies(
+    ctx: &QueryCtx,
+    params: GetDependenciesParams,
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
+    get_dependencies::handle(ctx, params)
+}
+
+pub(crate) fn outline(
+    ctx: &QueryCtx,
+    params: GetFileOutlineParams,
+) -> Result<ToolAnswer<OutlinePage>, ErrorData> {
+    get_file_outline::handle(ctx, params)
+}
+
 /// [`definition`] for the server (`QueryCtx::resolve_lazily_off_worker`).
 pub(crate) async fn definition_off_worker(
     ctx: QueryCtx,
@@ -143,6 +173,16 @@ pub(crate) async fn implementations_off_worker(
     params: FindImplementationsParams,
 ) -> Result<ToolAnswer<ImplementationAnswer>, ErrorData> {
     ctx.resolve_lazily_off_worker(find_implementations::dispatch, params).await
+}
+
+/// `search_code`, on the blocking pool. `coverage` is `Some` while the
+/// embedding pass is still owed.
+pub(crate) async fn search_off_worker(
+    ctx: QueryCtx,
+    params: SearchCodeParams,
+    coverage: Option<Coverage>,
+) -> Result<ToolAnswer<SearchAnswer>, ErrorData> {
+    search_code::handle_off_worker(ctx, params, coverage).await
 }
 
 /// Lets the test helpers read a typed answer as the client would.
