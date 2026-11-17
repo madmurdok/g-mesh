@@ -8,7 +8,6 @@
 //! protocol); the why goes in a `//` comment, cross-tool guidance in
 //! `get_info`'s instructions (`docs/adr/0003-mcp-instructions-rendering.md`).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,10 +25,10 @@ use crate::gc::last_used;
 use crate::graph::Direction;
 use crate::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::ipc::AsyncStream;
-use crate::plugin_manifest::Capabilities;
 use crate::protocol::types::Position;
 use crate::storage::index_store::IndexStore;
 
+use self::context::QueryCtx;
 use self::progress::{Beat, Cancel};
 
 mod anchor;
@@ -38,6 +37,7 @@ mod answer;
 mod answer_tests;
 // `pub(crate)` so `cli::plugin_check::expectations` calls the same handler
 // functions as the tools below; every other submodule stays private.
+pub(crate) mod context;
 pub(crate) mod find_callers_callees;
 pub(crate) mod find_definition;
 pub(crate) mod find_implementations;
@@ -339,12 +339,24 @@ impl GMeshMcpServer {
         ));
     }
 
-    /// Every discovered plugin's declared `[plugin.capabilities]`, which the
-    /// four edge-walking tools hand to `provenance::resolve`. Read fresh per
-    /// call: it never changes while the daemon runs
-    /// (`plugin_manifest::discover`), so a cache would save nothing.
-    fn capabilities(&self) -> HashMap<String, Capabilities> {
-        self.host.receiver_call_capabilities()
+    /// The context of one tool call: `file_paths` is a find tool's filter
+    /// (its unindexed entries become `uncovered`), `file` the anchoring file
+    /// of a path-anchored tool (its coverage becomes `coverage`). The host's
+    /// capabilities and entry points are read fresh per call: they never
+    /// change while the daemon runs (`plugin_manifest::discover`), so a cache
+    /// would save nothing.
+    fn query_ctx(&self, file_paths: Option<&[String]>, file: Option<&str>) -> QueryCtx {
+        QueryCtx {
+            store: Arc::clone(&self.store),
+            embedding: Arc::clone(&self.embedding),
+            shapes: Arc::clone(&self.shapes),
+            hints: self.hints.clone(),
+            project_root: self.host.project_root().to_path_buf(),
+            capabilities: self.host.receiver_call_capabilities(),
+            entry_points: self.host.entry_points(),
+            uncovered: self.filter_coverage(file_paths),
+            coverage: file.and_then(|path| self.host.path_coverage(path)),
+        }
     }
 
     /// The `file_paths` filter entries of a find tool whose language is not
@@ -663,18 +675,10 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
-        let store = Arc::clone(&self.store);
-        let project_root = self.host.project_root().to_path_buf();
         let params = params.0;
-        let coverage = params.file_path.as_deref().and_then(|path| self.host.path_coverage(path));
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_definition::handle_in(&store, &project_root, semantic, coverage.as_ref(), params.clone())
-            },
-        )
-        .await
+        self.query_ctx(None, params.file_path.as_deref())
+            .resolve_lazily_off_worker(find_definition::handle, params)
+            .await
     }
 
     #[tool(
@@ -689,24 +693,10 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_references", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, hints, params) =
-            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
-        let uncovered = self.filter_coverage(params.file_paths.as_deref());
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_references::handle_in_covered(
-                    &store,
-                    semantic,
-                    &capabilities,
-                    &hints,
-                    &uncovered,
-                    params.clone(),
-                )
-            },
-        )
-        .await
+        let params = params.0;
+        self.query_ctx(params.file_paths.as_deref(), None)
+            .resolve_lazily_off_worker(find_references::handle, params)
+            .await
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -718,24 +708,10 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_callers", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, hints, params) =
-            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
-        let uncovered = self.filter_coverage(params.file_paths.as_deref());
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_callers_callees::handle_callers_in_covered(
-                    &store,
-                    semantic,
-                    &capabilities,
-                    &hints,
-                    &uncovered,
-                    params.clone(),
-                )
-            },
-        )
-        .await
+        let params = params.0;
+        self.query_ctx(params.file_paths.as_deref(), None)
+            .resolve_lazily_off_worker(find_callers_callees::handle_callers, params)
+            .await
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -747,24 +723,10 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_callees", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, hints, params) =
-            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
-        let uncovered = self.filter_coverage(params.file_paths.as_deref());
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_callers_callees::handle_callees_in_covered(
-                    &store,
-                    semantic,
-                    &capabilities,
-                    &hints,
-                    &uncovered,
-                    params.clone(),
-                )
-            },
-        )
-        .await
+        let params = params.0;
+        self.query_ctx(params.file_paths.as_deref(), None)
+            .resolve_lazily_off_worker(find_callers_callees::handle_callees, params)
+            .await
     }
 
     #[tool(
@@ -779,29 +741,12 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_implementations", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, hints, params) =
-            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        let params = params.0;
         // `transitive` ignores `file_paths`, so it names nothing about them.
-        let uncovered = if params.transitive.unwrap_or(false) {
-            Vec::new()
-        } else {
-            self.filter_coverage(params.file_paths.as_deref())
-        };
-        find_definition::resolve_lazily_off_worker(
-            Arc::clone(&self.embedding),
-            Arc::clone(&self.shapes),
-            move |semantic| {
-                find_implementations::dispatch_in_covered(
-                    &store,
-                    semantic,
-                    &capabilities,
-                    &hints,
-                    &uncovered,
-                    params.clone(),
-                )
-            },
-        )
-        .await
+        let file_paths = if params.transitive.unwrap_or(false) { None } else { params.file_paths.as_deref() };
+        self.query_ctx(file_paths, None)
+            .resolve_lazily_off_worker(find_implementations::dispatch, params)
+            .await
     }
 
     #[tool(
@@ -818,8 +763,7 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
-        let coverage = self.host.path_coverage(&params.0.file_path);
-        get_file_outline::handle_covered(&self.store, coverage.as_ref(), params.0)
+        get_file_outline::handle(&self.query_ctx(None, Some(&params.0.file_path)), params.0)
     }
 
     #[tool(
@@ -838,13 +782,7 @@ impl GMeshMcpServer {
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "get_dependencies", call_started, file_path).await;
         }
-        // The union of every plugin's declared entry points (see
-        // `McpHost::entry_points` and
-        // `graph::queries::entry_point_rank_expr`). Read fresh per call: it
-        // never changes while the daemon runs.
-        let entry_points = self.host.entry_points();
-        let coverage = params.0.file_path.as_deref().and_then(|path| self.host.path_coverage(path));
-        get_dependencies::handle_covered(&self.store, &entry_points, &self.hints, coverage.as_ref(), params.0)
+        get_dependencies::handle(&self.query_ctx(None, params.0.file_path.as_deref()), params.0)
     }
 
     #[tool(

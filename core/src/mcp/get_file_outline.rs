@@ -5,8 +5,6 @@
 //! ordered by source position (`graph::pagination::paginate_defines`)
 //! instead of the resolved/locality rule the symbol-anchored tools use.
 
-use std::sync::Arc;
-
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
@@ -16,10 +14,8 @@ use crate::graph::pagination;
 use crate::graph::queries;
 use crate::mcp::response_bound;
 use crate::model::NodeRecord;
-use crate::storage::index_store::IndexStore;
 
-use crate::mcp::PathCoverage;
-
+use super::context::QueryCtx;
 use super::not_indexed;
 use super::tool_result::{internal_error, success};
 use super::{GetFileOutlineParams, OutlineDetail};
@@ -154,24 +150,12 @@ fn list_outline(
     Ok(Outline { page, total })
 }
 
-/// [`handle_covered`] for a path whose language is indexed.
-#[cfg(test)]
-pub(super) fn handle(
-    store: &Arc<IndexStore>,
-    params: GetFileOutlineParams,
-) -> Result<CallToolResult, ErrorData> {
-    handle_covered(store, None, params)
-}
-
-/// [`handle`], told whether the path's language is indexed at all: a miss on
-/// a path in an absent or failed language is refused with
+/// `ctx.coverage` says whether the path's language is indexed at all: a miss
+/// on a path in an absent or failed language is refused with
 /// [`not_indexed::miss`]'s structured reason instead of the bare message.
-pub(super) fn handle_covered(
-    store: &Arc<IndexStore>,
-    coverage: Option<&PathCoverage>,
-    params: GetFileOutlineParams,
-) -> Result<CallToolResult, ErrorData> {
-    let conn = store.read();
+pub(super) fn handle(ctx: &QueryCtx, params: GetFileOutlineParams) -> Result<CallToolResult, ErrorData> {
+    let coverage = ctx.coverage.as_ref();
+    let conn = ctx.store.read();
 
     let file_node = queries::find_file_node(&conn, &params.file_path)
         .map_err(|e| internal_error("failed to look up file", e))?;
@@ -206,9 +190,12 @@ pub(super) fn handle_covered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::PathCoverage;
     use crate::model::EdgeRecord;
+    use crate::storage::index_store::IndexStore;
     use crate::storage::schema;
     use crate::storage::write::{upsert_edge, upsert_node};
+    use std::sync::Arc;
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -261,7 +248,7 @@ mod tests {
         .unwrap();
 
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
+        let result = handle(&QueryCtx::for_test(&Arc::new(IndexStore::new(conn))), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         let names: Vec<&str> = results.iter().map(|r| r["name"].as_str().unwrap()).collect();
@@ -274,7 +261,7 @@ mod tests {
         upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
 
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
+        let result = handle(&QueryCtx::for_test(&Arc::new(IndexStore::new(conn))), params).unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
         assert_eq!(body["hasMore"], false);
@@ -285,7 +272,7 @@ mod tests {
         let conn = setup();
         let params =
             GetFileOutlineParams { file_path: "does/not/exist.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
+        let result = handle(&QueryCtx::for_test(&Arc::new(IndexStore::new(conn))), params).unwrap();
         assert!(error_text(&result).contains("does/not/exist.rs"));
     }
 
@@ -299,7 +286,7 @@ mod tests {
             .unwrap();
 
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
+        let result = handle(&QueryCtx::for_test(&Arc::new(IndexStore::new(conn))), params).unwrap();
         assert!(error_text(&result).contains("a.rs"));
     }
 
@@ -326,7 +313,7 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle(&conn, params).unwrap();
+            let result = handle(&QueryCtx::for_test(&conn), params).unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["name"].as_str().unwrap().to_string()));
@@ -364,7 +351,7 @@ mod tests {
 
         let params =
             GetFileOutlineParams { file_path: "a.rs".to_string(), limit: Some(30), ..Default::default() };
-        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
+        let result = handle(&QueryCtx::for_test(&Arc::new(IndexStore::new(conn))), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 30, "30 symbols must fit in a single page once limit covers them all");
@@ -389,7 +376,7 @@ mod tests {
         }
 
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), ..Default::default() };
-        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
+        let result = handle(&QueryCtx::for_test(&Arc::new(IndexStore::new(conn))), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 25, "no limit means every row that fits the budget");
@@ -464,7 +451,7 @@ mod tests {
         detail: Option<OutlineDetail>,
     ) -> (String, serde_json::Value) {
         let params = GetFileOutlineParams { file_path: "a.rs".to_string(), cursor, limit, detail };
-        let result = handle(store, params).unwrap();
+        let result = handle(&QueryCtx::for_test(store), params).unwrap();
         let body = json_body(&result);
         let text = match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),
@@ -664,13 +651,17 @@ mod tests {
 
     fn outline_of(conn: Connection, coverage: Option<&PathCoverage>, file_path: &str) -> CallToolResult {
         let params = GetFileOutlineParams { file_path: file_path.to_string(), ..Default::default() };
-        handle_covered(&Arc::new(IndexStore::new(conn)), coverage, params).unwrap()
+        handle(
+            &QueryCtx { coverage: coverage.cloned(), ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn))) },
+            params,
+        )
+        .unwrap()
     }
 
     /// An absent language's file is refused with the
     /// structured reason and the install command.
     ///
-    /// Control: in `handle_covered`'s miss arm, call
+    /// Control: in `handle`'s miss arm, call
     /// `tool_result::error(..)` instead of `not_indexed::miss` - the body is
     /// not JSON.
     #[test]

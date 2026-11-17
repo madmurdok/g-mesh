@@ -52,7 +52,9 @@ use clap::Args;
 
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
+use crate::mcp::context::QueryCtx;
 use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::session_hints::SessionHints;
 use crate::plugin_manifest::{plain_spelling, read_manifest, PluginManifest};
 use crate::protocol::ndjson::BulkItem;
 use crate::storage::index_store::IndexStore;
@@ -458,12 +460,17 @@ fn expectations_section(
     let capabilities = HashMap::from([(manifest.language.clone(), manifest.capabilities)]);
     let shapes = QueryShapes::from_manifests([manifest]);
     let ctx = expectations::EvalContext {
-        conn,
-        embedding: &embedding,
-        project_root: &project_root,
-        entry_points: &entry_points,
-        capabilities: &capabilities,
-        shapes: &shapes,
+        query: QueryCtx {
+            store: Arc::clone(conn),
+            embedding: Arc::new(embedding),
+            shapes: Arc::new(shapes),
+            hints: SessionHints::default(),
+            project_root,
+            capabilities,
+            entry_points,
+            uncovered: Vec::new(),
+            coverage: None,
+        },
     };
 
     let mut results =

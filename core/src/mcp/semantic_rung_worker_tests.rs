@@ -4,7 +4,7 @@
 //! blocked, the daemon still serves other calls and other lock takers, and the
 //! answers are the ones the ladder gave before.
 
-use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::context::QueryCtx;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -100,7 +100,7 @@ fn body(result: &CallToolResult) -> Value {
 /// inference is off the worker.
 ///
 /// Control: in `GMeshMcpServer::find_definition`, call
-/// `find_definition::resolve_lazily` (the synchronous driver, which embeds
+/// `QueryCtx::resolve_lazily` (the synchronous driver, which embeds
 /// on the calling thread) instead of `resolve_lazily_off_worker` - both calls
 /// stall behind the inference until the watchdog opens the gate, and the
 /// first assertion fails.
@@ -223,8 +223,13 @@ async fn the_ladder_answers_as_before_on_exact_suffix_and_semantic_rungs() {
             include_source: Some(false),
         };
         let direct = body(
-            &find_definition::handle(&store, Path::new("."), &embedding, QueryShapes::shipped(), params)
-                .unwrap(),
+            &QueryCtx {
+                embedding: Arc::clone(&embedding),
+                project_root: Path::new(".").to_path_buf(),
+                ..QueryCtx::for_test(&store)
+            }
+            .resolve_lazily(find_definition::handle, params)
+            .unwrap(),
         );
 
         assert_eq!(served["resolvedBy"], rung, "{query}: {served}");

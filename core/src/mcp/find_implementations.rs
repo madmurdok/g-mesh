@@ -18,7 +18,6 @@
 //! [`dispatch`] and [`from_root`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use anyhow::Context;
 use rmcp::model::CallToolResult;
@@ -26,20 +25,17 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
 use crate::graph::Direction;
 use crate::mcp::response_bound;
-use crate::mcp::PathCoverage;
 use crate::model::NodeRecord;
 use crate::plugin_manifest::Capabilities;
-use crate::storage::index_store::IndexStore;
 
+use super::context::QueryCtx;
 use super::not_indexed::{self, NotIndexed};
-use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{error, internal_error, success};
 use super::{anchor, find_definition, provenance, FindImplementationsParams, SymbolQueryParams};
@@ -164,31 +160,15 @@ fn list_implementations(
     Ok(response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
 }
 
-#[cfg(test)]
-pub(super) fn handle(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    capabilities: &HashMap<String, Capabilities>,
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
-    let hints = SessionHints::default();
-    find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_in(store, semantic, capabilities, &hints, &[], params.clone())
-    })
-}
-
 /// The single-hop walk, one pass - see [`find_definition::SemanticRung`].
-/// `uncovered`: the `file_paths` entries whose language is not indexed,
+/// `ctx.uncovered`: the `file_paths` entries whose language is not indexed,
 /// named in the answer's `notIndexed` (`not_indexed::group`).
-fn handle_in(
-    store: &Arc<IndexStore>,
+fn handle(
+    ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    uncovered: &[(String, PathCoverage)],
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
+    let QueryCtx { store, capabilities, hints, uncovered, .. } = ctx;
     let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, semantic, &params)? {
@@ -562,50 +542,20 @@ fn continued(
     success(&walk)
 }
 
-/// The tool's entry point, both passes of it ([`dispatch_in`] is one).
+/// The tool's entry point, one pass of it - see
+/// [`find_definition::SemanticRung`]; [`QueryCtx::resolve_lazily`] runs both.
 /// Dispatches on `transitive`/`resume_token` and otherwise defers entirely to
-/// the unmodified single-hop [`handle_in`]: the non-transitive path here is
-/// not a reimplementation of that logic, it
-/// *is* that logic, called with a plain [`SymbolQueryParams`] built from this
-/// struct's shared fields - which is what makes the single-hop response
-/// byte-identical to what it was before this file gained a `transitive`
-/// concept, by construction rather than by parallel maintenance.
+/// the single-hop [`handle`], called with a plain [`SymbolQueryParams`] built
+/// from this struct's shared fields, so the single-hop response is the same
+/// with or without `transitive: false`. Only the direct walk names
+/// `ctx.uncovered` (`notIndexed`): the transitive walk and a resumed one
+/// ignore `file_paths`, so they ignore `uncovered` too.
 pub(crate) fn dispatch(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    capabilities: &HashMap<String, Capabilities>,
-    params: FindImplementationsParams,
-) -> Result<CallToolResult, ErrorData> {
-    let hints = SessionHints::default();
-    find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        dispatch_in(store, semantic, capabilities, &hints, params.clone())
-    })
-}
-
-/// One pass of [`dispatch`] - see [`find_definition::SemanticRung`].
-pub(crate) fn dispatch_in(
-    store: &Arc<IndexStore>,
+    ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
-    dispatch_in_covered(store, semantic, capabilities, hints, &[], params)
-}
-
-/// [`dispatch_in`], with `uncovered` the `file_paths` entries whose language
-/// is not indexed (`GMeshMcpServer::filter_coverage`). Only the direct walk
-/// names them (`notIndexed`): the transitive walk and a resumed one ignore
-/// `file_paths`, so they ignore `uncovered` too.
-pub(crate) fn dispatch_in_covered(
-    store: &Arc<IndexStore>,
-    semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    uncovered: &[(String, PathCoverage)],
-    params: FindImplementationsParams,
-) -> Result<CallToolResult, ErrorData> {
+    let QueryCtx { store, capabilities, hints, .. } = ctx;
     let FindImplementationsParams {
         symbol_id,
         symbol_name,
@@ -634,7 +584,7 @@ pub(crate) fn dispatch_in_covered(
     let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: None };
 
     if !transitive.unwrap_or(false) {
-        return handle_in(store, semantic, capabilities, hints, uncovered, symbol_params);
+        return handle(ctx, semantic, symbol_params);
     }
 
     let conn = store.read();

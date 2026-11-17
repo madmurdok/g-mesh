@@ -3,28 +3,22 @@
 //! `graph::pagination::paginate_edges`; this module is just the "anchor
 //! lookup -> incoming usage edges -> usage-site JSON" wiring around it.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use anyhow::Context;
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
 use crate::graph::Direction;
 use crate::mcp::response_bound;
-use crate::mcp::PathCoverage;
 use crate::model::NodeRecord;
-use crate::plugin_manifest::{Capabilities, MemberOverrides};
-use crate::storage::index_store::IndexStore;
+use crate::plugin_manifest::MemberOverrides;
 
+use super::context::QueryCtx;
 use super::not_indexed::{self, NotIndexed};
 use super::overrides::{self, OverriddenMember, Overrides};
-use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
 use super::unlinked::{self, UnlinkedUsages};
@@ -222,19 +216,6 @@ fn list_references(
     Ok(response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
 }
 
-pub(crate) fn handle(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
-    find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_in(store, semantic, capabilities, hints, params.clone())
-    })
-}
-
 /// Everything a reference page carries besides its rows, fetched once so that
 /// candidate pages can be measured whole before one is sent.
 struct ReferenceParts<'a> {
@@ -316,28 +297,16 @@ impl ReferenceParts<'_> {
     }
 }
 
-/// One pass of [`handle`] - see [`find_definition::SemanticRung`].
-pub(crate) fn handle_in(
-    store: &Arc<IndexStore>,
+/// One pass of `find_references` - see [`find_definition::SemanticRung`];
+/// [`QueryCtx::resolve_lazily`] runs both. `ctx.uncovered` (the `file_paths`
+/// entries whose language is not indexed) is named in `notIndexed`
+/// (`not_indexed::group`).
+pub(crate) fn handle(
+    ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    handle_in_covered(store, semantic, capabilities, hints, &[], params)
-}
-
-/// [`handle_in`], with `uncovered` the `file_paths` entries whose language
-/// is not indexed (`GMeshMcpServer::filter_coverage`): the answer names them
-/// in `notIndexed` (`not_indexed::group`).
-pub(crate) fn handle_in_covered(
-    store: &Arc<IndexStore>,
-    semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    uncovered: &[(String, PathCoverage)],
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
+    let QueryCtx { store, capabilities, hints, uncovered, .. } = ctx;
     let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, semantic, &params)? {
@@ -452,9 +421,14 @@ pub(crate) fn handle_in_covered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::PathCoverage;
     use crate::model::{EdgeRecord, NodeRecord};
+    use crate::plugin_manifest::Capabilities;
+    use crate::storage::index_store::IndexStore;
     use crate::storage::schema;
     use crate::storage::write::{upsert_edge, upsert_node};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// The capability map every test in this module passes: empty, so
     /// `provenance::resolve` reads "no plugin here declares a semantic
@@ -509,14 +483,11 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 2, "{body}");
@@ -628,15 +599,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let callers = json_body(
-            &super::super::find_callers_callees::handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    super::super::find_callers_callees::handle_callers,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let mut caller_ids: Vec<&str> = callers["results"]
             .as_array()
@@ -652,15 +620,12 @@ mod tests {
         );
 
         let references = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let mut reference_ids: Vec<&str> = references["results"]
             .as_array()
@@ -700,19 +665,16 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams {
-                    symbol_id: Some("target".to_string()),
-                    limit: Some(1),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams {
+                        symbol_id: Some("target".to_string()),
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 1, "precondition: limit 1 shows a single row");
         assert_eq!(body["hasMore"], true, "precondition: four more references are behind the cursor");
@@ -751,15 +713,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert_eq!(body["hasMore"], false, "precondition: the page is complete");
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
@@ -792,15 +751,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert_eq!(body["hasMore"], false);
         let files =
@@ -833,19 +789,16 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams {
-                    symbol_id: Some("target".to_string()),
-                    file_paths: Some(vec!["a.ts".to_string()]),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams {
+                        symbol_id: Some("target".to_string()),
+                        file_paths: Some(vec!["a.ts".to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
         );
         let files =
             body["files"].as_array().expect("two in-scope rows in one file still leave deduplication to do");
@@ -912,15 +865,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
@@ -1067,15 +1017,9 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
@@ -1146,15 +1090,9 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
         let mut file_paths: Vec<&str> =
             body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
@@ -1196,15 +1134,9 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "the out-of-scope file's reference must not come back");
@@ -1236,30 +1168,24 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let omitted = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let explicit_empty = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams {
-                    symbol_id: Some("target".to_string()),
-                    file_paths: Some(Vec::new()),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams {
+                        symbol_id: Some("target".to_string()),
+                        file_paths: Some(Vec::new()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
         );
         assert_eq!(
             omitted, explicit_empty,
@@ -1275,14 +1201,11 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -1317,14 +1240,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle, params)
             .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
@@ -1363,14 +1283,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle, params)
             .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
@@ -1399,14 +1316,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle, params)
             .unwrap(),
         );
         assert_eq!(body["anchor"]["id"], "target");
@@ -1434,26 +1348,20 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let by_id = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let by_name = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         // Everything but `resolvedBy` must match: the walk, the results and the
         // anchor are properties of the node, however the caller addressed it.
@@ -1478,14 +1386,11 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_name: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -1495,14 +1400,11 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -1534,15 +1436,9 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
 
         let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
@@ -1567,14 +1463,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle, params)
             .unwrap(),
         );
         assert!(
@@ -1619,15 +1512,9 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap();
+            let result = QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["referencingSymbolId"].as_str().unwrap().to_string()));
@@ -1664,15 +1551,9 @@ mod tests {
     fn hint_for(store: &Arc<IndexStore>, hints: &SessionHints) -> String {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                hints,
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), hints: hints.clone(), ..QueryCtx::for_test(store) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
         body["hint"].as_str().unwrap_or_default().to_string()
     }
@@ -1742,12 +1623,13 @@ mod tests {
             answer,
             ..Default::default()
         };
-        handle_in_covered(
-            store,
+        handle(
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                uncovered: uncovered.to_vec(),
+                ..QueryCtx::for_test(store)
+            },
             &find_definition::SemanticRung::off(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            uncovered,
             params,
         )
         .unwrap()
@@ -1851,14 +1733,12 @@ mod tests {
         answer: Option<Answer>,
     ) -> serde_json::Value {
         json_body(
-            &handle(
-                store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                capabilities,
-                hints,
-                params_for(id, answer),
-            )
+            &QueryCtx {
+                capabilities: capabilities.clone(),
+                hints: hints.clone(),
+                ..QueryCtx::for_test(store)
+            }
+            .resolve_lazily(handle, params_for(id, answer))
             .unwrap(),
         )
     }
@@ -1870,14 +1750,12 @@ mod tests {
         id: &str,
     ) -> serde_json::Value {
         json_body(
-            &handle_callers(
-                store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                capabilities,
-                hints,
-                params_for(id, None),
-            )
+            &QueryCtx {
+                capabilities: capabilities.clone(),
+                hints: hints.clone(),
+                ..QueryCtx::for_test(store)
+            }
+            .resolve_lazily(handle_callers, params_for(id, None))
             .unwrap(),
         )
     }
@@ -1946,7 +1824,7 @@ mod tests {
     /// The mode comes from the anchor language's capabilities: no entry for
     /// the language (or another language's `by_name`) is `none`, so the same
     /// override carries no field and no sentence. Control: pass
-    /// `MemberOverrides::ByName` to `overrides::probe` in `handle_in_covered`
+    /// `MemberOverrides::ByName` to `overrides::probe` in `handle`
     /// whatever the map says.
     #[test]
     fn the_anchor_languages_capability_gates_overrides_on_references() {
@@ -2068,14 +1946,11 @@ mod tests {
         upsert_edge(&mut conn, EdgeRecord::new("e", "user", "stub", "CALLS", "tree-sitter", true)).unwrap();
 
         let params = SymbolQueryParams { symbol_name: Some("GetName".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         let body = json_body(&result);
         let rows = body["results"].as_array().unwrap_or_else(|| panic!("{body}"));

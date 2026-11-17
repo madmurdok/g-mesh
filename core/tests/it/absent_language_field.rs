@@ -14,7 +14,7 @@
 //!   now gets the absent refusal for a file it had an outline for.
 //!
 //! The control for the whole file: in `GMeshMcpServer::get_file_outline`,
-//! pass `None` instead of `coverage` to `get_file_outline::handle_covered` -
+//! build the call's `QueryCtx` with `coverage: None` -
 //! every outline refusal is the plain `no file '...' found` text and the
 //! JSON parse fails. Each test names its own narrower control too.
 
@@ -318,7 +318,7 @@ async fn select(client: &RunningService<RoleClient, ()>, project: &str) {
 /// No order between processes is asserted beyond the test's own sequential
 /// calls and the stop it waits for.
 ///
-/// Control: pass `None` to `get_file_outline::handle_covered` in
+/// Control: build the `QueryCtx` with `coverage: None` in
 /// `GMeshMcpServer::get_file_outline` - the last outline is the plain
 /// no-file text and the JSON parse fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

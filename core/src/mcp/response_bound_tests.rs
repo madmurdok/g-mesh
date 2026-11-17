@@ -5,19 +5,17 @@
 //! cut (never lost) at the budget, and every tally the byte caps shorten says
 //! so.
 
+use crate::mcp::context::QueryCtx;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
-use super::session_hints::SessionHints;
 use super::unlinked::CandidateTally;
 use super::{find_callers_callees, find_implementations, find_references};
 use super::{Answer, FindImplementationsParams, SymbolQueryParams};
-use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::decode_cursor;
-use crate::mcp::query_shapes::QueryShapes;
 use crate::mcp::response_bound::{self, EXCLUDED_TALLY_MAX_BYTES, FILE_TALLY_MAX_BYTES, MAX_RESPONSE_BYTES};
 use crate::model::{Diff, EdgeRecord, NodeRecord};
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
@@ -168,10 +166,7 @@ fn ask(
     cursor: Option<String>,
     answer: Option<Answer>,
 ) -> (serde_json::Value, usize) {
-    let caps = capabilities(pending);
-    let embedding = EmbeddingPipeline::disabled();
-    let shapes = QueryShapes::shipped();
-    let hints = SessionHints::default();
+    let ctx = QueryCtx { capabilities: capabilities(pending), ..QueryCtx::for_test(store) };
     let params = SymbolQueryParams {
         symbol_id: Some("t".into()),
         limit: Some(limit),
@@ -180,16 +175,11 @@ fn ask(
         ..Default::default()
     };
     let result = match tool {
-        Tool::Callers => {
-            find_callers_callees::handle_callers(store, &embedding, shapes, &caps, &hints, params)
-        }
-        Tool::Callees => find_callers_callees::handle_callees(store, &embedding, shapes, &caps, params),
-        Tool::References => find_references::handle(store, &embedding, shapes, &caps, &hints, params),
-        Tool::Implementations => find_implementations::dispatch(
-            store,
-            &embedding,
-            shapes,
-            &caps,
+        Tool::Callers => ctx.resolve_lazily(find_callers_callees::handle_callers, params),
+        Tool::Callees => ctx.resolve_lazily(find_callers_callees::handle_callees, params),
+        Tool::References => ctx.resolve_lazily(find_references::handle, params),
+        Tool::Implementations => ctx.resolve_lazily(
+            find_implementations::dispatch,
             FindImplementationsParams {
                 symbol_id: Some("t".into()),
                 limit: Some(limit),
@@ -256,13 +246,13 @@ fn every_caller_page_fits_the_ceiling() {
     sweep(Tool::Callers, &[(0, 0, 0, false), (200, 50, 30, false), (60, 50, 100, true)]);
 }
 
-/// Control as for callees, in `find_references::handle_in`.
+/// Control as for callees, in `find_references::handle`.
 #[test]
 fn every_reference_page_fits_the_ceiling() {
     sweep(Tool::References, &[(0, 0, 0, false), (200, 50, 30, false), (60, 0, 0, true)]);
 }
 
-/// Control as for callees, in `find_implementations::handle_in`.
+/// Control as for callees, in `find_implementations::handle`.
 #[test]
 fn every_single_hop_implementation_page_fits_the_ceiling() {
     sweep(Tool::Implementations, &[(0, 0, 0, false), (60, 0, 0, false), (200, 0, 0, true)]);
