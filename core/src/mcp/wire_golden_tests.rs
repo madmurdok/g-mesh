@@ -5,6 +5,7 @@
 //!
 //! Assertions go through [`assert_wire`] on the rendered text only, so the
 //! type that builds the answer can change without touching a test.
+//! [`typed_answers`] checks the typed answers behind those bytes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,6 +38,8 @@ use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::vectors::{insert, register_extension};
 use crate::storage::write::{upsert_edge, upsert_node};
+
+mod typed_answers;
 
 const UPDATE_ENV: &str = "G_MESH_UPDATE_WIRE_GOLDEN";
 
