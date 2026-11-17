@@ -492,3 +492,10 @@ with this map, and the build stays green between them (D5). Alternative: one opu
   answered with semantic neighbours). Fallback: grep for `CallToolResult`/`ContentBlock`/
   `success(`/`error(` over `core/src/mcp`, `core/src/cli`, `core/src/daemon`, `core/tests`
   (section 0 lists the results).
+
+## 8. Owner review (2026-11-17)
+
+- D6: "Assertions те же, хелперы меняются (Recommended)".
+- D2: "Остаётся в handlers (Recommended)".
+- Slicing: "Сначала golden-тесты (Recommended)" — wire-golden tests on the current code first.
+- D1, D3, D4, D5, D7 as recommended.
