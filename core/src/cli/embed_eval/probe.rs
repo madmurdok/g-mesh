@@ -65,8 +65,11 @@ pub fn run(args: &ProbeArgs) -> Result<()> {
         bail!("variant {} is not a model arm; the probe embeds queries", variant.name);
     }
     let base = variants.encoder_of(variant)?;
-    let options =
-        if args.options_from_env { InferenceOptions::from_env() } else { InferenceOptions::default() };
+    let options = if args.options_from_env {
+        crate::config::embedding::inference_options()
+    } else {
+        InferenceOptions::default()
+    };
     let model =
         EmbeddingModel::load_with_options(&base.model_dir(eval_dir)?, base.encoder_spec()?, &options)?;
     let (queries, _) = queries::load(eval_dir, &args.corpus)?;

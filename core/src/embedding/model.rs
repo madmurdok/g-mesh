@@ -11,8 +11,7 @@
 //!   silently produces garbage vectors rather than an error, which is why the
 //!   two are loaded from one directory as a unit.
 //!
-//! The default model is `jina-embeddings-v2-base-code` (the value
-//! [`crate::config::EmbeddingConfig`] already defaults to): 12 layers, hidden
+//! The default model is [`DEFAULT_MODEL_NAME`], `jina-embeddings-v2-base-code`: 12 layers, hidden
 //! size 768, mean pooling, ALiBi positions so it accepts up to 8192 tokens
 //! (though [`EmbeddingModel::load`] truncates to far fewer - see
 //! [`DEFAULT_MAX_SEQUENCE_LENGTH`]). Nothing in this module is specific to it beyond the two shape checks -
@@ -46,7 +45,7 @@
 //! of the repository it came from.
 //!
 //! `g-mesh model fetch` (see [`crate::cli::model`]) does exactly that, into the
-//! directory [`resolve_model_dir`] resolves to - it is a user-typed command,
+//! directory `config::embedding::resolve_model_dir` resolves to - it is a user-typed command,
 //! never something this module or the daemon triggers.
 //! `core/scripts/fetch-embedding-model.sh` is the same download as a shell
 //! one-liner, kept for a source checkout that has no built binary yet; both
@@ -124,7 +123,7 @@ pub(crate) const TEXT_FORM_TAG: &str = "structured";
 /// any other model's name as configured (its weights are not g-mesh's to
 /// pin), then [`TEXT_FORM_TAG`].
 pub(crate) fn embedding_version(model_name: &str) -> String {
-    if model_name == crate::config::EmbeddingConfig::default().model {
+    if model_name == DEFAULT_MODEL_NAME {
         format!("{model_name}+{DEFAULT_WEIGHTS_TAG}+{TEXT_FORM_TAG}")
     } else {
         format!("{model_name}+{TEXT_FORM_TAG}")
@@ -213,7 +212,10 @@ pub const MAX_SEQUENCE_LENGTH: usize = 8192;
 /// is still there for a caller that deliberately wants more.
 pub const DEFAULT_MAX_SEQUENCE_LENGTH: usize = 1024;
 
-/// Overrides where [`default_model_dir`] looks. Exists so tests and
+/// The embedding model a project uses unless its config names another.
+pub const DEFAULT_MODEL_NAME: &str = "jina-embeddings-v2-base-code";
+
+/// Overrides where [`default_model_dir_from`] looks. Exists so tests and
 /// development checkouts can point at a model directory outside the user's
 /// home without a config file; ordinary runs never set it.
 pub const MODEL_DIR_ENV: &str = "G_MESH_MODEL_DIR";
@@ -397,12 +399,7 @@ impl ExecutionTarget {
 }
 
 impl InferenceOptions {
-    /// Reads the `G_MESH_EMBED_*` variables of the process environment.
-    pub fn from_env() -> Self {
-        Self::from_env_with(|name| std::env::var(name).ok())
-    }
-
-    /// [`from_env`](Self::from_env) over any variable lookup. Never fails:
+    /// The `G_MESH_EMBED_*` variables, read through `get`. Never fails:
     /// an unparsable value is logged and the default kept.
     pub fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Self {
         let mut options = Self::default();
@@ -1059,7 +1056,8 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Where the weights for `model_name` are expected to live:
-/// `~/.g-mesh/models/<model_name>/`, or `$G_MESH_MODEL_DIR` if set.
+/// `~/.g-mesh/models/<model_name>/`, or `dir_override` (`$G_MESH_MODEL_DIR`,
+/// read by `config::embedding::model_dir`) if set.
 ///
 /// `~/.g-mesh/` is already where g-mesh keeps everything else it owns (indexes
 /// and config), and models are per-machine rather than per-project - the same
@@ -1072,41 +1070,22 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// developer's home, and weights are an immutable per-machine cache rather
 /// than per-run state. Moving them with it would turn every isolated run into
 /// a 154 MiB download. Use `G_MESH_MODEL_DIR` to move them on purpose.
-pub fn default_model_dir(model_name: &str) -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os(MODEL_DIR_ENV) {
-        return Ok(PathBuf::from(dir));
+pub fn default_model_dir_from(dir_override: Option<&Path>, model_name: &str) -> Result<PathBuf> {
+    if let Some(dir) = dir_override {
+        return Ok(dir.to_path_buf());
     }
     let home = dirs::home_dir().context("could not resolve home directory")?;
     Ok(home.join(".g-mesh").join("models").join(model_name))
-}
-
-/// The full resolution order for a model directory: an explicitly given path,
-/// else [`default_model_dir`] (`$G_MESH_MODEL_DIR`, else
-/// `~/.g-mesh/models/<model_name>`).
-///
-/// Lives here, beside the loader that *reads* those directories, because the
-/// writer (`g-mesh model fetch`, see [`crate::cli::model`]) and the reader
-/// disagreeing about the location is the one failure neither side can detect:
-/// the fetcher would report success and the loader would still report a
-/// missing model. Only one of them may own the answer, and it is this
-/// function.
-pub fn resolve_model_dir(explicit: Option<&Path>, model_name: &str) -> Result<PathBuf> {
-    match explicit {
-        Some(dir) => Ok(dir.to_path_buf()),
-        None => default_model_dir(model_name),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Name of the model the tests below expect in [`default_model_dir`].
-    /// Deliberately the same string [`crate::config::EmbeddingConfig`]
-    /// defaults to - if that default ever changes, these tests should start
-    /// looking somewhere else too.
+    /// Where the tests below expect the default model's weights.
     fn test_model_dir() -> PathBuf {
-        default_model_dir(&crate::config::EmbeddingConfig::default().model).unwrap()
+        let dir_override = std::env::var_os(MODEL_DIR_ENV).map(PathBuf::from);
+        default_model_dir_from(dir_override.as_deref(), DEFAULT_MODEL_NAME).unwrap()
     }
 
     fn load_test_model() -> EmbeddingModel {
@@ -1129,27 +1108,11 @@ mod tests {
 
     #[test]
     fn the_default_model_directory_lives_under_the_g_mesh_home() {
-        // Only meaningful when the override is unset, which is the normal case
-        // and the only one the default path claims to describe.
-        if std::env::var_os(MODEL_DIR_ENV).is_some() {
-            return;
-        }
         let home = dirs::home_dir().unwrap();
         assert_eq!(
-            default_model_dir("some-model").unwrap(),
+            default_model_dir_from(None, "some-model").unwrap(),
             home.join(".g-mesh").join("models").join("some-model")
         );
-    }
-
-    /// An explicit directory wins over both the env override and the home
-    /// default - the `--dir` argument of `g-mesh model fetch` relies on this,
-    /// and so does anyone who set `G_MESH_MODEL_DIR` and then asked for a
-    /// different directory once.
-    #[test]
-    fn an_explicit_directory_wins_over_the_env_override_and_the_default() {
-        let explicit = Path::new("/somewhere/else");
-        assert_eq!(resolve_model_dir(Some(explicit), "some-model").unwrap(), explicit);
-        assert_eq!(resolve_model_dir(None, "some-model").unwrap(), default_model_dir("some-model").unwrap());
     }
 
     /// A build without `ep-coreml` refuses a CoreML target with an error

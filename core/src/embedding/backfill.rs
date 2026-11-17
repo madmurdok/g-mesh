@@ -463,11 +463,11 @@ mod tests {
             },
         )
         .unwrap();
-        let model = crate::config::EmbeddingConfig::default().model;
-        let current = crate::embedding::model::embedding_version(&model);
+        let model = crate::embedding::model::DEFAULT_MODEL_NAME;
+        let current = crate::embedding::model::embedding_version(model);
         assert_ne!(current, model, "the default model's version must not be the fp32 weights' bare name");
         let zeros = [0.0; crate::embedding::EMBEDDING_DIM];
-        crate::storage::vectors::insert(&conn, "embedded_by_fp32", &zeros, &model).unwrap();
+        crate::storage::vectors::insert(&conn, "embedded_by_fp32", &zeros, model).unwrap();
         crate::storage::vectors::insert(&conn, "embedded_by_int8", &zeros, &current).unwrap();
         crate::storage::vectors::insert(&conn, "embedded_from_full_text", &zeros, &format!("{model}+int8"))
             .unwrap();

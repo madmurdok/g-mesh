@@ -342,7 +342,9 @@ pub(super) fn start_services(
     // Not loaded here, not even in the background (a startup thread broke the
     // restart budgets): the first `apply` pays for it on its own thread. A
     // missing model does not stop the daemon, which never fetches one.
-    let embedding = Arc::new(EmbeddingPipeline::load(&project_config.embedding));
+    let embedding = Arc::new(EmbeddingPipeline::load(crate::config::embedding::embedding_settings(
+        &project_config.embedding,
+    )));
     let _ = fs::remove_file(dir.rerank_outcome_file());
     embedding.reranker().record_outcome_to(dir.rerank_outcome_file());
 

@@ -40,7 +40,7 @@
 //! same pinned revision into the same directory - the script and this command
 //! coexist, and `the_shell_script_and_this_command_agree_on_the_pinned_revision`
 //! fails if they ever drift apart. The target directory comes from
-//! [`crate::embedding::resolve_model_dir`], the loader's own resolution, so
+//! [`crate::config::embedding::resolve_model_dir`], the loader's own resolution, so
 //! "downloaded successfully" and "model not found" cannot both be true.
 //!
 //! # Plugin assets
@@ -64,15 +64,15 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::cli::ModelCommand;
+use crate::config::embedding::{rerank_model_dir, resolve_model_dir};
 use crate::config::EmbeddingConfig;
 use crate::embedding::model::{
     DEFAULT_ONNX_REMOTE_PATH, DEFAULT_ONNX_SHA256, DEFAULT_ONNX_SIZE, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
 use crate::embedding::rerank::{
-    default_rerank_model_dir, RERANK_MODEL_REPO, RERANK_MODEL_REVISION, RERANK_ONNX_REMOTE_PATH,
-    RERANK_ONNX_SHA256, RERANK_ONNX_SIZE, RERANK_TOKENIZER_SHA256, RERANK_TOKENIZER_SIZE,
+    RERANK_MODEL_REPO, RERANK_MODEL_REVISION, RERANK_ONNX_REMOTE_PATH, RERANK_ONNX_SHA256, RERANK_ONNX_SIZE,
+    RERANK_TOKENIZER_SHA256, RERANK_TOKENIZER_SIZE,
 };
-use crate::embedding::resolve_model_dir;
 
 /// The Hugging Face repository the default model comes from.
 pub(crate) const MODEL_REPO: &str = "jinaai/jina-embeddings-v2-base-code";
@@ -240,11 +240,11 @@ pub fn run(command: &ModelCommand) -> Result<()> {
     let stdout = std::io::stdout();
     match command {
         ModelCommand::Fetch { dir, no_rerank } => {
-            let rerank_dir = if *no_rerank { None } else { Some(default_rerank_model_dir()?) };
+            let rerank_dir = if *no_rerank { None } else { Some(rerank_model_dir()?) };
             fetch(dir.as_deref(), rerank_dir.as_deref(), &mut stdout.lock())
         }
         ModelCommand::Status { dir } => {
-            status(dir.as_deref(), Some(&default_rerank_model_dir()?), &mut stdout.lock())
+            status(dir.as_deref(), Some(&rerank_model_dir()?), &mut stdout.lock())
         }
     }
 }
@@ -1329,7 +1329,7 @@ mod tests {
 
     /// The disagreement this task closes, stated as a test: the directory
     /// `status`/`fetch` talk about has to be the one the *daemon* reads, which
-    /// is `default_model_dir(configured_name)` - not the default's.
+    /// is `config::embedding::model_dir(configured_name)` - not the default's.
     #[test]
     fn the_reported_directory_is_the_one_the_daemon_would_read() {
         let configured =
@@ -1337,10 +1337,10 @@ mod tests {
 
         let reported = model_dir(None, &configured).unwrap();
 
-        assert_eq!(reported, crate::embedding::model::default_model_dir("some-other-model").unwrap());
+        assert_eq!(reported, crate::config::embedding::model_dir("some-other-model").unwrap());
         assert_ne!(
             reported,
-            crate::embedding::model::default_model_dir(&EmbeddingConfig::default().model).unwrap(),
+            crate::config::embedding::model_dir(&EmbeddingConfig::default().model).unwrap(),
             "reporting the default's directory is exactly the bug: status inspects one directory \
              while the daemon reads another, and neither mentions the other"
         );
