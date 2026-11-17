@@ -162,7 +162,8 @@ cmd_observe() {
 
 	local partial=0
 	[ -z "$only" ] || partial=1
-	python3 - "$OUT/spawns.log" "$OUT/observed.txt" "$MAP" "$write" core/tests/it/main.rs "$partial" <<'PY'
+	python3 - "$OUT/spawns.log" "$OUT/observed.txt" "$MAP" "$write" core/tests/it/main.rs "$partial" "$CARGO_PLUGINS
+$GO_PLUGINS" <<'PY'
 import re
 import sys
 
@@ -198,7 +199,8 @@ if not partial:
     for m in it_modules:
         observed.setdefault(f"it:{m}", set())
 
-ORDER = ["typescript", "rust", "python", "go"]
+# The order of a row's plugins: cargo plugins, then go ones.
+ORDER = sys.argv[7].split()
 def order(key):
     prefix, module = key.split(":", 1)
     return (["it", "scripts", "lib"].index(prefix), module)

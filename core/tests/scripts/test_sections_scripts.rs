@@ -467,13 +467,13 @@ fn every_listed_section_has_exactly_one_ci_step_that_runs_it_when_selected() {
     }
 }
 
-/// A scratch checkout: the real `scripts/test-sections.sh` and `map`, when
-/// given, as `scripts/test-plugin-spawns.txt`.
+/// A scratch checkout: the real `scripts/test-sections.sh`, the
+/// `build-targets.sh` it reads the plugin list from, and `map`, when given, as
+/// `scripts/test-plugin-spawns.txt`.
 fn sections_root(map: Option<&str>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("scripts/test-sections.sh");
-    fs::create_dir_all(script.parent().unwrap()).unwrap();
-    for name in ["test-sections.sh", "prune-stale-objects.sh"] {
+    fs::create_dir_all(dir.path().join("scripts/lib")).unwrap();
+    for name in ["test-sections.sh", "prune-stale-objects.sh", "build-targets.sh", "lib/runnable.sh"] {
         fs::copy(repo_root().join("scripts").join(name), dir.path().join("scripts").join(name)).unwrap();
     }
     if let Some(map) = map {

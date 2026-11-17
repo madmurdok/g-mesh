@@ -10,7 +10,7 @@
 #   scripts/test-sections.sh check-ci [<ci.yml>]     every section has its CI step, and no other
 #
 # `filter` and `run` also take the selectors `core-spawns-<plugin>` (plugin:
-# typescript, rust, python, go): the core tests that start that plugin's real
+# a language of `build-targets.sh --plugins`): the core tests that start that plugin's real
 # process, by module, as scripts/test-plugin-spawns.txt lists them.
 #
 # Invariants:
@@ -99,11 +99,23 @@ spawns_filter() {
 	echo "package(g-mesh) & (${clauses:-none()})"
 }
 
+# Succeeds when $1 is a language of `build-targets.sh --plugins`.
+bundled_plugin() {
+	local plugins
+	plugins="$(bash scripts/build-targets.sh --plugins)" || {
+		echo "test-sections: could not read build-targets.sh --plugins" >&2
+		exit 2
+	}
+	case $'\n'"$plugins"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac
+	return 1
+}
+
 # Prints the filterset of section (or `core-spawns-<plugin>` selector) $1;
 # returns 1 for an unknown name.
 section_filter() {
 	case "$1" in
-	core-spawns-typescript | core-spawns-rust | core-spawns-python | core-spawns-go)
+	core-spawns-*)
+		bundled_plugin "${1#core-spawns-}" || return 1
 		spawns_filter "${1#core-spawns-}"
 		;;
 	core-it) echo 'package(g-mesh) & kind(test) & !binary_id(g-mesh::scripts)' ;;
@@ -129,7 +141,7 @@ usage: scripts/test-sections.sh list
        scripts/test-sections.sh run [--profile P] [--keep-going] <section>...|all|full|none
        scripts/test-sections.sh check
        scripts/test-sections.sh check-ci [<ci.yml>]
-<section> may also be core-spawns-<plugin> (typescript, rust, python, go).
+<section> may also be core-spawns-<plugin> (<plugin>: a language of build-targets.sh --plugins).
 EOF
 }
 

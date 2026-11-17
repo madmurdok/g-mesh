@@ -12,8 +12,8 @@
 //! that a line names the plugin and the first changed path; not the wording.
 //!
 //! `GM_CUT_RELEASE_SH` replaces the script under test with another copy (its
-//! `scripts/lib/` beside it), so a control revert can be run against this
-//! test binary without editing the checkout. Bash only, so Unix only: the
+//! `scripts/lib/` and `build-targets.sh` beside it), so a control revert can
+//! be run against this test binary without editing the checkout. Bash only, so Unix only: the
 //! release is cut from a Unix shell.
 
 use std::fs;

@@ -257,11 +257,17 @@ fn crlf_lines_and_blank_lines_are_tolerated() {
     assert_eq!(select_raw("docs/a.md\r\n"), "none");
 }
 
-/// A scratch checkout holding the real selector and section scripts and
-/// `map` as `scripts/test-plugin-spawns.txt`.
+/// A scratch checkout holding the real selector and section scripts, the
+/// `build-targets.sh` they read the plugin list from, and `map` as
+/// `scripts/test-plugin-spawns.txt`.
 fn scratch_root_with_map(map: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    for script in ["scripts/test-select.sh", "scripts/test-sections.sh"] {
+    for script in [
+        "scripts/test-select.sh",
+        "scripts/test-sections.sh",
+        "scripts/build-targets.sh",
+        "scripts/lib/runnable.sh",
+    ] {
         write_executable(&dir.path().join(script), &fs::read_to_string(repo_root().join(script)).unwrap());
     }
     write_file(dir.path(), "scripts/test-plugin-spawns.txt", map);
@@ -547,14 +553,20 @@ fn write_file(root: &Path, relative: &str, body: &str) {
     fs::write(path, body).unwrap();
 }
 
-/// A scratch repository holding copies of the two section scripts, a doc,
+/// A scratch repository holding copies of the two section scripts (and the
+/// `build-targets.sh` they read the plugin list from), a doc,
 /// a core file and a wire file, committed on `main` and branched as
 /// `release-9.9.9`, with HEAD on `main`.
 fn scratch_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q", "-b", "main"]);
-    for script in ["scripts/test-select.sh", "scripts/test-sections.sh"] {
+    for script in [
+        "scripts/test-select.sh",
+        "scripts/test-sections.sh",
+        "scripts/build-targets.sh",
+        "scripts/lib/runnable.sh",
+    ] {
         let body = fs::read_to_string(repo_root().join(script)).unwrap();
         write_executable(&root.join(script), &body);
     }
