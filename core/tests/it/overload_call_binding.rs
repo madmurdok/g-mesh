@@ -32,7 +32,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rusqlite::Connection;
 
@@ -153,7 +153,7 @@ fn each_call_of_an_overloaded_function_is_stored_against_the_overload_it_binds()
     let project = Project::new();
     let mut daemon = spawn_daemon(project.root());
 
-    let pid_file = daemon::pid_path(project.root()).unwrap();
+    let pid_file = StateDir::of(project.root()).map(|sd| sd.pid_file()).unwrap();
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while !pid_file.exists() {
         assert!(Instant::now() < deadline, "timed out waiting for the daemon and its plugin to start");

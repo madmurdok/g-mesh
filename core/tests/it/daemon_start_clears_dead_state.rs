@@ -16,7 +16,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use g_mesh::daemon;
 use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 
@@ -47,11 +46,13 @@ impl Project {
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     fn socket(&self) -> PathBuf {
-        daemon::socket_path(self.root()).expect("failed to resolve the daemon socket path")
+        StateDir::of(self.root())
+            .map(|sd| sd.socket_file())
+            .expect("failed to resolve the daemon socket path")
     }
 
     /// Starts a daemon directly (this process reaps it) and waits until the
@@ -115,7 +116,10 @@ fn a_daemon_start_clears_what_a_dead_daemon_left_before_it_publishes_its_pid_fil
 
     project.start_daemon();
 
-    assert!(daemon::is_listening(project.root()).unwrap(), "the new daemon must serve the endpoint");
+    assert!(
+        StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap(),
+        "the new daemon must serve the endpoint"
+    );
     assert!(!marker.exists(), "the dead daemon's suspension marker must be cleared");
     assert!(state.suspended_markers().is_empty(), "no suspension marker may survive a restart");
     assert!(!staging.exists(), "the dead reindex's staging index must be removed");

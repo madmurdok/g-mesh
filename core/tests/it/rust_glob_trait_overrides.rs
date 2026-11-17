@@ -30,7 +30,7 @@
 
 use std::path::Path;
 
-use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::service::RunningService;
@@ -133,8 +133,12 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        for path in
-            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())].into_iter().flatten()
+        for path in [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ]
+        .into_iter()
+        .flatten()
         {
             common::kill_pid_file(&path);
         }

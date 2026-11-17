@@ -290,7 +290,7 @@ pub const FINGERPRINT_UNAVAILABLE: &str = "unavailable";
 const BASELINE_FINGERPRINT_IGNORE: &[&str] =
     &[".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"];
 
-/// The language whose pid file `daemon::plugin_pid_path` resolves: the
+/// The language whose pid file `StateDir::plugin_pid_file` is asked for: the
 /// bundled TypeScript plugin's manifest `language`, which is also its
 /// directory name under a plugin root.
 ///

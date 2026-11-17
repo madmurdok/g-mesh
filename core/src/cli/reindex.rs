@@ -235,6 +235,7 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::state_dir::StateDir;
     use std::path::PathBuf;
 
     #[test]
@@ -347,7 +348,7 @@ mod tests {
 
         drop(hold);
         assert_eq!(daemon::rebuild_in_progress(project.path()).unwrap(), None);
-        assert!(!daemon::rebuild_marker_path_in(&state.0).exists(), "the marker is removed");
+        assert!(!StateDir::at(&state.0).rebuild_marker_file().exists(), "the marker is removed");
     }
 
     /// A rebuild does not start while another process holds the daemon
@@ -365,6 +366,6 @@ mod tests {
 
         let refused = stop_for_rebuild(project.path(), "init").err().expect("the rebuild must refuse");
         assert!(format!("{refused:#}").contains("still holds the daemon lock"), "{refused:#}");
-        assert!(!daemon::rebuild_marker_path_in(&state.0).exists(), "a refused rebuild leaves no marker");
+        assert!(!StateDir::at(&state.0).rebuild_marker_file().exists(), "a refused rebuild leaves no marker");
     }
 }

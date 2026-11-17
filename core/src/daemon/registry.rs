@@ -76,7 +76,7 @@
 //! languages can never step on each other's record, on a crash relaunch any
 //! more than on an ordinary sleep. `cli::status`/`cli::stop`/`cli::clean`
 //! read every `plugin-<language>.pid` file present
-//! ([`discovered_pid_files`]) rather than assuming exactly one.
+//! ([`StateDir::plugin_pid_files`]) rather than assuming exactly one.
 //!
 //! # The index's generation string (task 163)
 //!
@@ -109,18 +109,6 @@ use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{self, IndexStore, Unit};
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
-
-/// Every `plugin-<language>.pid` file currently present in `state_dir`, paired
-/// with its language. Compat wrapper over `StateDir::plugin_pid_files`.
-pub fn discovered_pid_files(state_dir: &Path) -> Vec<(String, PathBuf)> {
-    StateDir::at(state_dir).plugin_pid_files()
-}
-
-/// Every `plugin-<language>.suspended` marker in `state_dir`, with its reason.
-/// Compat wrapper over `StateDir::suspended_markers`.
-pub fn discovered_suspended_markers(state_dir: &Path) -> Vec<(String, String)> {
-    StateDir::at(state_dir).suspended_markers()
-}
 
 /// The generation string an index is stamped with, and the thing
 /// `storage::schema::ensure_current` compares: core's hand-maintained pipeline
@@ -166,10 +154,7 @@ pub fn discovered_suspended_markers(state_dir: &Path) -> Vec<(String, String)> {
 /// version check needs only discovery's output and has to run before anything
 /// trusts the index at all), and `cli::init`/`cli::reindex` never build a
 /// registry in the first place. Taking `&DiscoveredPlugins` directly removes
-/// that ordering problem rather than working around it - the same shape, and
-/// for the same reason, as [`discovered_pid_files`] above: a fact about
-/// plugins that callers with no live registry still have to be able to ask
-/// for.
+/// that ordering problem rather than working around it.
 pub fn indexer_version(discovered: &DiscoveredPlugins) -> String {
     format!("{CURRENT_INDEXER_VERSION}+{}", plugins_digest(discovered))
 }

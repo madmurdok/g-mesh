@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon;
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, PLUGIN_IDLE_ENV};
 use g_mesh::ipc;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use rusqlite::{Connection, OpenFlags};
@@ -330,9 +331,11 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
 
     let mut daemon_process = Daemon::spawn(project.root(), PLUGIN_IDLE, CORE_IDLE_EFFECTIVELY_NEVER);
 
-    let plugin_pid_file = daemon::plugin_pid_path(project.root()).unwrap();
-    let core_pid_file = daemon::pid_path(project.root()).unwrap();
-    let endpoint = daemon::endpoint(project.root()).unwrap();
+    let plugin_pid_file = StateDir::of(project.root())
+        .map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE))
+        .unwrap();
+    let core_pid_file = StateDir::of(project.root()).map(|sd| sd.pid_file()).unwrap();
+    let endpoint = StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)).unwrap();
     // Read before the walk is waited on, not after: the control-plane plugin
     // is idle for the whole cold start (the walk runs in a process of its
     // own), so it is entitled to fall asleep while that walk is still going.
@@ -356,7 +359,7 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
     assert!(daemon_process.is_running(), "the core must outlive the plugin's shorter timeout");
     assert_eq!(recorded_pid(&core_pid_file), daemon_process.pid(), "the core is the same process");
     assert!(
-        daemon::is_listening(project.root()).unwrap(),
+        StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap(),
         "the core must still be serving its endpoint with its plugin asleep"
     );
 
@@ -470,7 +473,9 @@ fn the_core_exits_on_its_own_longer_timeout_with_nothing_attached() {
     // guaranteed to exist the instant `wait_until_indexed` returns. Waited on
     // here, after `started_waiting`, precisely so this wait's own duration
     // doesn't get excluded from what `started_waiting.elapsed()` measures.
-    let plugin_pid_file = daemon::plugin_pid_path(project.root()).unwrap();
+    let plugin_pid_file = StateDir::of(project.root())
+        .map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE))
+        .unwrap();
     wait_for("the plugin to start", || plugin_pid_file.exists());
     let plugin_pid = recorded_pid(&plugin_pid_file);
 
@@ -488,7 +493,7 @@ fn the_core_exits_on_its_own_longer_timeout_with_nothing_attached() {
 
     wait_for("the plugin to go with its core", || !daemon::is_process_alive(plugin_pid));
     assert!(
-        !daemon::is_listening(project.root()).unwrap(),
+        !StateDir::of(project.root()).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap(),
         "an exited core must leave nothing listening on its endpoint"
     );
     // The socket file is in this list only on Unix: on Windows the endpoint is
@@ -499,12 +504,14 @@ fn the_core_exits_on_its_own_longer_timeout_with_nothing_attached() {
     // final as built.
     #[allow(unused_mut)]
     let mut leftovers = vec![
-        daemon::pid_path(project.root()).unwrap(),
-        daemon::plugin_pid_path(project.root()).unwrap(),
-        daemon::build_stamp_path(project.root()).unwrap(),
+        StateDir::of(project.root()).map(|sd| sd.pid_file()).unwrap(),
+        StateDir::of(project.root())
+            .map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE))
+            .unwrap(),
+        StateDir::of(project.root()).map(|sd| sd.build_stamp_file()).unwrap(),
     ];
     #[cfg(unix)]
-    leftovers.push(daemon::socket_path(project.root()).unwrap());
+    leftovers.push(StateDir::of(project.root()).map(|sd| sd.socket_file()).unwrap());
     for leftover in leftovers {
         assert!(
             !leftover.exists(),

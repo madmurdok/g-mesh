@@ -43,9 +43,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use g_mesh::daemon;
 use g_mesh::daemon::plugin::PluginProcess;
 use g_mesh::embedding::EmbeddingPipeline;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::{self, project_dir};
 use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
@@ -93,18 +93,20 @@ impl Project {
     /// file, the legacy single plugin pid file, and the registry's
     /// per-language one for the bundled plugin.
     fn stop(&self) {
-        let mut pid_files: Vec<PathBuf> =
-            [daemon::pid_path(self.root()), daemon::plugin_pid_path(self.root())]
-                .into_iter()
-                .flatten()
-                .collect();
+        let mut pid_files: Vec<PathBuf> = [
+            StateDir::of(self.root()).map(|sd| sd.pid_file()),
+            StateDir::of(self.root()).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if let Ok(state) = project_dir(self.root()) {
             pid_files.push(state.join("plugin-typescript.pid"));
         }
         for path in pid_files {
             common::kill_pid_file(&path);
         }
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
     }

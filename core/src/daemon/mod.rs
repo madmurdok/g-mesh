@@ -22,7 +22,7 @@ pub mod semantic;
 pub mod workspace_reindex;
 
 use std::fs::{File, TryLockError};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -38,101 +38,14 @@ use crate::mcp;
 use crate::paths::state_dir::{OnUnreadable, StateDir};
 use crate::storage::index_store::IndexStore;
 
-// ---- Compat wrappers over `paths::state_dir::StateDir`, kept for the integration
-// tests that call them; production code uses `StateDir` directly. ----
-
 pub use crate::control::lock::{inspect_daemon_lock, DaemonLock};
 pub use crate::paths::state_dir::{read_pid_file, read_pid_file_result, write_pid_file};
-
-/// Where a project's daemon listens; the shim derives the same endpoint from
-/// its cwd. A socket file on Unix, a pipe name on Windows (`ipc::windows`).
-pub fn endpoint(root: &Path) -> Result<ipc::Endpoint> {
-    crate::control::lock::endpoint(&StateDir::of(root)?)
-}
-
-/// [`endpoint`] from an already-known state directory (`ipc::endpoint_for`).
-pub fn endpoint_in(state_dir: &Path) -> Option<ipc::Endpoint> {
-    ipc::endpoint_for(&StateDir::at(state_dir))
-}
-
-#[cfg(unix)]
-pub fn socket_path(root: &Path) -> Result<PathBuf> {
-    Ok(StateDir::of(root)?.socket_file())
-}
-
-pub fn pid_path(root: &Path) -> Result<PathBuf> {
-    Ok(StateDir::of(root)?.pid_file())
-}
-
-/// The bundled JS/TS plugin's pid file.
-pub fn plugin_pid_path(root: &Path) -> Result<PathBuf> {
-    Ok(plugin_pid_path_in(StateDir::of(root)?.path()))
-}
-
-pub fn pid_path_in(state_dir: &Path) -> PathBuf {
-    StateDir::at(state_dir).pid_file()
-}
-
-pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
-    StateDir::at(state_dir).plugin_pid_file(plugin::BUNDLED_LANGUAGE)
-}
-
-pub fn phase_path_in(state_dir: &Path) -> PathBuf {
-    StateDir::at(state_dir).phase_file()
-}
-
-pub fn rerank_outcome_path_in(state_dir: &Path) -> PathBuf {
-    StateDir::at(state_dir).rerank_outcome_file()
-}
-
-pub fn progress_path_in(state_dir: &Path) -> PathBuf {
-    StateDir::at(state_dir).progress_file()
-}
-
-pub fn read_progress_in(state_dir: &Path) -> Option<indexing_status::ProgressSnapshot> {
-    indexing_status::read_progress(&StateDir::at(state_dir))
-}
-
-pub fn read_phase_in(state_dir: &Path) -> Option<String> {
-    StateDir::at(state_dir).read_phase()
-}
-
-pub fn build_stamp_path(root: &Path) -> Result<PathBuf> {
-    Ok(StateDir::of(root)?.build_stamp_file())
-}
-
-pub fn build_stamp_path_in(state_dir: &Path) -> PathBuf {
-    StateDir::at(state_dir).build_stamp_file()
-}
-
-/// The file shims serialize their bootstrap on.
-pub fn lock_path(root: &Path) -> Result<PathBuf> {
-    Ok(StateDir::of(root)?.bootstrap_lock_file())
-}
-
-pub fn daemon_lock_path_in(state_dir: &Path) -> PathBuf {
-    StateDir::at(state_dir).daemon_lock_file()
-}
-
-pub fn rebuild_marker_path_in(state_dir: &Path) -> PathBuf {
-    StateDir::at(state_dir).rebuild_marker_file()
-}
-
-pub fn serving_owner_in(state_dir: &Path) -> Option<u32> {
-    StateDir::at(state_dir).serving_owner()
-}
 
 /// Whether a process with this pid exists: a snapshot, and pids are reused, so
 /// callers that care corroborate it with the endpoint.
 pub fn is_process_alive(pid: u32) -> bool {
     crate::process::is_alive(pid)
 }
-
-pub fn is_listening(root: &Path) -> Result<bool> {
-    crate::control::lock::is_listening(&StateDir::of(root)?)
-}
-
-// ---- end of compat wrappers ----
 
 /// A CLI rebuild of a project's index in progress, as its marker records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
