@@ -297,3 +297,221 @@ reference = "jina-v2-base-code-fp32"
 name = "bm25"
 arm = "bm25"
 role = "informational"
+
+# --- GM-436: base arms of the query adapters (docs/design/GM-436-laptop-training.md, section 5.1)
+# gte-small on the shipped structured text (pins of the gte-small row), and a
+# words-shuffled twin for each adapter base. A words-shuffled row takes its
+# text form from its own row, so each one sets `text = "structured"`. Adapter
+# rows (`arm = "adapter"`) are appended below by eval/training/gm436/export_adapter.py.
+
+[[variant]]
+name = "gte-small-structured"
+arm = "model"
+role = "cost"
+hf_repo = "thenlper/gte-small"
+revision = "17e1f347d17fe144873b1201da91788898c639cd"
+onnx_file = "onnx/model.onnx"
+model_dir = "work/models/gte-small"
+pooling = "mean"
+dimension = 384
+max_tokens = 512
+token_type_ids = true
+text = "structured"
+
+[[variant]]
+name = "gte-small-structured-words-shuffled"
+arm = "words-shuffled"
+role = "informational"
+reference = "gte-small-structured"
+text = "structured"
+
+[[variant]]
+name = "jina-v2-base-code-int8-structured-words-shuffled"
+arm = "words-shuffled"
+role = "informational"
+reference = "jina-v2-base-code-int8-structured"
+text = "structured"
+
+[[variant]]
+name = "gte-structured-adapter-full"
+arm = "adapter"
+role = "cost"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-adapter-full/W.f32"
+adapter_sha256 = "014d4c4d109ff007867f63842a1651b6e706d59dfe8c53ba089e93d4fdcc532d"
+
+[[variant]]
+name = "gte-structured-adapter-lowrank"
+arm = "adapter"
+role = "cost"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-adapter-lowrank/W.f32"
+adapter_sha256 = "943956e5e6da60a8e1500d670c698d887049d30176e62509b41017b141e6fb44"
+
+[[variant]]
+name = "gte-structured-adapter-procrustes"
+arm = "adapter"
+role = "cost"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-adapter-procrustes/W.f32"
+adapter_sha256 = "9e15cecf9eacbe7c591912304dcbee35cb44f9593ec797cf23ad177fce80009c"
+
+[[variant]]
+name = "gte-structured-adapter-curve0.25"
+arm = "adapter"
+role = "informational"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-adapter-curve0.25/W.f32"
+adapter_sha256 = "1ca5617ace6a49d4fc72cf13b77fa6d862d251a89dfa08d1dd4ef722334f6d5d"
+
+[[variant]]
+name = "gte-structured-adapter-curve0.5"
+arm = "adapter"
+role = "informational"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-adapter-curve0.5/W.f32"
+adapter_sha256 = "0d38797f9766c263a92ee93fa7319ba3012054169a7af7765202e10d550edc04"
+
+[[variant]]
+name = "gte-structured-adapter-c1"
+arm = "adapter"
+role = "informational"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-adapter-c1/W.f32"
+adapter_sha256 = "89a9115558454317963f203f5326150258eb52263b9a4a4d644660817a0786b3"
+
+[[variant]]
+name = "gte-structured-identity"
+arm = "adapter"
+role = "informational"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-identity/W.f32"
+adapter_sha256 = "89a9115558454317963f203f5326150258eb52263b9a4a4d644660817a0786b3"
+
+[[variant]]
+name = "gte-structured-ws-adapter-full"
+arm = "adapter"
+role = "informational"
+reference = "gte-small-structured-words-shuffled"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-ws-adapter-full/W.f32"
+adapter_sha256 = "014d4c4d109ff007867f63842a1651b6e706d59dfe8c53ba089e93d4fdcc532d"
+
+[[variant]]
+name = "gte-structured-ws-identity"
+arm = "adapter"
+role = "informational"
+reference = "gte-small-structured-words-shuffled"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-ws-identity/W.f32"
+adapter_sha256 = "89a9115558454317963f203f5326150258eb52263b9a4a4d644660817a0786b3"
+
+[[variant]]
+name = "int8-structured-adapter-full"
+arm = "adapter"
+role = "quality"
+reference = "jina-v2-base-code-int8-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/int8-structured-adapter-full/W.f32"
+adapter_sha256 = "42410f835c142411a682135dc86cc2a9b03ef274bdce8a5a1fa050461ee559c7"
+
+[[variant]]
+name = "int8-structured-adapter-lowrank"
+arm = "adapter"
+role = "quality"
+reference = "jina-v2-base-code-int8-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/int8-structured-adapter-lowrank/W.f32"
+adapter_sha256 = "9643e638cc848055a1ca37b17bc1a4eccb962eda04a3b4a167960eab69088494"
+
+[[variant]]
+name = "int8-structured-adapter-procrustes"
+arm = "adapter"
+role = "quality"
+reference = "jina-v2-base-code-int8-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/int8-structured-adapter-procrustes/W.f32"
+adapter_sha256 = "1512e1a5da59ab3fe2285d86bdb11b80c7b09bb2a232b20d742eae6bd563f316"
+
+[[variant]]
+name = "int8-structured-adapter-curve0.25"
+arm = "adapter"
+role = "informational"
+reference = "jina-v2-base-code-int8-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/int8-structured-adapter-curve0.25/W.f32"
+adapter_sha256 = "b4e752aeaf59489aceb4506bf2de8631b693d594dcdc98d89d2c5698e5594289"
+
+[[variant]]
+name = "int8-structured-adapter-curve0.5"
+arm = "adapter"
+role = "informational"
+reference = "jina-v2-base-code-int8-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/int8-structured-adapter-curve0.5/W.f32"
+adapter_sha256 = "e48e552fe84c252445350419d63d1bbafbd1afb1a450ef557dc6079cf302a379"
+
+[[variant]]
+name = "int8-structured-adapter-c1"
+arm = "adapter"
+role = "informational"
+reference = "jina-v2-base-code-int8-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/int8-structured-adapter-c1/W.f32"
+adapter_sha256 = "ac7e6609b5d948adafaa45e5846f25cbb1a65a967fa75fa85b497b03a18bdc22"
+
+[[variant]]
+name = "int8-structured-identity"
+arm = "adapter"
+role = "informational"
+reference = "jina-v2-base-code-int8-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/int8-structured-identity/W.f32"
+adapter_sha256 = "ac7e6609b5d948adafaa45e5846f25cbb1a65a967fa75fa85b497b03a18bdc22"
+
+[[variant]]
+name = "int8-structured-ws-adapter-full"
+arm = "adapter"
+role = "informational"
+reference = "jina-v2-base-code-int8-structured-words-shuffled"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/int8-structured-ws-adapter-full/W.f32"
+adapter_sha256 = "42410f835c142411a682135dc86cc2a9b03ef274bdce8a5a1fa050461ee559c7"
+
+[[variant]]
+name = "int8-structured-ws-identity"
+arm = "adapter"
+role = "informational"
+reference = "jina-v2-base-code-int8-structured-words-shuffled"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/int8-structured-ws-identity/W.f32"
+adapter_sha256 = "ac7e6609b5d948adafaa45e5846f25cbb1a65a967fa75fa85b497b03a18bdc22"
+
+[[variant]]
+name = "gte-structured-adapter-c4-no-go"
+arm = "adapter"
+role = "informational"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-adapter-c4-no-go/W.f32"
+adapter_sha256 = "1f6cf66e2d815020e1638efbc8b915804542c423888f6c726ed7f178e1ed5951"
+
+[[variant]]
+name = "gte-structured-distill-f0.25"
+arm = "adapter"
+role = "cost"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-distill-f0.25/W.f32"
+adapter_sha256 = "16e1258c1b1cd2cdbcb9c6508ae9a995dbcf4a6cd548430aa70af6adce08741f"
+
+[[variant]]
+name = "gte-structured-distill-f0.5"
+arm = "adapter"
+role = "cost"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-distill-f0.5/W.f32"
+adapter_sha256 = "bfb11e7af86382b918477daf856d8db2ccf356906693711026c7d23581847c3c"
+
+[[variant]]
+name = "gte-structured-distill-f1.0"
+arm = "adapter"
+role = "cost"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-distill-f1.0/W.f32"
+adapter_sha256 = "e715e0400b2c2852fd25f0f6298005cfe870ce87e0b17219a268327461cc47d1"
+
+[[variant]]
+name = "gte-structured-distill-c2"
+arm = "adapter"
+role = "informational"
+reference = "gte-small-structured"
+adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-distill-c2/W.f32"
+adapter_sha256 = "3756ae702b519db3bcccc250925abe67275924a2df84ac878fc658a95a3aa2fa"
