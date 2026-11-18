@@ -2,9 +2,10 @@
 //! to the [`PluginRegistry`], which is why it lives in `daemon`, not `watcher`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::daemon::registry::{self, PluginRegistry};
 use crate::daemon::seed;
@@ -20,6 +21,54 @@ use crate::watcher::{Change, ProjectWatcher};
 /// once quiet this long, and a settled burst is drained only when the loop
 /// wakes, so this must stay short. Unrelated to the idle timeouts.
 pub(crate) const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
+
+/// How long the watcher must have delivered no event before a by-name miss
+/// or a `semanticNeighbours` page says so. A healthy watcher delivers an edit
+/// within about a second, so an agent querying right after its own edit sees
+/// no hint unless the stream has stalled.
+pub(crate) const WATCHER_QUIET_HINT_AFTER: Duration = Duration::from_secs(5);
+
+/// When the watcher's consumer last saw the watcher receive any signal (a
+/// path, ignored ones included, or a Rescan), or started listening. One per daemon, written by
+/// the consumer thread, read by every MCP call; an atomic, no lock, no I/O.
+pub(crate) struct WatcherClock {
+    base: Instant,
+    /// Milliseconds from `base` to the last event, plus one; `0` while no
+    /// consumer has started.
+    last: AtomicU64,
+}
+
+impl WatcherClock {
+    pub(crate) fn new() -> Self {
+        Self { base: Instant::now(), last: AtomicU64::new(0) }
+    }
+
+    /// Records an event (or the consumer's start) now.
+    pub(crate) fn heard(&self) {
+        let since_base = self.base.elapsed().as_millis();
+        let stamp = u64::try_from(since_base).unwrap_or(u64::MAX - 1) + 1;
+        self.last.store(stamp, Ordering::Relaxed);
+    }
+
+    /// How long before `now` the last event came; `None` while no consumer
+    /// has started. A test ages the last event by passing a later `now`.
+    pub(crate) fn quiet_for_at(&self, now: Instant) -> Option<Duration> {
+        let stamp = self.last.load(Ordering::Relaxed);
+        let last = self.base + Duration::from_millis(stamp.checked_sub(1)?);
+        Some(now.saturating_duration_since(last))
+    }
+
+    /// [`quiet_for_at`](Self::quiet_for_at), kept only when it reaches
+    /// [`WATCHER_QUIET_HINT_AFTER`]: the quiet a by-name answer reports.
+    pub(crate) fn quiet_worth_saying_at(&self, now: Instant) -> Option<Duration> {
+        self.quiet_for_at(now).filter(|quiet| *quiet >= WATCHER_QUIET_HINT_AFTER)
+    }
+
+    /// [`quiet_worth_saying_at`](Self::quiet_worth_saying_at) now.
+    pub(crate) fn quiet_worth_saying(&self) -> Option<Duration> {
+        self.quiet_worth_saying_at(Instant::now())
+    }
+}
 
 /// What the watcher's consumer does before its first batch.
 pub(crate) enum ConsumerStart {
@@ -94,6 +143,8 @@ pub(crate) fn spawn_watch_consumer(
         // one an earlier start's death left semantic-pending).
         registry.owed_semantic_file_passes(&conn);
         let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+        // The start's reconcile read the disk, so the quiet counts from here.
+        registry.watcher_clock().heard();
         loop {
             watch_and_route_once(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry);
         }
@@ -169,7 +220,11 @@ pub(crate) fn watch_and_route_once(
     conn: &IndexStore,
     registry: &PluginRegistry,
 ) {
-    match watcher.next_change(DEBOUNCE_WINDOW) {
+    let change = watcher.next_change(DEBOUNCE_WINDOW);
+    if watcher.take_signal_seen() {
+        registry.watcher_clock().heard();
+    }
+    match change {
         Some(Change::Path(path)) => {
             crate::log_timing!("fs_event path={}", timing_path(root, &path));
             debouncer.record(path)

@@ -470,6 +470,7 @@ fn expectations_section(
             entry_points,
             uncovered: Vec::new(),
             coverage: None,
+            watcher_quiet: None,
         },
     };
 

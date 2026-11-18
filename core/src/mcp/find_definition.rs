@@ -273,6 +273,17 @@ pub(crate) struct FileNamePage {
     results: Vec<DefinitionCandidate>,
 }
 
+impl FileNamePage {
+    /// Appends `note` to a `semanticNeighbours` page's explanation; a
+    /// file-name page is left as it is.
+    pub(crate) fn note_if_semantic(&mut self, note: &str) {
+        if matches!(self.resolved_by, ResolvedBy::SemanticNeighbours) {
+            self.explanation.push(' ');
+            self.explanation.push_str(note);
+        }
+    }
+}
+
 /// Which column an ambiguous query matched on, and so which set of
 /// declarations the candidate page ranks. See [`resolve_symbol_name`] for
 /// when each is reached.
@@ -1085,7 +1096,7 @@ fn by_file_name(
         // answer in all of them.
         return Ok(Err(match by_semantic_neighbours(conn, semantic, name) {
             Some(page) => Redirect::Candidates(Candidates::Suggested(page)),
-            None => Redirect::refused(format!("g-mesh: no symbol named '{name}' found")),
+            None => Redirect::Refused(Refusal::NoSymbol(format!("g-mesh: no symbol named '{name}' found"))),
         }));
     }
 

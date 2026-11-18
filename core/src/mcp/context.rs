@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::ErrorData;
 
@@ -42,6 +43,10 @@ pub(crate) struct QueryCtx {
     /// Why the call's anchoring file (`file_path`) can be missing from the
     /// index; `None` when its language is indexed.
     pub(crate) coverage: Option<PathCoverage>,
+    /// How long the file watcher has delivered no event, when long enough to
+    /// say so (`McpHost::watcher_quiet`); a by-name miss or a
+    /// `semanticNeighbours` page then names it.
+    pub(crate) watcher_quiet: Option<Duration>,
 }
 
 impl QueryCtx {
@@ -120,6 +125,7 @@ impl QueryCtx {
             entry_points: Vec::new(),
             uncovered: Vec::new(),
             coverage: None,
+            watcher_quiet: None,
         }
     }
 }
