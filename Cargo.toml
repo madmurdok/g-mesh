@@ -36,3 +36,6 @@
 [workspace]
 resolver = "2"
 members = ["core", "manifest", "plugins/python", "plugins/rust", "plugins/sdk", "plugins/sdk-lsp", "plugins/typescript", "walk", "wire"]
+
+[workspace.dependencies]
+tree-sitter = "0.25"

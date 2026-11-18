@@ -812,6 +812,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "tree-sitter",
 ]
 
 [[package]]

@@ -35,6 +35,9 @@ path = "toy/main.rs"
 name = "g-mesh-fake-plugin"
 path = "fake/main.rs"
 
+[features]
+tree-sitter = ["dep:tree-sitter"]
+
 [dependencies]
 anyhow = "1"
 # The wire types themselves, shared verbatim with core so the two cannot
@@ -57,6 +60,8 @@ serde_json = "1"
 sha2 = "0.10"
 # `testing::PluginCheck` writes `[plugin.semantic]` back out as TOML.
 toml = "0.8"
+# Only for `CharColumns::point`/`node_range`; off unless a tree-sitter plugin asks.
+tree-sitter = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
