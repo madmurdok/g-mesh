@@ -108,8 +108,8 @@ pub(crate) trait WirePage: Serialize {
 /// `quiet`.
 pub(crate) fn watcher_quiet_note(quiet: Duration) -> String {
     format!(
-        "The file watcher has delivered no event for {} s, so a file edited since may not be indexed \
-         yet; get_file_outline on that file reads it fresh, then re-query.",
+        "No file change reported for {} s. If you just edited the file that should define it, \
+         get_file_outline on that file reads it fresh.",
         quiet.as_secs()
     )
 }

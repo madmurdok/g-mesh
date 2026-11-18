@@ -5,6 +5,7 @@ pub mod ignore_layers;
 pub mod rescan;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::RwLock;
 use std::time::Duration;
@@ -50,6 +51,9 @@ pub struct ProjectWatcher {
     // `reload_ignores` when a `.gitignore` or a link may have changed; read
     // for every event.
     ignores: RwLock<IgnoreLayers>,
+    // Set by `next_change` on every signal it receives, ignored paths
+    // included, before any filtering; cleared by [`Self::take_signal_seen`].
+    signal_seen: AtomicBool,
 }
 
 impl ProjectWatcher {
@@ -145,6 +149,7 @@ impl ProjectWatcher {
             test_events: tx,
             root: root.to_path_buf(),
             ignores,
+            signal_seen: AtomicBool::new(false),
         })
     }
 
@@ -232,6 +237,9 @@ impl ProjectWatcher {
     /// the ignore layers do not judge directories that way. A rescan the
     /// remap would drop, or one outside the root, is widened to the root, so
     /// a dropped event is never lost with it.
+    ///
+    /// Every signal received, a dropped or ignored one included, is recorded
+    /// for [`Self::take_signal_seen`].
     pub fn next_change(&self, timeout: Duration) -> Option<Change> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -239,7 +247,11 @@ impl ProjectWatcher {
             if remaining.is_zero() {
                 return None;
             }
-            match self.events.recv_timeout(remaining) {
+            let signal = self.events.recv_timeout(remaining);
+            if signal.is_ok() {
+                self.signal_seen.store(true, Ordering::Relaxed);
+            }
+            match signal {
                 Ok(WatchSignal::Path(path)) => {
                     let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let path = match layers.to_indexed(&path) {
@@ -265,6 +277,13 @@ impl ProjectWatcher {
                 Err(RecvTimeoutError::Disconnected) => return None,
             }
         }
+    }
+
+    /// Whether [`Self::next_change`] received any signal since the last call,
+    /// including ones it dropped as ignored (a build writing `target/`); clears
+    /// the record.
+    pub fn take_signal_seen(&self) -> bool {
+        self.signal_seen.swap(false, Ordering::Relaxed)
     }
 
     /// Test-only seam: queues a Rescan of `path` exactly as the OS callback

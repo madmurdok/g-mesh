@@ -196,6 +196,13 @@ delivery after the flood, was not observed. Each arm ran once (C twice).
   event (decision 3 is folded into F3). F1 (starvation watchdog with a stat
   sweep) is backlog task GM-727; decision 2 (N, project size) moves there.
 - Decision 4: "Нет, хватает (Recommended)": no repeat with a real cargo build.
+- Review of the F3 code (S3, finding F-1, an idle project shows the hint on
+  nearly every miss): "Мягкая формулировка (Recommended)". The hint stays on
+  every miss past the threshold, worded as a neutral fact plus advice that
+  holds both on an idle project and under starvation: "No file change
+  reported for N s. If you just edited the file that should define it,
+  get_file_outline on that file reads it fresh." The clock also counts
+  events under ignored directories (finding F-2).
 
 ## 7. Artifacts
 

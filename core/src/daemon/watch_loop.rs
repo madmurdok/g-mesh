@@ -28,8 +28,8 @@ pub(crate) const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 /// no hint unless the stream has stalled.
 pub(crate) const WATCHER_QUIET_HINT_AFTER: Duration = Duration::from_secs(5);
 
-/// When the watcher's consumer last took an event (a non-ignored path or a
-/// Rescan) off the watcher, or started listening. One per daemon, written by
+/// When the watcher's consumer last saw the watcher receive any signal (a
+/// path, ignored ones included, or a Rescan), or started listening. One per daemon, written by
 /// the consumer thread, read by every MCP call; an atomic, no lock, no I/O.
 pub(crate) struct WatcherClock {
     base: Instant,
@@ -221,7 +221,7 @@ pub(crate) fn watch_and_route_once(
     registry: &PluginRegistry,
 ) {
     let change = watcher.next_change(DEBOUNCE_WINDOW);
-    if change.is_some() {
+    if watcher.take_signal_seen() {
         registry.watcher_clock().heard();
     }
     match change {
