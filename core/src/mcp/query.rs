@@ -2,6 +2,8 @@
 //! The server renders them (`response_bound::render`); `plugin_check` reads
 //! them.
 
+use std::time::Duration;
+
 use rmcp::ErrorData;
 use serde::Serialize;
 
@@ -73,6 +75,10 @@ pub(crate) enum Candidates {
 pub(crate) enum Refusal {
     /// Prose, one text block.
     Text(String),
+    /// Prose, one text block: no declaration, file or import carries the
+    /// queried name. Sent like `Text`; kept apart so a quiet watcher can be
+    /// named on it ([`note_watcher_quiet`]).
+    NoSymbol(String),
     /// A miss on a path whose language is not indexed: JSON `{error, notIndexed}`.
     NotIndexed { error: String, not_indexed: NotIndexed },
 }
@@ -82,7 +88,9 @@ impl Refusal {
     /// JSON body the wire carries.
     pub(crate) fn message(&self) -> &str {
         match self {
-            Refusal::Text(message) | Refusal::NotIndexed { error: message, .. } => message,
+            Refusal::Text(message)
+            | Refusal::NoSymbol(message)
+            | Refusal::NotIndexed { error: message, .. } => message,
         }
     }
 }
@@ -96,33 +104,64 @@ pub(crate) trait WirePage: Serialize {
     }
 }
 
+/// The sentence a by-name answer carries while the watcher has been quiet
+/// `quiet`.
+pub(crate) fn watcher_quiet_note(quiet: Duration) -> String {
+    format!(
+        "The file watcher has delivered no event for {} s, so a file edited since may not be indexed \
+         yet; get_file_outline on that file reads it fresh, then re-query.",
+        quiet.as_secs()
+    )
+}
+
+/// `answer` with [`watcher_quiet_note`] appended to a by-name miss
+/// ([`Refusal::NoSymbol`]) or a `semanticNeighbours` page; every other
+/// answer, and any answer while `quiet` is `None`, unchanged.
+pub(crate) fn note_watcher_quiet<P>(
+    quiet: Option<Duration>,
+    answer: Result<ToolAnswer<P>, ErrorData>,
+) -> Result<ToolAnswer<P>, ErrorData> {
+    let Some(quiet) = quiet else { return answer };
+    let note = watcher_quiet_note(quiet);
+    Ok(match answer? {
+        ToolAnswer::Refused(Refusal::NoSymbol(message)) => {
+            ToolAnswer::Refused(Refusal::NoSymbol(format!("{message}. {note}")))
+        }
+        ToolAnswer::Candidates(Candidates::Suggested(mut page)) => {
+            page.note_if_semantic(&note);
+            ToolAnswer::Candidates(Candidates::Suggested(page))
+        }
+        other => other,
+    })
+}
+
 /// `find_definition`, both passes of the semantic rung included.
 pub(crate) fn definition(
     ctx: &QueryCtx,
     params: FindDefinitionParams,
 ) -> Result<ToolAnswer<DefinitionNode>, ErrorData> {
-    ctx.resolve_lazily(find_definition::handle, params)
+    note_watcher_quiet(ctx.watcher_quiet, ctx.resolve_lazily(find_definition::handle, params))
 }
 
 pub(crate) fn references(
     ctx: &QueryCtx,
     params: SymbolQueryParams,
 ) -> Result<ToolAnswer<ReferencesAnswer>, ErrorData> {
-    ctx.resolve_lazily(find_references::handle, params)
+    note_watcher_quiet(ctx.watcher_quiet, ctx.resolve_lazily(find_references::handle, params))
 }
 
 pub(crate) fn callers(
     ctx: &QueryCtx,
     params: SymbolQueryParams,
 ) -> Result<ToolAnswer<CallersAnswer>, ErrorData> {
-    ctx.resolve_lazily(find_callers_callees::handle_callers, params)
+    note_watcher_quiet(ctx.watcher_quiet, ctx.resolve_lazily(find_callers_callees::handle_callers, params))
 }
 
 pub(crate) fn implementations(
     ctx: &QueryCtx,
     params: FindImplementationsParams,
 ) -> Result<ToolAnswer<ImplementationAnswer>, ErrorData> {
-    ctx.resolve_lazily(find_implementations::dispatch, params)
+    note_watcher_quiet(ctx.watcher_quiet, ctx.resolve_lazily(find_implementations::dispatch, params))
 }
 
 pub(crate) fn dependencies(
@@ -144,35 +183,46 @@ pub(crate) async fn definition_off_worker(
     ctx: QueryCtx,
     params: FindDefinitionParams,
 ) -> Result<ToolAnswer<DefinitionNode>, ErrorData> {
-    ctx.resolve_lazily_off_worker(find_definition::handle, params).await
+    let quiet = ctx.watcher_quiet;
+    note_watcher_quiet(quiet, ctx.resolve_lazily_off_worker(find_definition::handle, params).await)
 }
 
 pub(crate) async fn references_off_worker(
     ctx: QueryCtx,
     params: SymbolQueryParams,
 ) -> Result<ToolAnswer<ReferencesAnswer>, ErrorData> {
-    ctx.resolve_lazily_off_worker(find_references::handle, params).await
+    let quiet = ctx.watcher_quiet;
+    note_watcher_quiet(quiet, ctx.resolve_lazily_off_worker(find_references::handle, params).await)
 }
 
 pub(crate) async fn callers_off_worker(
     ctx: QueryCtx,
     params: SymbolQueryParams,
 ) -> Result<ToolAnswer<CallersAnswer>, ErrorData> {
-    ctx.resolve_lazily_off_worker(find_callers_callees::handle_callers, params).await
+    let quiet = ctx.watcher_quiet;
+    note_watcher_quiet(
+        quiet,
+        ctx.resolve_lazily_off_worker(find_callers_callees::handle_callers, params).await,
+    )
 }
 
 pub(crate) async fn callees_off_worker(
     ctx: QueryCtx,
     params: SymbolQueryParams,
 ) -> Result<ToolAnswer<CalleesAnswer>, ErrorData> {
-    ctx.resolve_lazily_off_worker(find_callers_callees::handle_callees, params).await
+    let quiet = ctx.watcher_quiet;
+    note_watcher_quiet(
+        quiet,
+        ctx.resolve_lazily_off_worker(find_callers_callees::handle_callees, params).await,
+    )
 }
 
 pub(crate) async fn implementations_off_worker(
     ctx: QueryCtx,
     params: FindImplementationsParams,
 ) -> Result<ToolAnswer<ImplementationAnswer>, ErrorData> {
-    ctx.resolve_lazily_off_worker(find_implementations::dispatch, params).await
+    let quiet = ctx.watcher_quiet;
+    note_watcher_quiet(quiet, ctx.resolve_lazily_off_worker(find_implementations::dispatch, params).await)
 }
 
 /// `search_code`, on the blocking pool. `coverage` is `Some` while the

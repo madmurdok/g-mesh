@@ -1,10 +1,13 @@
 //! A test [`McpHost`]: the registry's pure answers over a fixed
 //! `DiscoveredPlugins` (no supervisors, no plugin processes, no failed
-//! languages), a pending-change counter, and a count of recorded requests.
+//! languages), a pending-change counter, a count of recorded requests, and a
+//! settable watcher quiet.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use super::host::{Activity, McpHost, PathCoverage};
 use crate::plugin_manifest::{Capabilities, DiscoveredPlugins, PluginManifest};
@@ -17,6 +20,8 @@ pub(crate) struct FakeHost {
     pending: AtomicUsize,
     /// How many times `Activity::request` ran.
     requests: AtomicUsize,
+    /// What `watcher_quiet` answers; `None` until a test sets it.
+    watcher_quiet: Mutex<Option<Duration>>,
 }
 
 impl FakeHost {
@@ -32,12 +37,20 @@ impl FakeHost {
             discovered,
             pending: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
+            watcher_quiet: Mutex::new(None),
         }
     }
 
     /// Queues `files` changes for the next `replay_pending` to drain.
     pub(crate) fn queue(&self, files: usize) {
         self.pending.fetch_add(files, Ordering::SeqCst);
+    }
+
+    /// Makes `watcher_quiet` answer `quiet`, as the daemon would after that
+    /// long without a watcher event.
+    #[expect(dead_code, reason = "the seam the watcher-quiet tests drive")]
+    pub(crate) fn set_watcher_quiet(&self, quiet: Option<Duration>) {
+        *self.watcher_quiet.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = quiet;
     }
 
     /// How many times `Activity::request` has run.
@@ -102,5 +115,9 @@ impl McpHost for FakeHost {
 
     fn ensure_fresh(&self, _store: &IndexStore, _file_path: &str) -> anyhow::Result<Option<String>> {
         Ok(None)
+    }
+
+    fn watcher_quiet(&self) -> Option<Duration> {
+        *self.watcher_quiet.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }

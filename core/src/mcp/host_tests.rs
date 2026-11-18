@@ -101,6 +101,9 @@ impl McpHost for Recording {
     fn ensure_fresh(&self, store: &IndexStore, file_path: &str) -> anyhow::Result<Option<String>> {
         self.inner.ensure_fresh(store, file_path)
     }
+    fn watcher_quiet(&self) -> Option<Duration> {
+        self.inner.watcher_quiet()
+    }
 }
 
 fn node(id: &str, kind: &str, file: &str) -> NodeRecord {

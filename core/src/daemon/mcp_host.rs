@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::lifecycle::CoreActivity;
 use super::registry::PluginRegistry;
@@ -84,5 +85,9 @@ impl McpHost for DaemonHost {
         self.registry
             .ensure_fresh(store, file_path)
             .map(|outcome| outcome.map(|outcome| format!("{outcome:?}")))
+    }
+
+    fn watcher_quiet(&self) -> Option<Duration> {
+        self.registry.watcher_clock().quiet_worth_saying()
     }
 }

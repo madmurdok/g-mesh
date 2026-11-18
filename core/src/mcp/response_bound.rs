@@ -128,7 +128,7 @@ pub(crate) fn render<P: WirePage>(answer: &ToolAnswer<P>) -> Result<CallToolResu
             CallToolResult::success(blocks)
         }
         ToolAnswer::Candidates(candidates) => CallToolResult::success(vec![json(candidates)?]),
-        ToolAnswer::Refused(Refusal::Text(message)) => {
+        ToolAnswer::Refused(Refusal::Text(message) | Refusal::NoSymbol(message)) => {
             CallToolResult::error(vec![ContentBlock::text(message.clone())])
         }
         ToolAnswer::Refused(Refusal::NotIndexed { error, not_indexed }) => {
