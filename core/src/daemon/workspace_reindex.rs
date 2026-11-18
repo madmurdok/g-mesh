@@ -112,10 +112,7 @@ fn remove_staging(path: &Path) {
     for file in [path, journal.as_path()] {
         if let Err(err) = std::fs::remove_file(file) {
             if err.kind() != std::io::ErrorKind::NotFound {
-                crate::log_line!(
-                    "g-mesh daemon: could not remove the staging index {} ({err})",
-                    file.display()
-                );
+                crate::log_role!("could not remove the staging index {} ({err})", file.display());
             }
         }
     }
@@ -149,11 +146,9 @@ pub(crate) fn remove_stale_semantic_pending(
     match schema::clear_stale_semantic_pending(conn, &capable) {
         Ok(0) => {}
         Ok(cleared) => {
-            crate::log_line!(
-                "g-mesh daemon: cleared the stale semantic-pending rows of {cleared} language(s)"
-            )
+            crate::log_role!("cleared the stale semantic-pending rows of {cleared} language(s)")
         }
-        Err(err) => crate::log_line!("g-mesh daemon: could not clear stale semantic-pending rows ({err:#})"),
+        Err(err) => crate::log_role!("could not clear stale semantic-pending rows ({err:#})"),
     }
 }
 
@@ -164,14 +159,12 @@ pub(crate) fn resume_pending(registry: &PluginRegistry, store: &IndexStore) {
     let pending = match store.with(schema::pending_reindexes) {
         Ok(pending) => pending,
         Err(err) => {
-            crate::log_line!("g-mesh daemon: could not read the interrupted workspace reindexes ({err:#})");
+            crate::log_role!("could not read the interrupted workspace reindexes ({err:#})");
             return;
         }
     };
     for (language, trigger) in pending {
-        crate::log_line!(
-            "g-mesh daemon: the {language} workspace reindex after {trigger} was interrupted - rerunning it"
-        );
+        crate::log_role!("the {language} workspace reindex after {trigger} was interrupted - rerunning it");
         registry.workspace_file_changed(store, &language, &trigger);
     }
 }
@@ -218,8 +211,8 @@ pub(crate) fn run_with(
     let embed_stats = supervisor.with_exclusive_access(|process| -> Result<EmbedStats> {
         if let Some(process) = process {
             if let Err(err) = process.notify_workspace_changed(changed_file) {
-                crate::log_line!(
-                    "g-mesh daemon: failed to notify the {language} plugin that {changed_file} changed \
+                crate::log_role!(
+                    "failed to notify the {language} plugin that {changed_file} changed \
                      ({err:#}) - it keeps whatever module/crate map it had cached, but the reindex below \
                      walks the language from scratch regardless"
                 );
@@ -256,8 +249,8 @@ fn prepare_semantic_pass(supervisor: &PluginSupervisor, process: Option<&PluginP
         return;
     }
     if let Err(err) = process.notify_prepare_semantic_pass() {
-        crate::log_line!(
-            "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) \
+        crate::log_role!(
+            "could not tell the {language} plugin its semantic pass is owed ({err:#}) \
              - it starts its engine when the pass is asked instead"
         );
     }
@@ -287,9 +280,7 @@ fn semantic_pass_after_swap(
                     _ => schema::record_language_semantic_pass(conn, language),
                 });
                 if let Err(err) = recorded {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to record {language}'s semantic pass after {after} ({err:#})"
-                    );
+                    crate::log_role!("failed to record {language}'s semantic pass after {after} ({err:#})");
                     semantic::record_failure(store, language, &err);
                 }
             }
@@ -299,14 +290,14 @@ fn semantic_pass_after_swap(
             // Incomplete, with the unfinished files named: already recorded
             // residual by the pass (`ingest::apply`); the next daemon start
             // asks only those files.
-            Ok(Some(SemanticPassOutcome::Residual { left })) => crate::log_line!(
-                "g-mesh daemon: the {language} semantic pass after {after} left {left} file(s) \
+            Ok(Some(SemanticPassOutcome::Residual { left })) => crate::log_role!(
+                "the {language} semantic pass after {after} left {left} file(s) \
                  unfinished - the next start asks only those"
             ),
             Ok(None) => semantic::record_not_run(store, language),
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: the {language} semantic pass after {after} failed ({err:#}) - \
+                crate::log_role!(
+                    "the {language} semantic pass after {after} failed ({err:#}) - \
                      its edges keep whatever the structural pass resolved"
                 );
                 semantic::record_failure(store, language, &err);
@@ -315,9 +306,7 @@ fn semantic_pass_after_swap(
 
         let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
         if let Err(err) = store.with(|conn| schema::reconcile_semantic_pass_rollup(conn, &capable)) {
-            crate::log_line!(
-                "g-mesh daemon: failed to update the project-wide semantic-pass roll-up ({err:#})"
-            );
+            crate::log_role!("failed to update the project-wide semantic-pass roll-up ({err:#})");
         }
     }
 }
@@ -360,15 +349,15 @@ pub(crate) fn retry_failed(
         walked_files.iter().map(String::as_str),
         walk_started,
     ) {
-        Ok(baselines) if baselines.skipped > 0 => crate::log_line!(
-            "g-mesh daemon: {} of {} retried {language} files got no staleness baseline - each reindexes on \
+        Ok(baselines) if baselines.skipped > 0 => crate::log_role!(
+            "{} of {} retried {language} files got no staleness baseline - each reindexes on \
              its first query",
             baselines.skipped,
             walked_files.len()
         ),
         Ok(_) => {}
-        Err(err) => crate::log_line!(
-            "g-mesh daemon: could not record the retried {language} files' staleness baselines - each \
+        Err(err) => crate::log_role!(
+            "could not record the retried {language} files' staleness baselines - each \
              reindexes on its first query: {err:#}"
         ),
     }
@@ -469,8 +458,8 @@ fn rebuild(
         },
     )?;
     let counts = plan.counts;
-    crate::log_line!(
-        "g-mesh daemon: {language} reindex swapped in - nodes -{} +{}, edges -{} +{}, containers -{} +{}, \
+    crate::log_role!(
+        "{language} reindex swapped in - nodes -{} +{}, edges -{} +{}, containers -{} +{}, \
          {} texts owed a vector, {} file(s) structural until the semantic pass, {} placeholder(s) kept \
          for it",
         counts.delete_nodes,
@@ -2061,7 +2050,7 @@ mod tests {
     /// this pass did not re-send: what the pass sent and the syntactic edge
     /// stay. The plugin never retracts across processes
     /// (`a_new_bridge_does_not_retract_what_an_earlier_process_emitted` in
-    /// `plugins/sdk/tests/lsp_bridge.rs`), so core's sweep is what removes it.
+    /// `plugins/sdk-lsp/tests/lsp_bridge.rs`), so core's sweep is what removes it.
     ///
     /// Control: `semantic_sweep = false` in `plugins/typescript/plugin.toml`
     /// -> `alpha-old` survives.

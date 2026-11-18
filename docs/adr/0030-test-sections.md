@@ -14,12 +14,12 @@ from the rest without downloading the log. GM-539 also needs units it can
 select by changed paths.
 
 ## Decision
-We split the suite into 12 named sections, each a nextest filterset over the
+We split the suite into 13 named sections, each a nextest filterset over the
 whole workspace, held in `scripts/test-sections.sh`: `core-it`,
 `core-scripts`, `core-mcp`, `core-daemon`, `core-cli`, `core-graph`,
-`core-rest`, `sdk`, `plugin-typescript`, `plugin-rust`, `plugin-python`,
-`wire` (which also holds `g-mesh-walk`, the other leaf crate the rest build
-on). Core's integration tests are two binaries: `core-scripts` is
+`core-rest`, `sdk`, `sdk-lsp`, `plugin-typescript`, `plugin-rust`, `plugin-python`,
+`wire` (which also holds `g-mesh-walk` and `g-mesh-manifest`, the other leaf
+crates the rest build on). Core's integration tests are two binaries: `core-scripts` is
 `binary_id(g-mesh::scripts)` (tests whose subject is a file under
 `scripts/`), and `core-it` is the rest of core's `kind(test)`, so a new test
 binary lands in `core-it` rather than in no section (GM-671: split out so a
@@ -47,6 +47,10 @@ section has one CI step.
   `scripts/test-sections-check.py` fails on a test in no section, in two
   sections, or matched by a section but absent from the suite. CI's linux row
   and `cut-release.sh` run it.
+- **A CI step check.** `check` first runs `check-ci`: each section in
+  `SECTIONS` has exactly one `tests: <section>` step in `ci.yml` that runs it
+  and selects it by name, and no step runs an unlisted section. Adding a
+  section is a `SECTIONS` entry plus its step; a missing step fails `check`.
 - **CI: steps in one job, not a matrix.** One build step, then one step per
   section with its own timeout and JUnit file. A matrix over sections would
   be 44 jobs, each with its own cold build.
@@ -78,6 +82,8 @@ Accepted 2026-10-09 (owner decisions Q1 and Q2 in the design note, section 10).
   accepts all three. CI's `select` job and a local verify run call the same
   script. `wire/`, the SDK, cargo and nextest config, CI workflows and the
   selection scripts select `full`, and so does any path no rule names.
+  `plugins/sdk-lsp/` selects `sdk-lsp`, the plugin sections and every core
+  section (GM-713); the SDK itself stays `full`.
 - **A plugin change runs that plugin's section and all six core sections**
   (Q1), never the other plugins' sections. Core tests spawn and read every
   plugin, so narrowing core further would trade safety for little time.

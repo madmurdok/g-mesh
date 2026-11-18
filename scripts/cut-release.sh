@@ -21,7 +21,8 @@
 #
 # GM-288: since the repository became a cargo workspace (GM-284), `core/
 # Cargo.toml` is not the only manifest with a hand-pinned `version` -
-# `wire/Cargo.toml`, `plugins/sdk/Cargo.toml`, `plugins/rust/Cargo.toml` and,
+# `wire/Cargo.toml`, `plugins/sdk/Cargo.toml`, `plugins/sdk-lsp/Cargo.toml`,
+# `plugins/rust/Cargo.toml` and,
 # since GM-298, `plugins/python/Cargo.toml` (and since GM-514 `walk/Cargo.toml`)
 # each carry their own. Nothing
 # forces them to agree with core's, and a crate
@@ -35,9 +36,9 @@
 # and README.md's own release checklist), this script instead grows the same
 # check it already runs to cover every workspace member: `core/Cargo.toml`
 # stays the one manifest whose version *names* the release, and wire's,
-# walk's and plugins/sdk's versions are checked to equal it (the three
-# language plugins carry their own, see below), in `check_workspace_versions`
-# below, before a single test runs. A member added to the workspace later
+# walk's, manifest's, plugins/sdk's and plugins/sdk-lsp's versions are checked to equal
+# it (the three language plugins carry their own, see below), in
+# `check_workspace_versions` below, before a single test runs. A member added to the workspace later
 # that forgets this gets caught here, not after a release ships with it
 # silently stale - which is the whole reason this got written down instead of
 # only fixed: this decision is what the next language plugin's manifest
@@ -58,10 +59,11 @@
 #     two are bumped together only when the plugin changed since the previous
 #     release tag. `check_crate_backed_plugin_versions` below enforces both:
 #     the agreement, and the change rule. A plugin changed when its shipped
-#     inputs differ from the tag: its own and plugins/sdk's, wire's and walk's
-#     `src/`; its own `Cargo.toml` and `plugin.toml` and sdk's, wire's and
-#     walk's `Cargo.toml`, each with its own version line ignored (so the
-#     release bump of sdk/wire/walk is not a change); and the registry/git
+#     inputs differ from the tag: its own and plugins/sdk's, plugins/sdk-lsp's,
+#     wire's, walk's and manifest's `src/`; its own `Cargo.toml` and
+#     `plugin.toml` and sdk's, sdk-lsp's, wire's, walk's and manifest's
+#     `Cargo.toml`, each with its own version line ignored (so the release
+#     bump of sdk/sdk-lsp/wire/walk/manifest is not a change); and the registry/git
 #     packages its `Cargo.lock` dependency closure reaches. Tests, fixtures,
 #     READMEs and every other path do not count. A changed plugin whose
 #     version did not move, or a version lower than at the tag, stops the cut;
@@ -246,7 +248,9 @@ EOF
 OTHER_WORKSPACE_MANIFESTS=(
 	"wire/Cargo.toml"
 	"walk/Cargo.toml"
+	"manifest/Cargo.toml"
 	"plugins/sdk/Cargo.toml"
+	"plugins/sdk-lsp/Cargo.toml"
 )
 
 # The `version` of a manifest's `[package]` section. Same restriction as
@@ -290,23 +294,28 @@ check_workspace_versions() {
 	log "workspace versions agree: $core_version (core, ${OTHER_WORKSPACE_MANIFESTS[*]})"
 }
 
-# The cargo-workspace language plugins, by directory under plugins/. Each
-# carries its own version and is checked by `check_crate_backed_plugin_versions`
-# (see this script's header comment for the rule, and why Go is not here). A
-# new cargo-workspace plugin is a deliberate addition to this list, the same
-# fail-closed shape OTHER_WORKSPACE_MANIFESTS uses.
-CRATE_BACKED_PLUGINS=(
-	rust
-	python
-	typescript
-)
+# The cargo-workspace language plugins, by directory under plugins/: the
+# `cargo` kind of build-targets.sh's plugin list, read from the build-targets.sh
+# beside this script. Each carries its own version and is checked by
+# `check_crate_backed_plugin_versions` (see this script's header comment for
+# the rule, and why Go is not here).
+CRATE_BACKED_PLUGINS=()
+crate_backed_plugins="$(bash "$(dirname "${BASH_SOURCE[0]}")/build-targets.sh" --plugins cargo)" ||
+	die "could not read the cargo plugins from build-targets.sh --plugins cargo"
+while IFS= read -r plugin; do
+	[ -z "$plugin" ] || CRATE_BACKED_PLUGINS+=("$plugin")
+done <<<"$crate_backed_plugins"
+unset crate_backed_plugins plugin
+[ ${#CRATE_BACKED_PLUGINS[@]} -gt 0 ] || die "build-targets.sh --plugins cargo named no plugin"
 
 # The release-versioned crates every plugin in CRATE_BACKED_PLUGINS is built
 # from. Their `src/` and `Cargo.toml` are shipped inputs of each plugin.
 PLUGIN_SHARED_CRATES=(
 	plugins/sdk
+	plugins/sdk-lsp
 	wire
 	walk
+	manifest
 )
 
 # The `plugin_version` of a plugin.toml's `[plugin]` section. Same
@@ -477,8 +486,8 @@ check_crate_backed_plugin_versions() {
 		dir="plugins/$plugin"
 		cargo_toml="$REPO_ROOT/$dir/Cargo.toml"
 		plugin_toml="$REPO_ROOT/$dir/plugin.toml"
-		[ -f "$cargo_toml" ] || die "plugin manifest not found: $dir/Cargo.toml (update CRATE_BACKED_PLUGINS in this script if it moved or was removed)"
-		[ -f "$plugin_toml" ] || die "plugin manifest not found: $dir/plugin.toml (update CRATE_BACKED_PLUGINS in this script if it moved or was removed)"
+		[ -f "$cargo_toml" ] || die "plugin manifest not found: $dir/Cargo.toml (update PLUGINS in scripts/build-targets.sh if it moved or was removed)"
+		[ -f "$plugin_toml" ] || die "plugin manifest not found: $dir/plugin.toml (update PLUGINS in scripts/build-targets.sh if it moved or was removed)"
 		crate_version="$(package_version "$cargo_toml")"
 		[ -n "$crate_version" ] || die "could not determine version from $dir/Cargo.toml"
 		toml_version="$(plugin_toml_version "$plugin_toml")"

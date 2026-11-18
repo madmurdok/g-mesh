@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
 use super::*;
 use crate::daemon::bulk_index;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::queries;
+use crate::mcp::query::test_support::Rendered;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
 use crate::model::{EdgeRecord, PlaceholderTargetRecord};
 use crate::plugin_manifest::{read_manifest, DiscoveredPlugins};
@@ -115,7 +115,8 @@ fn by_name(symbol: &str) -> SymbolQueryParams {
     SymbolQueryParams { symbol_name: Some(symbol.to_string()), ..Default::default() }
 }
 
-fn json_body(result: &CallToolResult) -> serde_json::Value {
+fn json_body(result: &impl Rendered) -> serde_json::Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -340,7 +341,7 @@ fn the_marker_is_absent_when_every_candidate_already_calls_the_method() {
 }
 
 /// The `file:` URI of an absolute path, spelled independently of the SDK's
-/// own (see `plugins/sdk/tests/lsp_bridge.rs`' `file_uri` for why).
+/// own (see `plugins/sdk-lsp/tests/lsp_bridge.rs`' `file_uri` for why).
 fn file_uri(path: &std::path::Path) -> String {
     let text = path.to_string_lossy();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text).replace('\\', "/");

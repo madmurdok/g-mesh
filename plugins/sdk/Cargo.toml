@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-sdk"
-version = "4.32.0"
+version = "4.33.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Everything a g-mesh language plugin needs that is not its language: protocol loop, project walk, incremental diff, ids"
@@ -26,20 +26,6 @@ path = "src/lib.rs"
 name = "g-mesh-plugin-toy"
 path = "toy/main.rs"
 
-# The scripted language server `tests/lsp_bridge.rs` spawns through the real
-# `lsp::LspBridge`. A `[[bin]]` for the same reason the toy plugin is one -
-# cargo exports `CARGO_BIN_EXE_g-mesh-fake-lsp` to this package's integration
-# tests and builds it before they run - and in a top-level directory rather
-# than under `tests/` because cargo auto-discovers `tests/*/main.rs` as an
-# integration test target of its own.
-#
-# It is not shipped: nothing installs it, no manifest names it, and its only
-# caller is a `#[test]`. See its own module doc for why the fixture is a
-# process rather than a mock.
-[[bin]]
-name = "g-mesh-fake-lsp"
-path = "fake-lsp/main.rs"
-
 # The stand-in plugin core's own tests spawn (`core/src/daemon/test_plugin.rs`,
 # `core/tests/it/semantic_pass_trigger.rs`) through a manifest whose `command` is
 # `${G_MESH_BIN_DIR}/g-mesh-fake-plugin`. Here rather than in core because
@@ -48,6 +34,9 @@ path = "fake-lsp/main.rs"
 [[bin]]
 name = "g-mesh-fake-plugin"
 path = "fake/main.rs"
+
+[features]
+tree-sitter = ["dep:tree-sitter"]
 
 [dependencies]
 anyhow = "1"
@@ -60,6 +49,8 @@ g-mesh-wire = { path = "../../wire" }
 # guard, shared with core so the two agree on which files exist and under
 # which spelling. Its only dependency is `ignore`.
 g-mesh-walk = { path = "../../walk" }
+# The `plugin.toml` schema, shared with core and the LSP bridge.
+g-mesh-manifest = { path = "../../manifest" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Node and edge ids are sha256 prefixes, and the scheme is a cross-plugin
@@ -67,10 +58,10 @@ serde_json = "1"
 # `crypto`, the Go plugin with `crypto/sha256`, this crate with `sha2`. Core
 # already depends on it too.
 sha2 = "0.10"
-# `plugin.toml`, read back by the plugin itself for the walk's `exclude_dirs`
-# and the extensions it claims - see `manifest`' module doc for why the
-# plugin re-reads the file core also reads rather than being told.
+# `testing::PluginCheck` writes `[plugin.semantic]` back out as TOML.
 toml = "0.8"
+# Only for `CharColumns::point`/`node_range`; off unless a tree-sitter plugin asks.
+tree-sitter = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

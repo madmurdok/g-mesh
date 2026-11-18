@@ -59,6 +59,7 @@ mod progress;
 #[cfg(test)]
 mod progress_tests;
 mod provenance;
+pub(crate) mod query;
 pub(crate) mod query_shapes;
 pub(crate) mod response_bound;
 #[cfg(test)]
@@ -82,6 +83,10 @@ mod tool_result;
 mod tools_list_tests;
 mod unlinked;
 mod untyped;
+#[cfg(test)]
+mod watcher_quiet_tests;
+#[cfg(test)]
+mod wire_golden_tests;
 
 pub use self::host::{Activity, McpHost, PathCoverage};
 
@@ -104,20 +109,20 @@ pub(crate) use similarity::floor as shipped_similarity_floor;
 /// g-mesh daemon: prepare: cancelled tool=get_file_outline request=3 waited_ms=900 progress_sent=4
 /// ```
 fn trace_call(what: std::fmt::Arguments<'_>) {
-    if std::env::var_os(TRACE_CALLS_ENV).is_some_and(|v| !v.is_empty()) {
-        crate::log_line!("g-mesh daemon: {what}");
+    if crate::knobs::flag(&crate::knobs::TRACE_CALLS) {
+        crate::log_role!("{what}");
     }
 }
 
 /// Turns on [`trace_call`]. Any non-empty value.
-pub const TRACE_CALLS_ENV: &str = "G_MESH_TRACE_CALLS";
+pub const TRACE_CALLS_ENV: &str = crate::knobs::TRACE_CALLS.name;
 
 /// How often a tool call that is waiting for the index sends a progress
 /// notification, in milliseconds - only ever to a request that carried a
 /// `progressToken` (D6 in `docs/architecture/lazy-indexing.md`). `0` sends
 /// none at all, which is M1's "progress off" arm. Unset or unparsable means
 /// [`DEFAULT_PROGRESS_INTERVAL`].
-pub const PROGRESS_INTERVAL_ENV: &str = "G_MESH_PROGRESS_INTERVAL_MS";
+pub const PROGRESS_INTERVAL_ENV: &str = crate::knobs::PROGRESS_INTERVAL_MS.name;
 
 /// D6's heartbeat: often enough to keep an idle timer measured in tens of
 /// seconds or more alive, rarely enough to be no load at all.
@@ -126,7 +131,7 @@ pub const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 /// The longest a tool call waits for the index before it gives up with an
 /// explicit "still indexing, call again" tool error, in milliseconds (D7).
 /// `0` removes the cap. Unset or unparsable means [`DEFAULT_INDEX_WAIT_CAP`].
-pub const INDEX_WAIT_CAP_ENV: &str = "G_MESH_INDEX_WAIT_CAP_MS";
+pub const INDEX_WAIT_CAP_ENV: &str = crate::knobs::INDEX_WAIT_CAP_MS.name;
 
 /// D7's default: under Claude Code's 30 min stdio idle window, so even a call
 /// that carries no progress token ends with an answer the agent can act on
@@ -139,7 +144,7 @@ pub const DEFAULT_INDEX_WAIT_CAP: Duration = Duration::from_secs(25 * 60);
 /// call: once one call has waited it out, later calls during the same pass
 /// answer at once. `0` does not wait. Unset or unparsable means
 /// [`SEARCH_EMBEDDING_WAIT`].
-pub const SEARCH_EMBEDDING_WAIT_ENV: &str = "G_MESH_SEARCH_EMBEDDING_WAIT_MS";
+pub const SEARCH_EMBEDDING_WAIT_ENV: &str = crate::knobs::SEARCH_EMBEDDING_WAIT_MS.name;
 
 /// Under Claude Code's 120 s move-to-background threshold; long enough for a
 /// small project's whole backfill or one file-change batch
@@ -158,17 +163,6 @@ pub const SEARCH_EMBEDDING_WAIT: Duration = Duration::from_secs(20);
 /// fix fits but a new tool or a batch of new parameters does not.
 pub const TOOLS_LIST_BYTE_CEILING: usize = 13_600;
 
-/// Reads a millisecond-valued env var, falling back to `default` when it is
-/// unset, empty or not a number. Read per call, so a test can change it
-/// without starting a new daemon.
-fn env_millis(name: &str, default: Duration) -> Duration {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(default)
-}
-
 /// A wait duration for a person: `"950ms"`, `"42s"`, `"18m 5s"`.
 fn human_duration(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
@@ -184,10 +178,15 @@ fn human_duration(elapsed: Duration) -> String {
 /// A failed walk is a tool error carrying its message, never an answer read
 /// off an empty or partial graph; the next call retries
 /// (`IndexingStatus::request_activation`).
-fn walk_failed(message: &str) -> CallToolResult {
-    CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+fn walk_failed(message: &str) -> query::Refusal {
+    query::Refusal::Text(format!(
         "g-mesh could not build this project's index: {message}. The next tool call retries the build."
-    ))])
+    ))
+}
+
+/// Sends an answer a tool gave before it ran.
+fn render_early(early: query::Refusal) -> Result<CallToolResult, ErrorData> {
+    response_bound::render(&query::Redirect::Refused(early))
 }
 
 /// Serves one accepted connection as an MCP session until the peer
@@ -275,7 +274,7 @@ impl GMeshMcpServer {
         ctx: &RequestContext<RoleServer>,
         tool: &str,
         need: Need,
-    ) -> Result<Option<CallToolResult>, ErrorData> {
+    ) -> Result<Option<query::Refusal>, ErrorData> {
         // Taken before the indexing wait, so the replay's heartbeat continues
         // the wait's `progress` values and stays strictly increasing.
         let call_started = Instant::now();
@@ -331,7 +330,7 @@ impl GMeshMcpServer {
         let replayed = match joined {
             Ok(count) => count,
             Err(err) => {
-                crate::log_line!("g-mesh daemon: the plugin wake task failed: {err}");
+                crate::log_role!("the plugin wake task failed: {err}");
                 0
             }
         };
@@ -360,6 +359,7 @@ impl GMeshMcpServer {
             entry_points: self.host.entry_points(),
             uncovered: self.filter_coverage(file_paths),
             coverage: file.and_then(|path| self.host.path_coverage(path)),
+            watcher_quiet: self.host.watcher_quiet(),
         }
     }
 
@@ -425,9 +425,9 @@ impl GMeshMcpServer {
         match joined {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => {
-                crate::log_line!("g-mesh daemon: query-time staleness check failed for {owned_path}: {err:#}")
+                crate::log_role!("query-time staleness check failed for {owned_path}: {err:#}")
             }
-            Err(err) => crate::log_line!("g-mesh daemon: the staleness-check task failed: {err}"),
+            Err(err) => crate::log_role!("the staleness-check task failed: {err}"),
         }
     }
 
@@ -452,9 +452,9 @@ impl GMeshMcpServer {
         ctx: &RequestContext<RoleServer>,
         tool: &str,
         need: Need,
-    ) -> Result<Option<CallToolResult>, ErrorData> {
+    ) -> Result<Option<query::Refusal>, ErrorData> {
         let started = Instant::now();
-        let cap = env_millis(INDEX_WAIT_CAP_ENV, DEFAULT_INDEX_WAIT_CAP);
+        let cap = crate::knobs::millis_lenient(&crate::knobs::INDEX_WAIT_CAP_MS, DEFAULT_INDEX_WAIT_CAP);
         // `0` is "no cap": `checked_add` failing (a cap too large to be a
         // real instant) means the same.
         let deadline = if cap.is_zero() { None } else { started.checked_add(cap) };
@@ -465,15 +465,13 @@ impl GMeshMcpServer {
             // D7: the cap. No part of the question is answered - no rows,
             // nothing that could be read as a result - only why, and that
             // calling again is the remedy.
-            WaitOutcome::TimedOut => {
-                Some(CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
-                    "g-mesh: the index for {} is still being built ({}; this call waited {}). No answer was \
+            WaitOutcome::TimedOut => Some(query::Refusal::Text(format!(
+                "g-mesh: the index for {} is still being built ({}; this call waited {}). No answer was \
                  computed - call this tool again; the index keeps building in the background.",
-                    self.host.project_root().display(),
-                    self.indexing.progress_detail(),
-                    human_duration(started.elapsed())
-                ))]))
-            }
+                self.host.project_root().display(),
+                self.indexing.progress_detail(),
+                human_duration(started.elapsed())
+            ))),
             WaitOutcome::Failed(message) => Some(walk_failed(&message)),
         })
     }
@@ -539,14 +537,15 @@ impl GMeshMcpServer {
     async fn wait_for_embeddings(
         &self,
         ctx: &RequestContext<RoleServer>,
-    ) -> Result<Result<Option<search_code::Coverage>, CallToolResult>, ErrorData> {
+    ) -> Result<Result<Option<search_code::Coverage>, query::Refusal>, ErrorData> {
         let started = Instant::now();
         let spent = self.indexing.embedding_wait_spent();
         let bound = if spent {
             Duration::ZERO
         } else {
-            self.search_embedding_wait
-                .unwrap_or_else(|| env_millis(SEARCH_EMBEDDING_WAIT_ENV, SEARCH_EMBEDDING_WAIT))
+            self.search_embedding_wait.unwrap_or_else(|| {
+                crate::knobs::millis_lenient(&crate::knobs::SEARCH_EMBEDDING_WAIT_MS, SEARCH_EMBEDDING_WAIT)
+            })
         };
         let deadline = started.checked_add(bound);
         let outcome =
@@ -562,14 +561,13 @@ impl GMeshMcpServer {
                 }
                 let (embedded, total) = self.indexing.embed_progress();
                 let phase = self.indexing.phase();
-                search_code::Coverage::partial(
+                Ok(search_code::Coverage::partial(
                     &phase,
                     embedded,
                     total,
                     (!spent).then(|| started.elapsed()),
                     self.host.project_root(),
-                )
-                .map_or(Ok(None), |coverage| Ok(Some(coverage)))
+                ))
             }
         })
     }
@@ -584,7 +582,7 @@ impl GMeshMcpServer {
     fn mark_used(&self) {
         self.host.request();
         if let Err(err) = self.store.with(last_used::touch) {
-            crate::log_line!("g-mesh daemon: failed to record lastUsed: {err:#}");
+            crate::log_role!("failed to record lastUsed: {err:#}");
         }
     }
 
@@ -626,8 +624,8 @@ impl GMeshMcpServer {
             _ if matches!(phase, Phase::Failed(_)) => None,
             Ok(retries) => Some(retries),
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: failed to read language retries for the MCP instructions, \
+                crate::log_role!(
+                    "failed to read language retries for the MCP instructions, \
                      leaving the retry state unsaid: {err:#}"
                 );
                 None
@@ -639,8 +637,8 @@ impl GMeshMcpServer {
                 &capabilities,
             )),
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: failed to read present languages for the MCP instructions, \
+                crate::log_role!(
+                    "failed to read present languages for the MCP instructions, \
                      falling back to the installed plugins: {err:#}"
                 );
                 instructions::Covered::Installed(installed())
@@ -652,8 +650,8 @@ impl GMeshMcpServer {
             }
             (covered, outcomes) => {
                 if let Err(err) = outcomes {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to read language outcomes for the MCP instructions, \
+                    crate::log_role!(
+                        "failed to read language outcomes for the MCP instructions, \
                          falling back to the missing plugins: {err:#}"
                     );
                 }
@@ -665,7 +663,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "find_definition",
-        description = "Find where a symbol is defined, and get the declaration's source back with it. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it. The response carries the declaration's own text, so a follow-up read of that file is usually unnecessary; pass include_source: false if you only want coordinates. Line and column numbers in the response are zero-based; source.firstLine beside them is one-based, as an editor shows it."
+        description = "Find where a symbol is defined, and get the declaration's source back with it. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it. The response carries the declaration's own text, so a follow-up read of that file is usually unnecessary; pass include_source: false if you only want coordinates. Line and column numbers in the response are zero-based; source.firstLine beside them is one-based, as an editor shows it. By name, answers can lag behind edits during a heavy build; with file_path, the file is re-read first."
     )]
     async fn find_definition(
         &self,
@@ -674,15 +672,15 @@ impl GMeshMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let call_started = Instant::now();
         if let Some(early) = self.prepare(&ctx, "find_definition", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "find_definition", call_started, file_path).await;
         }
         let params = params.0;
-        self.query_ctx(None, params.file_path.as_deref())
-            .resolve_lazily_off_worker(find_definition::handle, params)
-            .await
+        let answer =
+            query::definition_off_worker(self.query_ctx(None, params.file_path.as_deref()), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -695,12 +693,12 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "find_references", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let params = params.0;
-        self.query_ctx(params.file_paths.as_deref(), None)
-            .resolve_lazily_off_worker(find_references::handle, params)
-            .await
+        let answer =
+            query::references_off_worker(self.query_ctx(params.file_paths.as_deref(), None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(name = "find_callers", description = "List the functions that call the given function.")]
@@ -710,12 +708,12 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "find_callers", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let params = params.0;
-        self.query_ctx(params.file_paths.as_deref(), None)
-            .resolve_lazily_off_worker(find_callers_callees::handle_callers, params)
-            .await
+        let answer =
+            query::callers_off_worker(self.query_ctx(params.file_paths.as_deref(), None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(name = "find_callees", description = "List the functions the given function calls.")]
@@ -725,12 +723,12 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "find_callees", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let params = params.0;
-        self.query_ctx(params.file_paths.as_deref(), None)
-            .resolve_lazily_off_worker(find_callers_callees::handle_callees, params)
-            .await
+        let answer =
+            query::callees_off_worker(self.query_ctx(params.file_paths.as_deref(), None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -743,19 +741,18 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "find_implementations", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let params = params.0;
         // `transitive` ignores `file_paths`, so it names nothing about them.
         let file_paths = if params.transitive.unwrap_or(false) { None } else { params.file_paths.as_deref() };
-        self.query_ctx(file_paths, None)
-            .resolve_lazily_off_worker(find_implementations::dispatch, params)
-            .await
+        let answer = query::implementations_off_worker(self.query_ctx(file_paths, None), params).await?;
+        response_bound::render(&answer)
     }
 
     #[tool(
         name = "get_file_outline",
-        description = "List the symbols a file declares, members included, in source order; pages are capped at about 8k bytes. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep. `exported` means reachable from outside the file, not that the symbol's own line carries a visibility keyword - e.g. in Rust, a trait method or a trait-impl method is exported through the trait/impl even where the language forbids writing `pub` on that line itself."
+        description = "List the symbols a file declares, members included, in source order; pages are capped at about 8k bytes. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep. `exported` means reachable from outside the file, not that the symbol's own line carries a visibility keyword - e.g. in Rust, a trait method or a trait-impl method is exported through the trait/impl even where the language forbids writing `pub` on that line itself. Re-reads the file first."
     )]
     async fn get_file_outline(
         &self,
@@ -764,10 +761,11 @@ impl GMeshMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let call_started = Instant::now();
         if let Some(early) = self.prepare(&ctx, "get_file_outline", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
-        get_file_outline::handle(&self.query_ctx(None, Some(&params.0.file_path)), params.0)
+        let answer = query::outline(&self.query_ctx(None, Some(&params.0.file_path)), params.0)?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -781,12 +779,13 @@ impl GMeshMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let call_started = Instant::now();
         if let Some(early) = self.prepare(&ctx, "get_dependencies", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         if let Some(file_path) = &params.0.file_path {
             self.ensure_file_fresh(&ctx, "get_dependencies", call_started, file_path).await;
         }
-        get_dependencies::handle(&self.query_ctx(None, params.0.file_path.as_deref()), params.0)
+        let answer = query::dependencies(&self.query_ctx(None, params.0.file_path.as_deref()), params.0)?;
+        response_bound::render(&answer)
     }
 
     #[tool(
@@ -799,13 +798,14 @@ impl GMeshMcpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(early) = self.prepare(&ctx, "search_code", Need::Structural).await? {
-            return Ok(early);
+            return render_early(early);
         }
         let coverage = match self.wait_for_embeddings(&ctx).await? {
             Ok(coverage) => coverage,
-            Err(early) => return Ok(early),
+            Err(early) => return render_early(early),
         };
-        search_code::handle_off_worker(self.query_ctx(None, None), params.0, coverage).await
+        let answer = query::search_off_worker(self.query_ctx(None, None), params.0, coverage).await?;
+        response_bound::render(&answer)
     }
 }
 

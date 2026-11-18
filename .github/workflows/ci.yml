@@ -824,6 +824,12 @@ jobs:
         shell: bash
         run: scripts/test-sections.sh run --profile ci sdk
 
+      - name: "tests: sdk-lsp"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' sdk-lsp ')) }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci sdk-lsp
+
       - name: "tests: plugin-typescript"
         if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' plugin-typescript ')) }}
         timeout-minutes: 10

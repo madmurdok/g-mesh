@@ -3,15 +3,12 @@
 
 use g_mesh_plugin_sdk::{run, PluginSpec};
 
-use g_mesh_plugin_typescript::extractor::grammar::EXTENSIONS;
 use g_mesh_plugin_typescript::extractor::TypeScriptExtractor;
-use g_mesh_plugin_typescript::project;
 
 fn main() -> ! {
     run(
         TypeScriptExtractor,
-        PluginSpec::new("typescript", env!("CARGO_PKG_VERSION"), &EXTENSIONS)
-            .exclude_dirs(&project::EXCLUDE_DIRS),
+        PluginSpec::from_manifest_str(include_str!("../plugin.toml")),
         // The vtsls tier. A *factory*, not an engine: the SDK calls
         // it on the first `semanticPass` and never before, so a structural
         // wake-up neither looks for vtsls nor starts it.

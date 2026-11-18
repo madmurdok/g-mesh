@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::ContentBlock;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -19,6 +19,7 @@ use crate::embedding::EmbeddingPipeline;
 use crate::indexing_status::{IndexingStatus, Phase};
 use crate::mcp::host::{Activity, McpHost, PathCoverage};
 use crate::mcp::host_fake::FakeHost;
+use crate::mcp::query::test_support::Rendered;
 use crate::model::{Diff, EdgeRecord, NodeRecord};
 use crate::plugin_manifest::{Capabilities, PluginManifest};
 use crate::storage::index_store::IndexStore;
@@ -100,6 +101,9 @@ impl McpHost for Recording {
     fn ensure_fresh(&self, store: &IndexStore, file_path: &str) -> anyhow::Result<Option<String>> {
         self.inner.ensure_fresh(store, file_path)
     }
+    fn watcher_quiet(&self) -> Option<Duration> {
+        self.inner.watcher_quiet()
+    }
 }
 
 fn node(id: &str, kind: &str, file: &str) -> NodeRecord {
@@ -147,7 +151,8 @@ fn project(dir: &Path) -> std::path::PathBuf {
     root
 }
 
-fn json_body(result: &CallToolResult) -> Value {
+fn json_body(result: &impl Rendered) -> Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),

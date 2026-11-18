@@ -8,7 +8,6 @@
 
 use std::collections::HashSet;
 
-use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -24,8 +23,9 @@ use crate::model::NodeRecord;
 
 use super::context::QueryCtx;
 use super::not_indexed;
+use super::query::{ToolAnswer, WirePage};
 use super::session_hints::{self, HintKey, SessionHints};
-use super::tool_result::{error, internal_error, success};
+use super::tool_result::internal_error;
 use super::GetDependenciesParams;
 
 /// The only edge kind this tool walks: `get_dependencies` answers "what does
@@ -126,7 +126,7 @@ impl From<ReachedNode> for DependencyNode {
 /// tools' own pagination.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DependencyWalk {
+pub(crate) struct DependencyWalk {
     results: Vec<DependencyNode>,
     truncated: bool,
     truncated_by: Option<&'static str>,
@@ -148,6 +148,8 @@ struct DependencyWalk {
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
 }
+
+impl WirePage for DependencyWalk {}
 
 /// `session_hints::WALK_COMPLETE` (with the `import type` clause for a
 /// language that has type-only imports, and Rust's uncovered paths for Rust)
@@ -347,7 +349,11 @@ struct WalkShape {
 /// them. The exploration budget is deliberately not one of the caller's
 /// dials: it bounds what the query engine visits internally, not what the
 /// caller asked to see, so it is always the module default here.
-fn from_root(conn: &Connection, root: String, shape: &WalkShape) -> Result<CallToolResult, ErrorData> {
+fn from_root(
+    conn: &Connection,
+    root: String,
+    shape: &WalkShape,
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     from_root_reporting(conn, root, shape, None)
 }
 
@@ -360,7 +366,7 @@ fn from_root_reporting(
     root: String,
     shape: &WalkShape,
     resolved_from: Option<ResolvedFrom>,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     let mut options = TraversalOptions::new(root, shape.direction);
     options.edge_kind = Some(IMPORT_EDGE.to_string());
     // `DEFAULT_MAX_DEPTH` here, not `TraversalOptions::new`'s own default -
@@ -378,7 +384,7 @@ fn from_root_reporting(
     let mut walk = bound_walk(result, direction, edge_kind, max_depth, max_fanout, Vec::new(), Vec::new());
     walk.resolved_from = resolved_from;
     walk.hint = walk_hint(&walk, language.as_deref(), &shape.hints);
-    success(&walk)
+    Ok(ToolAnswer::Page(walk))
 }
 
 /// `file_path` anchors a walk three ways, tried in this order, with no new
@@ -410,7 +416,7 @@ fn from_file(
     entry_points: &[String],
     file_path: &str,
     shape: &WalkShape,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     let anchor =
         queries::find_file_node(conn, file_path).map_err(|e| internal_error("failed to look up file", e))?;
 
@@ -429,7 +435,7 @@ fn from_file(
             let container = containers.into_iter().next().expect("len checked above");
             return from_root(conn, container.id, shape);
         }
-        _ => return error(ambiguous_container_message(file_path, &containers)),
+        _ => return Ok(ToolAnswer::refused(ambiguous_container_message(file_path, &containers))),
     }
 
     // Not a file or a container key. Before refusing, see whether what was
@@ -439,7 +445,7 @@ fn from_file(
         let resolved = ResolvedFrom::file(file_path, entry.file_path);
         return from_root_reporting(conn, entry.id, shape, Some(resolved));
     }
-    error(no_file_message(conn, entry_points, file_path)?)
+    Ok(ToolAnswer::refused(no_file_message(conn, entry_points, file_path)?))
 }
 
 /// `Incoming` from an indexed file, which is the one arm of [`from_file`] a
@@ -497,7 +503,7 @@ fn incoming_from_file(
     node_id: &str,
     file_path: &str,
     shape: &WalkShape,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     let imported_directly = queries::has_incoming_edge(conn, node_id, IMPORT_EDGE)
         .map_err(|e| internal_error("failed to probe a file's importers", e))?;
     if imported_directly {
@@ -513,7 +519,7 @@ fn incoming_from_file(
             let resolved = ResolvedFrom::module(file_path, container.key);
             from_root_reporting(conn, container.node_id, shape, Some(resolved))
         }
-        _ => error(ambiguous_defining_container_message(file_path, &defined)),
+        _ => Ok(ToolAnswer::refused(ambiguous_defining_container_message(file_path, &defined))),
     }
 }
 
@@ -734,7 +740,7 @@ fn from_module(
     entry_points: &[String],
     module_id: &str,
     shape: &WalkShape,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     let anchor =
         queries::get_node(conn, module_id).map_err(|e| internal_error("failed to look up module", e))?;
 
@@ -744,7 +750,7 @@ fn from_module(
             .map_err(|e| internal_error("failed to look up file", e))?
         {
             Some(node) => from_root(conn, node.id, shape),
-            None => error(no_file_message(conn, entry_points, module_id)?),
+            None => Ok(ToolAnswer::refused(no_file_message(conn, entry_points, module_id)?)),
         },
     }
 }
@@ -752,7 +758,11 @@ fn from_module(
 /// Continues a walk the exploration budget cut short. The token carries the
 /// anchor, direction and limits of the walk it continues, so nothing about
 /// its shape is re-read from the parameters here.
-fn continued(conn: &Connection, token: &str, hints: &SessionHints) -> Result<CallToolResult, ErrorData> {
+fn continued(
+    conn: &Connection,
+    token: &str,
+    hints: &SessionHints,
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     // Decoded a second time here (`traversal::resume` decodes its own copy
     // internally) purely to read the walk's shape back out for `bound_walk` -
     // cheap, and keeps `traversal`'s public surface free of a getter that
@@ -774,7 +784,7 @@ fn continued(conn: &Connection, token: &str, hints: &SessionHints) -> Result<Cal
     let mut walk =
         bound_walk(result, direction, edge_kind, max_depth, max_fanout, prior_visited, prior_walked);
     walk.hint = walk_hint(&walk, language.as_deref(), hints);
-    success(&walk)
+    Ok(ToolAnswer::Page(walk))
 }
 
 /// `ctx.entry_points` is the union of every discovered plugin's
@@ -785,7 +795,10 @@ fn continued(conn: &Connection, token: &str, hints: &SessionHints) -> Result<Cal
 /// is refused with the reason ([`not_indexed::miss`]) before the
 /// container-key and entry-point fallbacks, since a path with a known
 /// language extension is a file path, not a key.
-pub(crate) fn handle(ctx: &QueryCtx, params: GetDependenciesParams) -> Result<CallToolResult, ErrorData> {
+pub(crate) fn handle(
+    ctx: &QueryCtx,
+    params: GetDependenciesParams,
+) -> Result<ToolAnswer<DependencyWalk>, ErrorData> {
     let QueryCtx { store, entry_points, hints, .. } = ctx;
     let coverage = ctx.coverage.as_ref();
     let conn = store.read();
@@ -799,17 +812,18 @@ pub(crate) fn handle(ctx: &QueryCtx, params: GetDependenciesParams) -> Result<Ca
         // resolve silently: the token already names the walk it continues,
         // and picking one of the two would answer a question nobody asked.
         (Some(_), _, _) => {
-            error("g-mesh: `resume_token` already carries the walk it continues - call it without `file_path`/`module_id`")
+            Ok(ToolAnswer::refused("g-mesh: `resume_token` already carries the walk it continues - call it without `file_path`/`module_id`"))
         }
         (None, Some(file_path), None) => match coverage {
             Some(coverage) if uncovered_miss(&conn, &file_path)? => {
                 not_indexed::miss(&conn, Some(coverage), format!("g-mesh: no file '{file_path}' found in the index"))
+                    .map(ToolAnswer::Refused)
             }
             _ => from_file(&conn, entry_points, &file_path, &shape),
         },
         (None, None, Some(module_id)) => from_module(&conn, entry_points, &module_id, &shape),
-        (None, Some(_), Some(_)) => error("g-mesh: give either `file_path` or `module_id`, not both"),
-        (None, None, None) => error("g-mesh: give either `file_path` or `module_id` to start from"),
+        (None, Some(_), Some(_)) => Ok(ToolAnswer::refused("g-mesh: give either `file_path` or `module_id`, not both")),
+        (None, None, None) => Ok(ToolAnswer::refused("g-mesh: give either `file_path` or `module_id` to start from")),
     }
 }
 

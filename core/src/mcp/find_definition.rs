@@ -5,7 +5,6 @@
 use std::cell::Cell;
 use std::path::Path;
 
-use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -18,10 +17,11 @@ use crate::model::NodeRecord;
 
 use super::context::QueryCtx;
 use super::not_indexed;
+use super::query::{Candidates, Redirect, Refusal, ToolAnswer, WirePage};
 use super::query_shapes::QueryShapes;
 use super::similarity;
 use super::source;
-use super::tool_result::{error, internal_error, success};
+use super::tool_result::internal_error;
 use super::FindDefinitionParams;
 
 /// Nothing in the ticket specifies a page size for the ambiguous-candidate
@@ -49,7 +49,7 @@ const CANDIDATE_SOURCE_CHARS: usize = 1_500;
 /// happens to match exactly one node.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DefinitionNode {
+pub(crate) struct DefinitionNode {
     id: String,
     kind: String,
     name: String,
@@ -78,6 +78,8 @@ struct DefinitionNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<source::Snippet>,
 }
+
+impl WirePage for DefinitionNode {}
 
 impl DefinitionNode {
     /// The node with the rung that reached it, for the name-addressed path.
@@ -180,7 +182,7 @@ impl From<super::search_code::SearchResult> for DefinitionCandidate {
 /// them agree on an item type.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CandidatePage {
+pub(crate) struct CandidatePage {
     /// Always `true`, and the reason this field exists at all: the four
     /// symbol-anchored tools return this page *in place of* their own result
     /// shape when a `symbol_name` turns out ambiguous, and both shapes are
@@ -263,12 +265,23 @@ impl CandidatePage {
 /// resolved to nothing here.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct FileNamePage {
+pub(crate) struct FileNamePage {
     resolved_by: ResolvedBy,
     /// Always `false`: these are not competing readings of one name.
     ambiguous: bool,
     explanation: String,
     results: Vec<DefinitionCandidate>,
+}
+
+impl FileNamePage {
+    /// Appends `note` to a `semanticNeighbours` page's explanation; a
+    /// file-name page is left as it is.
+    pub(crate) fn note_if_semantic(&mut self, note: &str) {
+        if matches!(self.resolved_by, ResolvedBy::SemanticNeighbours) {
+            self.explanation.push(' ');
+            self.explanation.push_str(note);
+        }
+    }
 }
 
 /// Which column an ambiguous query matched on, and so which set of
@@ -443,16 +456,18 @@ fn by_position(
     file_path: &str,
     line: u32,
     col: u32,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<DefinitionNode>, ErrorData> {
     let found = queries::find_by_position(conn, file_path, line, col)
         .map_err(|e| internal_error("failed to resolve file+position", e))?;
 
-    match found {
-        Some(node) => success(&DefinitionNode::from(node).with_source(project_root)),
-        None => {
-            not_indexed::miss(conn, coverage, format!("g-mesh: no symbol found at {file_path}:{line}:{col}"))
-        }
-    }
+    Ok(match found {
+        Some(node) => ToolAnswer::Page(DefinitionNode::from(node).with_source(project_root)),
+        None => ToolAnswer::Refused(not_indexed::miss(
+            conn,
+            coverage,
+            format!("g-mesh: no symbol found at {file_path}:{line}:{col}"),
+        )?),
+    })
 }
 
 /// Which rung of the resolution ladder produced an answer - see
@@ -635,7 +650,7 @@ pub(super) fn resolve_symbol_name(
     name: &str,
     cursor: Option<&str>,
     source_root: Option<&Path>,
-) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
+) -> Result<Result<Resolved, Redirect>, ErrorData> {
     let mut exact = queries::find_by_qualified_name(conn, name, None)
         .map_err(|e| internal_error("failed to look up node by qualifiedName", e))?;
 
@@ -666,7 +681,7 @@ pub(super) fn resolve_symbol_name(
     if let Some(column) = ambiguous_over {
         let page = find_candidates_by_name(conn, column, &[Lookup::any(name)], cursor)
             .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-        return success(&CandidatePage::ambiguous(page, None, cursor, source_root)).map(Err);
+        return Ok(Err(ambiguous(CandidatePage::ambiguous(page, None, cursor, source_root))));
     }
 
     match matches.into_iter().next() {
@@ -702,7 +717,7 @@ fn by_qualified_name_suffix(
     name: &str,
     cursor: Option<&str>,
     source_root: Option<&Path>,
-) -> Result<Option<Result<Resolved, CallToolResult>>, ErrorData> {
+) -> Result<Option<Result<Resolved, Redirect>>, ErrorData> {
     let mut matched = queries::find_by_qualified_suffix(conn, name)
         .map_err(|e| internal_error("failed to look up nodes by qualifiedName suffix", e))?;
     match matched.len() {
@@ -711,7 +726,7 @@ fn by_qualified_name_suffix(
         _ => {
             let page = find_candidates_by_qualified_suffix(conn, &[Lookup::any(name)], cursor)
                 .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-            success(&CandidatePage::ambiguous(page, None, cursor, source_root)).map(|page| Some(Err(page)))
+            Ok(Some(Err(ambiguous(CandidatePage::ambiguous(page, None, cursor, source_root)))))
         }
     }
 }
@@ -735,7 +750,7 @@ fn by_stripped_prefix(
     name: &str,
     cursor: Option<&str>,
     source_root: Option<&Path>,
-) -> Result<Option<Result<Resolved, CallToolResult>>, ErrorData> {
+) -> Result<Option<Result<Resolved, Redirect>>, ErrorData> {
     let mut lookups: Vec<Lookup<'_>> = Vec::new();
     for (language, remainder) in shapes.rewrites(name) {
         match lookups.iter_mut().find(|lookup| lookup.key == remainder) {
@@ -784,8 +799,7 @@ fn by_stripped_prefix(
     if let Some(column) = ambiguous_over {
         let page = find_candidates_by_name(conn, column, &lookups, cursor)
             .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-        return success(&CandidatePage::ambiguous(page, page_label, cursor, source_root))
-            .map(|page| Some(Err(page)));
+        return Ok(Some(Err(ambiguous(CandidatePage::ambiguous(page, page_label, cursor, source_root)))));
     }
     if !matches.is_empty() {
         let by = if exact.len() == 1 { ResolvedBy::QualifiedName } else { ResolvedBy::Name };
@@ -800,10 +814,14 @@ fn by_stripped_prefix(
         _ => {
             let page = find_candidates_by_qualified_suffix(conn, &lookups, cursor)
                 .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-            success(&CandidatePage::ambiguous(page, page_label, cursor, source_root))
-                .map(|page| Some(Err(page)))
+            Ok(Some(Err(ambiguous(CandidatePage::ambiguous(page, page_label, cursor, source_root)))))
         }
     }
+}
+
+/// The redirect for an ambiguous rung's candidate page.
+fn ambiguous(page: CandidatePage) -> Redirect {
+    Redirect::Candidates(Candidates::Ambiguous(page))
 }
 
 /// How many neighbours to offer. The calibration found the correct hit ranked
@@ -907,7 +925,7 @@ fn by_semantic_neighbours(
     conn: &Connection,
     semantic: &SemanticRung<'_>,
     name: &str,
-) -> Option<Result<CallToolResult, ErrorData>> {
+) -> Option<FileNamePage> {
     let shapes = semantic.shapes();
     if shapes.refused_by_all(name) {
         return None;
@@ -943,7 +961,7 @@ fn by_semantic_neighbours(
         return None;
     }
 
-    Some(success(&FileNamePage {
+    Some(FileNamePage {
         resolved_by: ResolvedBy::SemanticNeighbours,
         ambiguous: false,
         explanation: format!(
@@ -952,7 +970,7 @@ fn by_semantic_neighbours(
              relying on it, and re-query by its id."
         ),
         results,
-    }))
+    })
 }
 
 /// How many specifiers a refusal names before it stops. Three, because the
@@ -1003,7 +1021,7 @@ const MAX_NAMED_SPECIFIERS: usize = 3;
 /// blast radius of GM-367 on `find_references`/`find_callers`/`find_callees`/
 /// `find_implementations`, which share this resolution, to the *text* of a
 /// refusal rather than the shape of a response.
-fn import_only_refusal(conn: &Connection, name: &str) -> Result<Option<CallToolResult>, ErrorData> {
+fn import_only_refusal(conn: &Connection, name: &str) -> Result<Option<Refusal>, ErrorData> {
     let specifiers = queries::import_specifiers_named(conn, name)
         .map_err(|e| internal_error("failed to look up import placeholders by name", e))?;
     if specifiers.is_empty() {
@@ -1024,7 +1042,7 @@ fn import_only_refusal(conn: &Connection, name: &str) -> Result<Option<CallToolR
          site here. For what a file imports, or what imports it, use get_dependencies.",
         named.join(", ")
     );
-    error(message).map(Some)
+    Ok(Some(Refusal::Text(message)))
 }
 
 /// The last rung before a refusal: no declaration carries the name, but a file
@@ -1062,7 +1080,7 @@ fn by_file_name(
     conn: &Connection,
     semantic: &SemanticRung<'_>,
     name: &str,
-) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
+) -> Result<Result<Resolved, Redirect>, ErrorData> {
     const MAX_SUGGESTIONS: usize = 5;
     let in_file = queries::find_in_file_named(conn, name, MAX_SUGGESTIONS)
         .map_err(|e| internal_error("failed to look up nodes by file name", e))?;
@@ -1070,16 +1088,16 @@ fn by_file_name(
         // Before the semantic rung, because this is a fact the index holds
         // and that one offers a resemblance - see [`import_only_refusal`].
         if let Some(refusal) = import_only_refusal(conn, name)? {
-            return Ok(Err(refusal));
+            return Ok(Err(Redirect::Refused(refusal)));
         }
         // The last rung before giving up. It returns `None` for every way of
         // having nothing useful to say - no model, a specifier-shaped query,
         // nothing scoring high enough - so the terse refusal below stays the
         // answer in all of them.
-        return match by_semantic_neighbours(conn, semantic, name) {
-            Some(page) => page.map(Err),
-            None => error(format!("g-mesh: no symbol named '{name}' found")).map(Err),
-        };
+        return Ok(Err(match by_semantic_neighbours(conn, semantic, name) {
+            Some(page) => Redirect::Candidates(Candidates::Suggested(page)),
+            None => Redirect::Refused(Refusal::NoSymbol(format!("g-mesh: no symbol named '{name}' found"))),
+        }));
     }
 
     // Distinct files, in the order their rows first appear on the page - not
@@ -1097,7 +1115,7 @@ fn by_file_name(
         [only] => (format!("The file {only} is, and declares these"), "its"),
         many => (format!("These files are, and between them declare these: {}", many.join(", ")), "their"),
     };
-    success(&FileNamePage {
+    Ok(Err(Redirect::Candidates(Candidates::Suggested(FileNamePage {
         resolved_by: ResolvedBy::FileName,
         ambiguous: false,
         explanation: format!(
@@ -1120,8 +1138,7 @@ fn by_file_name(
                 source: None,
             })
             .collect(),
-    })
-    .map(Err)
+    }))))
 }
 
 /// `find_definition`'s own symbol-name input: the shared resolution above,
@@ -1132,11 +1149,11 @@ fn by_name(
     semantic: &SemanticRung<'_>,
     name: &str,
     cursor: Option<&str>,
-) -> Result<CallToolResult, ErrorData> {
-    match resolve_symbol_name(conn, semantic, name, cursor, project_root)? {
-        Ok(resolved) => success(&DefinitionNode::resolved(resolved).with_source(project_root)),
-        Err(finished) => Ok(finished),
-    }
+) -> Result<ToolAnswer<DefinitionNode>, ErrorData> {
+    Ok(match resolve_symbol_name(conn, semantic, name, cursor, project_root)? {
+        Ok(resolved) => ToolAnswer::Page(DefinitionNode::resolved(resolved).with_source(project_root)),
+        Err(finished) => finished.widen(),
+    })
 }
 
 /// `find_definition` by an exact node id - the follow-up an ambiguous page
@@ -1146,11 +1163,11 @@ fn by_symbol_id(
     conn: &Connection,
     project_root: Option<&Path>,
     symbol_id: &str,
-) -> Result<CallToolResult, ErrorData> {
-    match super::anchor::by_id(conn, symbol_id)? {
-        Ok(resolved) => success(&DefinitionNode::resolved(resolved).with_source(project_root)),
-        Err(finished) => Ok(finished),
-    }
+) -> Result<ToolAnswer<DefinitionNode>, ErrorData> {
+    Ok(match super::anchor::by_id(conn, symbol_id)? {
+        Ok(resolved) => ToolAnswer::Page(DefinitionNode::resolved(resolved).with_source(project_root)),
+        Err(finished) => finished.widen(),
+    })
 }
 
 /// One pass of `find_definition` - see [`SemanticRung`];
@@ -1161,7 +1178,7 @@ pub(crate) fn handle(
     ctx: &QueryCtx,
     semantic: &SemanticRung<'_>,
     params: FindDefinitionParams,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<DefinitionNode>, ErrorData> {
     let conn = ctx.store.read();
     let project_root = ctx.project_root.as_path();
     let coverage = ctx.coverage.as_ref();
@@ -1176,7 +1193,9 @@ pub(crate) fn handle(
     if let Some(symbol_id) = params.symbol_id {
         return match (params.symbol_name, params.file_path, params.position) {
             (None, None, None) => by_symbol_id(&conn, project_root, &symbol_id),
-            _ => error("g-mesh: give `symbol_id` alone, without `symbol_name`, `file_path` or `position`"),
+            _ => Ok(ToolAnswer::refused(
+                "g-mesh: give `symbol_id` alone, without `symbol_name`, `file_path` or `position`",
+            )),
         };
     }
 
@@ -1186,12 +1205,12 @@ pub(crate) fn handle(
         }
         (None, None, Some(name)) => by_name(&conn, project_root, semantic, &name, params.cursor.as_deref()),
         (None, None, None) if params.cursor.is_some() => {
-            error("g-mesh: `cursor` continues a previous ambiguous symbol_name lookup - give the same symbol_name again")
+            Ok(ToolAnswer::refused("g-mesh: `cursor` continues a previous ambiguous symbol_name lookup - give the same symbol_name again"))
         }
         (None, None, None) => {
-            error("g-mesh: give `symbol_id`, `symbol_name`, or both `file_path` and `position`")
+            Ok(ToolAnswer::refused("g-mesh: give `symbol_id`, `symbol_name`, or both `file_path` and `position`"))
         }
-        _ => error("g-mesh: `file_path` and `position` must be given together"),
+        _ => Ok(ToolAnswer::refused("g-mesh: `file_path` and `position` must be given together")),
     }
 }
 

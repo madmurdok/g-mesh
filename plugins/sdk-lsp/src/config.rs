@@ -18,11 +18,10 @@
 //! typo fails to be discovered *at all*, taking its structural tier down with
 //! it, to protect a string only the plugin ever reads.
 //!
-//! The SDK already re-reads `plugin.toml` for its own walk
-//! ([`crate::manifest`], whose module doc argues the case), so reading three
-//! more keys out of the same file costs one more struct and no new mechanism.
-//! Core's parser ignores unknown sections (it has no `deny_unknown_fields`),
-//! which is what makes the two readers of one file possible at all.
+//! Core, the SDK and this module read the file through one schema,
+//! `g-mesh-manifest`, which keeps `[plugin.semantic]` as a raw table: core
+//! never decodes it, and [`SemanticConfig::from_manifest_at`] decodes and
+//! checks it here.
 //!
 //! # Why not the plugin's own code
 //!
@@ -125,7 +124,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 
 /// What a server does before it can answer - the manifest's one claim about
 /// its *shape*, as opposed to its command line.
@@ -323,7 +321,7 @@ impl SemanticConfig {
     }
 
     /// Reads `[plugin.semantic]` from this plugin's own manifest, wherever
-    /// [`crate::manifest`] finds it.
+    /// [`g_mesh_plugin_sdk::manifest_path`] finds it.
     ///
     /// `Ok(None)` means there is no manifest, or it has no `[plugin.semantic]`
     /// section - a plugin with no LSP tier, which is not an error. An `Err` is
@@ -333,14 +331,14 @@ impl SemanticConfig {
     /// server, which is the failure this crate spends most of its doc comments
     /// refusing to produce.
     pub fn from_manifest() -> Result<Option<Self>> {
-        match crate::manifest::manifest_path() {
+        match g_mesh_plugin_sdk::manifest_path() {
             Some(path) => Self::from_manifest_at(&path),
             None => Ok(None),
         }
     }
 
     /// [`SemanticConfig::from_manifest`] with the search already done - the
-    /// testable half, for the same reason [`crate::manifest`] splits its own
+    /// testable half, for the same reason the SDK's `manifest` module splits its own
     /// resolution that way (a process-global environment variable is not
     /// something parallel tests can each set).
     pub fn from_manifest_at(path: &Path) -> Result<Option<Self>> {
@@ -351,16 +349,21 @@ impl SemanticConfig {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
         };
-        let raw: RawManifest = toml::from_str(&contents)
+        let manifest = g_mesh_manifest::parse(&contents)
             .with_context(|| format!("failed to parse {} as TOML", path.display()))?;
-        let Some(semantic) = raw.plugin.and_then(|plugin| plugin.semantic) else { return Ok(None) };
+        let Some(plugin) = manifest.plugin else { return Ok(None) };
+        let Some(semantic) = plugin
+            .semantic_section()
+            .with_context(|| format!("failed to parse {}'s [plugin.semantic]", path.display()))?
+        else {
+            return Ok(None);
+        };
 
-        anyhow::ensure!(
-            !semantic.command.trim().is_empty(),
-            "{}: [plugin.semantic] command is empty",
-            path.display()
-        );
-        let command = resolve_command(&semantic.command, path);
+        let command = semantic
+            .command
+            .with_context(|| format!("{}: [plugin.semantic] has no command", path.display()))?;
+        anyhow::ensure!(!command.trim().is_empty(), "{}: [plugin.semantic] command is empty", path.display());
+        let command = resolve_command(&command, path);
         let mut config = Self::new(command);
         config.args = semantic.args;
         config.env = semantic.env;
@@ -451,41 +454,6 @@ fn to_json(value: toml::Value) -> serde_json::Value {
             serde_json::Value::Object(table.into_iter().map(|(key, value)| (key, to_json(value))).collect())
         }
     }
-}
-
-/// Only the section this module reads. Deliberately permissive about
-/// everything else in the file, including `[plugin]` itself being absent -
-/// this reader's job is to find one optional table, not to validate a
-/// manifest core has already validated.
-#[derive(Debug, Deserialize)]
-struct RawManifest {
-    plugin: Option<RawPlugin>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawPlugin {
-    semantic: Option<RawSemantic>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawSemantic {
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-    #[serde(default)]
-    engine: Option<String>,
-    #[serde(default)]
-    implementation_kinds: Vec<String>,
-    #[serde(default)]
-    initialization_options: Option<toml::Value>,
-    #[serde(default)]
-    settings: Option<toml::Value>,
-    #[serde(default)]
-    readiness: Option<String>,
-    #[serde(default)]
-    overload_disambiguation: Option<String>,
 }
 
 #[cfg(test)]

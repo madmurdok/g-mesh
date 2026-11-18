@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::progress::{with_heartbeat, Beat, Cancel};
-use super::{env_millis, DEFAULT_PROGRESS_INTERVAL, PROGRESS_INTERVAL_ENV};
+use super::{DEFAULT_PROGRESS_INTERVAL, PROGRESS_INTERVAL_ENV};
 
 /// One progress notification the server tried to send.
 #[derive(Debug, Clone)]
@@ -89,7 +89,8 @@ impl Harness {
     /// `open`: whether sends complete at once; `failures`: how many of the
     /// first sends fail.
     fn new(open: bool, failures: usize) -> Self {
-        let every = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
+        let every =
+            crate::knobs::millis_lenient(&crate::knobs::PROGRESS_INTERVAL_MS, DEFAULT_PROGRESS_INTERVAL);
         assert!(!every.is_zero(), "{PROGRESS_INTERVAL_ENV} must not be 0 for these tests");
         let t0 = Instant::now();
         let attempts = Arc::new(Mutex::new(Vec::new()));

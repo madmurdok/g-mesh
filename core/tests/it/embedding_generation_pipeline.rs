@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use g_mesh::daemon::bulk_index;
 use g_mesh::daemon::manifest::DiscoveredPlugins;
 use g_mesh::daemon::plugin::BUNDLED_LANGUAGE;
-use g_mesh::embedding::{default_model_dir, CacheSettings, EmbeddingModel, EmbeddingPipeline};
+use g_mesh::embedding::{CacheSettings, EmbeddingModel, EmbeddingPipeline};
 use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
@@ -136,7 +136,16 @@ fn vector_row_exists(conn: &Connection, node_id: &str) -> bool {
 }
 
 fn model_dir() -> PathBuf {
-    default_model_dir(&g_mesh::config::EmbeddingConfig::default().model).unwrap()
+    g_mesh::config::embedding::model_dir(g_mesh::embedding::DEFAULT_MODEL_NAME).unwrap()
+}
+
+/// The default model's pipeline as the daemon resolves it, with `cache` in
+/// place of the global config's.
+fn pipeline_with_cache(cache: Option<CacheSettings>) -> EmbeddingPipeline {
+    let mut settings =
+        g_mesh::config::embedding::embedding_settings(&g_mesh::config::EmbeddingConfig::default());
+    settings.cache = cache;
+    EmbeddingPipeline::load(settings)
 }
 
 /// Whether the real weights this suite needs are present on disk - the same
@@ -155,7 +164,7 @@ fn load_real_pipeline() -> EmbeddingPipeline {
     );
     // Without the machine-wide embedding cache: these tests count what the
     // model computes, which a cache warmed by an earlier run would serve.
-    let pipeline = EmbeddingPipeline::load_with_cache(&g_mesh::config::EmbeddingConfig::default(), None);
+    let pipeline = pipeline_with_cache(None);
     assert!(
         pipeline.is_available(),
         "{} does not hold the pinned weights (fp32 ones, say); run `g-mesh model fetch`",
@@ -389,20 +398,19 @@ fn top_ten(conn: &Connection, query: &[f32]) -> Vec<(String, u64)> {
 #[ignore = "needs the real model weights; see this file's module doc comment"]
 fn cached_vectors_are_bit_identical_to_fresh_ones_and_rank_the_same() {
     assert!(weights_available(), "real model weights are required for this test");
-    let config = g_mesh::config::EmbeddingConfig::default();
     let cache_dir = tempfile::tempdir().unwrap();
     let cache = || Some(CacheSettings::new(cache_dir.path().join("cache.sqlite"), 512));
 
-    let (cold_conn, cold) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS)
-        .walk_then_backfill(&EmbeddingPipeline::load_with_cache(&config, cache()));
+    let (cold_conn, cold) =
+        Project::with_source(MANY_DOCUMENTED_FUNCTIONS).walk_then_backfill(&pipeline_with_cache(cache()));
     assert_eq!(cold.cache_hits, 0, "a new cache has nothing to serve");
     assert!(cold.embedded >= 12, "every documented function is embedded: {cold:?}");
 
-    let (warm_conn, warm) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS)
-        .walk_then_backfill(&EmbeddingPipeline::load_with_cache(&config, cache()));
+    let (warm_conn, warm) =
+        Project::with_source(MANY_DOCUMENTED_FUNCTIONS).walk_then_backfill(&pipeline_with_cache(cache()));
     assert_eq!((warm.embedded, warm.cache_hits), (0, cold.embedded), "every vector is a hit");
 
-    let uncached = EmbeddingPipeline::load_with_cache(&config, None);
+    let uncached = pipeline_with_cache(None);
     let (off_conn, off) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS).walk_then_backfill(&uncached);
     assert_eq!((off.embedded, off.cache_hits), (cold.embedded, 0));
 

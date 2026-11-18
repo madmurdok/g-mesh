@@ -261,7 +261,7 @@ fn rerank_status(core: CoreState, state_dir: &Path) -> RerankStatus {
         Some(record) => RerankStatus::Daemon(record),
         None => RerankStatus::OnDisk {
             daemon_alive: live_pid.is_some(),
-            state: RerankModelState::from_environment(),
+            state: RerankModelState::of(crate::config::embedding::rerank_settings()),
         },
     }
 }

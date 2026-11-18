@@ -6,15 +6,20 @@
 #   scripts/test-sections.sh list                    section names, in run order
 #   scripts/test-sections.sh filter <section>        the section's filterset
 #   scripts/test-sections.sh run [--profile P] [--keep-going] <section>...|all|full|none
-#   scripts/test-sections.sh check                   the sections partition the suite
+#   scripts/test-sections.sh check                   check-ci, then: the sections partition the suite
+#   scripts/test-sections.sh check-ci [<ci.yml>]     every section has its CI step, and no other
 #
 # `filter` and `run` also take the selectors `core-spawns-<plugin>` (plugin:
-# typescript, rust, python, go): the core tests that start that plugin's real
+# a language of `build-targets.sh --plugins`): the core tests that start that plugin's real
 # process, by module, as scripts/test-plugin-spawns.txt lists them.
 #
 # Invariants:
 # - The sections partition the suite: every test, ignored ones included, is in
 #   exactly one section. `check` proves it; CI and `cut-release.sh` run it.
+# - SECTIONS is the one section list. Each section has exactly one ci.yml step
+#   named "tests: <section>" that runs it and whose `if:` selects it by name,
+#   and every step that runs a section runs a listed one. `check-ci` proves it
+#   without cargo; `check` runs it first.
 # - `core-rest` is the complement of the other core lib sections, so a new
 #   top-level core module lands in it without an edit here.
 # - `core-it` is the complement of `core-scripts` within core's `kind(test)`,
@@ -34,6 +39,7 @@
 #   cargo nextest run --workspace -E "$(scripts/test-sections.sh filter core-mcp)"
 set -euo pipefail
 
+CALLER_DIR="$PWD"
 cd "$(dirname "$0")/.."
 
 SECTIONS=(
@@ -45,6 +51,7 @@ SECTIONS=(
 	core-graph
 	core-rest
 	sdk
+	sdk-lsp
 	plugin-typescript
 	plugin-rust
 	plugin-python
@@ -93,11 +100,23 @@ spawns_filter() {
 	echo "package(g-mesh) & (${clauses:-none()})"
 }
 
+# Succeeds when $1 is a language of `build-targets.sh --plugins`.
+bundled_plugin() {
+	local plugins
+	plugins="$(bash scripts/build-targets.sh --plugins)" || {
+		echo "test-sections: could not read build-targets.sh --plugins" >&2
+		exit 2
+	}
+	case $'\n'"$plugins"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac
+	return 1
+}
+
 # Prints the filterset of section (or `core-spawns-<plugin>` selector) $1;
 # returns 1 for an unknown name.
 section_filter() {
 	case "$1" in
-	core-spawns-typescript | core-spawns-rust | core-spawns-python | core-spawns-go)
+	core-spawns-*)
+		bundled_plugin "${1#core-spawns-}" || return 1
 		spawns_filter "${1#core-spawns-}"
 		;;
 	core-it) echo 'package(g-mesh) & kind(test) & !binary_id(g-mesh::scripts)' ;;
@@ -108,10 +127,11 @@ section_filter() {
 	core-graph) echo 'package(g-mesh) & kind(lib) & test(/^(graph|link)::/)' ;;
 	core-rest) echo 'package(g-mesh) & (kind(bin) | (kind(lib) & !test(/^(mcp|daemon|cli|graph|link)::/)))' ;;
 	sdk) echo 'package(g-mesh-plugin-sdk)' ;;
+	sdk-lsp) echo 'package(g-mesh-plugin-sdk-lsp)' ;;
 	plugin-typescript) echo 'package(g-mesh-plugin-typescript)' ;;
 	plugin-rust) echo 'package(g-mesh-plugin-rust)' ;;
 	plugin-python) echo 'package(g-mesh-plugin-python)' ;;
-	wire) echo 'package(g-mesh-wire) | package(g-mesh-walk)' ;;
+	wire) echo 'package(g-mesh-wire) | package(g-mesh-walk) | package(g-mesh-manifest)' ;;
 	*) return 1 ;;
 	esac
 }
@@ -122,7 +142,8 @@ usage: scripts/test-sections.sh list
        scripts/test-sections.sh filter <section>
        scripts/test-sections.sh run [--profile P] [--keep-going] <section>...|all|full|none
        scripts/test-sections.sh check
-<section> may also be core-spawns-<plugin> (typescript, rust, python, go).
+       scripts/test-sections.sh check-ci [<ci.yml>]
+<section> may also be core-spawns-<plugin> (<plugin>: a language of build-targets.sh --plugins).
 EOF
 }
 
@@ -272,7 +293,58 @@ cmd_run() {
 	fi
 }
 
+# Checks workflow $1 against SECTIONS: each section has exactly one step that
+# runs it (`run: scripts/test-sections.sh run --profile ci <section>`), named
+# "tests: <section>", whose `if:` contains ' <section> '; no step runs a
+# section SECTIONS lacks. Prints every disagreement and exits 1 on any.
+cmd_check_ci() {
+	local ci="$1"
+	[ -r "$ci" ] || {
+		echo "test-sections: cannot read $ci" >&2
+		exit 2
+	}
+	local problems
+	problems="$(awk -v sections="${SECTIONS[*]}" -v q="'" '
+		BEGIN { n = split(sections, list, " "); for (i = 1; i <= n; i++) listed[list[i]] = 1 }
+		function flush() {
+			if (sec != "") runs[sec]++
+			if (sec in listed) {
+				if (name != "\"tests: " sec "\"") bad[++nbad] = "section " sec ": its step is named " name ", want \"tests: " sec "\""
+				if (index(cond, q " " sec " " q) == 0) bad[++nbad] = "section " sec ": the if: of its step does not select it by name (" q " " sec " " q ")"
+			}
+			sec = ""; name = ""; cond = ""
+		}
+		{ sub(/\r$/, "") }
+		/^[[:space:]]*- name:/ {
+			flush()
+			name = $0; sub(/^[[:space:]]*- name:[[:space:]]*/, "", name)
+			next
+		}
+		/^[[:space:]]*if:/ { cond = $0; next }
+		/^[[:space:]]*run: scripts\/test-sections\.sh run --profile ci [^[:space:]]+[[:space:]]*$/ {
+			sec = $NF
+			next
+		}
+		END {
+			flush()
+			for (i = 1; i <= n; i++) {
+				if (runs[list[i]] != 1) bad[++nbad] = "section " list[i] ": " (runs[list[i]] + 0) " ci.yml steps run it, want exactly one"
+			}
+			for (s in runs) if (!(s in listed)) bad[++nbad] = "a ci.yml step runs " s ", which is not in SECTIONS"
+			for (i = 1; i <= nbad; i++) print bad[i]
+		}
+	' "$ci")"
+	if [ -n "$problems" ]; then
+		echo "FAIL: $ci and the test sections disagree:" >&2
+		printf '  %s\n' "${problems//$'\n'/$'\n'  }" >&2
+		echo "A section is a SECTIONS entry in scripts/test-sections.sh plus one \"tests: <section>\" step in $ci." >&2
+		return 1
+	fi
+	echo "OK: every section has exactly one CI step in $ci"
+}
+
 cmd_check() {
+	cmd_check_ci .github/workflows/ci.yml
 	require_nextest
 	local py name
 	py="$(python_cmd)"
@@ -313,6 +385,15 @@ check)
 		exit 2
 	}
 	cmd_check
+	;;
+check-ci)
+	[ $# -le 2 ] || {
+		usage
+		exit 2
+	}
+	ci="${2:-.github/workflows/ci.yml}"
+	case "$ci" in /*) ;; *) [ $# -eq 1 ] || ci="$CALLER_DIR/$ci" ;; esac
+	cmd_check_ci "$ci"
 	;;
 *)
 	usage

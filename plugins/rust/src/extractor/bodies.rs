@@ -53,7 +53,7 @@
 //!    two. The bridge's edge onto a placeholder shares the structural edge's
 //!    id only when the structural edge is itself onto a placeholder of the
 //!    same address (a declaration in another file), so agreement is tested
-//!    on the target as well as on the id (`plugins/sdk/src/lsp/bridge.rs`).
+//!    on the target as well as on the id (`plugins/sdk-lsp/src/bridge.rs`).
 //!  - **`x.f`** - a field read through a receiver (anything but `self`
 //!    inside an `impl`), recorded as [`OpenSiteKind::ReceiverField`]. When
 //!    this file spells out the receiver's type `T`, the read also gets the
@@ -1375,7 +1375,7 @@ impl Bodies<'_, '_> {
         if container == module.key || !self.project.has_container(&container) {
             return;
         }
-        let range = self.emitter.positions().range(at);
+        let range = self.emitter.positions().node_range(at);
         self.emitter.module_import(PathTarget::Container(container), &spell(prefix), range);
     }
 
@@ -1631,7 +1631,7 @@ impl Bodies<'_, '_> {
         match bound {
             Bound::Here(to) => Some(self.emitter.resolved_edge(kind, from, &to)),
             Bound::There { target, name } => {
-                let range = self.emitter.positions().range(at);
+                let range = self.emitter.positions().node_range(at);
                 let placeholder =
                     self.emitter.placeholder(PlaceholderKind::PendingSymbol, &name, target, range);
                 Some(self.emitter.placeholder_edge(kind, from, &placeholder))
@@ -1661,7 +1661,7 @@ impl Bodies<'_, '_> {
         replaces: Option<String>,
     ) {
         let asked = path_last_segment(at);
-        let position = self.emitter.positions().at(asked.start_position());
+        let position = self.emitter.positions().point(asked.start_position());
         self.emitter.open_site(OpenSite {
             from_id: from.to_string(),
             position,
@@ -1846,7 +1846,7 @@ impl Bodies<'_, '_> {
             NodeKind::Type,
             name.clone(),
             module.qualified_path(&self.fn_local_path(&name)),
-            self.emitter.positions().range(item),
+            self.emitter.positions().node_range(item),
         )
         .native_kind("impl")
         .visibility(Visibility::Public)

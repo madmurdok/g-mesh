@@ -63,6 +63,8 @@
 *.ndjson        text eol=lf
 *.toy           text eol=lf
 *.fk            text eol=lf
+# Compared byte for byte with the rendered MCP answer, which uses LF.
+core/src/mcp/testdata/wire_golden/*.txt text eol=lf
 
 # --- docs and repository metadata ------------------------------------------
 *.md            text eol=lf

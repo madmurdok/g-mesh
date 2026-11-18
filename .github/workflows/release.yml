@@ -31,14 +31,13 @@
 # static `CGO_ENABLED=0` binary cross-compiled for the target in
 # `plugins/go/`, and since GM-288 the Rust plugin, a plain cargo binary built
 # in the same workspace as core for the same target, in `plugins/rust/` - see
-# `scripts/bundle-rust-plugin.sh` for why that needs no extra toolchain setup
+# `scripts/bundle-cargo-plugin.sh` for why that needs no extra toolchain setup
 # here (it is built by the Rust toolchain this file already installs for
 # core). Since GM-298 the same is true of the Python plugin, in `plugins/python/` -
 # it is a tree-sitter structural extractor written in Rust, not a program run
 # by a Python interpreter, so it needs no Python on this runner and no Python
 # on the machine that later runs it either; see
-# `scripts/bundle-python-plugin.sh` for the same reasoning
-# `scripts/bundle-rust-plugin.sh` already gives. Every plugin directory lives
+# `scripts/bundle-cargo-plugin.sh`, which serves both. Every plugin directory lives
 # where `daemon::manifest::bundled_roots` looks beside the executable.
 # `scripts/install.sh` (#66) fetches exactly these assets, by the URLs the
 # section below fixes, and verifies the `.sha256` beside each archive before
@@ -51,8 +50,8 @@
 #    It, not the tag, is what the artifacts are named after; the tag is checked
 #    against it in the first step of every build job so a mismatch costs a
 #    minute instead of four 90-minute builds. `wire/Cargo.toml`,
-#    `walk/Cargo.toml` and `plugins/sdk/Cargo.toml` must say the same version
-#    too. `plugins/rust`, `plugins/python` and `plugins/typescript` carry their
+#    `walk/Cargo.toml`, `manifest/Cargo.toml`, `plugins/sdk/Cargo.toml` and
+#    `plugins/sdk-lsp/Cargo.toml` must say the same version too. `plugins/rust`, `plugins/python` and `plugins/typescript` carry their
 #    own version (`Cargo.toml` and `plugin.toml`, which the shipped manifest
 #    carries unchanged), bumped only when the plugin changed since the
 #    previous release tag. `scripts/cut-release.sh` refuses if any of this
@@ -186,12 +185,12 @@ on:
       - "scripts/build-targets.sh"
       - "scripts/bundle-plugin.sh"
       - "scripts/bundle-go-plugin.sh"
-      - "scripts/bundle-rust-plugin.sh"
-      - "scripts/bundle-python-plugin.sh"
+      - "scripts/bundle-cargo-plugin.sh"
       - "scripts/prepare-release-assets.sh"
       # GM-613: the shared "can this run here" helpers every build script
       # sources, and the script that decides whether `tests` runs.
       - "scripts/lib/runnable.sh"
+      - "scripts/lib/bundle-tail.sh"
       - "scripts/ci-green-for-commit.sh"
       # GM-333: a change to any of these should get the same "watch all
       # four jobs" PR run as a change to the build/package scripts above -
@@ -582,13 +581,17 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
             }
-            foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
+            $bundled = @(& bash scripts/build-targets.sh --plugins)
+            if ($LASTEXITCODE -ne 0 -or $bundled.Count -eq 0) {
+              throw "build-targets.sh --plugins exited $LASTEXITCODE or named no plugin"
+            }
+            foreach ($lang in $bundled) {
               if ($pluginsOutput -notmatch "(?m)^$lang +[0-9]") {
                 throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$pluginsOutput"
               }
             }
 
-            Write-Host "PASS: install.ps1 installed g-mesh $version from the staged archive, and the installed binary runs with all four bundled plugins discovered"
+            Write-Host "PASS: install.ps1 installed g-mesh $version from the staged archive, and the installed binary runs with every bundled plugin discovered ($($bundled -join ', '))"
 
             Write-Host "==> indexing scripts/release-smoke-fixture with the installed binary"
             Copy-Item -LiteralPath (Join-Path $PWD 'scripts/release-smoke-fixture') -Destination $smokeProject -Recurse
@@ -751,9 +754,11 @@ jobs:
   # default install directory and user-Path edit. Once under PowerShell 7
   # (`pwsh`) and once under Windows PowerShell 5.1 (`powershell`, what stock
   # Windows ships). It tests what is already published, not this commit, so
-  # it has no checkout and no build. It runs on a manual dispatch and on a tag
-  # run once `publish` succeeded; on a tag run `releases/latest` must be that
-  # tag. Its token is read-only; it publishes nothing.
+  # it builds nothing; it checks out only scripts/, for the plugin list the
+  # installed binary must see (`build-targets.sh --plugins`). It runs on a
+  # manual dispatch and on a tag run once `publish` succeeded; on a tag run
+  # `releases/latest` must be that tag. Its token is read-only; it publishes
+  # nothing.
   install-latest:
     name: Install the latest published release on Windows
     needs: publish
@@ -767,6 +772,15 @@ jobs:
       # runner IPs run out of the unauthenticated 60-per-hour limit.
       GITHUB_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+      - name: Bundled plugin languages
+        shell: bash
+        run: |
+          bundled="$(bash scripts/build-targets.sh --plugins | tr '\n' ' ')"
+          [ -n "${bundled// /}" ] || { echo "build-targets.sh --plugins named no plugin" >&2; exit 1; }
+          echo "G_MESH_BUNDLED_PLUGINS=${bundled% }" >> "$GITHUB_ENV"
       - name: README one-liner under PowerShell 7 (pwsh)
         shell: pwsh
         run: |
@@ -788,12 +802,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
           }
-          foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
+          $bundled = @($env:G_MESH_BUNDLED_PLUGINS -split ' ' | Where-Object { $_ })
+          if ($bundled.Count -eq 0) {
+            throw "G_MESH_BUNDLED_PLUGINS is empty"
+          }
+          foreach ($lang in $bundled) {
             if ($plugins -notmatch "(?m)^$lang +[0-9]") {
               throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$plugins"
             }
           }
-          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with all four bundled plugins"
+          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with every bundled plugin ($($bundled -join ', '))"
 
       - name: README one-liner under Windows PowerShell 5.1 (powershell)
         shell: powershell
@@ -819,12 +837,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
           }
-          foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
+          $bundled = @($env:G_MESH_BUNDLED_PLUGINS -split ' ' | Where-Object { $_ })
+          if ($bundled.Count -eq 0) {
+            throw "G_MESH_BUNDLED_PLUGINS is empty"
+          }
+          foreach ($lang in $bundled) {
             if ($plugins -notmatch "(?m)^$lang +[0-9]") {
               throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$plugins"
             }
           }
-          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with all four bundled plugins"
+          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with every bundled plugin ($($bundled -join ', '))"
 
   # The publish job's dangerous half - "are these the right files, under the
   # right names" - rehearsed on every non-tag run, so it is not first exercised

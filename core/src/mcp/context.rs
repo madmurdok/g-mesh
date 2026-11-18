@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 
 use crate::embedding::EmbeddingPipeline;
@@ -43,6 +43,10 @@ pub(crate) struct QueryCtx {
     /// Why the call's anchoring file (`file_path`) can be missing from the
     /// index; `None` when its language is indexed.
     pub(crate) coverage: Option<PathCoverage>,
+    /// How long the file watcher has delivered no event, when long enough to
+    /// say so (`McpHost::watcher_quiet`); a by-name miss or a
+    /// `semanticNeighbours` page then names it.
+    pub(crate) watcher_quiet: Option<Duration>,
 }
 
 impl QueryCtx {
@@ -52,11 +56,11 @@ impl QueryCtx {
     /// and release the store itself, so nothing is held between the passes.
     /// Synchronous: for callers already off the async workers (the CLI,
     /// tests).
-    pub(crate) fn resolve_lazily<P: Clone>(
+    pub(crate) fn resolve_lazily<P: Clone, R>(
         &self,
-        handler: impl Fn(&QueryCtx, &SemanticRung<'_>, P) -> Result<CallToolResult, ErrorData>,
+        handler: impl Fn(&QueryCtx, &SemanticRung<'_>, P) -> Result<R, ErrorData>,
         params: P,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<R, ErrorData> {
         let first = SemanticRung::deferred(&self.embedding, &self.shapes);
         let answer = handler(self, &first, params.clone())?;
         let Some(name) = first.reached() else { return Ok(answer) };
@@ -74,14 +78,15 @@ impl QueryCtx {
     /// so the model's load and the vector scan never stall the other calls
     /// the daemon is serving. As with `search_code::handle_off_worker`,
     /// dropping the future does not stop the blocking work.
-    pub(crate) async fn resolve_lazily_off_worker<P, H>(
+    pub(crate) async fn resolve_lazily_off_worker<P, R, H>(
         self,
         handler: H,
         params: P,
-    ) -> Result<CallToolResult, ErrorData>
+    ) -> Result<R, ErrorData>
     where
         P: Clone + Send + 'static,
-        H: Fn(&QueryCtx, &SemanticRung<'_>, P) -> Result<CallToolResult, ErrorData> + Send + 'static,
+        R: Send + 'static,
+        H: Fn(&QueryCtx, &SemanticRung<'_>, P) -> Result<R, ErrorData> + Send + 'static,
     {
         let name = {
             let first = SemanticRung::deferred(&self.embedding, &self.shapes);
@@ -120,6 +125,7 @@ impl QueryCtx {
             entry_points: Vec::new(),
             uncovered: Vec::new(),
             coverage: None,
+            watcher_quiet: None,
         }
     }
 }

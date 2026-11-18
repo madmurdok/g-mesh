@@ -7,7 +7,7 @@ use rmcp::model::ProgressNotificationParam;
 use rmcp::service::RequestContext;
 use rmcp::RoleServer;
 
-use super::{env_millis, DEFAULT_PROGRESS_INTERVAL, PROGRESS_INTERVAL_ENV};
+use super::DEFAULT_PROGRESS_INTERVAL;
 
 /// Whether a heartbeated wait also ends on the request's cancellation.
 pub(super) enum Cancel {
@@ -39,7 +39,8 @@ pub(super) async fn with_heartbeat<F: Future>(
     task: F,
     message: impl Fn() -> String,
 ) -> (Beat<F::Output>, u32) {
-    let interval = env_millis(PROGRESS_INTERVAL_ENV, DEFAULT_PROGRESS_INTERVAL);
+    let interval =
+        crate::knobs::millis_lenient(&crate::knobs::PROGRESS_INTERVAL_MS, DEFAULT_PROGRESS_INTERVAL);
     let token = ctx.meta.get_progress_token().filter(|_| !interval.is_zero());
 
     // The ticker's first tick is one interval in, not immediately: a
@@ -67,8 +68,8 @@ pub(super) async fn with_heartbeat<F: Future>(
                     .with_message(message());
                 match ctx.peer.notify_progress(param).await {
                     Ok(()) => sent += 1,
-                    Err(err) => crate::log_line!(
-                        "g-mesh daemon: could not send a progress notification for request {}: {err}",
+                    Err(err) => crate::log_role!(
+                        "could not send a progress notification for request {}: {err}",
                         ctx.id
                     ),
                 }

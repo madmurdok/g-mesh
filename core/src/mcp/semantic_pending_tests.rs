@@ -5,7 +5,6 @@ use crate::mcp::context::QueryCtx;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
 use super::session_hints::SessionHints;
@@ -13,6 +12,7 @@ use super::{find_callers_callees, find_implementations, find_references};
 use super::{FindImplementationsParams, SymbolQueryParams};
 use crate::embedding::text::TextRule;
 use crate::embedding::EmbeddingPipeline;
+use crate::mcp::query::test_support::Rendered;
 use crate::mcp::response_bound::MAX_RESPONSE_BYTES;
 use crate::model::{Diff, EdgeRecord, NodeRecord};
 use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
@@ -38,7 +38,8 @@ fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
     )])
 }
 
-fn body(result: &CallToolResult) -> (serde_json::Value, usize) {
+fn body(result: &impl Rendered) -> (serde_json::Value, usize) {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => (serde_json::from_str(&text.text).unwrap(), text.text.len()),
@@ -446,13 +447,21 @@ fn ask(store: &Arc<IndexStore>, hints: &SessionHints, tool: Tool, id: &str) -> s
         ..QueryCtx::for_test(store)
     };
     let result = match tool {
-        Tool::Callers => ctx.resolve_lazily(find_callers_callees::handle_callers, by_id(id)),
-        Tool::References => ctx.resolve_lazily(find_references::handle, by_id(id)),
-        Tool::Callees => ctx.resolve_lazily(find_callers_callees::handle_callees, by_id(id)),
-        Tool::Implementations => ctx.resolve_lazily(
-            find_implementations::dispatch,
-            FindImplementationsParams { symbol_id: Some(id.to_string()), ..Default::default() },
-        ),
+        Tool::Callers => ctx
+            .resolve_lazily(find_callers_callees::handle_callers, by_id(id))
+            .map(|answer| answer.rendered()),
+        Tool::References => {
+            ctx.resolve_lazily(find_references::handle, by_id(id)).map(|answer| answer.rendered())
+        }
+        Tool::Callees => ctx
+            .resolve_lazily(find_callers_callees::handle_callees, by_id(id))
+            .map(|answer| answer.rendered()),
+        Tool::Implementations => ctx
+            .resolve_lazily(
+                find_implementations::dispatch,
+                FindImplementationsParams { symbol_id: Some(id.to_string()), ..Default::default() },
+            )
+            .map(|answer| answer.rendered()),
     }
     .unwrap();
     body(&result).0

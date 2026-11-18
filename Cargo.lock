@@ -721,13 +721,14 @@ dependencies = [
 
 [[package]]
 name = "g-mesh"
-version = "4.32.0"
+version = "4.33.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
  "dirs",
  "flate2",
+ "g-mesh-manifest",
  "g-mesh-walk",
  "g-mesh-wire",
  "globset",
@@ -756,11 +757,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "g-mesh-manifest"
+version = "4.33.0"
+dependencies = [
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "g-mesh-plugin-python"
-version = "4.32.0"
+version = "4.33.0"
 dependencies = [
  "anyhow",
+ "g-mesh-manifest",
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "g-mesh-wire",
  "serde",
  "serde_json",
@@ -772,10 +783,12 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-plugin-rust"
-version = "4.32.0"
+version = "4.33.0"
 dependencies = [
  "anyhow",
+ "g-mesh-manifest",
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "g-mesh-wire",
  "landlock",
  "libc",
@@ -788,9 +801,10 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-plugin-sdk"
-version = "4.32.0"
+version = "4.33.0"
 dependencies = [
  "anyhow",
+ "g-mesh-manifest",
  "g-mesh-walk",
  "g-mesh-wire",
  "serde",
@@ -798,14 +812,31 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "tree-sitter",
+]
+
+[[package]]
+name = "g-mesh-plugin-sdk-lsp"
+version = "4.33.0"
+dependencies = [
+ "anyhow",
+ "g-mesh-manifest",
+ "g-mesh-plugin-sdk",
+ "g-mesh-wire",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
 name = "g-mesh-plugin-typescript"
-version = "4.32.0"
+version = "4.33.0"
 dependencies = [
  "anyhow",
+ "g-mesh-manifest",
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "g-mesh-wire",
  "serde",
  "serde_json",
@@ -817,14 +848,14 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-walk"
-version = "4.32.0"
+version = "4.33.0"
 dependencies = [
  "ignore",
 ]
 
 [[package]]
 name = "g-mesh-wire"
-version = "4.32.0"
+version = "4.33.0"
 dependencies = [
  "schemars",
  "serde",

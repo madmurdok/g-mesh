@@ -319,10 +319,8 @@ use g_mesh_plugin_sdk::{walk_project, RelPath};
 /// project. The same reasoning as `site-packages`, arriving through a
 /// different package manager.
 ///
-/// This constant is the one list in code: `main.rs`'s
-/// [`g_mesh_plugin_sdk::PluginSpec::exclude_dirs`] fallback, the semantic
-/// tier's `walk_scope` and `tests/conformance.rs` all take it from here.
-/// The one copy that cannot be derived is `plugin.toml`'s
+/// This constant is the one list in code: the semantic tier's `walk_scope`
+/// takes it from here. The one copy that cannot be derived is `plugin.toml`'s
 /// `[plugin.workspace] exclude_dirs`, which core, its watcher and `status`
 /// read before any plugin process exists; the test
 /// `plugin_toml_exclude_dirs_equal_exclude_dirs` below pins the two equal,
@@ -1121,14 +1119,11 @@ mod tests {
     /// nothing but a second way to be equal.
     #[test]
     fn plugin_toml_exclude_dirs_equal_exclude_dirs() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))).unwrap();
-        let listed: Vec<&str> = manifest["plugin"]["workspace"]["exclude_dirs"]
-            .as_array()
-            .expect("plugin.toml declares [plugin.workspace] exclude_dirs")
-            .iter()
-            .map(|dir| dir.as_str().expect("every exclude_dirs entry is a string"))
-            .collect();
+        let manifest =
+            g_mesh_manifest::parse(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml")))
+                .unwrap();
+        let workspace = manifest.plugin.expect("plugin.toml declares [plugin]").workspace;
+        let listed: Vec<&str> = workspace.exclude_dirs.iter().map(String::as_str).collect();
         assert_eq!(listed, EXCLUDE_DIRS, "plugin.toml's exclude_dirs must equal project::EXCLUDE_DIRS");
     }
 

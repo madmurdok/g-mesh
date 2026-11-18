@@ -20,7 +20,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -51,10 +51,10 @@ pub(crate) const RERANK_TOKENIZER_SHA256: &str =
 
 /// Overrides the cross-encoder's directory. Separate from
 /// `G_MESH_MODEL_DIR`, which names the embedding model's own directory.
-pub const RERANK_MODEL_DIR_ENV: &str = "G_MESH_RERANK_MODEL_DIR";
+pub const RERANK_MODEL_DIR_ENV: &str = crate::knobs::RERANK_MODEL_DIR.name;
 
 /// `off` (any case) switches the rerank off, whatever the global config says.
-pub const RERANK_ENV: &str = "G_MESH_RERANK";
+pub const RERANK_ENV: &str = crate::knobs::RERANK.name;
 
 /// How many of the embedding ranking's first rows are reordered.
 pub const WINDOW: usize = 30;
@@ -90,14 +90,24 @@ pub(crate) trait Scorer: Send + Sync {
     fn count_tokens(&self, text: &str) -> usize;
 }
 
-/// The cross-encoder's directory: `$G_MESH_RERANK_MODEL_DIR`, else
+/// The cross-encoder's directory: `dir_override` (`$G_MESH_RERANK_MODEL_DIR`,
+/// read by `config::embedding::rerank_model_dir`), else
 /// `~/.g-mesh/models/ms-marco-MiniLM-L6-v2`, beside the embedding model.
-pub fn default_rerank_model_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os(RERANK_MODEL_DIR_ENV).filter(|dir| !dir.is_empty()) {
-        return Ok(PathBuf::from(dir));
+pub fn rerank_model_dir_from(dir_override: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = dir_override {
+        return Ok(dir.to_path_buf());
     }
     let home = dirs::home_dir().context("could not resolve home directory")?;
     Ok(home.join(".g-mesh").join("models").join(RERANK_MODEL_NAME))
+}
+
+/// [`rerank_model_dir_from`] under the process's `$G_MESH_RERANK_MODEL_DIR`,
+/// for tests that need the real cross-encoder.
+#[cfg(test)]
+pub(crate) fn env_rerank_model_dir() -> PathBuf {
+    let dir_override =
+        std::env::var_os(RERANK_MODEL_DIR_ENV).filter(|dir| !dir.is_empty()).map(PathBuf::from);
+    rerank_model_dir_from(dir_override.as_deref()).unwrap()
 }
 
 /// Whether `dir` holds the pinned weights and tokenizer, by sha256. The
@@ -306,28 +316,11 @@ impl Scorer for CrossEncoder {
     }
 }
 
-/// Whether the rerank is on, and where its model is: read once, on the
-/// first call that would rerank.
-pub(crate) struct RerankSettings {
-    pub(crate) enabled: bool,
-    pub(crate) model_dir: Result<PathBuf>,
-}
-
-impl RerankSettings {
-    /// The global config's `[rerank] enabled`, overridden by
-    /// [`RERANK_ENV`]`=off`, and [`default_rerank_model_dir`].
-    pub(crate) fn from_environment() -> Self {
-        let enabled = !env_disables_rerank(std::env::var_os(RERANK_ENV).as_deref())
-            && crate::config::read_global_config().map(|config| config.rerank.enabled).unwrap_or_else(|err| {
-                crate::log_line!("g-mesh: failed to read the global config ({err:#}) - the rerank keeps its default (on)");
-                true
-            });
-        Self { enabled, model_dir: default_rerank_model_dir() }
-    }
-}
-
-fn env_disables_rerank(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| value.eq_ignore_ascii_case("off"))
+/// Whether the rerank is on, and where its model is.
+#[derive(Debug)]
+pub struct RerankSettings {
+    pub enabled: bool,
+    pub model_dir: Result<PathBuf>,
 }
 
 type SettingsSource = Box<dyn Fn() -> RerankSettings + Send + Sync>;
@@ -347,16 +340,10 @@ pub enum RerankModelState {
 }
 
 impl RerankModelState {
-    /// The state under the global config, the environment and the default
-    /// model directory.
-    pub fn from_environment() -> Self {
-        Self::of(RerankSettings::from_environment())
-    }
-
     /// Checks presence and size only, as `g-mesh model status` does: no
     /// sha256 over the 23 MB weights. A same-size file with other bytes
     /// reads `Present` here while the daemon refuses it.
-    pub(crate) fn of(settings: RerankSettings) -> Self {
+    pub fn of(settings: RerankSettings) -> Self {
         if !settings.enabled {
             return Self::Disabled;
         }
@@ -442,11 +429,19 @@ pub struct Reranker {
 }
 
 impl Reranker {
-    /// The production rerank: settings from the global config and the
-    /// environment, the real model, the daemon log.
-    pub fn from_environment() -> Self {
+    /// The production rerank: `settings`, the real model, the daemon log.
+    /// The model is loaded on the first call that asks.
+    pub fn new(settings: RerankSettings) -> Self {
+        let settings = Mutex::new(Some(settings));
         Self {
-            settings: Box::new(RerankSettings::from_environment),
+            settings: Box::new(move || {
+                settings.lock().unwrap_or_else(PoisonError::into_inner).take().unwrap_or_else(|| {
+                    RerankSettings {
+                        enabled: false,
+                        model_dir: Err(anyhow!("the rerank settings were already taken")),
+                    }
+                })
+            }),
             loader: Box::new(|dir| Ok(Box::new(CrossEncoder::load(dir)?) as Box<dyn Scorer>)),
             outcome: OnceLock::new(),
             missing_hint_sent: AtomicBool::new(false),
@@ -533,8 +528,9 @@ impl Reranker {
                     Ok(scorer) => Outcome::Loaded(scorer),
                     Err(err) => {
                         (self.log)(&format!(
-                            "g-mesh daemon: rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
-                             search_code keeps the embedding order. Run g-mesh model fetch to enable it."
+                            "{prefix}rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
+                             search_code keeps the embedding order. Run g-mesh model fetch to enable it.",
+                            prefix = crate::log::role_prefix()
                         ));
                         let absent = dir.as_ref().is_some_and(|dir| {
                             [ONNX_FILE_NAME, TOKENIZER_FILE_NAME].iter().any(|name| !dir.join(name).exists())
@@ -554,8 +550,9 @@ impl Reranker {
                     .and_then(|json| std::fs::write(path, json).map_err(anyhow::Error::from));
                 if let Err(err) = written {
                     (self.log)(&format!(
-                        "g-mesh daemon: failed to record the rerank outcome at {} ({err:#})",
-                        path.display()
+                        "{prefix}failed to record the rerank outcome at {} ({err:#})",
+                        path.display(),
+                        prefix = crate::log::role_prefix()
                     ));
                 }
             }
@@ -577,8 +574,9 @@ impl Reranker {
             Ok(logits) => logits,
             Err(err) => {
                 (self.log)(&format!(
-                    "g-mesh daemon: the rerank failed for one search_code call ({err:#}) - it keeps the \
-                     embedding order"
+                    "{prefix}the rerank failed for one search_code call ({err:#}) - it keeps the \
+                     embedding order",
+                    prefix = crate::log::role_prefix()
                 ));
                 return None;
             }
@@ -586,10 +584,11 @@ impl Reranker {
         let order = blended_order(&logits, cosines);
         if order.is_none() {
             (self.log)(&format!(
-                "g-mesh daemon: the rerank produced {} logits for {} rows, or a non-finite one - this \
+                "{prefix}the rerank produced {} logits for {} rows, or a non-finite one - this \
                  search_code call keeps the embedding order",
                 logits.len(),
-                cosines.len()
+                cosines.len(),
+                prefix = crate::log::role_prefix()
             ));
         }
         order
@@ -718,14 +717,6 @@ mod tests {
         assert_eq!(blended_order(&[f32::NAN, 1.0], &[0.5, 0.4]), None);
         assert_eq!(blended_order(&[f32::INFINITY], &[0.5]), None);
         assert_eq!(blended_order(&[1.0], &[0.5, 0.4]), None);
-    }
-
-    #[test]
-    fn the_environment_switch_turns_the_rerank_off() {
-        assert!(env_disables_rerank(Some("off".as_ref())));
-        assert!(env_disables_rerank(Some("OFF".as_ref())));
-        assert!(!env_disables_rerank(Some("on".as_ref())));
-        assert!(!env_disables_rerank(None));
     }
 
     #[test]
@@ -1033,7 +1024,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn load_real() -> CrossEncoder {
-        let dir = default_rerank_model_dir().unwrap();
+        let dir = env_rerank_model_dir();
         CrossEncoder::load(&dir).unwrap_or_else(|err| panic!("could not load the cross-encoder: {err:#}"))
     }
 

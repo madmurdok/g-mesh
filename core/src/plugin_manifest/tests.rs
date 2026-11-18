@@ -98,7 +98,7 @@ fn the_installed_root_sits_beside_the_executable_and_outranks_the_checkout_root(
 fn the_override_env_var_replaces_the_entire_default_roots_list() {
     let override_dir = tempfile::tempdir().unwrap();
 
-    let roots = roots_with_override(Some(override_dir.path().to_str().unwrap().to_string()));
+    let roots = roots_with_override(Some(override_dir.path().to_path_buf()));
 
     assert_eq!(roots, vec![override_dir.path().to_path_buf()]);
 }
@@ -1258,4 +1258,122 @@ fn discovered_plugins_answer_the_language_trait_as_their_own_lookups_do() {
     assert_eq!(missing, ["typescript", "rust"]);
     assert_eq!(absent_for_path(&discovered, "pkg/Stubs.PYI"), None);
     assert_eq!(absent_for_path(&discovered, "src/lib.rs").map(|entry| entry.language), Some("rust"));
+}
+
+// --- the schema crate as core reads it (g-mesh-manifest) ------------------------
+
+/// Every key core requires, removed one at a time from [`well_formed_toml`]:
+/// each refusal names the manifest's path and the missing key.
+///
+/// Control C7: skip the `language` presence check in `read_manifest`
+/// (`plugin.language.unwrap_or_default()`) and the `language` row fails.
+#[test]
+fn each_required_key_missing_is_refused_naming_the_path_and_the_key() {
+    let full = well_formed_toml();
+    let cases: &[(&str, &str, &str)] = &[
+        ("language", "language = \"python\"\n", "`language`"),
+        (
+            "protocol_version",
+            &format!("protocol_version = {CURRENT_PROTOCOL_VERSION}\n"),
+            "`protocol_version`",
+        ),
+        ("plugin_version", "plugin_version = \"0.1.0\"\n", "`plugin_version`"),
+        (
+            "spawn table",
+            "[plugin.spawn]\ncommand = \"node\"\nargs = [\"dist/src/index.js\"]\n",
+            "[plugin.spawn]",
+        ),
+        ("spawn command", "command = \"node\"\n", "`command`"),
+        ("languages table", "[plugin.languages]\nextensions = [\".py\", \".pyi\"]\n", "[plugin.languages]"),
+        ("extensions", "extensions = [\".py\", \".pyi\"]\n", "`extensions`"),
+    ];
+    for (tag, removed, key) in cases {
+        assert!(full.contains(removed), "{tag}: the fixture must hold what is removed");
+        let (_root, dir) = plugin_dir("python", &full.replacen(removed, "", 1));
+        let message = format!("{:#}", read_manifest(&dir).expect_err(tag));
+        assert!(
+            message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()),
+            "{tag}: {message}"
+        );
+        assert!(message.contains(key), "{tag}: {message}");
+    }
+
+    let (_root, dir) = plugin_dir("python", "# no [plugin] table\n");
+    let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+    assert!(message.contains("[plugin]"), "{message}");
+}
+
+/// An unknown word for either other enum-valued capability is refused with
+/// the word and the path; an absent one is its default.
+#[test]
+fn an_unknown_enum_word_in_capabilities_is_refused_naming_the_word_and_path() {
+    for (key, word) in [("receiver_calls_structural", "sometimes"), ("member_overrides", "by_guess")] {
+        let body = format!("{}\n[plugin.capabilities]\n{key} = \"{word}\"\n", well_formed_toml());
+        let (_root, dir) = plugin_dir("python", &body);
+        let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+        assert!(
+            message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()),
+            "{key}: {message}"
+        );
+        assert!(message.contains(word), "{key}: {message}");
+        assert!(message.contains(key), "{key}: {message}");
+    }
+
+    let (_root, dir) = plugin_dir("python", &well_formed_toml());
+    let capabilities = read_manifest(&dir).unwrap().capabilities;
+    assert_eq!(capabilities.receiver_calls_structural, Default::default());
+    assert_eq!(capabilities.member_overrides, MemberOverrides::None);
+}
+
+/// Keys and tables core does not know - another reader's, or a newer
+/// schema's - do not stop core loading the manifest.
+#[test]
+fn unknown_keys_and_tables_are_ignored_by_core() {
+    let body = format!(
+        "{}\nunknown_key = 1\n\n[plugin.grammars]\ntsx = \"x\"\n\n\
+         [plugin.capabilities]\nsemantic_pass = true\nfuture_capability = \"x\"\n",
+        well_formed_toml()
+    );
+    let (_root, dir) = plugin_dir("python", &body);
+    let manifest = read_manifest(&dir).expect("unknown keys must be ignored");
+    assert!(manifest.capabilities.semantic_pass);
+}
+
+/// A wrong type inside a table only core reads is core's refusal, naming the
+/// path and the table: the schema keeps it raw, core decodes it strictly.
+#[test]
+fn a_wrong_type_in_a_core_only_table_is_refused_naming_the_path() {
+    for (table, body) in [
+        ("non_symbol_queries", "[plugin.non_symbol_queries]\nstarts_with = \"@\"\n"),
+        ("symbol_query_prefixes", "[plugin.symbol_query_prefixes]\nstrip = 5\n"),
+        ("reexports", "[plugin.reexports]\nlater_import_binds = \"yes\"\n"),
+    ] {
+        let (_root, dir) = plugin_dir("python", &format!("{}\n{body}", well_formed_toml()));
+        let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+        assert!(
+            message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()),
+            "{table}: {message}"
+        );
+        assert!(message.contains(table), "{table}: {message}");
+    }
+}
+
+/// `[plugin.semantic]` is the LSP bridge's: a wrong-typed key in it, or a
+/// table without `command`, is the bridge's error, and core still discovers
+/// the plugin, so its structural tier runs.
+///
+/// Control: have `read_manifest` decode the table
+/// (`plugin.semantic_section()?`) and both rows fail.
+#[test]
+fn a_malformed_semantic_table_does_not_stop_discovery() {
+    for (tag, semantic) in [
+        ("wrong type", "[plugin.semantic]\ncommand = \"server\"\nargs = \"--stdio\"\nreadiness = 5\n"),
+        ("no command", "[plugin.semantic]\nargs = [\"--stdio\"]\n"),
+    ] {
+        let body = format!("{}\n{semantic}", well_formed_toml());
+        let (_root, root) = discovery_root(&[("python", &body)]);
+        let discovered = discover(&[root]).unwrap_or_else(|err| panic!("{tag}: {err:#}"));
+        assert!(discovered.manifests.contains_key("python"), "{tag}");
+        assert_eq!(discovered.routing.get(".py"), Some(&"python".to_string()), "{tag}");
+    }
 }

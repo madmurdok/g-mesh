@@ -478,21 +478,21 @@ fn skip_or_eval_skips_only_the_semantic_tier_entries() {
 /// zero-element branch was unreachable. [`tool_outcome`] keeps them apart.
 #[test]
 fn a_tool_level_refusal_is_a_refusal_and_a_protocol_error_is_not() {
-    let refusal = CallToolResult::error(vec![ContentBlock::text("g-mesh: no symbol named 'x' found")]);
+    let refusal = ToolAnswer::<Value>::refused("g-mesh: no symbol named 'x' found");
     let Ok(ToolOutcome::Refusal(text)) = tool_outcome(Ok(refusal)) else {
-        panic!("is_error: true must be a Refusal, not an Err");
+        panic!("a refused answer must be a Refusal, not an Err");
     };
     assert_eq!(text, "g-mesh: no symbol named 'x' found");
 
-    let answer = CallToolResult::success(vec![ContentBlock::text("{\"results\":[]}")]);
+    let answer = ToolAnswer::Page(serde_json::json!({ "results": [] }));
     let Ok(ToolOutcome::Answer(value)) = tool_outcome(Ok(answer)) else {
-        panic!("a successful result must parse as an Answer");
+        panic!("a page must be an Answer");
     };
     assert!(value.get("results").is_some(), "{value}");
 
     // The arm an entry must never accept: the handler never produced a
     // result at all.
-    let protocol: Result<CallToolResult, ErrorData> =
+    let protocol: Result<ToolAnswer<Value>, ErrorData> =
         Err(ErrorData::internal_error("g-mesh: the index is gone".to_string(), None));
     assert!(tool_outcome(protocol).is_err(), "a protocol-level failure must stay an Err");
 }
@@ -501,8 +501,71 @@ fn a_tool_level_refusal_is_a_refusal_and_a_protocol_error_is_not() {
 /// a refusal is still exactly the `Err(text)` they have always reported.
 #[test]
 fn tool_json_still_reports_a_refusal_as_a_plain_error_string() {
-    let refusal = CallToolResult::error(vec![ContentBlock::text("g-mesh: nope")]);
+    let refusal = ToolAnswer::<Value>::refused("g-mesh: nope");
     assert_eq!(tool_json(tool_outcome(Ok(refusal))), Err("g-mesh: nope".to_string()));
+}
+
+/// A query context over an in-memory index holding `functions`, each a
+/// `(id, name, qualified name, file)`.
+fn query_ctx_over(functions: &[(&str, &str, &str, &str)]) -> QueryCtx {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::storage::schema::apply(&conn).unwrap();
+    for (id, name, qualified, file) in functions {
+        let node = crate::model::NodeRecord::new(*id, "Function", *name, *qualified, *file, "rust");
+        crate::storage::write::upsert_node(&mut conn, node).unwrap();
+    }
+    QueryCtx::for_test(&std::sync::Arc::new(crate::storage::index_store::IndexStore::new(conn)))
+}
+
+/// The kit reads the typed refusal, not the bytes a client gets: a miss on
+/// a path whose language is not indexed reaches `[[refusal]]` as its prose
+/// sentence, not as the `{error, notIndexed}` JSON body the wire carries.
+/// Control: build the outcome from the rendered text block - the refusal
+/// becomes that JSON.
+#[test]
+fn a_not_indexed_refusal_reaches_the_kit_as_prose_not_as_its_json_body() {
+    let python = crate::languages::entry("python").expect("python is catalogued");
+    let ctx = QueryCtx { coverage: Some(crate::mcp::PathCoverage::Absent(python)), ..query_ctx_over(&[]) };
+    let params = GetDependenciesParams {
+        file_path: Some("tools/gen.py".to_string()),
+        module_id: None,
+        direction: Direction::Outgoing,
+        max_depth: None,
+        max_fanout: None,
+        resume_token: None,
+    };
+    let Ok(ToolOutcome::Refusal(text)) = tool_outcome(query::dependencies(&ctx, params)) else {
+        panic!("a not-indexed miss must be a Refusal");
+    };
+    assert!(text.starts_with("g-mesh: no file 'tools/gen.py' found in the index"), "{text}");
+    assert!(text.contains("python files are not indexed here"), "{text}");
+    assert!(serde_json::from_str::<Value>(&text).is_err(), "the refusal must be prose, not JSON: {text}");
+}
+
+/// An ambiguous name is answered, not refused: the candidates reach the kit
+/// as a page [`is_candidate_page`] recognizes. Control: map
+/// `ToolAnswer::Candidates` to a `Refusal` in [`tool_outcome`].
+#[test]
+fn an_ambiguous_name_is_an_answer_the_kit_reads_as_a_candidate_page() {
+    let ctx =
+        query_ctx_over(&[("n1", "run", "pkg_a::run", "a/lib.rs"), ("n2", "run", "pkg_b::run", "b/lib.rs")]);
+    let params = FindDefinitionParams { symbol_name: Some("run".to_string()), ..definition_params() };
+    let Ok(ToolOutcome::Answer(value)) = tool_outcome(query::definition(&ctx, params)) else {
+        panic!("candidates must be an Answer");
+    };
+    assert!(is_candidate_page(&value), "{value}");
+    assert_eq!(value["ambiguous"], true, "{value}");
+    assert_eq!(value["results"].as_array().map(Vec::len), Some(2), "{value}");
+}
+
+/// The kit never parses rendered tool output: every answer it reads is a
+/// typed one, serialized to a `Value`.
+#[test]
+fn the_kit_source_reads_no_rendered_tool_output() {
+    let source = include_str!("../expectations.rs");
+    for rendered in ["serde_json::from_str", "CallToolResult", "ContentBlock"] {
+        assert!(!source.contains(rendered), "expectations.rs must not use `{rendered}`");
+    }
 }
 
 /// Decision 9's text assertion: every phrase must be present, each missing

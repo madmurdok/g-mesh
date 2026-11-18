@@ -1,6 +1,7 @@
 //! The one place this plugin writes to the graph: a thin layer over the
-//! SDK's [`FileGraphBuilder`] that adds the two things a Python extractor
-//! cannot do without - **de-duplication by id** and **character columns**.
+//! SDK's [`GraphEmitter`] (**de-duplication by id**) and [`CharColumns`]
+//! (**character columns**) that adds what only Python has - overload sets and
+//! re-export nodes.
 //!
 //! # Why de-duplication is a correctness requirement, not tidying
 //!
@@ -35,7 +36,7 @@
 //! downstream is wrong afterwards - `apply_diff` upserts by id - but the
 //! stream stops being a faithful description of the file, and the second
 //! branch silently replaces the first rather than merging with it.
-//! [`Emitter`] answers the honest version of the same thing: the **first**
+//! [`GraphEmitter`] answers the honest version of the same thing: the **first**
 //! occurrence in source order is emitted, every later one resolves to that
 //! same id, and edges written from inside the second branch land on the node
 //! the first produced.
@@ -48,8 +49,7 @@
 //! plugin. Mixing the two would put a declaration's column and its file's
 //! column in different units on any line containing a non-ASCII character,
 //! which for Python is not an exotic case at all: identifiers may be
-//! non-ASCII, and docstrings routinely are. [`Positions`] converts once,
-//! against a precomputed table of line starts.
+//! non-ASCII, and docstrings routinely are. the SDK's [`CharColumns`] converts once.
 //!
 //! # Overload sets
 //!
@@ -78,88 +78,21 @@
 //! is routed to them (`super::bodies`). See
 //! `docs/architecture/gm-511-python-property-accessors.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use g_mesh_plugin_sdk::ids::{edge_id, node_id};
+use g_mesh_plugin_sdk::ids::node_id;
 use g_mesh_plugin_sdk::wire::{
-    EdgeKind, NodeKind, PlaceholderTarget, Position, Range, TargetKey, TargetScope, WireDeclaration,
+    EdgeKind, NodeKind, PlaceholderTarget, Range, TargetKey, TargetScope, WireDeclaration,
 };
-use g_mesh_plugin_sdk::{FileGraph, FileGraphBuilder, NodeSpec, OpenSite, PlaceholderKind, RelPath};
-use tree_sitter::Node;
-
-/// Byte columns in, character columns out.
-pub(crate) struct Positions<'s> {
-    source: &'s str,
-    /// The byte offset each line starts at, indexed by line number.
-    line_starts: Vec<usize>,
-}
-
-impl<'s> Positions<'s> {
-    pub(crate) fn new(source: &'s str) -> Self {
-        let mut line_starts = vec![0usize];
-        line_starts.extend(source.match_indices('\n').map(|(at, _)| at + 1));
-        Self { source, line_starts }
-    }
-
-    /// One tree-sitter point, in the wire's units.
-    pub(crate) fn at(&self, point: tree_sitter::Point) -> Position {
-        let line = point.row;
-        let col = self
-            .line_starts
-            .get(line)
-            .and_then(|start| self.source.get(*start..start + point.column))
-            .map_or(point.column, |prefix| prefix.chars().count());
-        Position { line: line as u32, col: col as u32 }
-    }
-
-    /// A node's whole range.
-    pub(crate) fn range(&self, node: Node) -> Range {
-        Range { start: self.at(node.start_position()), end: self.at(node.end_position()) }
-    }
-
-    /// The file's own range, ending where its content ends: trailing
-    /// whitespace is trimmed, and the end is `(number of newlines, length of
-    /// the last line)` of what is left - the file's last real line, never
-    /// the empty line after a final newline.
-    ///
-    /// Not tree-sitter's root range, and not a byte count: this is the one
-    /// formula a space inserted before the file's last newline does not move,
-    /// which is what `id-stability.whitespace-edit` asks of every plugin (see
-    /// `core::cli::plugin_check::session::whitespace_edit` for why that
-    /// particular edit), which also requires that end line. It is
-    /// [`FileGraphBuilder::file_node`]'s own documented contract, called
-    /// here because this plugin builds its `File` node by hand - see
-    /// [`Emitter::new`]. The `Module` declaration takes the same range.
-    pub(crate) fn file_range(&self) -> Range {
-        g_mesh_plugin_sdk::CharColumns::new(self.source).file_range()
-    }
-}
-
-/// How a placeholder is recognised as one already emitted: everything its id
-/// is derived from, in a form that can key a map.
-type PlaceholderKey = (&'static str, bool, String, bool, String);
-
-fn placeholder_key(kind: PlaceholderKind, target: &PlaceholderTarget) -> PlaceholderKey {
-    let (is_container, scope) = match &target.scope {
-        TargetScope::File(path) => (false, path.clone()),
-        TargetScope::Container(container) => (true, container.clone()),
-    };
-    let (is_qualified, key) = match &target.key {
-        TargetKey::Name(name) => (false, name.clone()),
-        TargetKey::QualifiedName(qualified) => (true, qualified.clone()),
-    };
-    (kind.native_kind(), is_container, scope, is_qualified, key)
-}
+use g_mesh_plugin_sdk::{
+    CharColumns, FileGraph, FileGraphBuilder, GraphEmitter, NodeSpec, OpenSite, PlaceholderKind, RelPath,
+};
 
 /// The graph being built for one file, with every id emitted so far.
 pub(crate) struct Emitter<'s> {
-    graph: FileGraphBuilder,
+    inner: GraphEmitter,
     path: RelPath,
-    positions: Positions<'s>,
-    file_id: String,
-    nodes: HashSet<String>,
-    edges: HashSet<String>,
-    placeholders: HashMap<PlaceholderKey, String>,
+    columns: CharColumns<'s>,
     /// Every function definition of each node id, in source order - see
     /// "Overload sets" in the module doc.
     definitions: HashMap<String, Vec<Definition>>,
@@ -207,32 +140,27 @@ impl<'s> Emitter<'s> {
         source: &'s str,
         module_doc: Option<String>,
     ) -> Self {
-        let positions = Positions::new(source);
-        let mut graph = FileGraphBuilder::new(language, engine, path);
+        let columns = CharColumns::new(source);
+        let graph = FileGraphBuilder::new(language, engine, path);
         let name = path.as_str().rsplit('/').next().unwrap_or(path.as_str()).to_string();
-        let mut spec = NodeSpec::new(NodeKind::File, name, path.as_str(), positions.file_range());
+        let mut spec = NodeSpec::new(NodeKind::File, name, path.as_str(), columns.file_range());
         spec.doc_comment = module_doc;
-        let file_id = graph.add_node(spec);
         Self {
-            graph,
+            inner: GraphEmitter::new(graph, path, spec),
             path: path.clone(),
-            positions,
-            file_id: file_id.clone(),
-            nodes: HashSet::from([file_id]),
-            edges: HashSet::new(),
-            placeholders: HashMap::new(),
+            columns,
             definitions: HashMap::new(),
             reexports: Vec::new(),
             reexport_at: HashMap::new(),
         }
     }
 
-    pub(crate) fn positions(&self) -> &Positions<'s> {
-        &self.positions
+    pub(crate) fn positions(&self) -> &CharColumns<'s> {
+        &self.columns
     }
 
     pub(crate) fn file_id(&self) -> &str {
-        &self.file_id
+        self.inner.file_id()
     }
 
     /// Adds a declaration, with its `DEFINES` edge (and `EXPORTS`, which in
@@ -243,12 +171,7 @@ impl<'s> Emitter<'s> {
     /// conditional definition, a rebinding - adds nothing and returns the
     /// first one's id; see the module doc.
     pub(crate) fn declare(&mut self, spec: NodeSpec, exported: bool) -> String {
-        let id = node_id(self.path.as_str(), spec.kind, &spec.qualified_name, spec.native_kind.as_deref());
-        if self.nodes.insert(id.clone()) {
-            self.graph.add_node(spec);
-            self.graph.defines(&self.file_id.clone(), &id, exported);
-        }
-        id
+        self.inner.declare(spec, exported)
     }
 
     /// Records one function definition of node `id` - called for every
@@ -273,14 +196,7 @@ impl<'s> Emitter<'s> {
         target: PlaceholderTarget,
         range: Range,
     ) -> String {
-        let cache_key = placeholder_key(kind, &target);
-        if let Some(id) = self.placeholders.get(&cache_key) {
-            return id.clone();
-        }
-        let id = self.graph.add_placeholder(kind, name, target, range);
-        self.nodes.insert(id.clone());
-        self.placeholders.insert(cache_key, id.clone());
-        id
+        self.inner.placeholder(kind, name, target, range)
     }
 
     /// Adds a `reexport` node: what this module publishes, and what that
@@ -316,7 +232,7 @@ impl<'s> Emitter<'s> {
         container: &str,
         range: Range,
     ) -> String {
-        let qualified_name = format!("{} as {published}", render_target(&target));
+        let qualified_name = format!("{} as {published}", g_mesh_plugin_sdk::render_target(&target));
         let id = node_id(
             self.path.as_str(),
             NodeKind::Module,
@@ -327,7 +243,7 @@ impl<'s> Emitter<'s> {
             // The same re-export again: the later statement is the one that
             // last bound the name, so it is the one whose position counts.
             self.reexports[at].range = range;
-        } else if self.nodes.insert(id.clone()) {
+        } else if self.inner.claim_node(&id) {
             let mut spec = NodeSpec::new(NodeKind::Module, published, qualified_name, range)
                 .native_kind(PlaceholderKind::Reexport.native_kind());
             spec.container = Some(container.to_string());
@@ -342,56 +258,36 @@ impl<'s> Emitter<'s> {
     /// project does not contain, and returns its id. See
     /// `crate::project`'s Decision 8 for how "does not contain" is decided.
     pub(crate) fn external_module(&mut self, name: &str, range: Range) -> String {
-        let id = node_id(self.path.as_str(), NodeKind::Module, name, Some("external_module"));
-        if self.nodes.insert(id.clone()) {
-            self.graph.add_external_module(name, range);
-        }
-        id
+        self.inner.external_module(name, range)
     }
 
-    /// An edge onto a declaration of this same file: `resolved: true`, since
-    /// within one file nothing is left for core to confirm. Returns its id,
-    /// which a repeat shares.
+    /// An edge onto a declaration of this same file: `resolved: true`.
     pub(crate) fn resolved_edge(&mut self, kind: EdgeKind, from: &str, to: &str) -> String {
-        let id = edge_id(from, kind, to, None);
-        if self.edges.insert(id.clone()) {
-            self.graph.resolved_edge(kind, from, to);
-        }
-        id
+        self.inner.resolved_edge(kind, from, to)
     }
 
     /// An edge onto a placeholder: `resolved: false`, since only core can
-    /// confirm it. Returns its id, which a repeat shares.
+    /// confirm it.
     pub(crate) fn placeholder_edge(&mut self, kind: EdgeKind, from: &str, to: &str) -> String {
-        let id = edge_id(from, kind, to, None);
-        if self.edges.insert(id.clone()) {
-            self.graph.placeholder_edge(kind, from, to);
-        }
-        id
+        self.inner.placeholder_edge(kind, from, to)
     }
 
-    /// An `IMPORTS` edge onto a placeholder, carrying the import's text as
-    /// written as its `specifier` (GM-544): what core matches a resolution
-    /// delta's `Specifier` selectors against. When two imports draw the same
-    /// edge, the first one's text is kept; the id does not include it.
+    /// An `IMPORTS` edge onto a placeholder carrying the import's text as its
+    /// `specifier`.
     pub(crate) fn import_edge(&mut self, from: &str, to: &str, specifier: &str) -> String {
-        let id = edge_id(from, EdgeKind::Imports, to, None);
-        if self.edges.insert(id.clone()) {
-            self.graph.import_edge(from, to, specifier);
-        }
-        id
+        self.inner.import_edge(from, to, specifier)
     }
 
     /// Records a use site the structural tier could not settle - see
     /// `super`'s module doc, Decision 7.
     pub(crate) fn open_site(&mut self, site: OpenSite) {
-        self.graph.open_site(site);
+        self.inner.open_site(site);
     }
 
     /// Marks every node of this file as having come from a source with a
     /// syntax error. A normal answer, not a failure.
     pub(crate) fn mark_syntax_errors(&mut self) {
-        self.graph.mark_syntax_errors();
+        self.inner.mark_syntax_errors();
     }
 
     /// The graph, with each overload set's `declarations` attached. Only
@@ -415,33 +311,12 @@ impl<'s> Emitter<'s> {
                     has_body: !definition.overload,
                 })
                 .collect();
-            self.graph.set_declarations(&id, declarations);
+            self.inner.graph_mut().set_declarations(&id, declarations);
         }
         for spec in std::mem::take(&mut self.reexports) {
-            self.graph.add_node(spec);
+            self.inner.add_node(spec);
         }
-        self.graph.finish()
-    }
-}
-
-/// The label a placeholder's `qualifiedName` carries, in the SDK's own
-/// rendering (`FileGraphBuilder::add_placeholder`: "`<container>::<key>` for
-/// a container scope").
-///
-/// Reproduced here rather than imported because the SDK keeps its renderer
-/// private, and only one node kind needs it - see [`Emitter::reexport`], the
-/// one placeholder this plugin has to build a `NodeSpec` for itself. It is a
-/// *label*, not an address: core reads the structured `target` row, and all
-/// this has to be is injective enough that two placeholders of one file
-/// waiting on different things get different ids.
-fn render_target(target: &PlaceholderTarget) -> String {
-    let key = match &target.key {
-        TargetKey::Name(name) => name,
-        TargetKey::QualifiedName(qualified_name) => qualified_name,
-    };
-    match &target.scope {
-        TargetScope::File(path) => format!("{path}#{key}"),
-        TargetScope::Container(container) => format!("{container}::{key}"),
+        self.inner.finish()
     }
 }
 
@@ -464,7 +339,7 @@ pub(crate) fn container_target(container: &str, key: TargetKey, from_container: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use g_mesh_plugin_sdk::wire::Visibility;
+    use g_mesh_plugin_sdk::wire::{Position, Visibility};
 
     fn emitter(source: &'static str) -> Emitter<'static> {
         Emitter::new("python", "tree-sitter", &RelPath::new("pkg/mod.py"), source, None)
@@ -540,10 +415,30 @@ mod tests {
     #[test]
     fn a_column_is_converted_from_bytes_to_characters() {
         let source = "# é é\ndef a():\n    pass\n";
-        let positions = Positions::new(source);
+        let positions = CharColumns::new(source);
         // `é` is two bytes, so tree-sitter's column for the end of line 0 is
         // 7 where the character count is 5.
-        assert_eq!(positions.at(tree_sitter::Point { row: 0, column: 7 }), Position { line: 0, col: 5 });
-        assert_eq!(positions.at(tree_sitter::Point { row: 1, column: 3 }), Position { line: 1, col: 3 });
+        assert_eq!(positions.point(tree_sitter::Point { row: 0, column: 7 }), Position { line: 0, col: 5 });
+        assert_eq!(positions.point(tree_sitter::Point { row: 1, column: 3 }), Position { line: 1, col: 3 });
+    }
+
+    /// `CharColumns::node_range` over a parsed node: both ends in characters.
+    /// `b` starts at byte 8 but character 7, after the two-byte `é`.
+    ///
+    /// Control: `node_range` building its ends from the node's byte points
+    /// unconverted fails this.
+    #[test]
+    fn a_node_range_is_converted_from_bytes_to_characters() {
+        let source = "é = 1; b = 2\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let b = tree.root_node().descendant_for_byte_range(8, 9).unwrap();
+        assert_eq!(b.utf8_text(source.as_bytes()).unwrap(), "b");
+        assert_eq!(b.start_position().column, 8, "tree-sitter counts bytes");
+        assert_eq!(
+            CharColumns::new(source).node_range(b),
+            Range { start: Position { line: 0, col: 7 }, end: Position { line: 0, col: 8 } }
+        );
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::mcp::context::QueryCtx;
+use crate::mcp::query::test_support::Rendered;
 use crate::model::{EdgeRecord, NodeRecord};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -23,7 +24,8 @@ fn setup() -> Connection {
     conn
 }
 
-fn json_body(result: &CallToolResult) -> serde_json::Value {
+fn json_body(result: &impl Rendered) -> serde_json::Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -31,7 +33,8 @@ fn json_body(result: &CallToolResult) -> serde_json::Value {
     }
 }
 
-fn error_text(result: &CallToolResult) -> String {
+fn error_text(result: &impl Rendered) -> String {
+    let result = &result.rendered();
     assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => text.text.clone(),

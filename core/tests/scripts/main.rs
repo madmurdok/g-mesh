@@ -29,5 +29,6 @@ mod prune_stale_objects_script;
 mod release_packaging_scripts;
 mod sql_sites_script;
 mod test_local_script;
+mod test_plugin_spawns_script;
 mod test_sections_scripts;
 mod test_select_scripts;

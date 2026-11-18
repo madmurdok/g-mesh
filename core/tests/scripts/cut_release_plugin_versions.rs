@@ -4,16 +4,18 @@
 //! backwards, and must agree between `Cargo.toml` and `plugin.toml`.
 //!
 //! Each test builds a scratch git repository shaped like the workspace (core,
-//! `plugins/{rust,python,typescript,sdk}`, `wire`, `walk`, `plugin.toml`
+//! `plugins/{rust,python,typescript,sdk,sdk-lsp}`, `wire`, `walk`, `manifest`, `plugin.toml`
 //! files and a hand-written `Cargo.lock`), commits it, tags it `v1.0.0`,
 //! commits an edit, then sources the script (its `main` is guarded for that)
 //! with `REPO_ROOT` pointed at the scratch repo and calls the check for
 //! release `1.1.0`. The assertions are the exit status and, for a refusal,
 //! that a line names the plugin and the first changed path; not the wording.
+//! `check_workspace_versions`, which holds every shared crate at core's
+//! version, runs against the same repository.
 //!
 //! `GM_CUT_RELEASE_SH` replaces the script under test with another copy (its
-//! `scripts/lib/` beside it), so a control revert can be run against this
-//! test binary without editing the checkout. Bash only, so Unix only: the
+//! `scripts/lib/` and `build-targets.sh` beside it), so a control revert can
+//! be run against this test binary without editing the checkout. Bash only, so Unix only: the
 //! release is cut from a Unix shell.
 
 use std::fs;
@@ -62,6 +64,7 @@ name = "g-mesh-plugin-python"
 version = "1.0.0"
 dependencies = [
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "python-only",
 ]
 
@@ -71,6 +74,7 @@ version = "1.0.0"
 dependencies = [
  "dup 1.0.0",
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "rust-only",
 ]
 
@@ -84,10 +88,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "g-mesh-plugin-sdk-lsp"
+version = "1.0.0"
+dependencies = [
+ "g-mesh-plugin-sdk",
+ "g-mesh-wire",
+]
+
+[[package]]
 name = "g-mesh-plugin-typescript"
 version = "1.0.0"
 dependencies = [
  "g-mesh-plugin-sdk",
+ "g-mesh-plugin-sdk-lsp",
  "typescript-only",
 ]
 
@@ -163,9 +176,17 @@ impl Repo {
         repo.git(&["init", "-q", "-b", "main"]);
         repo.write("core/Cargo.toml", &manifest("g-mesh", ""));
         repo.write("plugins/sdk/Cargo.toml", &manifest("g-mesh-plugin-sdk", ""));
+        repo.write(
+            "plugins/sdk-lsp/Cargo.toml",
+            &manifest(
+                "g-mesh-plugin-sdk-lsp",
+                "\n[dependencies]\ng-mesh-plugin-sdk = { path = \"../sdk\" }\n",
+            ),
+        );
         repo.write("wire/Cargo.toml", &manifest("g-mesh-wire", ""));
         repo.write("walk/Cargo.toml", &manifest("g-mesh-walk", ""));
-        for crate_dir in ["core", "plugins/sdk", "wire", "walk"] {
+        repo.write("manifest/Cargo.toml", &manifest("g-mesh-manifest", ""));
+        for crate_dir in ["core", "plugins/sdk", "plugins/sdk-lsp", "wire", "walk", "manifest"] {
             repo.write(&format!("{crate_dir}/src/lib.rs"), "pub fn f() {}\n");
         }
         for plugin in PLUGINS {
@@ -174,7 +195,8 @@ impl Repo {
                 &format!("{dir}/Cargo.toml"),
                 &manifest(
                     &format!("g-mesh-plugin-{plugin}"),
-                    "\n[dependencies]\ng-mesh-plugin-sdk = { path = \"../sdk\" }\n",
+                    "\n[dependencies]\ng-mesh-plugin-sdk = { path = \"../sdk\" }\n\
+                     g-mesh-plugin-sdk-lsp = { path = \"../sdk-lsp\" }\n",
                 ),
             );
             repo.write(
@@ -328,10 +350,17 @@ impl Checked {
 #[test]
 fn the_release_bump_of_core_and_the_shared_crates_changes_no_plugin() {
     let repo = Repo::tagged();
-    for manifest in ["core/Cargo.toml", "plugins/sdk/Cargo.toml", "wire/Cargo.toml", "walk/Cargo.toml"] {
+    for manifest in [
+        "core/Cargo.toml",
+        "plugins/sdk/Cargo.toml",
+        "plugins/sdk-lsp/Cargo.toml",
+        "wire/Cargo.toml",
+        "walk/Cargo.toml",
+        "manifest/Cargo.toml",
+    ] {
         repo.set_crate_version(manifest, RELEASE);
     }
-    for name in ["g-mesh", "g-mesh-plugin-sdk", "g-mesh-wire", "g-mesh-walk"] {
+    for name in ["g-mesh", "g-mesh-plugin-sdk", "g-mesh-plugin-sdk-lsp", "g-mesh-wire", "g-mesh-walk"] {
         repo.set_lock_version(name, "1.0.0", RELEASE);
     }
     repo.commit_and_check().accepted();
@@ -375,6 +404,11 @@ fn an_sdk_source_edit_is_refused_for_every_plugin() {
 }
 
 #[test]
+fn an_sdk_lsp_source_edit_is_refused_for_every_plugin() {
+    a_shared_source_edit_is_refused_for_every_plugin("plugins/sdk-lsp");
+}
+
+#[test]
 fn a_wire_source_edit_is_refused_for_every_plugin() {
     a_shared_source_edit_is_refused_for_every_plugin("wire");
 }
@@ -382,6 +416,37 @@ fn a_wire_source_edit_is_refused_for_every_plugin() {
 #[test]
 fn a_walk_source_edit_is_refused_for_every_plugin() {
     a_shared_source_edit_is_refused_for_every_plugin("walk");
+}
+
+/// Runs `check_workspace_versions` against `repo` with core at 1.0.0.
+fn check_workspace_versions(repo: &Repo) -> Checked {
+    let output = isolated("bash")
+        .arg("-c")
+        .arg(r#"source "$1" && REPO_ROOT="$2" && check_workspace_versions 1.0.0"#)
+        .arg("cut-release-test")
+        .arg(script())
+        .arg(repo.path())
+        .output()
+        .expect("failed to run bash");
+    Checked(output)
+}
+
+#[test]
+fn the_workspace_versions_agree_when_every_shared_crate_matches_core() {
+    check_workspace_versions(&Repo::tagged()).accepted();
+}
+
+#[test]
+fn an_sdk_lsp_version_that_differs_from_cores_is_refused() {
+    let repo = Repo::tagged();
+    repo.set_crate_version("plugins/sdk-lsp/Cargo.toml", "1.1.0");
+    let checked = check_workspace_versions(&repo);
+    assert!(!checked.0.status.success(), "the check must refuse\n{}", checked.report());
+    assert!(
+        checked.stderr().contains("plugins/sdk-lsp/Cargo.toml says 1.1.0"),
+        "the refusal must name sdk-lsp's manifest and version\n{}",
+        checked.report()
+    );
 }
 
 /// A manifest edit that is not the version line is a change.
@@ -513,4 +578,69 @@ fn two_wrong_plugins_are_both_listed_in_one_run() {
     let checked = repo.commit_and_check();
     checked.refused("rust", "plugins/rust/plugin.toml");
     checked.refused("python", "plugins/python/src/lib.rs");
+}
+
+/// The plugin list of build-targets.sh as it stands in `PLUGINS=( ... )`.
+const PLUGIN_LIST: &str = "PLUGINS=(\n\ttypescript:cargo\n\tgo:go\n\trust:cargo\n\tpython:cargo\n)\n";
+
+/// `CRATE_BACKED_PLUGINS` of the script under test, sourced from a copy of
+/// its directory whose build-targets.sh lists `plugin_list` instead, and what
+/// that copy prints for `--plugins cargo`.
+fn crate_backed_plugins_with(plugin_list: &str) -> (Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = script().parent().unwrap().to_path_buf();
+    let scripts = dir.path().join("scripts");
+    fs::create_dir_all(scripts.join("lib")).unwrap();
+    fs::copy(script(), scripts.join("cut-release.sh")).unwrap();
+    for lib in fs::read_dir(source_dir.join("lib")).unwrap() {
+        let lib = lib.unwrap();
+        fs::copy(lib.path(), scripts.join("lib").join(lib.file_name())).unwrap();
+    }
+    let build_targets = fs::read_to_string(source_dir.join("build-targets.sh")).unwrap();
+    assert_eq!(
+        build_targets.matches(PLUGIN_LIST).count(),
+        1,
+        "build-targets.sh no longer holds {PLUGIN_LIST:?}"
+    );
+    fs::write(scripts.join("build-targets.sh"), build_targets.replace(PLUGIN_LIST, plugin_list)).unwrap();
+
+    let lines = |output: Output| -> Vec<String> {
+        assert!(
+            output.status.success(),
+            "status: {}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).collect()
+    };
+    let sourced = isolated("bash")
+        .arg("-c")
+        .arg(r#"source "$1" && printf '%s\n' "${CRATE_BACKED_PLUGINS[@]}""#)
+        .arg("cut-release-test")
+        .arg(scripts.join("cut-release.sh"))
+        .output()
+        .expect("failed to run bash");
+    let cargo = isolated("bash")
+        .arg(scripts.join("build-targets.sh"))
+        .args(["--plugins", "cargo"])
+        .output()
+        .expect("failed to run bash");
+    (lines(sourced), lines(cargo))
+}
+
+/// The crate-backed plugins cut-release checks are the `cargo` plugins of
+/// build-targets.sh's list: a cargo plugin added there is checked, a go one
+/// is not.
+///
+/// Control: restore the literal `CRATE_BACKED_PLUGINS=(rust python typescript)`
+/// - `foo` is missing and this fails.
+#[test]
+fn the_crate_backed_plugins_are_the_cargo_plugins_of_build_targets() {
+    let (checked, cargo) = crate_backed_plugins_with(PLUGIN_LIST);
+    assert_eq!(checked, cargo);
+
+    let (checked, cargo) =
+        crate_backed_plugins_with("PLUGINS=(\n\ttypescript:cargo\n\tgo:go\n\tfoo:cargo\n\tbar:go\n)\n");
+    assert_eq!(checked, ["typescript", "foo"]);
+    assert_eq!(checked, cargo);
 }

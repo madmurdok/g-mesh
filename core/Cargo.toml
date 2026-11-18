@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "4.32.0"
+version = "4.33.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -51,6 +51,8 @@ g-mesh-wire = { path = "../wire", features = ["json-schema"] }
 # (status, the absent-language count, the watcher's layers and link table,
 # the `.gitignore` gate) list the same files under the same spellings.
 g-mesh-walk = { path = "../walk" }
+# The `plugin.toml` schema, shared with the SDK and its LSP bridge.
+g-mesh-manifest = { path = "../manifest" }
 ignore = "0.4"
 notify = "6"
 # `[plugin] memoryLimitMb` (task GM-274, `daemon::memory`) needs each

@@ -98,6 +98,7 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
+use crate::daemon::watch_loop::WatcherClock;
 use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
 use crate::ingest::staleness::{self, StalenessOutcome};
@@ -488,6 +489,8 @@ pub struct PluginRegistry {
     /// update would put part of a language into an index that holds it wholly
     /// or not at all (ADR 0021).
     failed_languages: Mutex<HashSet<String>>,
+    /// When the watcher's consumer last took an event; read by the MCP host.
+    watcher_clock: WatcherClock,
 }
 
 impl PluginRegistry {
@@ -541,7 +544,13 @@ impl PluginRegistry {
             supervisors: Mutex::new(HashMap::new()),
             unroutable: Mutex::new(HashSet::new()),
             failed_languages: Mutex::new(HashSet::new()),
+            watcher_clock: WatcherClock::new(),
         }
+    }
+
+    /// When the watcher's consumer last took an event off the watcher.
+    pub(crate) fn watcher_clock(&self) -> &WatcherClock {
+        &self.watcher_clock
     }
 
     /// Records the languages the bulk walk failed, replacing any earlier set.
@@ -568,8 +577,8 @@ impl PluginRegistry {
                     matches!(outcome, LanguageOutcome::Failed { .. }).then_some(language)
                 }))
             }
-            Err(err) => crate::log_line!(
-                "g-mesh daemon: could not read the recorded language outcomes - failed languages are not \
+            Err(err) => crate::log_role!(
+                "could not read the recorded language outcomes - failed languages are not \
                  excluded from incremental updates until the next walk: {err:#}"
             ),
         }
@@ -696,9 +705,7 @@ impl PluginRegistry {
         let stored = match conn.with(|conn| schema::watch_path_languages(conn, &key)) {
             Ok(stored) => stored,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not look up {file_path} among the plugins' watch paths: {err:#}"
-                );
+                crate::log_role!("could not look up {file_path} among the plugins' watch paths: {err:#}");
                 Vec::new()
             }
         };
@@ -990,8 +997,8 @@ impl PluginRegistry {
             let running = self.supervisors.lock().unwrap().get(&language).and_then(SupervisorSlot::running);
             let Some(supervisor) = running else { continue };
             if let Err(err) = supervisor.files_created(&file_paths) {
-                crate::log_line!(
-                    "g-mesh daemon: could not tell the {language} plugin about {} created files: {err:#}",
+                crate::log_role!(
+                    "could not tell the {language} plugin about {} created files: {err:#}",
                     file_paths.len()
                 );
             }
@@ -1050,8 +1057,8 @@ impl PluginRegistry {
                 supervisor.file_changed(conn, file_path);
                 self.run_owed_reindex(conn, &supervisor);
             }
-            Err(err) => crate::log_line!(
-                "g-mesh daemon: could not start the {language} plugin for {file_path}: {err:#} - \
+            Err(err) => crate::log_role!(
+                "could not start the {language} plugin for {file_path}: {err:#} - \
                  the change was not indexed"
             ),
         }
@@ -1065,10 +1072,10 @@ impl PluginRegistry {
     fn run_owed_reindex(&self, conn: &IndexStore, supervisor: &Arc<PluginSupervisor>) {
         let Some((trigger, reason)) = supervisor.take_owed_reindex() else { return };
         let language = supervisor.language();
-        crate::log_line!("g-mesh daemon: reindexing all of {language} after {trigger} changed: {reason}");
+        crate::log_role!("reindexing all of {language} after {trigger} changed: {reason}");
         if let Err(err) = crate::daemon::workspace_reindex::run(self, supervisor, conn, &trigger) {
-            crate::log_line!(
-                "g-mesh daemon: failed to reindex the {language} workspace after {trigger} changed: \
+            crate::log_role!(
+                "failed to reindex the {language} workspace after {trigger} changed: \
                  {err:#} - {language}'s previous graph keeps serving, and the reindex runs again on \
                  the next daemon start"
             );
@@ -1102,15 +1109,15 @@ impl PluginRegistry {
                     crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
                 };
                 if let Err(err) = reindexed {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to reindex the {language} workspace after \
+                    crate::log_role!(
+                        "failed to reindex the {language} workspace after \
                          {changed_file} changed: {err:#} - {language}'s previous graph keeps \
                          serving, and the reindex runs again on the next daemon start"
                     );
                 }
             }
-            Err(err) => crate::log_line!(
-                "g-mesh daemon: could not start the {language} plugin to reindex its workspace \
+            Err(err) => crate::log_role!(
+                "could not start the {language} plugin to reindex its workspace \
                  after {changed_file} changed: {err:#}"
             ),
         }
@@ -1135,8 +1142,8 @@ impl PluginRegistry {
         let live = match conn.with(|conn| indexed_files_under(conn, &subtrees)) {
             Ok(live) => live,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not read the indexed files to compare after {trigger} changed: {err:#}"
+                crate::log_role!(
+                    "could not read the indexed files to compare after {trigger} changed: {err:#}"
                 );
                 return;
             }
@@ -1165,15 +1172,15 @@ impl PluginRegistry {
                 continue;
             }
             if added > GITIGNORE_REINDEX_GUARD {
-                crate::log_line!(
-                    "g-mesh daemon: {trigger} changed would add {added} {language} files to the index - \
+                crate::log_role!(
+                    "{trigger} changed would add {added} {language} files to the index - \
                      more than {GITIGNORE_REINDEX_GUARD}, so nothing was reindexed; run `g-mesh reindex` \
                      to index them"
                 );
                 continue;
             }
-            crate::log_line!(
-                "g-mesh daemon: {trigger} changed which {language} files are indexed (+{added}, \
+            crate::log_role!(
+                "{trigger} changed which {language} files are indexed (+{added}, \
                  -{removed}) - reindexing {language}"
             );
             // Whole-language: a resolution delta cannot say which files a
@@ -1199,7 +1206,7 @@ impl PluginRegistry {
             Ok(Some(indexed_at)) => indexed_at,
             Ok(None) => return,
             Err(err) => {
-                crate::log_line!("g-mesh daemon: could not read when the project was last walked: {err:#}");
+                crate::log_role!("could not read when the project was last walked: {err:#}");
                 return;
             }
         };
@@ -1309,7 +1316,7 @@ impl PluginRegistry {
             Ok(Some(_)) => {}
             Ok(None) => return reparsed,
             Err(err) => {
-                crate::log_line!("g-mesh daemon: could not read when the project was last walked: {err:#}");
+                crate::log_role!("could not read when the project was last walked: {err:#}");
                 return reparsed;
             }
         }
@@ -1317,8 +1324,8 @@ impl PluginRegistry {
         let mut live = match conn.with(crate::graph::files::known_file_paths) {
             Ok(live) => live,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not read the indexed files - changes made while no daemon \
+                crate::log_role!(
+                    "could not read the indexed files - changes made while no daemon \
                      ran are not reconciled: {err:#}"
                 );
                 return reparsed;
@@ -1367,8 +1374,8 @@ impl PluginRegistry {
         }
         for file_path in &unwalked {
             if let Err(err) = self.retire_file(conn, file_path) {
-                crate::log_line!(
-                    "g-mesh daemon: could not drop {file_path}, which this worktree does not walk, from the \
+                crate::log_role!(
+                    "could not drop {file_path}, which this worktree does not walk, from the \
                      seeded index: {err:#}"
                 );
             }
@@ -1388,8 +1395,8 @@ impl PluginRegistry {
                     }
                 }
                 Ok(_) => {}
-                Err(err) => crate::log_line!(
-                    "g-mesh daemon: could not reconcile {file_path} with the disk: {err:#} - the next \
+                Err(err) => crate::log_role!(
+                    "could not reconcile {file_path} with the disk: {err:#} - the next \
                      query of it retries"
                 ),
             }
@@ -1398,9 +1405,7 @@ impl PluginRegistry {
             if let Err(err) =
                 conn.with(|conn| schema::record_semantic_pending_files(conn, language, file_paths))
             {
-                crate::log_line!(
-                    "g-mesh daemon: could not record {language}'s reparsed files as semantic-pending: {err:#}"
-                );
+                crate::log_role!("could not record {language}'s reparsed files as semantic-pending: {err:#}");
             }
         }
         let trigger = match scope {
@@ -1415,8 +1420,8 @@ impl PluginRegistry {
                     .join(", ")
             ),
         };
-        crate::log_line!(
-            "g-mesh daemon: reconciled {} files{} with the disk in {} ms: {} deleted, {} created, {} reindexed",
+        crate::log_role!(
+            "reconciled {} files{} with the disk in {} ms: {} deleted, {} created, {} reindexed",
             known.len() + created.len() + deleted.len() + unwalked.len(),
             trigger,
             started.elapsed().as_millis(),
@@ -1468,8 +1473,8 @@ impl PluginRegistry {
             Ok(Some(source_root)) => PathBuf::from(source_root),
             Ok(None) => return,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not read where the seeded index came from - its watch files are \
+                crate::log_role!(
+                    "could not read where the seeded index came from - its watch files are \
                      not compared: {err:#}"
                 );
                 return;
@@ -1486,8 +1491,8 @@ impl PluginRegistry {
         let theirs = if source_root.is_dir() {
             watch_files_under(&source_root)
         } else {
-            crate::log_line!(
-                "g-mesh daemon: {} (the seed's source) is gone - every watch file of this worktree counts as \
+            crate::log_role!(
+                "{} (the seed's source) is gone - every watch file of this worktree counts as \
                  changed",
                 source_root.display()
             );
@@ -1512,8 +1517,8 @@ impl PluginRegistry {
             if self.is_failed_language(&language) {
                 continue;
             }
-            crate::log_line!(
-                "g-mesh daemon: {trigger} differs from the seed's source - reindexing {language} as an edit of it would"
+            crate::log_role!(
+                "{trigger} differs from the seed's source - reindexing {language} as an edit of it would"
             );
             self.workspace_file_changed(conn, &language, &trigger);
         }
@@ -1534,8 +1539,8 @@ impl PluginRegistry {
         let owed = match conn.with(schema::owed_semantic_pending_files) {
             Ok(owed) => owed,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not read the semantic-pending files a pass still owes - none is \
+                crate::log_role!(
+                    "could not read the semantic-pending files a pass still owes - none is \
                      retried this start: {err:#}"
                 );
                 return;
@@ -1548,8 +1553,8 @@ impl PluginRegistry {
             let supervisor = match self.get_or_spawn(&language) {
                 Ok(supervisor) => supervisor,
                 Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: could not start the {language} plugin for the semantic pass over \
+                    crate::log_role!(
+                        "could not start the {language} plugin for the semantic pass over \
                          {} semantic-pending file(s): {err:#}",
                         file_paths.len()
                     );
@@ -1566,12 +1571,12 @@ impl PluginRegistry {
                 process.scoped_semantic_pass(conn, file_paths, embedding)
             });
             match passed.and_then(|passed| passed) {
-                Ok(()) => crate::log_line!(
-                    "g-mesh daemon: semantic pass over {count} semantic-pending {language} file(s) in {} ms",
+                Ok(()) => crate::log_role!(
+                    "semantic pass over {count} semantic-pending {language} file(s) in {} ms",
                     started.elapsed().as_millis()
                 ),
-                Err(err) => crate::log_line!(
-                    "g-mesh daemon: the semantic pass over {count} semantic-pending {language} file(s) failed \
+                Err(err) => crate::log_role!(
+                    "the semantic pass over {count} semantic-pending {language} file(s) failed \
                      ({err:#}) - their edges keep whatever the structural pass resolved, and the next start \
                      asks them again"
                 ),
@@ -1600,14 +1605,16 @@ impl PluginRegistry {
         }
         Some(match extension {
             Some(extension) => format!(
-                "g-mesh daemon: no installed plugin claims \"{extension}\" files (first seen: \
+                "{prefix}no installed plugin claims \"{extension}\" files (first seen: \
                  {file_path}) - changes to them are not indexed; further \"{extension}\" files \
-                 will not be reported again"
+                 will not be reported again",
+                prefix = crate::log::role_prefix()
             ),
             None => format!(
-                "g-mesh daemon: no installed plugin claims files without an extension (first \
+                "{prefix}no installed plugin claims files without an extension (first \
                  seen: {file_path}) - changes to them are not indexed; further extensionless \
-                 files will not be reported again"
+                 files will not be reported again",
+                prefix = crate::log::role_prefix()
             ),
         })
     }
@@ -1798,8 +1805,8 @@ impl PluginRegistry {
             self.run_owed_reindex(conn, &supervisor);
             match replay {
                 Ok(count) => replayed += count,
-                Err(err) => crate::log_line!(
-                    "g-mesh daemon: could not replay the changes queued while the {} plugin \
+                Err(err) => crate::log_role!(
+                    "could not replay the changes queued while the {} plugin \
                      slept: {err:#}",
                     supervisor.language()
                 ),

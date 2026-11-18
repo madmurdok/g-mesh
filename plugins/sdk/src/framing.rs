@@ -6,7 +6,7 @@
 //! them existed here. Upwards it answers core's control plane
 //! ([`run`](crate::run)), whose framing is core's `protocol::jsonrpc`.
 //! Downwards - for a plugin whose semantic tier drives a language server
-//! ([`lsp`](crate::lsp)) - it *is* the LSP client, and LSP's base protocol is
+//! (`g_mesh_plugin_sdk_lsp`) - it *is* the LSP client, and LSP's base protocol is
 //! the same header, blank line and body, because core's control plane was
 //! modelled on it in the first place.
 //!

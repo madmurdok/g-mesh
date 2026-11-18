@@ -1752,7 +1752,7 @@ fn calls_from_f(conn: &IndexStore) -> Vec<String> {
 /// bridge sent before GM-489 (`e-sem` in place of a retracted `x`) leaves two
 /// rows once an edit re-sends `x` and the pass then fails - the reported
 /// duplicate. This stands in for the bridge, so it is not the reproduction;
-/// the bridge's own tests (`plugins/sdk/tests/lsp_bridge.rs`, "GM-489") are
+/// the bridge's own tests (`plugins/sdk-lsp/tests/lsp_bridge.rs`, "GM-489") are
 /// what show the bridge sends these shapes.
 #[test]
 fn a_typed_call_keeps_one_caller_row_through_an_edit_whatever_its_pass_does() {

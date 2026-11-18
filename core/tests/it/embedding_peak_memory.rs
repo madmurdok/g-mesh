@@ -29,8 +29,7 @@
 
 #![cfg(unix)]
 
-use g_mesh::config::EmbeddingConfig;
-use g_mesh::embedding::{default_model_dir, EmbeddingModel};
+use g_mesh::embedding::{EmbeddingModel, DEFAULT_MODEL_NAME};
 
 /// Peak resident set size of this process so far, in bytes.
 fn peak_rss_bytes() -> u64 {
@@ -56,7 +55,7 @@ const MAX_PEAK_GROWTH_BYTES: u64 = 1 << 30;
 #[test]
 #[ignore = "needs the real model weights; see this file's module doc comment"]
 fn an_over_long_input_does_not_raise_peak_memory_by_gigabytes() {
-    let dir = default_model_dir(&EmbeddingConfig::default().model).unwrap();
+    let dir = g_mesh::config::embedding::model_dir(DEFAULT_MODEL_NAME).unwrap();
     let model = EmbeddingModel::load(&dir)
         .unwrap_or_else(|err| panic!("could not load the real model from {}: {err:#}", dir.display()));
 

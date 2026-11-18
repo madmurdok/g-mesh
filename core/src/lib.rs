@@ -10,6 +10,7 @@ pub mod index_health;
 pub mod indexing_status;
 pub mod ingest;
 pub mod ipc;
+pub mod knobs;
 pub mod languages;
 pub mod link;
 pub mod log;

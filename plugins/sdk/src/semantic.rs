@@ -145,7 +145,7 @@ impl SemanticAnswer {
 /// A plugin's semantic tier: whatever can answer what the structural pass
 /// could only leave open.
 ///
-/// Implemented by an LSP bridge ([`crate::lsp::LspBridge`], GM-289), by an
+/// Implemented by an LSP bridge (`g_mesh_plugin_sdk_lsp::LspBridge`, GM-289), by an
 /// in-process type checker, or by anything else that can turn an
 /// [`OpenSite`](crate::OpenSite) into a target. The SDK owns when it is asked
 /// and what happens to the answer; the engine owns only the answering.
@@ -177,7 +177,7 @@ pub trait SemanticEngine: Send {
     /// and ask a whole-project pass. Called only on an engine that has
     /// already been started - one that has not will start fresh anyway.
     ///
-    /// The default does nothing. [`crate::lsp::LspBridge`] uses it to make
+    /// The default does nothing. `g_mesh_plugin_sdk_lsp::LspBridge` uses it to make
     /// the next pass wait for its server to finish reloading (GM-433).
     fn workspace_changed(&mut self) {}
 
@@ -187,7 +187,7 @@ pub trait SemanticEngine: Send {
     /// [`answer`](Self::answer). Called only after the engine has been
     /// constructed, and never for structural work.
     ///
-    /// The default does nothing. [`crate::lsp::LspBridge`] starts its
+    /// The default does nothing. `g_mesh_plugin_sdk_lsp::LspBridge` starts its
     /// language server.
     fn prepare(&mut self) {}
 
@@ -200,7 +200,7 @@ pub trait SemanticEngine: Send {
     /// own budgets apply. Called before every [`answer`](Self::answer), so a
     /// value never outlives the pass it was sent with.
     ///
-    /// The default does nothing. [`crate::lsp::LspBridge`] plans its pass
+    /// The default does nothing. `g_mesh_plugin_sdk_lsp::LspBridge` plans its pass
     /// within it.
     fn set_pass_deadline(&mut self, _deadline: Option<Instant>) {}
 }

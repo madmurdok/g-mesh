@@ -327,7 +327,7 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 
 	case "workspaceChanged":
 		// A notification, never a request - core always follows it with a
-		// per-language reindex of its own (see core/src/protocol/types.rs's
+		// per-language reindex of its own (see wire/src/lib.rs's
 		// ControlMessage::WorkspaceChanged doc comment), so a plugin never
 		// has to answer with a diff.
 		//

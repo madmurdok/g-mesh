@@ -1,0 +1,14 @@
+[package]
+name = "g-mesh-manifest"
+version = "4.33.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The plugin.toml schema core, the plugin SDK and its LSP bridge read: lenient serde types, validated by each reader"
+
+[lib]
+name = "g_mesh_manifest"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

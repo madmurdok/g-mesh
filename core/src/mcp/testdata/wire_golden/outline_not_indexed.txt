@@ -1,0 +1,3 @@
+isError: Some(true)
+--- block 0 ---
+{"error":"g-mesh: no file 'tools/gen.py' found in the index - python files are not indexed here: no plugin is installed (`g-mesh plugins install python`), so this is not evidence the file is empty or missing.","notIndexed":{"language":"python","reason":"pluginAbsent","command":"g-mesh plugins install python"}}

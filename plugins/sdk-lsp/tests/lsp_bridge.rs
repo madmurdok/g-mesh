@@ -7,7 +7,7 @@
 //! than it said it would, one that never answers, one that dies with questions
 //! outstanding. None of those is reachable through a mocked client - they are
 //! facts about two processes and a pipe - so every test here spawns
-//! `g-mesh-fake-lsp` (`plugins/sdk/fake-lsp/main.rs`) with a JSON script and
+//! `g-mesh-fake-lsp` (`plugins/sdk-lsp/fake-lsp/main.rs`) with a JSON script and
 //! lets the real client talk to it over real pipes.
 //!
 //! # The fixture, and why it looks like that
@@ -46,13 +46,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use g_mesh_plugin_sdk::lsp::{Budgets, LspBridge, SemanticConfig, ServerReadiness};
 use g_mesh_plugin_sdk::wire::{
     EdgeKind, NodeKind, Position, Range, SourceTier, TargetKey, TargetScope, WireEdge, WireNode,
 };
 use g_mesh_plugin_sdk::{
     FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind, RelPath, SdkIndex, SemanticAnswer, SemanticEngine,
 };
+use g_mesh_plugin_sdk_lsp::{Budgets, LspBridge, SemanticConfig, ServerProfile, ServerReadiness};
 use serde_json::{json, Value};
 
 /// The declaring file: four crabs, a space, and a three-character name. See
@@ -1471,7 +1471,7 @@ fn the_bridge_carries_no_language_of_its_own() {
 }
 
 /// A document is opened under the `languageId` its extension maps to in
-/// `LspBridge::language_ids`, and under the bridge's language without one -
+/// `ServerProfile::language_ids`, and under the bridge's language without one -
 /// read from what the server received.
 #[test]
 fn a_document_is_opened_under_the_language_id_its_extension_maps_to() {
@@ -1485,8 +1485,8 @@ fn a_document_is_opened_under_the_language_id_its_extension_maps_to() {
             "answers": answers_the_site(&scratch),
             "openedLog": log.to_string_lossy(),
         }));
-        let mut bridge =
-            LspBridge::with_budgets("toy", scratch.path(), config, budgets()).language_ids(by_extension);
+        let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets())
+            .with_profile(ServerProfile { language_ids: by_extension, ..ServerProfile::DEFAULT });
         let answer = bridge.answer(&[RelPath::new("src/b.toy")], &index).expect("the bridge answers");
         assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
         std::fs::read_to_string(&log).unwrap_or_default()
@@ -3197,7 +3197,7 @@ fn fenced(signature: &str) -> String {
 fn overload_bridge(
     scratch: &Scratch,
     answers: Vec<Value>,
-    disambiguation: g_mesh_plugin_sdk::lsp::OverloadDisambiguation,
+    disambiguation: g_mesh_plugin_sdk_lsp::OverloadDisambiguation,
     concurrency: usize,
 ) -> (LspBridge, PathBuf) {
     let log = scratch.path().join("asked.log");
@@ -3213,7 +3213,7 @@ fn overload_bridge(
     (LspBridge::with_budgets("toy", scratch.path(), config, budgets), log)
 }
 
-use g_mesh_plugin_sdk::lsp::OverloadDisambiguation::{Hover as ByHover, None as NoHover};
+use g_mesh_plugin_sdk_lsp::OverloadDisambiguation::{Hover as ByHover, None as NoHover};
 
 /// The semantic edges `answer` binds to an ordinal, as `(from, ordinal)`.
 fn bound(answer: &SemanticAnswer) -> Vec<(String, u32)> {
@@ -4016,15 +4016,18 @@ fn the_warm_up_sits_inside_the_pass_budget() {
 
 // --- GM-550: readiness from rust-analyzer's quiescent status ----------------
 //
-// `LspBridge::quiescent_signal` makes readiness read the server's
+// `ServerProfile::quiescent_status` makes readiness read the server's
 // `experimental/serverStatus` `quiescent` bit (fake-lsp's `serverStatus`
 // table scripts it). Every test here holds the settle long enough that the
 // fake's first `quiescent: false`, written while it handles `initialized`,
 // reaches the client long before a quiet period could pass on its own.
 
-/// A bridge with the GM-550 signal on and `budgets`.
+/// A profile with only the quiescent status on.
+const SIGNALLED: ServerProfile = ServerProfile { quiescent_status: true, ..ServerProfile::DEFAULT };
+
+/// A bridge with the quiescent status on and `budgets`.
 fn signalled_bridge(scratch: &Scratch, config: SemanticConfig, budgets: Budgets) -> LspBridge {
-    LspBridge::with_budgets("toy", scratch.path(), config, budgets).quiescent_signal()
+    LspBridge::with_budgets("toy", scratch.path(), config, budgets).with_profile(SIGNALLED)
 }
 
 /// rust-analyzer's capability is asked for only by a bridge with the signal
@@ -4047,7 +4050,7 @@ fn only_a_signalled_bridge_asks_for_the_server_status() {
         }));
         let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
         if signalled {
-            bridge = bridge.quiescent_signal();
+            bridge = bridge.with_profile(SIGNALLED);
         }
 
         assert!(pass(&mut bridge, &index).complete);
@@ -4062,13 +4065,16 @@ fn only_a_signalled_bridge_asks_for_the_server_status() {
     }
 }
 
-/// Only a bridge built with `client_watches_files` claims
+/// A profile with only client file watching on.
+const WATCHING: ServerProfile = ServerProfile { client_watches_files: true, ..ServerProfile::DEFAULT };
+
+/// Only a bridge whose profile sets `client_watches_files` claims
 /// `workspace.didChangeWatchedFiles` dynamic registration, which is what
 /// tells rust-analyzer not to run its own file watcher; every other bridge
 /// sends the workspace capabilities it always sent.
 ///
-/// Control: make `client_watches_files` default to `true` in
-/// `LspBridge::with_budgets`; the plain arm claims it too.
+/// Control: make `ServerProfile::DEFAULT`'s `client_watches_files` `true`;
+/// the plain arm claims it too.
 #[test]
 fn only_a_bridge_that_opts_in_claims_client_file_watching() {
     for opted_in in [true, false] {
@@ -4083,7 +4089,7 @@ fn only_a_bridge_that_opts_in_claims_client_file_watching() {
         }));
         let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
         if opted_in {
-            bridge = bridge.client_watches_files();
+            bridge = bridge.with_profile(WATCHING);
         }
 
         assert!(pass(&mut bridge, &index).complete);
@@ -4152,7 +4158,7 @@ fn a_watching_bridge_opens_edited_indexed_files_and_announces_only_the_rest() {
         "fileEventsLog": events.to_string_lossy(),
         "openedLog": opens.to_string_lossy(),
     }));
-    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).with_profile(WATCHING);
     let b = RelPath::new("src/b.toy");
     let first = bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
     assert_eq!(semantic_edges(&first).len(), 1, "the first pass opens b.toy: {:#?}", first.diff);
@@ -4214,7 +4220,7 @@ fn a_file_gone_from_disk_is_announced_deleted_even_while_the_index_holds_it() {
         "fileEventsLog": events.to_string_lossy(),
         "openedLog": opens.to_string_lossy(),
     }));
-    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).with_profile(WATCHING);
     let b = RelPath::new("src/b.toy");
     bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
     let events_before = file_events(&scratch, &events).len();
@@ -4265,7 +4271,7 @@ fn bridge_holding_a_open(scratch: &Scratch) -> (LspBridge, SdkIndex, [PathBuf; 3
         "openedLog": opens.to_string_lossy(),
         "openVersionsLog": versions.to_string_lossy(),
     }));
-    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).with_profile(WATCHING);
     let b = RelPath::new("src/b.toy");
     bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
     scratch.write("src/a.toy", A_TOY);
@@ -4342,7 +4348,7 @@ fn a_deleted_file_the_server_never_opened_is_announced_without_a_close() {
         "answers": answers_the_site(&scratch),
         "fileEventsLog": events.to_string_lossy(),
     }));
-    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).with_profile(WATCHING);
     let b = RelPath::new("src/b.toy");
     bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
     let before = file_events(&scratch, &events).len();
@@ -4443,7 +4449,7 @@ fn files_a_serverless_pass_was_sent_are_announced_by_the_next_pass_that_reaches_
         "openedLog": opens.to_string_lossy(),
         "log": log.to_string_lossy(),
     }));
-    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).with_profile(WATCHING);
 
     // a.toy has no call site; gone.toy is not in the index.
     for file in ["src/a.toy", "src/gone.toy"] {
@@ -4486,7 +4492,7 @@ fn a_watching_bridge_never_announces_a_manifest_or_a_config() {
         "answers": answers_the_site(&scratch),
         "fileEventsLog": events.to_string_lossy(),
     }));
-    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).with_profile(WATCHING);
     assert!(pass(&mut bridge, &index).complete);
 
     scratch.write("Cargo.toml", "[package]\nname = \"toy\"\nversion = \"0.2.0\"\n");

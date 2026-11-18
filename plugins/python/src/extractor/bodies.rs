@@ -306,7 +306,7 @@ impl<'a, 's> Bodies<'a, 's> {
             // (`super::scope`), so nothing else is emitted.
             "import_statement" | "import_from_statement" => {
                 if self.scopes.kind() != FrameKind::Module {
-                    let range = self.emitter.positions().range(node);
+                    let range = self.emitter.positions().node_range(node);
                     for edge in import_edges(node, self.source, self.project, self.module) {
                         emit_import_edge(
                             self.project,
@@ -496,7 +496,7 @@ impl<'a, 's> Bodies<'a, 's> {
                     self.emitter.resolved_edge(EdgeKind::SupertypeOf, subtype, &to);
                 }
                 Bound::There { target, name, .. } => {
-                    let range = self.emitter.positions().range(base);
+                    let range = self.emitter.positions().node_range(base);
                     let placeholder =
                         self.emitter.placeholder(PlaceholderKind::PendingSymbol, &name, target, range);
                     self.emitter.placeholder_edge(EdgeKind::SupertypeOf, subtype, &placeholder);
@@ -731,7 +731,7 @@ impl<'a, 's> Bodies<'a, 's> {
         };
         let Some(name_node) = argument(0, "name") else { return };
         let Some(name) = self.fold(name_node) else { return };
-        let range = self.emitter.positions().range(name_node);
+        let range = self.emitter.positions().node_range(name_node);
         let level = name.chars().take_while(|ch| *ch == '.').count();
         if callee == DynamicCallee::DunderImport {
             // D4: Python 3's default `level` is 0 (absolute); a relative
@@ -1004,7 +1004,7 @@ impl<'a, 's> Bodies<'a, 's> {
             return;
         }
         let Some(field) = node.child_by_field_name("attribute") else { return };
-        let position = self.emitter.positions().at(field.start_position());
+        let position = self.emitter.positions().point(field.start_position());
         self.emitter.open_site(OpenSite {
             from_id: from.to_string(),
             position,
@@ -1232,7 +1232,7 @@ impl<'a, 's> Bodies<'a, 's> {
             }
             Bound::There { target, name, looks_class } => {
                 let edge = if is_call && !looks_class { EdgeKind::Calls } else { EdgeKind::References };
-                let range = self.emitter.positions().range(at);
+                let range = self.emitter.positions().node_range(at);
                 let placeholder =
                     self.emitter.placeholder(PlaceholderKind::PendingSymbol, &name, target, range);
                 let written = self.emitter.placeholder_edge(edge, from, &placeholder);
@@ -1252,7 +1252,7 @@ impl<'a, 's> Bodies<'a, 's> {
     /// Decision 7's overloaded calls. The engine either binds every site of
     /// that edge to an overload or leaves the edge be.
     fn overload_call(&mut self, from: &str, replaces: String, at: Node) {
-        let position = self.emitter.positions().at(at.start_position());
+        let position = self.emitter.positions().point(at.start_position());
         self.emitter.open_site(OpenSite {
             from_id: from.to_string(),
             position,
