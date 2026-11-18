@@ -264,6 +264,20 @@ fn filter_prints_a_filterset_for_every_listed_section_and_refuses_an_unknown_one
     }
 }
 
+/// `sdk` and `sdk-lsp` each hold exactly one package.
+#[test]
+fn the_sdk_and_sdk_lsp_sections_each_select_only_their_own_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+    for (name, expected) in
+        [("sdk", "package(g-mesh-plugin-sdk)"), ("sdk-lsp", "package(g-mesh-plugin-sdk-lsp)")]
+    {
+        let output = sections_script(&path_env, &["filter", name]);
+        assert_eq!(output.status.code(), Some(0), "{name}: {}", describe(&output));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected, "{name}");
+    }
+}
+
 #[test]
 fn run_refuses_an_unknown_or_missing_section_before_calling_cargo() {
     let dir = tempfile::tempdir().unwrap();

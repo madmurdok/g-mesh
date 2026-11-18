@@ -195,6 +195,36 @@ fn two_plugin_changes_run_both_plugin_sections_in_list_order() {
     assert_eq!(select(&["plugins/python/src/a.rs", "plugins/typescript/src/b.rs"]), expected);
 }
 
+/// `plugins/sdk-lsp/` is shared by every LSP plugin: it selects its own
+/// section, every plugin section and every core section; with `--narrow`,
+/// other than its `Cargo.toml`, the core sections give way to the core tests
+/// that start each plugin. The SDK itself (`plugins/sdk/`) stays `full`.
+#[test]
+fn an_sdk_lsp_change_runs_its_section_and_every_plugin_section() {
+    let plugins = ["sdk-lsp", "plugin-typescript", "plugin-rust", "plugin-python"];
+    let wide = core_plus(&plugins);
+    let paths = [
+        "plugins/sdk-lsp/src/bridge/hover.rs",
+        "plugins/sdk-lsp/src/lib.rs",
+        "plugins/sdk-lsp/tests/lsp_bridge.rs",
+        "plugins/sdk-lsp/fake-lsp/main.rs",
+        "plugins/sdk-lsp/Cargo.toml",
+    ];
+    assert_each(&paths, &wide);
+    let spawns = plugins
+        .iter()
+        .copied()
+        .chain(["core-spawns-typescript", "core-spawns-rust", "core-spawns-python"])
+        .collect::<Vec<_>>()
+        .join(" ");
+    for path in &paths[..4] {
+        assert_eq!(narrowed(&[path]), spawns, "path {path} --narrow");
+    }
+    assert_eq!(narrowed(&["plugins/sdk-lsp/Cargo.toml"]), wide, "Cargo.toml --narrow");
+    assert_eq!(select(&["plugins/sdk/src/lib.rs"]), "full");
+    assert_eq!(narrowed(&["plugins/sdk/src/lib.rs"]), "full");
+}
+
 #[test]
 fn a_go_plugin_change_runs_the_core_sections_without_a_plugin_section() {
     assert_each(&["plugins/go/main.go", "plugins/go/plugin.toml"], &core_plus(&[]));

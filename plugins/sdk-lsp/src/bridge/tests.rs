@@ -1761,3 +1761,40 @@ fn a_site_asked_at_the_last_segment_covers_the_whole_written_path() {
     assert_eq!(covers(Some("fn run() {\n    new();\n}\n"), at(1, 4), "super::Q::new"), ((1, 4), (1, 17)));
     assert_eq!(covers(Some("x\n"), at(5, 2), "a::f"), ((5, 2), (5, 6)));
 }
+
+#[test]
+fn a_profiles_warm_up_becomes_the_bridges_warm_up_budget() {
+    let five = Duration::from_secs(5);
+    let profiled = LspBridge::new("toy", Path::new("/p"), SemanticConfig::new("toy-server"))
+        .with_profile(ServerProfile { warm_up: Some(five), ..ServerProfile::DEFAULT });
+    assert_eq!(profiled.budgets.warm_up, Some(five));
+
+    let default = LspBridge::new("toy", Path::new("/p"), SemanticConfig::new("toy-server"))
+        .with_profile(ServerProfile::DEFAULT);
+    assert_eq!(default.budgets.warm_up, None, "the default profile asks for no warm-up");
+
+    let seven = Duration::from_secs(7);
+    let budgeted = LspBridge::with_budgets(
+        "toy",
+        Path::new("/p"),
+        SemanticConfig::new("toy-server"),
+        Budgets { warm_up: Some(seven), ..Budgets::default() },
+    )
+    .with_profile(ServerProfile::DEFAULT);
+    assert_eq!(budgeted.budgets.warm_up, Some(seven), "a profile without a warm-up keeps the budget's");
+}
+
+/// Source-text pin: in `LspClient::start` the lifeline hook that kills live
+/// servers is registered before the server is pushed into `LIVE_SERVERS`, so
+/// a lifeline exit never sees a listed server with no hook to kill it. A
+/// runtime test would have to land a lifeline exit between two statements.
+#[test]
+fn the_kill_hook_is_registered_before_a_server_is_listed_live() {
+    let source = include_str!("../client.rs");
+    let start = source.find("pub(crate) fn start(").expect("LspClient::start");
+    let body = &source[start..];
+    let register =
+        body.find("on_lifeline_exit(kill_live_servers)").expect("start registers kill_live_servers");
+    let listed = body.find("servers.push(Arc::downgrade(&child))").expect("start lists the server");
+    assert!(register < listed, "the kill hook must be registered before the server is listed live");
+}

@@ -4,12 +4,14 @@
 //! backwards, and must agree between `Cargo.toml` and `plugin.toml`.
 //!
 //! Each test builds a scratch git repository shaped like the workspace (core,
-//! `plugins/{rust,python,typescript,sdk}`, `wire`, `walk`, `plugin.toml`
+//! `plugins/{rust,python,typescript,sdk,sdk-lsp}`, `wire`, `walk`, `plugin.toml`
 //! files and a hand-written `Cargo.lock`), commits it, tags it `v1.0.0`,
 //! commits an edit, then sources the script (its `main` is guarded for that)
 //! with `REPO_ROOT` pointed at the scratch repo and calls the check for
 //! release `1.1.0`. The assertions are the exit status and, for a refusal,
 //! that a line names the plugin and the first changed path; not the wording.
+//! `check_workspace_versions`, which holds every shared crate at core's
+//! version, runs against the same repository.
 //!
 //! `GM_CUT_RELEASE_SH` replaces the script under test with another copy (its
 //! `scripts/lib/` and `build-targets.sh` beside it), so a control revert can
@@ -400,6 +402,11 @@ fn an_sdk_source_edit_is_refused_for_every_plugin() {
 }
 
 #[test]
+fn an_sdk_lsp_source_edit_is_refused_for_every_plugin() {
+    a_shared_source_edit_is_refused_for_every_plugin("plugins/sdk-lsp");
+}
+
+#[test]
 fn a_wire_source_edit_is_refused_for_every_plugin() {
     a_shared_source_edit_is_refused_for_every_plugin("wire");
 }
@@ -407,6 +414,37 @@ fn a_wire_source_edit_is_refused_for_every_plugin() {
 #[test]
 fn a_walk_source_edit_is_refused_for_every_plugin() {
     a_shared_source_edit_is_refused_for_every_plugin("walk");
+}
+
+/// Runs `check_workspace_versions` against `repo` with core at 1.0.0.
+fn check_workspace_versions(repo: &Repo) -> Checked {
+    let output = isolated("bash")
+        .arg("-c")
+        .arg(r#"source "$1" && REPO_ROOT="$2" && check_workspace_versions 1.0.0"#)
+        .arg("cut-release-test")
+        .arg(script())
+        .arg(repo.path())
+        .output()
+        .expect("failed to run bash");
+    Checked(output)
+}
+
+#[test]
+fn the_workspace_versions_agree_when_every_shared_crate_matches_core() {
+    check_workspace_versions(&Repo::tagged()).accepted();
+}
+
+#[test]
+fn an_sdk_lsp_version_that_differs_from_cores_is_refused() {
+    let repo = Repo::tagged();
+    repo.set_crate_version("plugins/sdk-lsp/Cargo.toml", "1.1.0");
+    let checked = check_workspace_versions(&repo);
+    assert!(!checked.0.status.success(), "the check must refuse\n{}", checked.report());
+    assert!(
+        checked.stderr().contains("plugins/sdk-lsp/Cargo.toml says 1.1.0"),
+        "the refusal must name sdk-lsp's manifest and version\n{}",
+        checked.report()
+    );
 }
 
 /// A manifest edit that is not the version line is a change.
