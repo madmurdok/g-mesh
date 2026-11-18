@@ -395,6 +395,13 @@ not needed for the acceptance).
 4. Resume pass criterion: bit-exact `wSha256`, with the relative-1e-6
    fallback only by your approval in the report?
 
+**Owner decisions, 2026-11-19:**
+
+1. D1-D7: "Утверждаю (Recommended)".
+2. Pins: "Да, все четыре (Recommended)": torch 2.2.2, numpy 1.26.4, transformers 4.46.3, sentence-transformers 3.3.1 are pinned now.
+3. Kill switch: "Да, реальный запуск (Recommended)": the Lambda is invoked with a synthetic budget event in S6, after the CLI confirms no other GPU instance runs.
+4. Resume: "Бит в бит (Recommended)": the 1e-6 fallback only with the owner's approval in the measure report.
+
 ## 3. Edit map for the code slice
 
 New files (all under `eval/gpu/` unless noted):
