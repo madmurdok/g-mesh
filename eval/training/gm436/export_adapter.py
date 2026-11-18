@@ -96,7 +96,7 @@ def main():
         W = np.eye(a.identity, dtype=np.float32)
     else:
         import torch
-        state = torch.load(Path(a.run) / "checkpoint.pt", weights_only=False)
+        state = torch.load(Path(a.run) / "checkpoint.pt", map_location="cpu", weights_only=False)
         if not state["done"]:
             sys.exit(f"{a.run}: training not finished")
         W = np.asarray(state["bestW"], np.float32)
