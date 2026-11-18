@@ -189,68 +189,33 @@ fn count_expectations() -> (usize, usize) {
     (total, semantic)
 }
 
-/// The `[plugin.semantic]` section of the manifest this plugin ships, as TOML.
-///
-/// Read from `plugin.toml` and re-serialized rather than written out again
-/// here, so these tests check the configuration a user gets - the `--stdio`
-/// pyright cannot start without, the deliberately empty `implementation_kinds`,
-/// and the `settings` table that is the only channel pyright reads at all. A
-/// copy would drift, and the first sign of the drift would be a conformance
-/// run passing against a configuration nobody ships.
-///
-/// `command` is overridden when `server` is given, which is the whole of how
-/// the semantic and missing-toolchain arms differ.
-fn semantic_section(server: Option<&Path>) -> String {
-    let manifest = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
-    let text = std::fs::read_to_string(manifest).expect("plugins/python/plugin.toml is readable");
-    let parsed: toml::Value = toml::from_str(&text).expect("plugins/python/plugin.toml parses");
-    let mut section = parsed["plugin"]["semantic"].clone();
-    if let Some(server) = server {
-        section["command"] = toml::Value::String(server.to_string_lossy().into_owned());
-    }
-    let mut plugin = toml::map::Map::new();
-    plugin.insert("semantic".to_string(), section);
-    let mut root = toml::map::Map::new();
-    root.insert("plugin".to_string(), toml::Value::Table(plugin));
-    toml::to_string(&toml::Value::Table(root)).expect("the section re-serializes")
-}
-
+/// The manifest this plugin ships, read rather than restated, so these tests
+/// check the configuration a user gets - the `--stdio` pyright cannot start
+/// without, the deliberately empty `implementation_kinds`, and the
+/// `settings` table that is the only channel pyright reads at all.
 fn base() -> PluginCheck {
-    PluginCheck::new(
-        "python",
+    PluginCheck::from_manifest(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"),
         env!("CARGO_BIN_EXE_g-mesh-plugin-python"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/project"),
     )
-    .extensions(&[".py", ".pyi"])
-    .exclude_dirs(&g_mesh_plugin_python::project::EXCLUDE_DIRS)
-    .watch_files(&["pyproject.toml", "setup.cfg", "setup.py"])
-    .entry_points(&["__init__"])
-    // The shipped manifest declares it (GM-516).
-    .files_created(true)
 }
 
 /// The shipped configuration, with a real pyright.
 fn semantic() -> PluginCheck {
-    let server = pyright_langserver();
-    base()
-        .semantic_pass(true)
-        .receiver_calls("resolved", "unresolved")
-        .manifest_extra(semantic_section(Some(&server)))
+    base().semantic_command(pyright_langserver())
 }
 
 /// The manifest as 3.4.0 declared it: no semantic tier, so core never asks for
 /// one and the structural tier answers alone.
 fn structural_3_4_0() -> PluginCheck {
-    base().semantic_pass(false).receiver_calls("unresolved", "unresolved")
+    base().semantic_pass(false).receiver_calls("unresolved", "unresolved").without_semantic_section()
 }
 
 /// The shipped configuration on a machine with no pyright.
 fn missing_toolchain() -> PluginCheck {
     let nowhere = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/there-is-no-pyright-here");
-    base()
-        .semantic_pass(true)
-        .receiver_calls("resolved", "unresolved")
-        .manifest_extra(semantic_section(Some(&nowhere)))
+    base().semantic_command(nowhere)
 }
 
 /// GM-341: the npm shim extension worth trying beyond a bare spelling, on the

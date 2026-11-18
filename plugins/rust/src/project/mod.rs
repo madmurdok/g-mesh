@@ -126,9 +126,8 @@ use cargo_manifest::{RawCargoToml, RawTarget};
 /// [`g_mesh_plugin_sdk::BASELINE_EXCLUDED_DIRS`]: cargo's own build output,
 /// never source.
 ///
-/// This constant is the one list in code: `main.rs`'s
-/// [`g_mesh_plugin_sdk::PluginSpec::exclude_dirs`] fallback, the census and
-/// the tests all take it from here. The one copy that cannot be derived is
+/// This constant is the one list in code: the census and the tests take it
+/// from here. The one copy that cannot be derived is
 /// `plugin.toml`'s `[plugin.workspace] exclude_dirs`, which core, its watcher
 /// and `status` read before any plugin process exists; the test
 /// `plugin_toml_exclude_dirs_equal_exclude_dirs` below pins the two equal, so
@@ -667,14 +666,11 @@ mod tests {
     /// simplest rule to follow.
     #[test]
     fn plugin_toml_exclude_dirs_equal_exclude_dirs() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))).unwrap();
-        let listed: Vec<&str> = manifest["plugin"]["workspace"]["exclude_dirs"]
-            .as_array()
-            .expect("plugin.toml declares [plugin.workspace] exclude_dirs")
-            .iter()
-            .map(|dir| dir.as_str().expect("every exclude_dirs entry is a string"))
-            .collect();
+        let manifest =
+            g_mesh_manifest::parse(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml")))
+                .unwrap();
+        let workspace = manifest.plugin.expect("plugin.toml declares [plugin]").workspace;
+        let listed: Vec<&str> = workspace.exclude_dirs.iter().map(String::as_str).collect();
         assert_eq!(listed, EXCLUDE_DIRS, "plugin.toml's exclude_dirs must equal project::EXCLUDE_DIRS");
     }
 

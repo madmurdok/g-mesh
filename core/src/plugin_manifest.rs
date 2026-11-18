@@ -157,8 +157,7 @@ impl std::fmt::Display for MemberOverrides {
 /// What core may ask this plugin to do, and how far each tier's receiver-call
 /// resolution can be trusted. Read from the manifest, not the handshake: it is
 /// needed before any plugin process exists.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Capabilities {
     /// Whether core may send this plugin a `semanticPass` request (per file after
     /// a reparse, whole project after a walk). `false`: core never sends one and
@@ -403,38 +402,56 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
 
     let contents = fs::read_to_string(&manifest_path)
         .with_context(|| format!("failed to read plugin manifest at {}", manifest_path.display()))?;
-    let raw: RawManifest = toml::from_str(&contents)
+    let manifest = g_mesh_manifest::parse(&contents)
         .with_context(|| format!("failed to parse plugin manifest at {}", manifest_path.display()))?;
-    let plugin = raw.plugin;
+    let plugin = manifest
+        .plugin
+        .with_context(|| format!("plugin manifest at {} has no [plugin] table", manifest_path.display()))?;
+    let capabilities = capabilities_of(&plugin.capabilities).with_context(|| {
+        format!("invalid [plugin.capabilities] in plugin manifest at {}", manifest_path.display())
+    })?;
+    let (non_symbol_queries, symbol_query_prefixes, reexports) = core_tables_of(&plugin)
+        .with_context(|| format!("failed to parse plugin manifest at {}", manifest_path.display()))?;
+    let missing = |key: &str| anyhow::anyhow!("plugin manifest at {} has no {key}", manifest_path.display());
+    let language = plugin.language.ok_or_else(|| missing("`language` in [plugin]"))?;
+    let protocol_version =
+        plugin.protocol_version.ok_or_else(|| missing("`protocol_version` in [plugin]"))?;
+    let plugin_version = plugin.plugin_version.ok_or_else(|| missing("`plugin_version` in [plugin]"))?;
+    let spawn = plugin.spawn.ok_or_else(|| missing("[plugin.spawn] table"))?;
+    let spawn_command = spawn.command.ok_or_else(|| missing("`command` in [plugin.spawn]"))?;
+    let extensions = plugin
+        .languages
+        .ok_or_else(|| missing("[plugin.languages] table"))?
+        .extensions
+        .ok_or_else(|| missing("`extensions` in [plugin.languages]"))?;
 
     let dir_name = dir.file_name().and_then(|name| name.to_str()).with_context(|| {
         format!("plugin manifest directory {} has no valid (UTF-8) directory name", dir.display())
     })?;
-    if plugin.language != dir_name {
+    if language != dir_name {
         bail!(
             "plugin manifest at {} declares language \"{}\", but its containing directory is \
              named \"{}\" - the manifest's language must match the directory it lives in",
             manifest_path.display(),
-            plugin.language,
+            language,
             dir_name,
         );
     }
 
-    if plugin.protocol_version != CURRENT_PROTOCOL_VERSION {
+    if protocol_version != CURRENT_PROTOCOL_VERSION {
         bail!(
             "plugin manifest at {} declares protocol_version {}, but core expects protocol \
              version {} - refusing to load; update the plugin to match",
             manifest_path.display(),
-            plugin.protocol_version,
+            protocol_version,
             CURRENT_PROTOCOL_VERSION,
         );
     }
 
-    let command =
-        resolve_command(&plugin.spawn.command, dir, current_bin_dir().as_deref()).with_context(|| {
-            format!("invalid [plugin.spawn] command in plugin manifest at {}", manifest_path.display())
-        })?;
-    let args = plugin.spawn.args.iter().map(|arg| resolve_arg(arg, dir)).collect();
+    let command = resolve_command(&spawn_command, dir, current_bin_dir().as_deref()).with_context(|| {
+        format!("invalid [plugin.spawn] command in plugin manifest at {}", manifest_path.display())
+    })?;
+    let args = spawn.args.iter().map(|arg| resolve_arg(arg, dir)).collect();
 
     // Globs are validated here, not by TOML parsing: any string is valid TOML.
     let watch_files = plugin
@@ -453,7 +470,7 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    if plugin.reexports.named_shadows_glob && plugin.reexports.later_import_binds {
+    if reexports.named_shadows_glob && reexports.later_import_binds {
         bail!(
             "plugin manifest at {} sets both `named_shadows_glob` and `later_import_binds` in \
              [plugin.reexports] - they are opposite answers to which import binds a name; set one",
@@ -461,32 +478,65 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
         );
     }
 
-    validate_non_symbol_queries(&plugin.non_symbol_queries, &manifest_path)?;
-    validate_symbol_query_prefixes(
-        &plugin.symbol_query_prefixes,
-        &plugin.non_symbol_queries,
-        &manifest_path,
-    )?;
+    validate_non_symbol_queries(&non_symbol_queries, &manifest_path)?;
+    validate_symbol_query_prefixes(&symbol_query_prefixes, &non_symbol_queries, &manifest_path)?;
 
     Ok(PluginManifest {
-        language: plugin.language,
-        protocol_version: plugin.protocol_version,
-        plugin_version: plugin.plugin_version,
+        language,
+        protocol_version,
+        plugin_version,
         command,
         args,
-        extensions: plugin.languages.extensions,
+        extensions,
         fingerprint_ignore: plugin.fingerprint.ignore,
         manifest_dir: dir.to_path_buf(),
-        capabilities: plugin.capabilities,
+        capabilities,
         workspace: WorkspaceConfig {
             watch_files,
             exclude_dirs: plugin.workspace.exclude_dirs,
             entry_points: plugin.workspace.entry_points,
         },
-        non_symbol_queries: plugin.non_symbol_queries,
-        symbol_query_prefixes: plugin.symbol_query_prefixes,
-        reexports: plugin.reexports,
+        non_symbol_queries,
+        symbol_query_prefixes,
+        reexports,
     })
+}
+
+/// `[plugin.capabilities]` as core's types: an absent key takes its default,
+/// an unknown word for an enum-valued key is an error naming it.
+fn capabilities_of(section: &g_mesh_manifest::CapabilitiesSection) -> Result<Capabilities> {
+    fn word<T: serde::de::DeserializeOwned + Default>(key: &str, value: &Option<String>) -> Result<T> {
+        match value {
+            Some(word) => g_mesh_manifest::Value::String(word.clone())
+                .try_into()
+                .with_context(|| format!("`{key}` is \"{word}\"")),
+            None => Ok(T::default()),
+        }
+    }
+    Ok(Capabilities {
+        semantic_pass: section.semantic_pass.unwrap_or_default(),
+        semantic_sweep: section.semantic_sweep.unwrap_or_default(),
+        semantic_prepare: section.semantic_prepare.unwrap_or_default(),
+        files_created: section.files_created.unwrap_or_default(),
+        resolution_delta: section.resolution_delta.unwrap_or_default(),
+        receiver_calls: word("receiver_calls", &section.receiver_calls)?,
+        receiver_calls_structural: word("receiver_calls_structural", &section.receiver_calls_structural)?,
+        member_overrides: word("member_overrides", &section.member_overrides)?,
+    })
+}
+
+/// The three tables only core reads, decoded with core's strict types; an
+/// absent table is empty.
+fn core_tables_of(
+    plugin: &g_mesh_manifest::PluginSection,
+) -> Result<(NonSymbolShapes, SymbolQueryPrefixes, ReexportRules)> {
+    Ok((
+        g_mesh_manifest::decode_table(plugin.non_symbol_queries.as_ref())
+            .context("invalid [plugin.non_symbol_queries]")?,
+        g_mesh_manifest::decode_table(plugin.symbol_query_prefixes.as_ref())
+            .context("invalid [plugin.symbol_query_prefixes]")?,
+        g_mesh_manifest::decode_table(plugin.reexports.as_ref()).context("invalid [plugin.reexports]")?,
+    ))
 }
 
 /// An empty string is a prefix and an infix of every query, so it would
@@ -562,26 +612,13 @@ pub(crate) fn bare_manifest(language: &str) -> PluginManifest {
 /// as one embedded with `include_str!`.
 #[cfg(test)]
 pub(crate) fn query_tables_of(contents: &str) -> Result<(NonSymbolShapes, SymbolQueryPrefixes)> {
-    #[derive(Deserialize)]
-    struct Outer {
-        plugin: Inner,
-    }
-    #[derive(Deserialize)]
-    struct Inner {
-        #[serde(default)]
-        non_symbol_queries: NonSymbolShapes,
-        #[serde(default)]
-        symbol_query_prefixes: SymbolQueryPrefixes,
-    }
-    let outer: Outer = toml::from_str(contents).context("failed to parse plugin manifest")?;
+    let manifest = g_mesh_manifest::parse(contents).context("failed to parse plugin manifest")?;
+    let plugin = manifest.plugin.context("plugin manifest has no [plugin] table")?;
+    let (non_symbol_queries, symbol_query_prefixes, _) = core_tables_of(&plugin)?;
     let embedded = Path::new("<embedded>");
-    validate_non_symbol_queries(&outer.plugin.non_symbol_queries, embedded)?;
-    validate_symbol_query_prefixes(
-        &outer.plugin.symbol_query_prefixes,
-        &outer.plugin.non_symbol_queries,
-        embedded,
-    )?;
-    Ok((outer.plugin.non_symbol_queries, outer.plugin.symbol_query_prefixes))
+    validate_non_symbol_queries(&non_symbol_queries, embedded)?;
+    validate_symbol_query_prefixes(&symbol_query_prefixes, &non_symbol_queries, embedded)?;
+    Ok((non_symbol_queries, symbol_query_prefixes))
 }
 
 /// Discovery's output: every plugin found, keyed by language, plus the
@@ -839,73 +876,6 @@ fn resolve_arg(value: &str, dir: &Path) -> String {
     } else {
         value.to_string()
     }
-}
-
-// Raw (on-disk) shape.
-
-#[derive(Debug, Deserialize)]
-struct RawManifest {
-    plugin: RawPlugin,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawPlugin {
-    language: String,
-    protocol_version: u32,
-    plugin_version: String,
-    spawn: RawSpawn,
-    languages: RawLanguages,
-    /// Optional: absent means the built-in baseline ignore list only.
-    #[serde(default)]
-    fingerprint: RawFingerprint,
-    /// Optional, as is every field inside it (`Capabilities` is
-    /// `#[serde(default)]`), so a partial table fills the rest conservatively.
-    #[serde(default)]
-    capabilities: Capabilities,
-    /// `[plugin.workspace]` is optional - see [`RawWorkspace`].
-    #[serde(default)]
-    workspace: RawWorkspace,
-    /// Optional; absent refuses nothing.
-    #[serde(default)]
-    non_symbol_queries: NonSymbolShapes,
-    /// Optional; absent rewrites nothing. A table of its own, not a key in
-    /// `non_symbol_queries`, so a core that predates it ignores it.
-    #[serde(default)]
-    symbol_query_prefixes: SymbolQueryPrefixes,
-    /// Optional; absent declares no shadowing. Its own table, so a core that
-    /// predates it ignores it.
-    #[serde(default)]
-    reexports: ReexportRules,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawSpawn {
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawLanguages {
-    extensions: Vec<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawFingerprint {
-    #[serde(default)]
-    ignore: Vec<String>,
-}
-
-/// `[plugin.workspace]`'s on-disk shape: plain strings, which
-/// [`read_manifest`] compiles into globs after parsing.
-#[derive(Debug, Default, Deserialize)]
-struct RawWorkspace {
-    #[serde(default)]
-    watch_files: Vec<String>,
-    #[serde(default)]
-    exclude_dirs: Vec<String>,
-    #[serde(default)]
-    entry_points: Vec<String>,
 }
 
 #[cfg(test)]

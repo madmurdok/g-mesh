@@ -6,13 +6,11 @@
 use g_mesh_plugin_sdk::{run, PluginSpec};
 
 use g_mesh_plugin_python::extractor::PythonExtractor;
-use g_mesh_plugin_python::project;
 
 fn main() -> ! {
     run(
         PythonExtractor,
-        PluginSpec::new("python", env!("CARGO_PKG_VERSION"), &[".py", ".pyi"])
-            .exclude_dirs(&project::EXCLUDE_DIRS),
+        PluginSpec::from_manifest_str(include_str!("../plugin.toml")),
         // The pyright tier (GM-299). A *factory*, not an engine: the SDK calls
         // this on the first `semanticPass` and never before, which is what
         // `capabilities.semantic-engine-lazy` checks and what keeps a

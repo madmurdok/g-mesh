@@ -61,4 +61,6 @@ tree-sitter = "0.25"
 tree-sitter-python = "0.25"
 
 [dev-dependencies]
+# The `plugin.toml` schema, for the tests that pin this crate's manifest to its code.
+g-mesh-manifest = { path = "../../manifest" }
 tempfile = "3"

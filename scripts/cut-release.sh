@@ -36,7 +36,7 @@
 # and README.md's own release checklist), this script instead grows the same
 # check it already runs to cover every workspace member: `core/Cargo.toml`
 # stays the one manifest whose version *names* the release, and wire's,
-# walk's, plugins/sdk's and plugins/sdk-lsp's versions are checked to equal
+# walk's, manifest's, plugins/sdk's and plugins/sdk-lsp's versions are checked to equal
 # it (the three language plugins carry their own, see below), in
 # `check_workspace_versions` below, before a single test runs. A member added to the workspace later
 # that forgets this gets caught here, not after a release ships with it
@@ -60,10 +60,10 @@
 #     release tag. `check_crate_backed_plugin_versions` below enforces both:
 #     the agreement, and the change rule. A plugin changed when its shipped
 #     inputs differ from the tag: its own and plugins/sdk's, plugins/sdk-lsp's,
-#     wire's and walk's `src/`; its own `Cargo.toml` and `plugin.toml` and
-#     sdk's, sdk-lsp's, wire's and walk's `Cargo.toml`, each with its own
-#     version line ignored (so the release bump of sdk/sdk-lsp/wire/walk is
-#     not a change); and the registry/git
+#     wire's, walk's and manifest's `src/`; its own `Cargo.toml` and
+#     `plugin.toml` and sdk's, sdk-lsp's, wire's, walk's and manifest's
+#     `Cargo.toml`, each with its own version line ignored (so the release
+#     bump of sdk/sdk-lsp/wire/walk/manifest is not a change); and the registry/git
 #     packages its `Cargo.lock` dependency closure reaches. Tests, fixtures,
 #     READMEs and every other path do not count. A changed plugin whose
 #     version did not move, or a version lower than at the tag, stops the cut;
@@ -248,6 +248,7 @@ EOF
 OTHER_WORKSPACE_MANIFESTS=(
 	"wire/Cargo.toml"
 	"walk/Cargo.toml"
+	"manifest/Cargo.toml"
 	"plugins/sdk/Cargo.toml"
 	"plugins/sdk-lsp/Cargo.toml"
 )
@@ -314,6 +315,7 @@ PLUGIN_SHARED_CRATES=(
 	plugins/sdk-lsp
 	wire
 	walk
+	manifest
 )
 
 # The `plugin_version` of a plugin.toml's `[plugin]` section. Same

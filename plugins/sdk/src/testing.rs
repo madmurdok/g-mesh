@@ -110,8 +110,9 @@ pub struct PluginCheck {
     watch_files: Vec<String>,
     semantic_pass: bool,
     files_created: bool,
-    receiver_calls: &'static str,
-    receiver_calls_structural: &'static str,
+    receiver_calls: String,
+    receiver_calls_structural: String,
+    semantic: Option<toml::Value>,
     expect: Option<PathBuf>,
     skip_semantic_expectations: bool,
     manifest_extra: Option<String>,
@@ -143,13 +144,62 @@ impl PluginCheck {
             watch_files: Vec::new(),
             semantic_pass: false,
             files_created: false,
-            receiver_calls: "unresolved",
-            receiver_calls_structural: "unresolved",
+            receiver_calls: "unresolved".to_string(),
+            receiver_calls_structural: "unresolved".to_string(),
+            semantic: None,
             expect: None,
             skip_semantic_expectations: false,
             manifest_extra: None,
             core_binary: None,
         }
+    }
+
+    /// A run configured as the plugin's own `plugin.toml` at `manifest`
+    /// declares it: `language`, `plugin_version`, `extensions`,
+    /// `[plugin.workspace]`'s `exclude_dirs`, `entry_points` and
+    /// `watch_files`, `[plugin.capabilities]`'s `semantic_pass`,
+    /// `files_created`, `receiver_calls` and `receiver_calls_structural`, and
+    /// `[plugin.semantic]` whole. The builder methods override any of them.
+    ///
+    /// # Panics
+    ///
+    /// If `manifest` cannot be read or parsed, or lacks `language`,
+    /// `plugin_version` or `extensions`.
+    pub fn from_manifest(
+        manifest: impl AsRef<Path>,
+        plugin_binary: impl Into<PathBuf>,
+        fixture: impl Into<PathBuf>,
+    ) -> Self {
+        let manifest = manifest.as_ref();
+        let text = fs::read_to_string(manifest)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest.display()));
+        let plugin = g_mesh_manifest::parse(&text)
+            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", manifest.display()))
+            .plugin
+            .unwrap_or_else(|| panic!("{} has no [plugin] table", manifest.display()));
+        let missing = |key: &str| -> ! { panic!("{} has no {key}", manifest.display()) };
+        let language = plugin.language.clone().unwrap_or_else(|| missing("language"));
+        let capabilities = &plugin.capabilities;
+        let mut check = Self::new(language, plugin_binary, fixture);
+        check.plugin_version = plugin.plugin_version.clone().unwrap_or_else(|| missing("plugin_version"));
+        check.extensions = plugin
+            .languages
+            .clone()
+            .and_then(|languages| languages.extensions)
+            .unwrap_or_else(|| missing("[plugin.languages] extensions"));
+        check.exclude_dirs = plugin.workspace.exclude_dirs.clone();
+        check.entry_points = plugin.workspace.entry_points.clone();
+        check.watch_files = plugin.workspace.watch_files.clone();
+        check.semantic_pass = capabilities.semantic_pass.unwrap_or_default();
+        check.files_created = capabilities.files_created.unwrap_or_default();
+        if let Some(word) = &capabilities.receiver_calls {
+            check.receiver_calls = word.clone();
+        }
+        if let Some(word) = &capabilities.receiver_calls_structural {
+            check.receiver_calls_structural = word.clone();
+        }
+        check.semantic = plugin.semantic;
+        check
     }
 
     /// The extensions the manifest claims - lowercase and dot-prefixed.
@@ -198,8 +248,28 @@ impl PluginCheck {
     /// `receiver_calls_structural`, as the manifest spells them
     /// (`"resolved"` / `"unresolved"`).
     pub fn receiver_calls(mut self, best_tier: &'static str, structural: &'static str) -> Self {
-        self.receiver_calls = best_tier;
-        self.receiver_calls_structural = structural;
+        self.receiver_calls = best_tier.to_string();
+        self.receiver_calls_structural = structural.to_string();
+        self
+    }
+
+    /// `[plugin.semantic] command`, keeping the rest of the table
+    /// [`PluginCheck::from_manifest`] read; with no table, one holding only
+    /// `command`.
+    pub fn semantic_command(mut self, command: impl AsRef<Path>) -> Self {
+        let command = toml::Value::String(command.as_ref().to_string_lossy().into_owned());
+        let mut table = match self.semantic.take() {
+            Some(toml::Value::Table(table)) => table,
+            _ => toml::map::Map::new(),
+        };
+        table.insert("command".to_string(), command);
+        self.semantic = Some(toml::Value::Table(table));
+        self
+    }
+
+    /// Writes no `[plugin.semantic]`, for a run with no semantic tier.
+    pub fn without_semantic_section(mut self) -> Self {
+        self.semantic = None;
         self
     }
 
@@ -222,21 +292,15 @@ impl PluginCheck {
         self
     }
 
-    /// TOML appended verbatim to the generated manifest.
-    ///
-    /// The generated manifest carries the keys core's `read_manifest`
-    /// validates and nothing else, which was enough while no SDK plugin had a
-    /// semantic tier of its own. A plugin whose engine is configured *by that
-    /// manifest* - anything on `g_mesh_plugin_sdk_lsp::LspBridge`, whose
-    /// `SemanticConfig::from_manifest` reads `[plugin.semantic]` out of the
-    /// same file - cannot be checked without it: the run would write a
-    /// manifest promising `semantic_pass = true` and then hand the plugin no
-    /// server to run.
+    /// TOML appended verbatim to the generated manifest, for tables the
+    /// generated manifest does not write (`[plugin.non_symbol_queries]` and
+    /// the other query tables). `[plugin.semantic]` is written from
+    /// [`PluginCheck::from_manifest`] or [`PluginCheck::semantic_command`],
+    /// so a second one here is a duplicate table.
     ///
     /// It is appended, so it may only *add* sections: everything above it is
-    /// already written. That is deliberate - a helper that let a test rewrite
-    /// `language` or `command` would be a helper for checking something other
-    /// than the plugin.
+    /// already written, and a test cannot rewrite `language` or `command`
+    /// through it.
     pub fn manifest_extra(mut self, toml: impl Into<String>) -> Self {
         self.manifest_extra = Some(toml.into());
         self
@@ -313,10 +377,19 @@ impl PluginCheck {
             let items: Vec<String> = values.iter().map(|value| format!("{value:?}")).collect();
             format!("[{}]", items.join(", "))
         };
-        let extra = match &self.manifest_extra {
-            Some(extra) => format!("\n{}\n", extra.trim_end()),
-            None => String::new(),
-        };
+        let mut extra = String::new();
+        if let Some(semantic) = &self.semantic {
+            let mut plugin = toml::map::Map::new();
+            plugin.insert("semantic".to_string(), semantic.clone());
+            let mut root = toml::map::Map::new();
+            root.insert("plugin".to_string(), toml::Value::Table(plugin));
+            let section =
+                toml::to_string(&toml::Value::Table(root)).expect("a [plugin.semantic] table serializes");
+            extra.push_str(&format!("\n{}\n", section.trim_end()));
+        }
+        if let Some(manifest_extra) = &self.manifest_extra {
+            extra.push_str(&format!("\n{}\n", manifest_extra.trim_end()));
+        }
         format!(
             "# Written by g_mesh_plugin_sdk::testing::PluginCheck for one conformance run.\n\
              [plugin]\n\

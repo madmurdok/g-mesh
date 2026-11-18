@@ -728,6 +728,7 @@ dependencies = [
  "clap",
  "dirs",
  "flate2",
+ "g-mesh-manifest",
  "g-mesh-walk",
  "g-mesh-wire",
  "globset",
@@ -756,10 +757,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "g-mesh-manifest"
+version = "4.33.0"
+dependencies = [
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "g-mesh-plugin-python"
 version = "4.33.0"
 dependencies = [
  "anyhow",
+ "g-mesh-manifest",
  "g-mesh-plugin-sdk",
  "g-mesh-plugin-sdk-lsp",
  "g-mesh-wire",
@@ -776,6 +786,7 @@ name = "g-mesh-plugin-rust"
 version = "4.33.0"
 dependencies = [
  "anyhow",
+ "g-mesh-manifest",
  "g-mesh-plugin-sdk",
  "g-mesh-plugin-sdk-lsp",
  "g-mesh-wire",
@@ -793,6 +804,7 @@ name = "g-mesh-plugin-sdk"
 version = "4.33.0"
 dependencies = [
  "anyhow",
+ "g-mesh-manifest",
  "g-mesh-walk",
  "g-mesh-wire",
  "serde",
@@ -807,6 +819,7 @@ name = "g-mesh-plugin-sdk-lsp"
 version = "4.33.0"
 dependencies = [
  "anyhow",
+ "g-mesh-manifest",
  "g-mesh-plugin-sdk",
  "g-mesh-wire",
  "serde",
@@ -820,6 +833,7 @@ name = "g-mesh-plugin-typescript"
 version = "4.33.0"
 dependencies = [
  "anyhow",
+ "g-mesh-manifest",
  "g-mesh-plugin-sdk",
  "g-mesh-plugin-sdk-lsp",
  "g-mesh-wire",

@@ -25,6 +25,7 @@ path = "fake-lsp/main.rs"
 
 [dependencies]
 anyhow = "1"
+g-mesh-manifest = { path = "../../manifest" }
 g-mesh-plugin-sdk = { path = "../sdk" }
 g-mesh-wire = { path = "../../wire" }
 serde = { version = "1", features = ["derive"] }

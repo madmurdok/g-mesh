@@ -46,6 +46,8 @@ g-mesh-wire = { path = "../../wire" }
 # guard, shared with core so the two agree on which files exist and under
 # which spelling. Its only dependency is `ignore`.
 g-mesh-walk = { path = "../../walk" }
+# The `plugin.toml` schema, shared with core and the LSP bridge.
+g-mesh-manifest = { path = "../../manifest" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Node and edge ids are sha256 prefixes, and the scheme is a cross-plugin
@@ -53,9 +55,7 @@ serde_json = "1"
 # `crypto`, the Go plugin with `crypto/sha256`, this crate with `sha2`. Core
 # already depends on it too.
 sha2 = "0.10"
-# `plugin.toml`, read back by the plugin itself for the walk's `exclude_dirs`
-# and the extensions it claims - see `manifest`' module doc for why the
-# plugin re-reads the file core also reads rather than being told.
+# `testing::PluginCheck` writes `[plugin.semantic]` back out as TOML.
 toml = "0.8"
 
 [dev-dependencies]

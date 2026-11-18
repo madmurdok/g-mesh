@@ -21,8 +21,9 @@
 #
 # Invariants:
 # - A path no rule names selects `full`: an unknown path is never skipped.
-# - A change to anything every crate builds on (wire, the SDK, cargo and
-#   nextest config, CI and this selection machinery) selects `full`.
+# - A change to anything every crate builds on (wire, the manifest schema,
+#   the SDK, cargo and nextest config, CI and this selection machinery)
+#   selects `full`.
 # - A change under `core/` selects every core section; one under
 #   `core/tests/log_line/` (which the SDK's tests include) adds `sdk`. With
 #   `--narrow` only: `core/src/cli/` or `core/src/mcp/` selects that module's
@@ -164,7 +165,7 @@ add() {
 # One path, first matching row wins. Sets `full` or adds sections.
 classify() {
 	case "$1" in
-	wire/* | plugins/sdk/*) full=1 ;;
+	wire/* | manifest/* | plugins/sdk/*) full=1 ;;
 	Cargo.toml | Cargo.lock | .cargo/* | .config/nextest.toml | rust-toolchain*) full=1 ;;
 	.github/workflows/* | scripts/test-sections.sh | scripts/test-sections-check.py | scripts/test-select.sh) full=1 ;;
 	scripts/test-plugin-spawns.txt) full=1 ;;

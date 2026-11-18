@@ -6,7 +6,6 @@
 use g_mesh_plugin_sdk::{run, PluginSpec};
 
 use g_mesh_plugin_rust::extractor::RustExtractor;
-use g_mesh_plugin_rust::project;
 
 fn main() -> ! {
     // The sandbox trampoline must run before anything starts a thread.
@@ -16,7 +15,7 @@ fn main() -> ! {
     }
     run(
         RustExtractor,
-        PluginSpec::new("rust", env!("CARGO_PKG_VERSION"), &[".rs"]).exclude_dirs(&project::EXCLUDE_DIRS),
+        PluginSpec::from_manifest_str(include_str!("../plugin.toml")),
         // The rust-analyzer tier (GM-290). A *factory*, not an engine: the SDK
         // calls this on the first `semanticPass` (or the `prepareSemanticPass`
         // core sends when one is owed) and never before, which is

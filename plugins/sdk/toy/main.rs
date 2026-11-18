@@ -64,7 +64,7 @@ const SEMANTIC_ENGINE: &str = "toy-resolver";
 fn main() -> ! {
     run(
         ToyExtractor,
-        PluginSpec::new(LANGUAGE, env!("CARGO_PKG_VERSION"), &[".toy"]).exclude_dirs(&["vendor"]),
+        PluginSpec::from_manifest_str(include_str!("plugin.toml")),
         // A factory, not an engine: the SDK calls it on the first
         // `semanticPass` and never before, which is what
         // `capabilities.semantic-engine-lazy` checks. Nothing is constructed
