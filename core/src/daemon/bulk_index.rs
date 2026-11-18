@@ -17,17 +17,18 @@ use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::daemon::indexing_status::IndexingStatus;
-use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::{path_case, plugin};
-use crate::languages::{self, LanguageOutcome};
+use crate::indexing_status::IndexingStatus;
+use crate::ingest::convert::{to_edge_record, to_node_record, PathWarnings};
+use crate::ingest::staleness;
+use crate::languages;
+use crate::model::Diff;
+use crate::plugin_manifest::{DiscoveredPlugins, PluginManifest};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
+use crate::storage::language_outcome::{self, LanguageOutcome};
 use crate::storage::schema;
-use crate::storage::write::Diff;
-use crate::watcher::apply::{to_edge_record, to_node_record, PathWarnings};
-use crate::watcher::staleness;
 
 /// Puts the plugin in one-shot bulk-index mode; must stay in sync with
 /// `BULK_INDEX_FLAG` in plugins/sdk/src/run.rs.
@@ -40,13 +41,13 @@ pub(crate) const BULK_INDEX_FLAG: &str = "--bulk-index";
 /// before walking". Must stay in sync with the plugins' own copies
 /// (`plugins/sdk/src/run.rs`, `plugins/go/main.go`) - see
 /// `docs/architecture/plugin-lifetime.md` §2.
-pub(crate) const BULK_STDIN_LIFELINE_ENV: &str = "G_MESH_BULK_STDIN_LIFELINE";
+pub(crate) const BULK_STDIN_LIFELINE_ENV: &str = crate::knobs::BULK_STDIN_LIFELINE.name;
 
 /// Nodes plus edges accumulated before a batch is committed: bounds both the
 /// memory held before a write and the number of transactions.
 const BATCH_ITEMS: usize = 2_000;
 
-/// `NodeKind::File`'s storage spelling (`watcher::apply::to_node_record`).
+/// `NodeKind::File`'s storage spelling (`ingest::convert::to_node_record`).
 const FILE_NODE_KIND: &str = "File";
 
 /// Test-only: holds a finished walk open for this many milliseconds before
@@ -56,19 +57,19 @@ const FILE_NODE_KIND: &str = "File";
 /// Applied *after* everything is committed: a test can wait for the row it is
 /// about to ask for and only then ask, so a "still indexing" answer proves the
 /// indexing flag gates the response rather than an empty table.
-pub const WALK_DELAY_ENV: &str = "G_MESH_BULK_INDEX_DELAY_MS";
+pub const WALK_DELAY_ENV: &str = crate::knobs::BULK_INDEX_DELAY_MS.name;
 
 /// Test-only: set to any non-empty value to switch off the count of files
 /// belonging to absent plugins ([`languages::count_absent_files`]), so a
 /// measurement can compare the walk with and without it. With it set, no
 /// language gets a `PluginAbsent` outcome. Real installs never set it.
-pub const ABSENT_COUNT_OFF_ENV: &str = "G_MESH_BULK_INDEX_NO_ABSENT_COUNT";
+pub const ABSENT_COUNT_OFF_ENV: &str = crate::knobs::BULK_INDEX_NO_ABSENT_COUNT.name;
 
 /// Test-only: path whose *deletion* releases the finished walk, so completion
 /// is an event the test causes rather than a duration (unlike
 /// [`WALK_DELAY_ENV`]). [`HOLD_LOCK_FILE_ENV`] is the sibling knob that holds
 /// the batch-commit lock itself open.
-pub const WALK_HOLD_FILE_ENV: &str = "G_MESH_BULK_INDEX_HOLD_FILE";
+pub const WALK_HOLD_FILE_ENV: &str = crate::knobs::BULK_INDEX_HOLD_FILE.name;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BulkIndexSummary {
@@ -79,11 +80,11 @@ pub struct BulkIndexSummary {
     /// one symbol, not the project's whole index.
     pub skipped_lines: usize,
     /// `IMPORTS` edges the post-walk linking pass repointed from a module
-    /// placeholder onto the real file it names (`graph::imports`).
+    /// placeholder onto the real file it names (`link::imports`).
     pub linked_imports: usize,
     /// `CALLS`/`REFERENCES`/`SUPERTYPE_OF` edges the post-walk linking pass
     /// repointed from a pending-symbol placeholder onto the symbol another
-    /// file exports (`graph::symbol_links`).
+    /// file exports (`link::symbol_links`).
     pub linked_symbols: usize,
     /// What the walk did for each discovered language, keyed by language.
     /// The counts above cover only the languages that ended `Indexed`.
@@ -121,7 +122,7 @@ impl<'a> WalkContext<'a> {
 /// edges are foreign keys onto nodes: a plugin emits a file's nodes before
 /// that same file's edges, and never an edge between files (see the
 /// dangling-edge guard in extract.ts). Every cross-file edge appears only
-/// afterwards, when `graph::imports` and `graph::symbol_links` link the walk's
+/// afterwards, when `link::imports` and `link::symbol_links` link the walk's
 /// placeholders - once, project-wide, after every language's stream is over,
 /// because only then does every node that will exist, exist.
 pub fn run(
@@ -178,7 +179,7 @@ pub fn run_with_progress(
                 })?;
                 (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines) = counts_before;
                 ctx.walked_files = walked_before;
-                failed.insert(manifest.language.clone(), languages::failed_error(&err));
+                failed.insert(manifest.language.clone(), language_outcome::failed_error(&err));
             }
             if let Some(progress) = progress {
                 progress.mark_language_done();
@@ -200,7 +201,7 @@ pub fn run_with_progress(
     let WalkContext { mut summary, walked_files, .. } = ctx;
     let walked_files = walked_files.unwrap_or_default();
 
-    let file_counts = conn.with(file_counts_by_language)?;
+    let file_counts = conn.with(crate::graph::files::file_counts_by_language)?;
     summary.outcomes = discovered
         .manifests
         .values()
@@ -232,7 +233,7 @@ pub fn run_with_progress(
         let mut message = String::from("every discovered language failed to index:");
         for (language, outcome) in &summary.outcomes {
             if let LanguageOutcome::Failed { error } = outcome {
-                message.push_str(&format!("\n  {language}: {}", languages::error_on_one_line(error)));
+                message.push_str(&format!("\n  {language}: {}", language_outcome::error_on_one_line(error)));
             }
         }
         bail!(message);
@@ -283,17 +284,7 @@ pub fn run_with_progress(
 /// records as owed to a deleted file's importers name files purged here too,
 /// so the language's owed re-extracts are cleared with its resolution facts.
 fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
-    let paths: Vec<String> = conn.with(|conn| -> Result<Vec<String>> {
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT filePath FROM nodes WHERE language = ?1 AND filePath <> '' ORDER BY filePath")
-            .context("failed to prepare the language's file query")?;
-        let rows = stmt
-            .query_map([language], |row| row.get(0))
-            .context("failed to query the language's files")?
-            .collect::<rusqlite::Result<_>>()
-            .context("failed to read the language's files")?;
-        Ok(rows)
-    })?;
+    let paths: Vec<String> = conn.with(|conn| crate::graph::files::file_paths_of_language(conn, language))?;
     conn.unit(Unit::BulkWalk, |store| {
         for path in &paths {
             let mut diff = Diff::default();
@@ -304,19 +295,6 @@ fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
             schema::set_resolution_facts(conn, language, None, &[])
         })
     })
-}
-
-/// Each language's `File`-node count.
-fn file_counts_by_language(conn: &rusqlite::Connection) -> Result<BTreeMap<String, usize>> {
-    let mut stmt = conn
-        .prepare("SELECT language, COUNT(*) FROM nodes WHERE kind = ?1 GROUP BY language")
-        .context("failed to prepare the per-language file count")?;
-    let rows = stmt
-        .query_map([FILE_NODE_KIND], |row| {
-            Ok((row.get::<_, String>(0)?, usize::try_from(row.get::<_, i64>(1)?).unwrap_or(0)))
-        })
-        .context("failed to count each language's files")?;
-    rows.collect::<rusqlite::Result<_>>().context("failed to read each language's file count")
 }
 
 /// Spawns `manifest`'s plugin in its one-shot `--bulk-index` mode for
@@ -426,7 +404,7 @@ fn walk_one_language_in(
 
 /// Whether [`ABSENT_COUNT_OFF_ENV`] is set to a non-empty value.
 fn absent_count_switched_off() -> bool {
-    std::env::var_os(ABSENT_COUNT_OFF_ENV).is_some_and(|value| !value.is_empty())
+    crate::knobs::flag(&crate::knobs::BULK_INDEX_NO_ABSENT_COUNT)
 }
 
 /// Honors [`WALK_HOLD_FILE_ENV`] and [`WALK_DELAY_ENV`]. A no-op unless one is
@@ -434,10 +412,10 @@ fn absent_count_switched_off() -> bool {
 fn hold_the_walk_open_for_tests() {
     // The file gate wins: a test that uses it wants the release to be its own
     // action, not blurred by a delay on top.
-    if let Some(path) = std::env::var_os(WALK_HOLD_FILE_ENV).filter(|p| !p.is_empty()) {
+    if let Some(path) = crate::knobs::os_non_empty(&crate::knobs::BULK_INDEX_HOLD_FILE) {
         let path = std::path::PathBuf::from(path);
-        crate::log_line!(
-            "g-mesh daemon: holding the finished bulk walk until {} is removed ({WALK_HOLD_FILE_ENV})",
+        crate::log_role!(
+            "holding the finished bulk walk until {} is removed ({WALK_HOLD_FILE_ENV})",
             path.display()
         );
         // Polled, and bounded so a test that forgets to release it fails as a
@@ -449,10 +427,10 @@ fn hold_the_walk_open_for_tests() {
         return;
     }
 
-    let Some(millis) = std::env::var(WALK_DELAY_ENV).ok().and_then(|v| v.trim().parse().ok()) else {
+    let Some(millis) = crate::knobs::parsed::<u64>(&crate::knobs::BULK_INDEX_DELAY_MS) else {
         return;
     };
-    crate::log_line!("g-mesh daemon: holding the finished bulk walk open for {millis}ms ({WALK_DELAY_ENV})");
+    crate::log_role!("holding the finished bulk walk open for {millis}ms ({WALK_DELAY_ENV})");
     std::thread::sleep(std::time::Duration::from_millis(millis));
 }
 
@@ -509,7 +487,7 @@ fn ingest_in<R: BufRead>(
                 if err.downcast_ref::<std::io::Error>().is_some() {
                     return Err(err).context("failed to read the plugin's bulk-index stream");
                 }
-                crate::log_line!("g-mesh daemon: skipping malformed bulk-index line: {err:#}");
+                crate::log_role!("skipping malformed bulk-index line: {err:#}");
                 ctx.summary.skipped_lines += 1;
                 continue;
             }
@@ -705,7 +683,7 @@ mod tests {
     /// Discovering two languages must spawn
     /// *both* plugins' one-shot `--bulk-index` mode and add their
     /// contributions together into one summary, not just walk the first (or
-    /// only) one found. Each fake plugin (`daemon::test_plugin`) emits a
+    /// only) one found. Each fake plugin (`test_plugin`) emits a
     /// fixed two nodes and one edge in bulk-index mode, so two languages
     /// summing to four nodes and two edges is only possible if both were
     /// actually spawned and both streams actually landed in the same index.
@@ -713,9 +691,9 @@ mod tests {
     fn discovering_two_languages_walks_both_and_sums_their_contributions() {
         let project = tempfile::tempdir().unwrap();
         let plugins = tempfile::tempdir().unwrap();
-        crate::daemon::test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
-        crate::daemon::test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
-        let discovered = crate::daemon::manifest::discover(&[plugins.path().to_path_buf()])
+        crate::test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
+        crate::test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
+        let discovered = crate::plugin_manifest::discover(&[plugins.path().to_path_buf()])
             .expect("the fixture plugins must discover cleanly");
         assert_eq!(discovered.manifests.len(), 2, "both fixture languages must have been discovered");
 
@@ -737,8 +715,8 @@ mod tests {
     fn a_single_discovered_language_is_walked_same_as_before_the_registry_took_over() {
         let project = tempfile::tempdir().unwrap();
         let plugins = tempfile::tempdir().unwrap();
-        crate::daemon::test_plugin::install(plugins.path(), "solo", &[".solo-src"]);
-        let discovered = crate::daemon::manifest::discover(&[plugins.path().to_path_buf()])
+        crate::test_plugin::install(plugins.path(), "solo", &[".solo-src"]);
+        let discovered = crate::plugin_manifest::discover(&[plugins.path().to_path_buf()])
             .expect("the fixture plugin must discover cleanly");
 
         let conn = setup_conn();
@@ -771,8 +749,8 @@ mod tests {
     // itself, and the walk fails only when every discovered one failed.
     // -----------------------------------------------------------------
 
-    use crate::daemon::test_plugin;
-    use crate::languages::LanguageOutcome;
+    use crate::storage::language_outcome::LanguageOutcome;
+    use crate::test_plugin;
 
     /// One NDJSON node line in the fake plugins' wire shape.
     fn node_of(id: &str, kind: &str, file_path: &str, language: &str) -> String {
@@ -837,8 +815,7 @@ mod tests {
     }
 
     fn discover_root(plugins: &Path) -> DiscoveredPlugins {
-        crate::daemon::manifest::discover(&[plugins.to_path_buf()])
-            .expect("the fixture plugins must discover")
+        crate::plugin_manifest::discover(&[plugins.to_path_buf()]).expect("the fixture plugins must discover")
     }
 
     /// The acceptance criterion's core: with one of two plugins' binaries
@@ -1123,7 +1100,7 @@ mod tests {
     /// (the row `src/a.beta-src`'s delete owes `src/b.beta-src` stays).
     #[test]
     fn purging_a_language_leaves_none_of_its_owed_re_extracts() {
-        use crate::storage::write::{EdgeRecord, NodeRecord};
+        use crate::model::{EdgeRecord, NodeRecord};
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         schema::apply(&conn).unwrap();

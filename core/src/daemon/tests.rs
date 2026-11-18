@@ -30,7 +30,21 @@ fn writing_a_pid_file_leaves_no_temporary_behind() {
     assert!(leftovers.is_empty(), "the temporary must be renamed, not left: {leftovers:?}");
 }
 use super::*;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::mpsc;
+
+use super::watch_loop::{
+    watch_and_route_once, Rescans, WatcherClock, DEBOUNCE_WINDOW, WATCHER_QUIET_HINT_AFTER,
+};
+use crate::paths::state_dir::{project_dir, DAEMON_LOCK_FILE, DAEMON_SERVING_FILE};
 use crate::storage::index_store::IndexStore;
+use crate::storage::schema;
+use crate::test_plugin;
+use crate::watcher::debounce::Debouncer;
+use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
+use crate::watcher::rescan::RescanScheduler;
+use crate::watcher::ProjectWatcher;
 
 /// Forces the exact shape of task 165's race deterministically, instead
 /// of relying on a real `kill -9`'s unpredictable teardown delay the way
@@ -65,8 +79,8 @@ fn a_lock_released_shortly_after_the_first_attempt_is_still_acquired() {
     // this cannot flake the other way - `acquire_singleton_lock` winning
     // a lock nobody was contending yet.
     ready_rx.recv().unwrap();
-    let acquired =
-        acquire_singleton_lock(dir.path()).expect("acquire_singleton_lock must not error on contention");
+    let acquired = acquire_singleton_lock(&StateDir::at(dir.path()))
+        .expect("acquire_singleton_lock must not error on contention");
     releaser.join().unwrap();
 
     assert!(
@@ -87,8 +101,8 @@ fn a_lock_held_past_the_retry_budget_is_not_acquired() {
     let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
     holder.lock().expect("failed to take the stand-in lock");
 
-    let acquired =
-        acquire_singleton_lock(dir.path()).expect("acquire_singleton_lock must not error on contention");
+    let acquired = acquire_singleton_lock(&StateDir::at(dir.path()))
+        .expect("acquire_singleton_lock must not error on contention");
 
     assert!(
         acquired.is_none(),
@@ -104,7 +118,7 @@ fn a_lock_held_past_the_retry_budget_is_not_acquired() {
 /// exactly as another process's would - the same property task 165's
 /// tests above already rely on.
 fn held_lock(dir: &Path) -> File {
-    acquire_singleton_lock(dir)
+    acquire_singleton_lock(&StateDir::at(dir))
         .expect("taking the lock must not error")
         .expect("nothing else holds this fixture's lock")
 }
@@ -134,15 +148,21 @@ fn eventually<T>(mut probe: impl FnMut() -> T, done: impl Fn(&T) -> bool) -> T {
 #[test]
 fn an_unheld_lock_reads_as_free() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(inspect_daemon_lock_in(dir.path(), false).unwrap(), DaemonLock::Free);
+    assert_eq!(
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
+        DaemonLock::Free
+    );
 
     // Including once a daemon has held it and let it go - the pid it
     // recorded while serving must not outlive the lock itself, or a
     // recycled pid would read as a wedged incumbent.
     let lock = held_lock(dir.path());
-    record_serving_owner(dir.path());
+    StateDir::at(dir.path()).record_serving_owner(std::process::id());
     drop(lock);
-    let state = eventually(|| inspect_daemon_lock_in(dir.path(), false).unwrap(), |s| *s == DaemonLock::Free);
+    let state = eventually(
+        || crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
+        |s| *s == DaemonLock::Free,
+    );
     assert_eq!(state, DaemonLock::Free, "a released lock is free however recently its holder was serving");
 }
 
@@ -156,7 +176,7 @@ fn a_lock_held_by_a_daemon_that_has_not_begun_serving_reads_as_starting() {
     let _lock = held_lock(dir.path());
 
     assert_eq!(
-        inspect_daemon_lock_in(dir.path(), false).unwrap(),
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
         DaemonLock::Starting,
         "a holder that never published itself as serving is starting up, not wedged"
     );
@@ -169,10 +189,10 @@ fn a_lock_held_by_a_daemon_that_has_not_begun_serving_reads_as_starting() {
 fn a_live_holder_that_served_and_stopped_listening_reads_as_wedged() {
     let dir = tempfile::tempdir().unwrap();
     let _lock = held_lock(dir.path());
-    record_serving_owner(dir.path());
+    StateDir::at(dir.path()).record_serving_owner(std::process::id());
 
     assert_eq!(
-        inspect_daemon_lock_in(dir.path(), false).unwrap(),
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
         DaemonLock::Wedged { pid: std::process::id() },
         "a live holder that was serving and answers nothing is the wedge, and it must be \
          named by pid so `stop` and the shim can act on it"
@@ -186,10 +206,10 @@ fn a_live_holder_that_served_and_stopped_listening_reads_as_wedged() {
 fn a_holder_that_is_still_answering_is_never_wedged() {
     let dir = tempfile::tempdir().unwrap();
     let _lock = held_lock(dir.path());
-    record_serving_owner(dir.path());
+    StateDir::at(dir.path()).record_serving_owner(std::process::id());
 
     assert_eq!(
-        inspect_daemon_lock_in(dir.path(), true).unwrap(),
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), true).unwrap(),
         DaemonLock::Serving,
         "a daemon answering on its socket must never be a candidate for eviction"
     );
@@ -202,13 +222,16 @@ fn a_holder_that_is_still_answering_is_never_wedged() {
 fn a_new_holder_does_not_inherit_its_predecessors_claim_to_be_serving() {
     let dir = tempfile::tempdir().unwrap();
     let first = held_lock(dir.path());
-    record_serving_owner(dir.path());
-    assert_eq!(serving_owner_in(dir.path()), Some(std::process::id()));
+    StateDir::at(dir.path()).record_serving_owner(std::process::id());
+    assert_eq!(StateDir::at(dir.path()).serving_owner(), Some(std::process::id()));
     drop(first);
 
     let _second = held_lock(dir.path());
-    assert_eq!(serving_owner_in(dir.path()), None, "taking the lock clears the record");
-    assert_eq!(inspect_daemon_lock_in(dir.path(), false).unwrap(), DaemonLock::Starting);
+    assert_eq!(StateDir::at(dir.path()).serving_owner(), None, "taking the lock clears the record");
+    assert_eq!(
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
+        DaemonLock::Starting
+    );
 }
 
 /// A lock file from a build that predates the record reads as `Starting` -
@@ -224,8 +247,11 @@ fn a_lock_file_with_no_record_in_it_is_never_treated_as_wedged() {
     let holder = File::options().create(true).write(true).truncate(false).open(&path).unwrap();
     holder.lock().unwrap();
 
-    assert_eq!(serving_owner_in(dir.path()), None);
-    assert_eq!(inspect_daemon_lock_in(dir.path(), false).unwrap(), DaemonLock::Starting);
+    assert_eq!(StateDir::at(dir.path()).serving_owner(), None);
+    assert_eq!(
+        crate::control::lock::inspect_daemon_lock_in(&StateDir::at(dir.path()), false).unwrap(),
+        DaemonLock::Starting
+    );
 }
 
 /// The record is what decides whether a live process gets signalled, so a
@@ -241,14 +267,14 @@ fn a_record_without_its_terminating_newline_is_not_a_record() {
     for partial in ["", "1", "12", "1234"] {
         fs::write(&path, partial).unwrap();
         assert_eq!(
-            serving_owner_in(dir.path()),
+            StateDir::at(dir.path()).serving_owner(),
             None,
             "{partial:?} is not a finished record and must not name anything to signal"
         );
     }
 
     fs::write(&path, "1234\n").unwrap();
-    assert_eq!(serving_owner_in(dir.path()), Some(1234));
+    assert_eq!(StateDir::at(dir.path()).serving_owner(), Some(1234));
 }
 
 /// A registry over `languages`, each installed as a fake plugin
@@ -280,8 +306,8 @@ fn registry_with(
 
     let dirs = install(plugins.path());
 
-    let discovered =
-        manifest::discover(&[plugins.path().to_path_buf()]).expect("the fixtures must discover cleanly");
+    let discovered = crate::plugin_manifest::discover(&[plugins.path().to_path_buf()])
+        .expect("the fixtures must discover cleanly");
     let root = project.path().canonicalize().expect("failed to canonicalize the fixture project root");
     let state_dir =
         project_dir(project.path()).expect("failed to resolve the fixture project's state directory");
@@ -908,30 +934,70 @@ fn exited_pid() -> u32 {
 /// A rebuild marker counts only while the pid it names is alive and the
 /// daemon lock is held; a missing or unreadable marker is no rebuild.
 ///
-/// Control: drop the `is_process_alive`/`daemon_lock_is_held` check in
+/// Control: drop the `is_alive`/`daemon_lock_held` check in
 /// `rebuild_in_progress_in`: the marker reads as a rebuild after its lock is
 /// released.
 #[test]
 fn a_rebuild_marker_counts_only_while_its_pid_lives_and_the_daemon_lock_is_held() {
     let dir = tempfile::tempdir().unwrap();
-    let marker = rebuild_marker_path_in(dir.path());
-    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "no marker");
+    let marker = StateDir::at(dir.path()).rebuild_marker_file();
+    assert_eq!(rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), None, "no marker");
 
-    write_rebuild_marker(&marker, "init").unwrap();
+    StateDir::at(dir.path()).write_rebuild_marker("init").unwrap();
     let lock = held_lock(dir.path());
-    let rebuild = rebuild_in_progress_in(dir.path()).unwrap().expect("a live marker under a held lock");
+    let rebuild =
+        rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap().expect("a live marker under a held lock");
     assert_eq!((rebuild.pid, rebuild.command.as_str()), (std::process::id(), "init"));
 
     drop(lock);
-    let rebuild = eventually(|| rebuild_in_progress_in(dir.path()).unwrap(), |r| r.is_none());
+    let rebuild = eventually(|| rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), |r| r.is_none());
     assert_eq!(rebuild, None, "the lock was released");
 
     let _lock = held_lock(dir.path());
     std::fs::write(&marker, format!("{}\n0\nreindex\n", exited_pid())).unwrap();
-    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "the pid is dead");
+    assert_eq!(rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), None, "the pid is dead");
 
     std::fs::write(&marker, "not a pid\n").unwrap();
-    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "an unreadable marker");
+    assert_eq!(rebuild_in_progress_in(&StateDir::at(dir.path())).unwrap(), None, "an unreadable marker");
+}
+
+/// A live marker under a daemon lock that cannot be opened is no rebuild:
+/// the lock reads as free, so the shim may bootstrap.
+///
+/// Control: probe with `OnUnreadable::Held` in `rebuild_in_progress_in`: the
+/// marker reads as a rebuild.
+#[cfg(unix)]
+#[test]
+fn a_live_rebuild_marker_under_an_unopenable_daemon_lock_is_no_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = StateDir::at(dir.path());
+    state_dir.write_rebuild_marker("reindex").unwrap();
+    if !crate::paths::state_dir::make_daemon_lock_unopenable(&state_dir) {
+        return;
+    }
+    assert_eq!(rebuild_in_progress_in(&state_dir).unwrap(), None);
+}
+
+/// A state directory reports the plugin pid files, suspension markers,
+/// progress snapshot, phase and serving owner its files hold.
+#[test]
+fn a_state_dir_reports_what_its_files_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let sd = StateDir::at(dir.path());
+    std::fs::write(sd.plugin_pid_file("rust"), "1\n").unwrap();
+    std::fs::write(sd.plugin_suspended_marker("go"), "crashed\n").unwrap();
+    assert_eq!(sd.plugin_pid_files().len(), 1);
+    assert_eq!(sd.suspended_markers(), vec![("go".to_string(), "crashed".to_string())]);
+
+    let snapshot = indexing_status::ProgressSnapshot { pid: 7, phase: "walk".into(), ..Default::default() };
+    std::fs::write(sd.progress_file(), serde_json::to_string(&snapshot).unwrap()).unwrap();
+    assert_eq!(indexing_status::read_progress(&sd), Some(snapshot));
+
+    std::fs::write(sd.phase_file(), "walk\n").unwrap();
+    assert_eq!(sd.read_phase().as_deref(), Some("walk"));
+
+    sd.record_serving_owner(4321);
+    assert_eq!(sd.serving_owner(), Some(4321));
 }
 
 // --- GM-616: a Rescan reconciles the subtree whose events the OS dropped ---
@@ -973,7 +1039,7 @@ fn indexed_file(root: &Path, conn: &IndexStore, file_path: &str) {
     let path = root.join(file_path);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "v0").unwrap();
-    let mtime = crate::watcher::staleness::mtime_millis(&fs::metadata(&path).unwrap()).unwrap();
+    let mtime = crate::fsutil::mtime_millis(&fs::metadata(&path).unwrap()).unwrap();
     conn.with(|c| crate::storage::write::upsert_indexed_file(c, file_path, mtime, "indexed")).unwrap();
 }
 
@@ -991,7 +1057,7 @@ fn edit(root: &Path, file_path: &str) {
 }
 
 fn is_stale(conn: &IndexStore, root: &Path, file_path: &str) -> bool {
-    conn.with(|c| crate::watcher::staleness::is_stale(c, root, file_path)).unwrap()
+    conn.with(|c| crate::ingest::staleness::is_stale(c, root, file_path)).unwrap()
 }
 
 /// Runs `watch_and_route_once` until `done` holds after an iteration, or
@@ -1085,7 +1151,7 @@ fn a_deletion_and_a_creation_whose_events_were_dropped_are_reconciled_by_a_resca
     );
     assert!(!requested(plugin_dir, "kept.python-src"), "an untouched file is not reparsed");
     let baseline = |file_path: &str| {
-        conn.with(|c| crate::watcher::staleness::has_indexed_baseline(c, file_path)).unwrap()
+        conn.with(|c| crate::ingest::staleness::has_indexed_baseline(c, file_path)).unwrap()
     };
     assert!(!baseline("gone.python-src"), "the deleted file is retired from the index");
     assert!(baseline("new.python-src"), "the created file is indexed");
@@ -1238,4 +1304,134 @@ fn a_gitignore_written_in_the_watermark_second_is_rechecked_by_a_rescan() {
 
     assert!(rechecked, "a .gitignore from the watermark's own second must reach gitignore_changed");
     assert!(!file_node("generated/x.python-src"), "the newly ignored file has left the index");
+}
+
+// --- GM-725: the watcher clock behind a by-name answer's quiet note ---
+
+/// A fresh clock reports no quiet, however late it is asked: no consumer
+/// listens yet.
+#[test]
+fn a_clock_no_consumer_started_reports_no_quiet() {
+    let clock = WatcherClock::new();
+    let late = std::time::Instant::now() + Duration::from_secs(3600);
+    assert_eq!(clock.quiet_for_at(late), None);
+    assert_eq!(clock.quiet_worth_saying_at(late), None);
+}
+
+/// After an event the quiet grows one for one with time, and is worth
+/// saying from exactly `WATCHER_QUIET_HINT_AFTER` on, not before.
+///
+/// Control: in `quiet_worth_saying_at`, compare with `>` instead of `>=` -
+/// the quiet at exactly the threshold is dropped and the boundary assertion
+/// fails.
+#[test]
+fn the_quiet_grows_with_time_and_is_worth_saying_from_the_threshold() {
+    let clock = WatcherClock::new();
+    let before = std::time::Instant::now();
+    clock.heard();
+
+    let at = |secs: u64| before + Duration::from_secs(secs);
+    let ten = clock.quiet_for_at(at(10)).expect("an event was heard");
+    let twenty = clock.quiet_for_at(at(20)).expect("an event was heard");
+    assert_eq!(twenty - ten, Duration::from_secs(10), "the quiet grows one for one with time");
+    assert!(ten >= Duration::from_secs(10) - Duration::from_millis(1), "{ten:?}");
+
+    let last = at(10) - ten;
+    assert_eq!(clock.quiet_worth_saying_at(last + WATCHER_QUIET_HINT_AFTER), Some(WATCHER_QUIET_HINT_AFTER));
+    assert_eq!(clock.quiet_worth_saying_at(last + WATCHER_QUIET_HINT_AFTER - Duration::from_millis(1)), None);
+    assert_eq!(clock.quiet_worth_saying_at(at(4)), None, "4 s after the event is recent");
+    assert_eq!(WATCHER_QUIET_HINT_AFTER, Duration::from_secs(5), "the threshold the spec names");
+}
+
+/// A later event resets the quiet.
+///
+/// Control: make `heard` store only when no event was recorded yet
+/// (`compare_exchange(0, ..)`) - the second event leaves the quiet as it was.
+#[test]
+fn a_later_event_resets_the_quiet() {
+    let clock = WatcherClock::new();
+    clock.heard();
+    let probe = std::time::Instant::now() + Duration::from_secs(60);
+    let first = clock.quiet_for_at(probe).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    clock.heard();
+    let second = clock.quiet_for_at(probe).unwrap();
+    assert!(first >= second + Duration::from_millis(40), "first {first:?}, second {second:?}");
+}
+
+/// A watcher over a fresh empty directory, its setup noise drained by
+/// receiving until nothing arrives for a second; the signal record cleared.
+/// `next_change` is called directly, so no registry's clock sees the noise.
+fn quiet_watcher(root: &Path) -> ProjectWatcher {
+    let watcher = ProjectWatcher::new(root).unwrap();
+    while watcher.next_change(Duration::from_secs(1)).is_some() {}
+    watcher.take_signal_seen();
+    watcher
+}
+
+/// The consumer stamps the clock for every signal the watcher receives,
+/// one it drops as ignored included, and never when none arrives.
+///
+/// Controls: in `watch_and_route_once`, stamp only on `Some(change)` - the
+/// ignored path leaves the clock silent and the second assertion fails; or
+/// stamp on every iteration - the first assertion fails.
+#[test]
+fn an_ignored_path_stamps_the_watcher_clock() {
+    let (project, _plugins, _dirs, registry) = registry_over(&["python"]);
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let watcher = quiet_watcher(&root);
+    let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+    let now = || std::time::Instant::now();
+
+    watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
+    assert_eq!(registry.watcher_clock().quiet_for_at(now()), None, "no signal, no stamp");
+
+    let ignored = root.join(".git/objects/ab/cdef");
+    assert!(watcher.is_ignored(&ignored), "the fixture path must be ignored");
+    watcher.inject_path(&ignored);
+    watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
+    let quiet = registry.watcher_clock().quiet_for_at(now()).expect("an ignored path stamps the clock");
+    assert!(quiet < Duration::from_secs(5), "stamped just now: {quiet:?}");
+}
+
+/// A Rescan stamps the clock too.
+#[test]
+fn a_rescan_stamps_the_watcher_clock() {
+    let (project, _plugins, _dirs, registry) = registry_over(&["python"]);
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let watcher = quiet_watcher(&root);
+    let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+
+    watcher.inject_rescan(&root);
+    watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
+    assert!(registry.watcher_clock().quiet_for_at(std::time::Instant::now()).is_some());
+}
+
+/// The quiet counts from the consumer's start: before it the clock reports
+/// none; once the consumer has started it reports one, with no event.
+///
+/// Control: drop the `heard()` before the loop in `spawn_watch_consumer` -
+/// the clock stays silent and the wait times out.
+#[test]
+fn the_quiet_counts_from_the_consumer_start() {
+    let (project, _plugins, _dirs, registry) = registry_over(&["python"]);
+    let registry = Arc::new(registry);
+    let root = project.path().canonicalize().unwrap();
+    let watcher = quiet_watcher(&root);
+    assert_eq!(registry.watcher_clock().quiet_for_at(std::time::Instant::now()), None);
+
+    super::watch_loop::spawn_watch_consumer(
+        watcher,
+        Arc::new(test_plugin::empty_index()),
+        Arc::clone(&registry),
+        root,
+        super::watch_loop::ConsumerStart::AfterWalk,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while registry.watcher_clock().quiet_for_at(std::time::Instant::now()).is_none() {
+        assert!(std::time::Instant::now() < deadline, "the consumer never started the clock");
+        thread::sleep(Duration::from_millis(10));
+    }
 }

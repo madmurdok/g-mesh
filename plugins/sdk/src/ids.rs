@@ -16,7 +16,7 @@
 //! exists to catch, and the cheapest way not to have it in a fourth language
 //! is for the fourth language not to invent a fourth answer.
 //!
-//! **`plugins/go` must match this**, and so must every later plugin. The
+//! **Every plugin must match this**, `plugins/go` included (its `ids.go` hashes the same NUL-joined bytes). The
 //! specification below is the whole contract; it is deliberately written as
 //! bytes rather than as code, so a Go or C# implementation can be checked
 //! against it without reading Rust.
@@ -70,15 +70,12 @@
 //! `nativeKind` is in the node id for the one case where identity is not
 //! enough on its own: a getter and a setter can share a `qualifiedName`.
 //!
-//! # Equivalence with the TS plugin
+//! # Pinned values
 //!
-//! `tests/id_scheme.rs` asserts this implementation against ids computed by
-//! the original Node TS plugin's own `nodeIdFor`/`edgeIdFor`,
-//! recorded as literal expected
-//! values. They are recorded rather than recomputed at test time because the
-//! point is to pin *this* crate against what the other implementation
-//! actually produced, not to re-run the other implementation and agree with
-//! whatever it does today.
+//! `tests/id_scheme.rs` asserts this implementation against literal expected
+//! ids, recorded rather than recomputed at test time, so the test pins the
+//! scheme itself and does not agree with whatever the code does today.
+//! `plugins/go` (`ids.go`) hashes the same NUL-joined bytes.
 
 use sha2::{Digest, Sha256};
 
@@ -140,8 +137,8 @@ pub fn edge_kind_wire_value(kind: EdgeKind) -> String {
 /// `native_kind` is `None` for an ordinary declaration and `Some` for
 /// anything whose `nativeKind` distinguishes it from another node with the
 /// same qualified name - a placeholder, a getter beside its setter. `None`
-/// hashes as the empty string, which is the same thing the TS plugin's
-/// `nativeKind ?? ""` does.
+/// hashes as the empty string, which keeps an absent `nativeKind` a real
+/// empty field.
 pub fn node_id(file_path: &str, kind: NodeKind, qualified_name: &str, native_kind: Option<&str>) -> String {
     digest("node", &[file_path, &node_kind_wire_value(kind), qualified_name, native_kind.unwrap_or("")])
 }

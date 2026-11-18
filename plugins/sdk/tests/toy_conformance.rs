@@ -66,14 +66,11 @@ const ALL_CHECKS: [&str; 17] = [
 ];
 
 fn check() -> PluginCheck {
-    PluginCheck::new(
-        "toy",
+    PluginCheck::from_manifest(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/toy/plugin.toml"),
         env!("CARGO_BIN_EXE_g-mesh-plugin-toy"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/toy-project"),
     )
-    .extensions(&[".toy"])
-    .exclude_dirs(&["vendor"])
-    .semantic_pass(true)
 }
 
 #[test]

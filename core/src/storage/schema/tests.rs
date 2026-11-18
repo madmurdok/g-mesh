@@ -1,3 +1,7 @@
+use std::collections::{BTreeMap, HashSet};
+
+use rusqlite::params;
+
 use super::*;
 
 /// A generation string shaped like the one `daemon::plugin::indexer_version`
@@ -1253,8 +1257,8 @@ fn a_reset_empties_the_residual_and_never_answered_files() {
 // ---------------------------------------------------------------------
 
 fn outcomes_of(
-    pairs: &[(&str, crate::languages::LanguageOutcome)],
-) -> std::collections::BTreeMap<String, crate::languages::LanguageOutcome> {
+    pairs: &[(&str, crate::storage::language_outcome::LanguageOutcome)],
+) -> std::collections::BTreeMap<String, crate::storage::language_outcome::LanguageOutcome> {
     pairs.iter().map(|(language, outcome)| (language.to_string(), outcome.clone())).collect()
 }
 
@@ -1268,7 +1272,7 @@ fn outcomes_of(
 /// live File nodes - it becomes 1, not 7.
 #[test]
 fn language_outcomes_read_indexed_counts_live_and_absent_counts_as_recorded() {
-    use crate::languages::LanguageOutcome;
+    use crate::storage::language_outcome::LanguageOutcome;
     let conn = setup();
     seed_file(&conn, "a.rs", "rust");
     seed_file(&conn, "b.rs", "rust");
@@ -1313,7 +1317,7 @@ fn language_outcomes_read_indexed_counts_live_and_absent_counts_as_recorded() {
 /// first walk survives.
 #[test]
 fn recording_outcomes_replaces_the_previous_walks_rows() {
-    use crate::languages::LanguageOutcome;
+    use crate::storage::language_outcome::LanguageOutcome;
     let conn = setup();
     record_language_outcomes(
         &conn,
@@ -1341,7 +1345,7 @@ fn recording_outcomes_replaces_the_previous_walks_rows() {
 /// `wipe` - the reset keeps the row.
 #[test]
 fn a_schema_12_index_is_reset_and_the_reset_drops_the_language_outcomes() {
-    use crate::languages::LanguageOutcome;
+    use crate::storage::language_outcome::LanguageOutcome;
     let conn = setup();
     conn.execute(
         "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '12', ?1, CURRENT_TIMESTAMP)",
@@ -1446,7 +1450,7 @@ fn stored_generation_reads_the_recorded_generation_without_writing() {
 /// is owed).
 #[test]
 fn a_start_owes_a_retry_only_to_a_discovered_failed_language_below_the_bound() {
-    use crate::languages::LanguageOutcome;
+    use crate::storage::language_outcome::LanguageOutcome;
     let conn = setup();
     let failed = || LanguageOutcome::Failed { error: "x".to_string() };
     record_language_outcomes(
@@ -1483,7 +1487,7 @@ fn a_start_owes_a_retry_only_to_a_discovered_failed_language_below_the_bound() {
 /// (reading the retries fails).
 #[test]
 fn an_index_without_the_retry_table_gains_it_without_a_reset() {
-    use crate::languages::LanguageOutcome;
+    use crate::storage::language_outcome::LanguageOutcome;
     let conn = setup();
     assert!(ensure_current(&conn, GENERATION).unwrap(), "a fresh index is initialized");
     record_bulk_index(&conn).unwrap();
@@ -1528,7 +1532,7 @@ fn a_reset_drops_the_language_retries() {
 /// `record_language_outcomes`.
 #[test]
 fn recording_a_walks_outcomes_clears_the_retry_counts() {
-    use crate::languages::LanguageOutcome;
+    use crate::storage::language_outcome::LanguageOutcome;
     let conn = setup();
     begin_language_retry(&conn, "python").unwrap();
     begin_language_retry(&conn, "python").unwrap();

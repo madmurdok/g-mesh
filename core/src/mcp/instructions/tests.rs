@@ -44,7 +44,7 @@ fn ts_only() -> Vec<PresentLanguage> {
 /// disagreeing with it.
 fn bundled_go_capabilities() -> Capabilities {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/go");
-    crate::daemon::manifest::read_manifest(&dir)
+    crate::plugin_manifest::read_manifest(&dir)
         .expect("the bundled Go plugin's manifest must be readable")
         .capabilities
 }
@@ -64,7 +64,7 @@ fn rust_present() -> PresentLanguage {
 /// `plugins/rust/plugin.toml` rather than transcribed.
 fn bundled_rust_capabilities() -> Capabilities {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/rust");
-    crate::daemon::manifest::read_manifest(&dir)
+    crate::plugin_manifest::read_manifest(&dir)
         .expect("the bundled Rust plugin's manifest must be readable")
         .capabilities
 }
@@ -74,7 +74,7 @@ fn bundled_rust_capabilities() -> Capabilities {
 /// `bundled_rust_capabilities`/`bundled_go_capabilities` pattern.
 fn bundled_python_capabilities() -> Capabilities {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/python");
-    crate::daemon::manifest::read_manifest(&dir)
+    crate::plugin_manifest::read_manifest(&dir)
         .expect("the bundled Python plugin's manifest must be readable")
         .capabilities
 }
@@ -103,7 +103,7 @@ fn bridge_semantic(language: &str) -> PresentLanguage {
             resolution_delta: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
-            member_overrides: crate::daemon::manifest::MemberOverrides::None,
+            member_overrides: crate::plugin_manifest::MemberOverrides::None,
         },
     }
 }
@@ -408,7 +408,7 @@ fn cold_start_falls_back_to_the_no_path_line_once_the_root_is_too_long() {
 }
 
 fn front_detection(names: &[String], truncated: bool) -> Detection {
-    use crate::daemon::candidates::{Candidate, Mode};
+    use crate::project_detect::{Candidate, Mode};
     Detection {
         mode: Mode::Multi,
         candidates: names
@@ -589,17 +589,18 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
-use crate::daemon::indexing_status::{IndexingStatus, Phase};
-use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::manifest::{discover, DiscoveredPlugins};
-use crate::daemon::registry::PluginRegistry;
+use crate::mcp::host_fake::FakeHost;
+
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::queries::upsert_node;
+use crate::indexing_status::{IndexingStatus, Phase};
 use crate::languages::{self, CATALOGUE};
 use crate::mcp::GMeshMcpServer;
+use crate::mcp::McpHost;
+use crate::model::NodeRecord;
+use crate::plugin_manifest::{discover, DiscoveredPlugins};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::NodeRecord;
+use crate::storage::write::upsert_node;
 
 /// The generic "unsupported" sentence (ADR 0022, section 3): said once,
 /// naming no catalogue.
@@ -1121,7 +1122,7 @@ fn resolved_receiver_calls_without_a_semantic_pass_are_never_resolving() {
         resolution_delta: false,
         receiver_calls: ReceiverCallResolution::Resolved,
         receiver_calls_structural: ReceiverCallResolution::Unresolved,
-        member_overrides: crate::daemon::manifest::MemberOverrides::None,
+        member_overrides: crate::plugin_manifest::MemberOverrides::None,
     };
     assert_eq!(receiver_class(&capabilities), ReceiverClass::Never);
     let rendered = build(&warm(vec![PresentLanguage { language: "zig".to_string(), capabilities }]));
@@ -1142,7 +1143,7 @@ fn a_structurally_resolving_language_is_static_without_the_pass_sentence() {
         resolution_delta: false,
         receiver_calls: ReceiverCallResolution::Resolved,
         receiver_calls_structural: ReceiverCallResolution::Resolved,
-        member_overrides: crate::daemon::manifest::MemberOverrides::None,
+        member_overrides: crate::plugin_manifest::MemberOverrides::None,
     };
     assert_eq!(receiver_class(&capabilities), ReceiverClass::Static);
     let rendered = build(&warm(vec![PresentLanguage { language: "zig".to_string(), capabilities }]));
@@ -1357,7 +1358,7 @@ fn ladder_step_4_replaces_the_covered_list_and_keeps_absent_and_failed_names() {
         resolution_delta: false,
         receiver_calls: ReceiverCallResolution::Resolved,
         receiver_calls_structural: ReceiverCallResolution::Resolved,
-        member_overrides: crate::daemon::manifest::MemberOverrides::None,
+        member_overrides: crate::plugin_manifest::MemberOverrides::None,
     };
     let many: Vec<PresentLanguage> = (0..80)
         .map(|i| PresentLanguage { language: format!("static{i:02}"), capabilities: static_tier })
@@ -1504,26 +1505,11 @@ fn server_over(
     phase: Phase,
 ) -> GMeshMcpServer {
     let root = dir.path().join("project");
-    let state = dir.path().join("state");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
     let indexing = IndexingStatus::structural();
     indexing.set_phase(phase);
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        found,
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
-    GMeshMcpServer::new(
-        store,
-        registry,
-        CoreActivity::new(),
-        indexing,
-        Arc::new(EmbeddingPipeline::disabled()),
-    )
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::over(&root, found));
+    GMeshMcpServer::new(store, host, indexing, Arc::new(EmbeddingPipeline::disabled()))
 }
 
 /// Absent languages come from the recorded outcomes, not re-derived from the
@@ -1636,7 +1622,7 @@ fn the_server_cold_start_names_installed_and_missing_plugins() {
 // ---------------------------------------------------------------------------
 // GM-330/S10: the failed item's cause (ADR 0022, section 3 failed row and
 // "Resolved at review" item 2) against errors stored by
-// `languages::failed_error`, one cause per line, outermost first.
+// `storage::language_outcome::failed_error`, one cause per line, outermost first.
 // ---------------------------------------------------------------------------
 
 /// The failed item `{lang} ({cause})` for `language` out of `rendered`.
@@ -1688,7 +1674,7 @@ fn a_real_missing_plugin_binary_renders_the_os_cause_without_the_path() {
         ),
     )
     .unwrap();
-    crate::daemon::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
+    crate::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 
@@ -1729,7 +1715,7 @@ fn a_cause_containing_colon_space_survives_whole_in_the_failed_item() {
         "invalid type: map, expected a string at line 3",
     ));
     let err = inner.context("reading the manifest").context("loading the rust plugin").unwrap_err();
-    let stored = languages::failed_error(&err);
+    let stored = crate::storage::language_outcome::failed_error(&err);
 
     assert_eq!(error_cause(&stored), "invalid type: map, expected a string at line 3");
     let rendered = rendered_with_rust_failed(&stored);
@@ -1858,7 +1844,7 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
         ),
     )
     .unwrap();
-    crate::daemon::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
+    crate::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 
@@ -1883,7 +1869,7 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
 
     // The hint names the spelling cargo builds on this platform
     // (`g-mesh-plugin-rust.exe` on Windows).
-    let named = crate::daemon::manifest::exe_suffixed(&binary, std::env::consts::EXE_SUFFIX)
+    let named = crate::plugin_manifest::exe_suffixed(&binary, std::env::consts::EXE_SUFFIX)
         .unwrap_or_else(|| binary.clone());
     let name = named.file_name().unwrap().to_str().unwrap();
     assert!(item.starts_with("rust (Run `cargo build --workspace` in "), "{rendered}");
@@ -2291,4 +2277,29 @@ fn a_failed_walk_keeps_the_failed_sentence_without_a_retry_state() {
         "{rendered}"
     );
     assert!(!rendered.contains("next start") && !rendered.contains("without success"), "{rendered}");
+}
+
+/// The cold start does no store read: with the store held by this thread
+/// (so any read would trip `IndexStore`'s re-entry panic), `Unindexed` and
+/// `Walking` still render the cold-start text, while `Ready` does read and
+/// trips it (the seam observes reads). Control: in `instructions`, call
+/// `language_overview(&self.store.read())` before the phase branch -> the
+/// cold start panics.
+#[test]
+fn the_cold_start_instructions_take_no_store_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(IndexStore::new(store_with_files(&["typescript"])));
+    let held = store.lock().unwrap();
+
+    for phase in [Phase::Unindexed, Phase::Walking] {
+        let server = server_over(&dir, real_plugins(&["typescript"]), Arc::clone(&store), phase);
+        let rendered = server.instructions();
+        assert!(rendered.contains("Plugins installed: typescript."), "{rendered}");
+    }
+
+    let server = server_over(&dir, real_plugins(&["typescript"]), Arc::clone(&store), Phase::Ready);
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.instructions()));
+    drop(held);
+    assert!(read.is_err(), "a ready server reads the store, so holding it must trip the re-entry check");
+    assert!(server.instructions().contains("Indexed here: typescript."));
 }

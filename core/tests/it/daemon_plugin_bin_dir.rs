@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -40,10 +40,10 @@ struct Project {
 impl Drop for Project {
     fn drop(&mut self) {
         let root = self.dir.path();
-        if let Ok(path) = daemon::pid_path(root) {
+        if let Ok(path) = StateDir::of(root).map(|sd| sd.pid_file()) {
             common::kill_pid_file(&path);
         }
-        if let Ok(endpoint) = daemon::endpoint(root) {
+        if let Ok(endpoint) = StateDir::of(root).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
         if let Ok(state) = project_dir(root) {

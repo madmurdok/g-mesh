@@ -1,0 +1,19 @@
+# The toy plugin's manifest: compiled into its binary
+# (`PluginSpec::from_manifest_str`) and read by its conformance test
+# (`PluginCheck::from_manifest`). Not shipped and not in a discovery root.
+[plugin]
+language = "toy"
+protocol_version = 2
+plugin_version = "0.0.0"
+
+[plugin.spawn]
+command = "./g-mesh-plugin-toy"
+
+[plugin.languages]
+extensions = [".toy"]
+
+[plugin.capabilities]
+semantic_pass = true
+
+[plugin.workspace]
+exclude_dirs = ["vendor"]

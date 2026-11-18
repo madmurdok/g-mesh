@@ -1,0 +1,955 @@
+//! The client half of the Language Server Protocol: as much of it as
+//! answering an open site needs, and not one method more.
+//!
+//! # Decision 2: no LSP crate
+//!
+//! The obvious move is `lsp-types` (or `lsp-server`, or `tower-lsp`), and it
+//! was weighed and refused. What this bridge sends is six requests and four
+//! notifications - `initialize`, `initialized`, `textDocument/didOpen`,
+//! `didChange`, `definition`, `implementation`, `$/cancelRequest`,
+//! `shutdown`, `exit`, plus the two server-initiated messages it has to
+//! answer - and what it reads out of the replies is a URI and two integers.
+//!
+//! Against that:
+//!
+//! - **`lsp-types` is the whole protocol as Rust types.** It models every
+//!   request, every capability struct and every optional field of a
+//!   specification that gains more of them every release, to save this file
+//!   the `json!` literals below. It also pins the protocol *version* into the
+//!   types, so keeping up with a server that speaks a newer one becomes a
+//!   dependency bump rather than an extra key in an object this crate already
+//!   passes through.
+//! - **`lsp-server`/`tower-lsp` bring a transport and a runtime** - crossbeam
+//!   channels, or tokio. This crate's whole dependency list is `anyhow`,
+//!   `serde`, `serde_json`, `sha2`, `toml` and `ignore`, and the design's
+//!   reason for that is stated in the doc: a plugin must not link what core
+//!   links.
+//! - **Every later language inherits this cost.** The SDK is what languages
+//!   #3 through #7 are built on (the design doc's "Paper stress test"), so a
+//!   dependency here is paid seven times and removed never.
+//!
+//! The counter-argument - "hand-rolled protocol code is where bugs live" - is
+//! real, and is why the framing is [`g_mesh_plugin_sdk::framing`] (one implementation,
+//! already exercised against core) and why the fake server in
+//! `plugins/sdk-lsp/fake-lsp` drives every path in this file, including the ones
+//! a real server only reaches when something goes wrong.
+//!
+//! # The server is a child, deliberately
+//!
+//! It is spawned as an ordinary child of the plugin process: no `setsid`, no
+//! double fork, no re-parenting. That is what makes
+//! `[plugin] memoryLimitMb` work at all - core samples a plugin's whole
+//! *process tree* (`core::daemon::memory::process_tree_rss_mb`, which walks
+//! parent → child links from the plugin's pid) and the design says explicitly
+//! that "tsserver, rust-analyzer and a language server behind the LSP bridge
+//! all count against their plugin". A detached server would be invisible to
+//! that sampler while holding the gigabytes the limit exists to catch.
+//!
+//! The other half of that promise is [`LspClient::shutdown`], called from
+//! `Drop`: core ends a plugin by closing its stdin, so a server left running
+//! when the plugin exits is an orphan holding a workspace open with nothing
+//! reading its pipes.
+//!
+//! `Drop` does not run on `process::exit`, which is how the plugin ends when
+//! core dies while it is busy on a request (the SDK's control-stream reader).
+//! For that path every running server's `Child` is also registered in
+//! [`LIVE_SERVERS`], and [`kill_live_servers`] ends them from any thread; the
+//! first server started registers it with
+//! [`g_mesh_plugin_sdk::on_lifeline_exit`], which the reader runs before it
+//! exits.
+
+use std::collections::BTreeMap;
+use std::io::BufReader;
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Mutex, MutexGuard, Once, Weak};
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
+
+use super::config::{SemanticConfig, ServerReadiness};
+use super::position::{file_uri, PositionEncoding};
+use g_mesh_plugin_sdk::framing::{read_frame, write_message};
+use g_mesh_plugin_sdk::on_lifeline_exit;
+
+/// How many lines of a server's stderr are forwarded before the rest is
+/// counted instead of printed.
+///
+/// Draining it is not optional - a server whose stderr pipe fills up blocks
+/// on its next log line, which looks exactly like a hang - but forwarding all
+/// of it is not either: a language server at its default log level can
+/// produce megabytes per pass, and the daemon's log is a shared resource.
+const STDERR_LINE_BUDGET: usize = 200;
+
+/// LSP's `ContentModified` error code: the server's state changed while it
+/// was answering, so the answer it would have given is void - not a refusal
+/// of the question. rust-analyzer sends it for every request in flight when
+/// it switches crate graphs (GM-429 finding 1, GM-433).
+pub(crate) const CONTENT_MODIFIED: i64 = -32801;
+
+/// What [`LspClient::poll`] saw.
+#[derive(Debug)]
+pub(crate) enum Poll {
+    /// A response to a request this client sent. `result` is whatever the
+    /// server answered, `Value::Null` included - which for `definition` is
+    /// the ordinary "nothing here" answer and not an error.
+    Answered { id: i64, result: Value },
+    /// The server answered a request with a JSON-RPC error. `code` is the
+    /// error's own code, when it carried a numeric one - the difference
+    /// between a refusal and [`CONTENT_MODIFIED`], "ask me again" (GM-433).
+    Failed { id: i64, code: Option<i64>, message: String },
+    /// Something moved that is not an answer: a progress notification, a
+    /// server request this client replied to, a log message. The caller
+    /// re-reads whatever state it is waiting on.
+    Noise,
+    /// Nothing arrived before the timeout.
+    Idle,
+    /// The server's stdout is closed: it exited, or crashed.
+    Closed,
+}
+
+/// Every language server this process has started and not yet reaped, for
+/// [`kill_live_servers`]. Weak, so the registry never keeps a client's
+/// `Child` alive past the client itself.
+static LIVE_SERVERS: Mutex<Vec<Weak<Mutex<Child>>>> = Mutex::new(Vec::new());
+
+/// Kills and reaps every language server still running, from whatever thread
+/// is about to call `process::exit`. The only caller is the SDK's
+/// control-plane reader's lifeline path (through [`on_lifeline_exit`]),
+/// which ends the process while the main thread may be deep in a request
+/// holding the clients - so the kill goes through the shared `Child` handles
+/// rather than through `LspClient`.
+pub fn kill_live_servers() {
+    let servers = LIVE_SERVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for server in servers.iter().filter_map(Weak::upgrade) {
+        let mut child = lock(&server);
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A server's `Child`, taken even if a panicking thread poisoned it: the
+/// handle itself is always in a usable state.
+fn lock(child: &Mutex<Child>) -> MutexGuard<'_, Child> {
+    child.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One running language server, and everything this process knows about it.
+pub(crate) struct LspClient {
+    language: String,
+    /// Shared with [`LIVE_SERVERS`], so [`kill_live_servers`] can reach it
+    /// from another thread. Locked only for a single non-blocking call (or a
+    /// `wait` straight after a `kill`), so neither side holds it long.
+    child: Arc<Mutex<Child>>,
+    stdin: ChildStdin,
+    incoming: Receiver<Value>,
+    next_id: i64,
+    /// What to answer `workspace/configuration` with, by section - see
+    /// [`SemanticConfig::settings`](super::config::SemanticConfig::settings).
+    /// Copied out of the config at start-up because a server may ask at any
+    /// moment, including from inside [`LspClient::poll`], where the config is
+    /// not in scope.
+    settings: BTreeMap<String, Value>,
+    /// How the server counts columns, from the negotiation in `initialize`.
+    encoding: PositionEncoding,
+    /// Work-done progress tokens the server has begun and not ended. While
+    /// this is non-empty the server is doing something it told us about -
+    /// which is the difference between "there is no definition there" and
+    /// "ask again when it has finished loading".
+    active_progress: BTreeMap<String, ()>,
+    /// Since when [`active_progress`](LspClient::active_progress) has been
+    /// empty, or `None` while something is in flight.
+    ///
+    /// This, rather than "is it empty right now", is what readiness is
+    /// measured against - see [`super::bridge::LspBridge`]'s readiness rules
+    /// and the rust-analyzer trace that made the difference load-bearing. It
+    /// starts at the client's own birth so that a server which never reports
+    /// progress becomes quiet purely by the clock.
+    idle_since: Option<Instant>,
+    /// Whether this server has already been quiet for a full settle once -
+    /// see [`LspClient::settle`]. It lives here rather than on the bridge
+    /// because it is a fact about *this* server: the next one starts up all
+    /// over again, and a flag that dies with the client cannot be left stale.
+    ///
+    /// It starts `true` for a
+    /// [`ServerReadiness::OnDemand`](super::config::ServerReadiness::OnDemand)
+    /// server (GM-310). That is the whole of that feature: "on demand" means
+    /// *born in the state every server reaches after its first settle*, which
+    /// is a state this client already had, that `wait_ready` already reads,
+    /// and that GM-290 already measured on every pass after the first. No new
+    /// rule, no second state machine - one server-shaped fact setting a latch
+    /// that exists.
+    settled: bool,
+    /// Whether this server's manifest says
+    /// [`ServerReadiness::OnDemand`](super::config::ServerReadiness::OnDemand) -
+    /// what [`LspClient::unsettle`] resets the latch *to*.
+    on_demand: bool,
+    /// Set once the server's stdout has closed, so a caller that polls again
+    /// after a crash is told the same thing rather than blocking.
+    closed: bool,
+    /// Whether this server's first question has been settled - answered,
+    /// refused or timed out - so that [`Budgets::warm_up`](super::Budgets)
+    /// no longer applies to it. A fact about *this* server for the same
+    /// reason as `settled`: a restarted server loads its project from cold
+    /// again, and a flag that dies with the client cannot be left stale.
+    warmed_up: bool,
+    /// Whether this client asked the server for rust-analyzer's
+    /// `experimental/serverStatus` notification and reads its `quiescent`
+    /// bit as readiness (GM-550) - see [`LspClient::settle`].
+    quiescent_signal: bool,
+    /// Whether `initialize` claims `workspace.didChangeWatchedFiles`
+    /// dynamic registration - see [`crate::ServerProfile::client_watches_files`].
+    client_watches_files: bool,
+    /// The `quiescent` bit of the last `experimental/serverStatus` the server
+    /// sent, or `None` while it has sent none. Read only when
+    /// [`quiescent_signal`](LspClient::quiescent_signal) is set.
+    quiescent: Option<bool>,
+    /// Set by [`LspClient::unsettle`] and cleared when the settle latches
+    /// again: after a project-model change the last `quiescent: true` may be
+    /// stale (core's notice can reach this plugin before the server notices
+    /// the change), so that one settle is the full quiet period, as GM-433
+    /// measured it, on top of the signal.
+    reloading: bool,
+}
+
+impl LspClient {
+    /// Spawns the server, runs `initialize`/`initialized`, and returns a
+    /// client that is connected but not necessarily *ready* - readiness is
+    /// the bridge's question, and this one is "is there a server at all".
+    ///
+    /// An `Err` here is the design doc's "semantic engine missing" failure
+    /// mode: no binary on `PATH`, or a binary that is not a language server.
+    ///
+    /// `quiescent_signal` asks the server for `experimental/serverStatus`
+    /// and makes its `quiescent` bit part of readiness - see
+    /// [`LspClient::settle`].
+    pub(crate) fn start(
+        language: &str,
+        config: &SemanticConfig,
+        root: &Path,
+        deadline: Instant,
+        quiescent_signal: bool,
+        client_watches_files: bool,
+    ) -> Result<Self> {
+        let mut command = Command::new(&config.command);
+        command
+            .args(&config.args)
+            .envs(&config.env)
+            // After the manifest's own env, so no manifest can unset it.
+            .env(super::resolve::NO_CWD_EXE_LOOKUP.0, super::resolve::NO_CWD_EXE_LOOKUP.1)
+            .current_dir(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to start the language server {}", config.command.display()))?;
+
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+
+        // One thread per pipe, both detached. They end when the server's
+        // stdout/stderr close, which is the only event either of them cares
+        // about, and neither holds anything the main thread needs to join on.
+        let (sender, incoming) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Ok(Some(body)) = read_frame(&mut reader) {
+                let Ok(message) = serde_json::from_slice::<Value>(&body) else { continue };
+                if sender.send(message).is_err() {
+                    return;
+                }
+            }
+        });
+        let label = language.to_string();
+        let server = config.engine.clone();
+        std::thread::spawn(move || drain_stderr(&label, &server, stderr));
+
+        // The hook is registered before the server joins LIVE_SERVERS, so a
+        // lifeline exit can never see the server listed but no hook to kill it.
+        static REGISTERED: Once = Once::new();
+        REGISTERED.call_once(|| on_lifeline_exit(kill_live_servers));
+        let child = Arc::new(Mutex::new(child));
+        {
+            let mut servers = LIVE_SERVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            servers.retain(|server| server.strong_count() > 0);
+            servers.push(Arc::downgrade(&child));
+        }
+
+        let mut client = Self {
+            language: language.to_string(),
+            child,
+            stdin,
+            incoming,
+            next_id: 1,
+            settings: config.settings.clone(),
+            encoding: PositionEncoding::Utf16,
+            active_progress: BTreeMap::new(),
+            idle_since: Some(Instant::now()),
+            settled: config.readiness == ServerReadiness::OnDemand,
+            on_demand: config.readiness == ServerReadiness::OnDemand,
+            closed: false,
+            warmed_up: false,
+            quiescent_signal,
+            client_watches_files,
+            quiescent: None,
+            reloading: false,
+        };
+        client.initialize(config, root, deadline)?;
+        Ok(client)
+    }
+
+    /// The `initialize` handshake, and the two things this bridge reads out of
+    /// its answer: how the server counts columns, and nothing else.
+    ///
+    /// The capabilities sent are the smallest set that is honest. Claiming
+    /// capabilities a client does not have is how a server ends up sending
+    /// requests nobody answers, and every unanswered server request is a
+    /// server that may never finish loading.
+    fn initialize(&mut self, config: &SemanticConfig, root: &Path, deadline: Instant) -> Result<()> {
+        let mut params = json!({
+            // Not this process's pid by accident: it is what tells a server to
+            // exit if we die without saying `exit`, which is the one safety net
+            // against an orphaned server holding a workspace open.
+            "processId": std::process::id(),
+            "rootUri": file_uri(root),
+            "workspaceFolders": [{ "uri": file_uri(root), "name": root.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "root".to_string()) }],
+            "capabilities": {
+                "general": { "positionEncodings": PositionEncoding::OFFERED },
+                "window": { "workDoneProgress": true },
+                "workspace": { "configuration": true, "workspaceFolders": true },
+                "textDocument": {
+                    "synchronization": { "dynamicRegistration": false },
+                    "definition": { "dynamicRegistration": false, "linkSupport": true },
+                    "implementation": { "dynamicRegistration": false, "linkSupport": true },
+                },
+            },
+        });
+        if self.quiescent_signal {
+            // rust-analyzer's extension: it then sends
+            // `experimental/serverStatus` whenever its status changes, with
+            // `quiescent: false` from the first moment it starts loading the
+            // project until it has loaded it and primed its caches (GM-550).
+            params["capabilities"]["experimental"] = json!({ "serverStatusNotification": true });
+        }
+        if self.client_watches_files {
+            // A server that would otherwise watch the project itself
+            // (rust-analyzer with `files.watcher = "client"`, its default)
+            // registers its globs with this client instead. The registration
+            // request is answered `null` like every other one, and no file
+            // event is ever forwarded on its strength: the server reacts to a
+            // change on disk only when the plugin asks it to.
+            params["capabilities"]["workspace"]["didChangeWatchedFiles"] =
+                json!({ "dynamicRegistration": true });
+        }
+        if let Some(options) = &config.initialization_options {
+            params["initializationOptions"] = options.clone();
+        }
+
+        let id = self.request("initialize", params)?;
+        let result = self.await_response(id, deadline).context("the server did not initialize")?;
+        self.encoding = PositionEncoding::from_capability(
+            result.get("capabilities").and_then(|caps| caps.get("positionEncoding")).and_then(Value::as_str),
+        );
+        self.notify("initialized", json!({}))?;
+        Ok(())
+    }
+
+    /// How this server counts columns.
+    pub(crate) fn encoding(&self) -> PositionEncoding {
+        self.encoding
+    }
+
+    /// Whether the server has reported nothing in flight for at least
+    /// `quiet` - which is what "this server has stopped working" means for a
+    /// server that reports its work in a *sequence* of tokens rather than in
+    /// one.
+    ///
+    /// `Duration::ZERO` asks only "is anything in flight right now", which is
+    /// the right question once a server has already shown, once, that it has
+    /// finished starting up.
+    pub(crate) fn quiet_for(&self, quiet: Duration) -> bool {
+        self.idle_since.is_some_and(|since| since.elapsed() >= quiet)
+    }
+
+    /// Tells this client that a document was just sent a `didOpen`/`didChange`
+    /// it has not yet reacted to, so [`quiet_for`](LspClient::quiet_for) stops
+    /// reporting a quiet period that predates the edit - GM-309.
+    ///
+    /// `settle` latching once per server (GM-290, see [`LspClient::settle`])
+    /// means every pass after the first asks `quiet_for(Duration::ZERO)`
+    /// rather than paying the settle again - correct once the server has
+    /// actually caught up with whatever the pass just sent it, and wrong in
+    /// the gap right after: a server does not begin reporting progress for an
+    /// edit the instant it receives one, and measured for pyright
+    /// (`docs/architecture/multi-language-plugins.md`, "Readiness, measured,
+    /// and deliberately not changed") that gap is ~0.6s. A question answered
+    /// empty inside it is answered by a server that has not yet noticed the
+    /// edit, and [`super::bridge`]'s per-answer deferral - "an empty answer
+    /// while the server is indexing is re-asked once" - only catches that
+    /// when `idle_since` is fresh enough to say so.
+    ///
+    /// So this resets it, but only when the client is not already busy: if a
+    /// progress is in flight `idle_since` is `None`, which already means
+    /// "not quiet" more strongly than any timestamp could, and overwriting it
+    /// with `Some(now)` would make a client that is genuinely mid-progress
+    /// read as quiet for the instant before the next `$/progress` message
+    /// corrects it. When the client *is* idle, resetting the clock buys
+    /// [`Budgets::settle`](super::bridge::Budgets::settle) worth of
+    /// scepticism toward the next empty answer - the same quiet period
+    /// readiness already trusts, not a longer one - and if the server never
+    /// reports anything for this edit at all, the deferred question is asked
+    /// again once that period passes and the second answer, empty or not, is
+    /// believed - exactly the server-that-reports-no-progress case
+    /// [`LspClient::settle`] already handles for start-up. It costs nothing
+    /// when no question lands in the gap, and at most one settle when one
+    /// does - never a settle paid by every pass, which is the guarantee
+    /// GM-290 measured and this must not spend back.
+    pub(crate) fn mark_edited(&mut self) {
+        if self.idle_since.is_some() {
+            self.idle_since = Some(Instant::now());
+        }
+    }
+
+    /// Whether this server is ready to be believed, latching the first time
+    /// it is - until a `workspaceChanged` unlatches it
+    /// ([`LspClient::unsettle`], GM-433).
+    ///
+    /// The first answer costs a full `quiet` period of silence; every answer
+    /// after that costs only "nothing is in flight right now". A server
+    /// proves what shape it is once - see [`super::bridge::LspBridge`]'s doc
+    /// on readiness - and a per-file pass that follows an edit must not pay
+    /// for that proof again.
+    ///
+    /// A server whose manifest declares
+    /// [`ServerReadiness::OnDemand`] starts with that latch already set
+    /// (GM-310): the proof is the plugin author's trace rather than this
+    /// process's own two seconds of waiting. Note what is *not* skipped -
+    /// `quiet_for(Duration::ZERO)` still answers "is something in flight right
+    /// now", so an on-demand server that happens to be mid-progress when a
+    /// pass begins is still waited for, exactly as an indexed one is on its
+    /// second pass.
+    ///
+    /// **A server that says when it is done is believed when it says so**
+    /// (GM-550). With [`quiescent_signal`](LspClient::quiescent_signal) set
+    /// and at least one `experimental/serverStatus` received, a
+    /// `quiescent: false` counts as work in flight
+    /// ([`LspClient::track_status`]), so the gaps between rust-analyzer's
+    /// start-up phases - measured at 1.99-2.47s, longer than the 2s settle -
+    /// are no longer quiet at all, and the first settle needs only "quiescent,
+    /// and nothing in flight right now" instead of a further `quiet` of
+    /// silence. Two cases keep the quiet period:
+    ///
+    /// - The server has sent no status at all: it does not implement the
+    ///   extension (an older or a different server behind the same manifest),
+    ///   and this is today's rule unchanged - the fallback costs nothing and
+    ///   never waits for a signal that is not coming.
+    /// - The first settle after [`LspClient::unsettle`]: the last
+    ///   `quiescent: true` may predate the project-model change, so GM-433's
+    ///   full quiet period applies, on top of the signal.
+    ///
+    /// A server that reported `quiescent: false` and never reports `true` is
+    /// waited for no longer than a server whose progress never ends:
+    /// [`Budgets::readiness`](super::bridge::Budgets::readiness) or the pass
+    /// deadline, after which the pass asks nothing and is incomplete.
+    pub(crate) fn settle(&mut self, quiet: Duration) -> bool {
+        if self.settled {
+            return self.quiet_for(Duration::ZERO);
+        }
+        let signalled = self.quiescent_signal && self.quiescent.is_some() && !self.reloading;
+        self.settled = self.quiet_for(if signalled { Duration::ZERO } else { quiet });
+        if self.settled {
+            self.reloading = false;
+        }
+        self.settled
+    }
+
+    /// Undoes [`LspClient::settle`]'s latch, so the next
+    /// [`wait_ready`](super::bridge::LspBridge) pays a full settle again -
+    /// GM-433. Called on a `workspaceChanged` only, never on a per-file edit
+    /// (that is [`LspClient::mark_edited`], which keeps GM-290's guarantee
+    /// that a per-file pass never pays a settle).
+    ///
+    /// A project-model change is the one event after which a server that has
+    /// already proved its shape starts over: measured on rust-analyzer after a
+    /// version bump (GM-429 finding 1), it ends "Building compile-time-deps",
+    /// is silent for ~13ms, then spends 3.4-4.5s on "Building CrateGraph",
+    /// "Roots Scanned", "Loading proc-macros" and "Indexing". A latched
+    /// client reads that 13ms gap as ready, and every question asked into
+    /// the next four seconds comes back empty or `ContentModified`. That is
+    /// the same sequence-of-tokens shape the settle exists for at start-up,
+    /// so it gets the same settle.
+    ///
+    /// The quiet clock restarts here too, as in [`LspClient::mark_edited`]
+    /// (and only when nothing is in flight, for the same reason): a server
+    /// that has not yet begun reporting its reload - it watches the manifest
+    /// itself, and core's notice may reach this plugin first - has been
+    /// quiet since long before the change, and without the restart that old
+    /// quiet would satisfy the settle at once.
+    ///
+    /// An on-demand server is left unchanged: latched, clock untouched. Its
+    /// manifest's claim (GM-310) is that it answers correctly without an
+    /// up-front quiet period, traced for pyright on start-up; nothing
+    /// measured says a project-model change makes that false for it, and
+    /// adding 2s per workspace change to it would be an unmeasured cost.
+    /// Whatever it does report in flight is still waited for
+    /// (`quiet_for(Duration::ZERO)`), and its empty answers are still
+    /// deferred while it is busy.
+    pub(crate) fn unsettle(&mut self) {
+        if self.on_demand {
+            return;
+        }
+        self.settled = false;
+        self.reloading = true;
+        self.mark_edited();
+    }
+
+    /// Whether this server's warm-up question is behind it - see
+    /// [`Budgets::warm_up`](super::Budgets).
+    pub(crate) fn warmed_up(&self) -> bool {
+        self.warmed_up
+    }
+
+    /// Records that this server's first question has been settled, whichever
+    /// way: the warm-up budget is spent once per server, never re-armed.
+    pub(crate) fn mark_warmed_up(&mut self) {
+        self.warmed_up = true;
+    }
+
+    /// Whether this server is gone.
+    ///
+    /// Two independent signs, because either can be the first to show: its
+    /// stdout closing (which the reader thread notices, and which is how a
+    /// crash mid-conversation presents), and the process having exited (which
+    /// is what a send failure leaves behind, where nothing may ever be read
+    /// again to notice the closed pipe).
+    pub(crate) fn gone(&mut self) -> bool {
+        self.closed || matches!(lock(&self.child).try_wait(), Ok(Some(_)))
+    }
+
+    /// How the server process ended, waiting up to `grace` for it to finish
+    /// exiting; `None` if it is still running then.
+    ///
+    /// A server that dies mid-conversation shows it first as a broken pipe or
+    /// a closed stdout, a moment before the process can be reaped, so an
+    /// immediate check would miss the exit it is looking for.
+    pub(crate) fn exit_status(&mut self, grace: Duration) -> Option<ExitStatus> {
+        let until = Instant::now() + grace;
+        loop {
+            let exited = lock(&self.child).try_wait();
+            match exited {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                _ => return None,
+            }
+        }
+    }
+
+    /// Sends a request and returns the id its answer will carry.
+    pub(crate) fn request(&mut self, method: &str, params: Value) -> Result<i64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .with_context(|| format!("failed to send {method} to the language server"))?;
+        Ok(id)
+    }
+
+    /// Sends a notification - no answer, no id.
+    pub(crate) fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .with_context(|| format!("failed to send {method} to the language server"))
+    }
+
+    /// Tells the server to stop working on a request whose answer is no
+    /// longer wanted.
+    ///
+    /// Best-effort in the strongest sense: it is a notification, the server
+    /// may ignore it, and an answer may already be in flight. What it buys is
+    /// a server that stops *computing* an answer this side has given up
+    /// waiting for - which matters exactly when a pass is already over
+    /// budget, and costs nothing when it does not.
+    pub(crate) fn cancel(&mut self, id: i64) {
+        let _ = self.notify("$/cancelRequest", json!({ "id": id }));
+    }
+
+    fn send(&mut self, message: &Value) -> Result<()> {
+        write_message(&mut self.stdin, message)?;
+        Ok(())
+    }
+
+    /// Waits up to `timeout` for the next thing the server says, handling
+    /// everything that is not an answer to one of our requests.
+    pub(crate) fn poll(&mut self, timeout: Duration) -> Poll {
+        if self.closed {
+            return Poll::Closed;
+        }
+        let message = match self.incoming.recv_timeout(timeout) {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout) => return Poll::Idle,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.closed = true;
+                return Poll::Closed;
+            }
+        };
+        self.handle(message)
+    }
+
+    /// [`LspClient::poll`] without waiting - drains what has already arrived.
+    fn poll_now(&mut self) -> Poll {
+        if self.closed {
+            return Poll::Closed;
+        }
+        match self.incoming.try_recv() {
+            Ok(message) => self.handle(message),
+            Err(TryRecvError::Empty) => Poll::Idle,
+            Err(TryRecvError::Disconnected) => {
+                self.closed = true;
+                Poll::Closed
+            }
+        }
+    }
+
+    /// One message from the server: an answer to pass up, or something this
+    /// client deals with itself.
+    fn handle(&mut self, message: Value) -> Poll {
+        let method = message.get("method").and_then(Value::as_str);
+        let id = message.get("id");
+
+        match (method, id) {
+            // A request from the server. Every one of these must be answered,
+            // including the ones this client has nothing to say about: a
+            // server waiting on a reply that never comes is a server that
+            // never finishes indexing, and "the plugin hung" is how that
+            // presents.
+            (Some(method), Some(id)) => {
+                let id = id.clone();
+                let result = server_request_reply(method, message.get("params"), &self.settings);
+                let _ = self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+                Poll::Noise
+            }
+            // A notification.
+            (Some(method), None) => {
+                if method == "$/progress" {
+                    self.track_progress(message.get("params"));
+                } else if method == "experimental/serverStatus" && self.quiescent_signal {
+                    self.track_status(message.get("params"));
+                }
+                Poll::Noise
+            }
+            // A response to one of ours.
+            (None, Some(id)) => {
+                let Some(id) = id.as_i64() else { return Poll::Noise };
+                if let Some(error) = message.get("error") {
+                    let text = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the server reported an error with no message");
+                    let code = error.get("code").and_then(Value::as_i64);
+                    return Poll::Failed { id, code, message: text.to_string() };
+                }
+                Poll::Answered { id, result: message.get("result").cloned().unwrap_or(Value::Null) }
+            }
+            (None, None) => Poll::Noise,
+        }
+    }
+
+    /// Follows a `$/progress` notification's `begin`/`end` for work-done
+    /// tokens.
+    ///
+    /// Only `begin` and `end` are tracked, never `report`: a percentage is
+    /// information for a human, and what this needs is the one bit "is the
+    /// server still working". An `end` for a token that never began still
+    /// clears it - servers do send those, and a token stuck "active" forever
+    /// would make this client believe a ready server is busy for the rest of
+    /// its life.
+    ///
+    /// Every `begin` also clears [`idle_since`](LspClient::idle_since), and
+    /// the `end` that empties the set starts it again, so the quiet *period*
+    /// - not the instantaneous emptiness of the set - is what a caller reads.
+    fn track_progress(&mut self, params: Option<&Value>) {
+        let Some(params) = params else { return };
+        let Some(token) = params.get("token") else { return };
+        let token = match token {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        match params.get("value").and_then(|value| value.get("kind")).and_then(Value::as_str) {
+            Some("begin") => {
+                self.active_progress.insert(token, ());
+                self.idle_since = None;
+            }
+            Some("end") => {
+                self.active_progress.remove(&token);
+                if self.active_progress.is_empty() && self.quiescent != Some(false) {
+                    self.idle_since = Some(Instant::now());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Follows rust-analyzer's `experimental/serverStatus` (GM-550): a
+    /// `quiescent: false` is work in flight exactly as a begun progress token
+    /// is, and the `quiescent: true` that ends it starts the quiet clock if no
+    /// token is left in flight - so [`LspClient::quiet_for`], the readiness
+    /// wait and `run_pass`'s deferral of empty answers all read it without a
+    /// rule of their own. A repeated `true` leaves a running quiet clock
+    /// alone. Any other field (`health`, `message`) is information for a
+    /// human, as a progress `report` is.
+    fn track_status(&mut self, params: Option<&Value>) {
+        let Some(quiescent) = params.and_then(|params| params.get("quiescent")).and_then(Value::as_bool)
+        else {
+            return;
+        };
+        self.quiescent = Some(quiescent);
+        if !quiescent {
+            self.idle_since = None;
+        } else if self.idle_since.is_none() && self.active_progress.is_empty() {
+            self.idle_since = Some(Instant::now());
+        }
+    }
+
+    /// Waits for one specific answer, dealing with everything else that
+    /// arrives meanwhile. Used only for `initialize`, which is the one request
+    /// this client has nothing else to do during.
+    fn await_response(&mut self, wanted: i64, deadline: Instant) -> Result<Value> {
+        loop {
+            let Some(remaining) =
+                deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero())
+            else {
+                bail!("the server did not answer request {wanted} within the budget for this pass");
+            };
+            match self.poll(remaining.min(Duration::from_millis(100))) {
+                Poll::Answered { id, result } if id == wanted => return Ok(result),
+                Poll::Failed { id, message, .. } if id == wanted => {
+                    bail!("the server answered request {wanted} with an error: {message}")
+                }
+                Poll::Closed => bail!("the language server exited before answering request {wanted}"),
+                _ => continue,
+            }
+        }
+    }
+
+    /// Ends the server: `shutdown`, `exit`, and a kill for one that ignores
+    /// both.
+    ///
+    /// Every step is best-effort and none of them can fail this process. A
+    /// server that has already crashed is the normal case for the first two,
+    /// and the kill is what makes the *last* case - a server that answered
+    /// `shutdown` and then kept running - bounded rather than permanent.
+    pub(crate) fn shutdown(&mut self, grace: Duration) {
+        let id = self.request("shutdown", Value::Null).ok();
+        if let Some(id) = id {
+            let _ = self.await_response(id, Instant::now() + grace);
+        }
+        let _ = self.notify("exit", Value::Null);
+
+        let until = Instant::now() + grace;
+        loop {
+            let exited = lock(&self.child).try_wait();
+            match exited {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                _ => break,
+            }
+        }
+        let mut child = lock(&self.child);
+        if child.kill().is_ok() {
+            let _ = child.wait();
+            g_mesh_plugin_sdk::log_line!(
+                "[{}] the language server did not exit when asked - killed it",
+                self.language
+            );
+        }
+    }
+
+    /// Drains whatever the server has said since the last poll, without
+    /// waiting. Called before a pass starts so that progress notifications
+    /// sent while the plugin was idle are accounted for rather than read as
+    /// "the server is busy" on the next question.
+    pub(crate) fn drain(&mut self) {
+        while matches!(self.poll_now(), Poll::Noise | Poll::Answered { .. } | Poll::Failed { .. }) {}
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        self.shutdown(Duration::from_millis(500));
+    }
+}
+
+/// What to answer a server-initiated request with.
+///
+/// `workspace/configuration` is the one that cannot be answered with a bare
+/// `null`: it asks for *n* settings and the specification says the answer is
+/// an array of *n* values, so a scalar makes a server that trusts its own
+/// protocol index into nothing. One value per item, in the order asked.
+///
+/// Each item names a `section`, and that is the whole of the lookup:
+/// `settings` is keyed by section name, a section it holds is answered with
+/// its value, and anything else - a section nobody configured, an item with
+/// no `section` at all - is answered `null`, which means "no configuration
+/// for that section" and is what every server handles. GM-289 answered
+/// `null` unconditionally, which was correct only for a server that takes its
+/// settings through `initializationOptions`; pyright takes them **only**
+/// here, and the measurement is in [`super::config`]'s module doc.
+///
+/// The `scopeUri` an item may also carry is deliberately ignored: this client
+/// opens exactly one workspace folder, so every scope is that folder and a
+/// per-scope answer would be the same answer with more ways to get it wrong.
+///
+/// Everything else gets `null`, which covers
+/// `window/workDoneProgress/create` (an acknowledgement),
+/// `client/registerCapability` (an acknowledgement: a server registering
+/// file watchers with a bridge built with
+/// [`client_watches_files`](crate::ServerProfile::client_watches_files)
+/// is told yes and then hears only what the plugin forwards) and whatever a future server
+/// invents. None of these is language-specific: they are base-protocol
+/// methods.
+///
+/// A free function because it reads nothing about the client beyond the map
+/// it is handed, which is also what lets its own test call the real thing
+/// rather than a copy of it.
+fn server_request_reply(method: &str, params: Option<&Value>, settings: &BTreeMap<String, Value>) -> Value {
+    match method {
+        "workspace/configuration" => {
+            let items = params
+                .and_then(|params| params.get("items"))
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            Value::Array(
+                items
+                    .iter()
+                    .map(|item| {
+                        item.get("section")
+                            .and_then(Value::as_str)
+                            .and_then(|section| settings.get(section))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect(),
+            )
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Forwards the server's stderr, prefixed, up to a budget - see
+/// [`STDERR_LINE_BUDGET`].
+fn drain_stderr(language: &str, server: &str, stderr: std::process::ChildStderr) {
+    use std::io::BufRead;
+    let mut lines = 0usize;
+    let mut suppressed = 0usize;
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        lines += 1;
+        if lines <= STDERR_LINE_BUDGET {
+            g_mesh_plugin_sdk::log_line!("[{language}] {server}: {line}");
+            if lines == STDERR_LINE_BUDGET {
+                g_mesh_plugin_sdk::log_line!(
+                    "[{language}] {server}: further output is counted rather than printed - \
+                     {STDERR_LINE_BUDGET} lines is this log's share of it"
+                );
+            }
+        } else {
+            suppressed += 1;
+        }
+    }
+    if suppressed > 0 {
+        g_mesh_plugin_sdk::log_line!(
+            "[{language}] {server}: {suppressed} further line(s) of server output were suppressed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reply shapes a server-initiated request gets, which are the
+    /// difference between a server that finishes loading and one that waits
+    /// forever - see [`server_request_reply`]. The end-to-end version, with a
+    /// real spawned server, is in `tests/lsp_bridge.rs`.
+    #[test]
+    fn a_configuration_request_is_answered_one_value_per_item() {
+        let none = BTreeMap::new();
+        let items = json!({ "items": [{}, {}, {}] });
+        assert_eq!(
+            server_request_reply("workspace/configuration", Some(&items), &none),
+            json!([null, null, null])
+        );
+        assert_eq!(server_request_reply("workspace/configuration", None, &none), json!([]));
+
+        let token = json!({ "token": "t" });
+        assert_eq!(server_request_reply("window/workDoneProgress/create", Some(&token), &none), Value::Null);
+        assert_eq!(server_request_reply("client/registerCapability", None, &none), Value::Null);
+    }
+
+    /// The GM-299 half: a configured section is answered with its value, in
+    /// the order asked, and everything else stays `null`. pyright asks for
+    /// `python` and `pyright` together and indexes the answer positionally,
+    /// so the order and the length are the contract, not just the contents.
+    #[test]
+    fn a_configured_section_is_answered_with_its_value_and_the_rest_stay_null() {
+        let mut settings = BTreeMap::new();
+        settings.insert("python".to_string(), json!({ "analysis": { "typeCheckingMode": "basic" } }));
+
+        let items = json!({ "items": [
+            { "scopeUri": "file:///p", "section": "python" },
+            { "scopeUri": "file:///p", "section": "pyright" },
+            { "scopeUri": "file:///p" },
+        ] });
+        assert_eq!(
+            server_request_reply("workspace/configuration", Some(&items), &settings),
+            json!([{ "analysis": { "typeCheckingMode": "basic" } }, null, null]),
+        );
+
+        // A section nobody asks for is never sent, and asking twice answers
+        // twice - a server may re-request after a `didChangeConfiguration`.
+        let twice = json!({ "items": [{ "section": "python" }, { "section": "python" }] });
+        let answer = server_request_reply("workspace/configuration", Some(&twice), &settings);
+        assert_eq!(answer.as_array().map(Vec::len), Some(2));
+        assert_eq!(answer[0], answer[1]);
+    }
+
+    /// The server runs with `NoDefaultCurrentDirectoryInExePath=1` even when
+    /// the manifest's `env` sets it to something else: its current directory
+    /// is the indexed project, where on Windows `cmd.exe` would otherwise
+    /// look for `node.exe` first.
+    #[cfg(unix)]
+    #[test]
+    fn the_server_runs_with_no_current_directory_exe_lookup_whatever_the_manifest_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen");
+        let mut config = SemanticConfig::new("/bin/sh");
+        config.args = vec![
+            "-c".to_string(),
+            format!("printf '%s' \"${{NoDefaultCurrentDirectoryInExePath-unset}}\" > '{}'", seen.display()),
+        ];
+        config.env.insert("NoDefaultCurrentDirectoryInExePath".to_string(), "0".to_string());
+
+        let started = LspClient::start(
+            "test",
+            &config,
+            dir.path(),
+            Instant::now() + Duration::from_secs(30),
+            false,
+            false,
+        );
+        assert!(started.is_err(), "a server that exits at once is not a client");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let read = || std::fs::read_to_string(&seen).unwrap_or_default();
+        while read().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(read(), "1");
+    }
+}

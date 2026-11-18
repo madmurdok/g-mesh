@@ -10,8 +10,9 @@
 # of a few modules); it never writes, and reports no unexercised entries.
 #
 # How: builds the workspace and lists its test binaries, replaces each real
-# plugin binary (target/debug/g-mesh-plugin-{typescript,rust,python},
-# plugins/go/g-mesh-plugin-go) with a wrapper that appends
+# plugin binary (target/debug/g-mesh-plugin-<lang> for each `cargo` plugin of
+# `build-targets.sh --plugins`, plugins/<lang>/g-mesh-plugin-<lang> for each
+# `go` one) with a wrapper that appends
 # "$NEXTEST_BINARY_ID <tab> $NEXTEST_TEST_NAME <tab> <plugin>" to a log and
 # execs the real binary, then runs every core section from the listed binaries
 # without a cargo build, and restores the binaries. Test failures are ignored:
@@ -49,13 +50,19 @@ die() {
 	exit 2
 }
 
+CARGO_PLUGINS="$(bash scripts/build-targets.sh --plugins cargo)" || die "could not read build-targets.sh --plugins cargo"
+GO_PLUGINS="$(bash scripts/build-targets.sh --plugins go)" || die "could not read build-targets.sh --plugins go"
+[ -n "$CARGO_PLUGINS$GO_PLUGINS" ] || die "build-targets.sh --plugins named no plugin"
+
 # Prints "<plugin> <binary path>" for every plugin the observer wraps.
 plugin_binaries() {
 	local p
-	for p in typescript rust python; do
+	for p in $CARGO_PLUGINS; do
 		echo "$p $TARGET/debug/g-mesh-plugin-$p"
 	done
-	echo "go $PWD/plugins/go/g-mesh-plugin-go"
+	for p in $GO_PLUGINS; do
+		echo "$p $PWD/plugins/$p/g-mesh-plugin-$p"
+	done
 }
 
 restore_binaries() {
@@ -155,7 +162,8 @@ cmd_observe() {
 
 	local partial=0
 	[ -z "$only" ] || partial=1
-	python3 - "$OUT/spawns.log" "$OUT/observed.txt" "$MAP" "$write" core/tests/it/main.rs "$partial" <<'PY'
+	python3 - "$OUT/spawns.log" "$OUT/observed.txt" "$MAP" "$write" core/tests/it/main.rs "$partial" "$CARGO_PLUGINS
+$GO_PLUGINS" <<'PY'
 import re
 import sys
 
@@ -191,7 +199,8 @@ if not partial:
     for m in it_modules:
         observed.setdefault(f"it:{m}", set())
 
-ORDER = ["typescript", "rust", "python", "go"]
+# The order of a row's plugins: cargo plugins, then go ones.
+ORDER = sys.argv[7].split()
 def order(key):
     prefix, module = key.split(":", 1)
     return (["it", "scripts", "lib"].index(prefix), module)

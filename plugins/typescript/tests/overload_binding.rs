@@ -12,9 +12,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use common::Fixture;
-use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
 use g_mesh_plugin_sdk::wire::{EdgeKind, SourceTier, WireEdge};
 use g_mesh_plugin_sdk::{Extractor, RelPath, SdkIndex, SemanticAnswer, SemanticEngine};
+use g_mesh_plugin_sdk_lsp::{LspBridge, SemanticConfig};
 use g_mesh_plugin_typescript::extractor::TypeScriptExtractor;
 
 const OVERLOAD_TS: &str = "export function format(value: string): string;\n\

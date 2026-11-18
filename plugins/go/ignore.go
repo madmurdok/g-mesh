@@ -1,18 +1,18 @@
 package main
 
 // A hand-rolled subset of .gitignore matching, mirroring
-// the shape plugins/sdk/src/walk.rs gets from the Rust `ignore` crate
+// the shape walk/src/lib.rs gets from the Rust `ignore` crate
 // (per-directory layers, later/deeper layer overrides earlier, negation)
 // rather than its implementation.
 //
-// Decision: hand-rolled rather than a dependency. `go.mod` for this plugin
-// has zero requirements today, which is worth keeping for a scaffold whose
-// only job is to prove the shape/stream/id/ownership contract with File
-// nodes - and the pattern subset actually needed (literal segments, `*`
+// Decision: hand-rolled rather than a dependency. The only requirement in
+// this plugin's go.mod is golang.org/x/tools v0.50.0, which the semantic tier
+// needs; a gitignore matcher would add a second one - and the pattern subset
+// actually needed (literal segments, `*`
 // and `?` wildcards within a segment, `**` across segments, a
 // directory-only trailing `/`, an anchoring leading `/` or embedded `/`,
 // negation with `!`, later-line-wins within one file) is exactly what the
-// TS plugin's own fixtures exercise and what real-world .gitignore files
+// testdata/walk.json cases exercise and what real-world .gitignore files
 // overwhelmingly use. What is deliberately not supported: character
 // classes (`[abc]`, `[!abc]`), backslash-escaped metacharacters, and `**`
 // fused with other text in the same segment (`**.log`) - the same tier of
@@ -42,10 +42,19 @@ import (
 // two equal, order included.
 var manifestExcludeDirs = []string{"vendor", "testdata"}
 
-// hardExcludedDirs is manifestExcludeDirs plus .git, which every plugin
-// excludes unconditionally regardless of the manifest.
+// baselineExcludedDirs is the set every plugin excludes unconditionally,
+// regardless of the manifest. It mirrors the Rust constant
+// BASELINE_EXCLUDED_DIRS in walk/src/lib.rs, which core and the SDK both
+// re-export; the Go test TestBaselineExcludedDirsEqualRustBaseline pins the
+// two equal.
+var baselineExcludedDirs = []string{".git", ".claude"}
+
+// hardExcludedDirs is manifestExcludeDirs plus baselineExcludedDirs.
 var hardExcludedDirs = func() map[string]bool {
-	dirs := map[string]bool{".git": true}
+	dirs := map[string]bool{}
+	for _, dir := range baselineExcludedDirs {
+		dirs[dir] = true
+	}
 	for _, dir := range manifestExcludeDirs {
 		dirs[dir] = true
 	}

@@ -14,11 +14,11 @@
 //!   (`daemon::build_stamp`), compared with this command's own; nothing else
 //!   in the report can show up a daemon that outlived an upgrade.
 //! - **Plugins**: one line per `plugin-<language>.pid` file
-//!   (`daemon::registry::discovered_pid_files`). A language with no pid file
+//!   (`StateDir::plugin_pid_files`). A language with no pid file
 //!   is not reported by name: "never touched" and "spawned, now asleep" are
 //!   indistinguishable from outside the daemon, so only "active", "orphaned"
 //!   and one summary line when there are none are reported.
-//! - **Index phase**: the word in `index.phase` (`daemon::read_phase_in`):
+//! - **Index phase**: the word in `index.phase` (`StateDir::read_phase`):
 //!   `unindexed`, `walking`, `structural`, `embedding`, `ready` or `failed`.
 //!   A project can sit `unindexed` under a live, idle daemon, so a live
 //!   daemon does not imply a walk.
@@ -35,28 +35,31 @@
 //! - **Files with syntax errors**: the plugin's `hasSyntaxErrors` flag.
 //!
 //! `--json` prints the same report as one object ([`to_json`]).
+//!
+//! The index's half of the report (coverage, languages, semantic pass) is
+//! read by [`crate::index_health`]; this module adds the daemon, plugin and
+//! build state around it and renders the whole.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
 
+use crate::control::lock::{self, DaemonLock};
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
-use crate::daemon::indexing_status::{group_thousands, ProgressSnapshot};
-use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::embedding::rerank::{OutcomeRecord, RerankModelState, RerankOutcome};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
-use crate::languages::LanguageOutcome;
-use crate::project_walk;
-use crate::storage::connection::project_dir;
-use crate::storage::schema::{SemanticLeftover, MAX_LANGUAGE_RETRIES};
-use crate::watcher::staleness::mtime_millis;
+use crate::index_health::{index_status, language_retries, language_section, semantic_pass_lines};
+pub use crate::index_health::{Coverage, IndexStatus, LanguageSection, Mode};
+use crate::indexing_status::{group_thousands, ProgressSnapshot};
+use crate::paths::state_dir::{read_pid_file, StateDir};
+use crate::plugin_manifest;
+use crate::storage::language_outcome::LanguageOutcome;
+use crate::storage::schema::MAX_LANGUAGE_RETRIES;
 
 /// Whether a daemon core is serving this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +131,7 @@ pub struct PluginReport {
 /// One language whose semantic passes are suspended right now: written by a
 /// running daemon's `PluginSupervisor::check_memory_limit` when `[plugin]
 /// memoryLimitMb` catches its process tree over the limit, and read here off
-/// disk (`daemon::registry::discovered_suspended_markers`). A listing of its
+/// disk (`StateDir::suspended_markers`). A listing of its
 /// own, not a field on [`PluginReport`]: a suspended plugin has no pid file
 /// (suspension removes it, like idle sleep), so the marker is the only trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,109 +142,8 @@ pub struct SuspendedLanguage {
     pub reason: String,
 }
 
-/// What the index covers, and what it still owes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexStatus {
-    /// Whether a full project walk has ever finished (`meta.bulkIndexedAt`).
-    pub bulk_indexed: bool,
-    /// Whether the whole-project semantic pass after a walk has ever finished
-    /// (`meta.semanticPassAt`). Independent of `bulk_indexed`: every walk
-    /// records `bulkIndexedAt` before asking for this pass, so an interrupted
-    /// pass leaves `bulk_indexed` true and this false, the combination
-    /// [`render`] calls out (see `daemon::semantic`'s module doc).
-    pub semantic_pass_completed: bool,
-    /// Semantic-pass-capable languages present in the index whose pass has
-    /// not completed (`language_state.semanticPassAt` unset), sorted.
-    pub semantic_pass_owed: Vec<String>,
-    /// `(language, reason)` for every language whose last whole-project
-    /// semantic pass failed (`language_state.semanticPassError`), sorted.
-    pub semantic_pass_failures: Vec<(String, String)>,
-    /// `(language, trigger)` for every workspace reindex that started and
-    /// never swapped in (`pending_reindex`), sorted: the previous graph of
-    /// the language still serves until it runs again.
-    pub pending_reindex: Vec<(String, String)>,
-    /// `(language, since, file count)` for every semantic-pass-capable
-    /// language whose pass is owed after a workspace reindex swap and not
-    /// done (`semantic_pending`, ADR 0009), sorted.
-    pub semantic_pending: Vec<(String, String, usize)>,
-    /// `(language, file count)` for every semantic-pass-capable language not
-    /// done whose files a workspace reindex changed and whose pass then
-    /// failed, finished residual or did not run: no pass has re-checked those
-    /// files' semantic edges (`semantic_pending_files` without a
-    /// `semantic_pending` row, ADR 0009), sorted.
-    pub semantic_stale: Vec<(String, usize)>,
-    /// Per semantic-pass-capable language: the files its last whole-project
-    /// pass left for the next start (residual, GM-521) and the files no pass
-    /// ever answered, sorted by language.
-    pub semantic_leftovers: Vec<SemanticLeftover>,
-    /// What the project walk found against the index; `None` in
-    /// [`Mode::Light`], which does not walk the project.
-    pub coverage: Option<Coverage>,
-    /// Project-relative paths of files the plugin flagged as only partially
-    /// parseable, sorted.
-    pub syntax_error_files: Vec<String>,
-}
-
-/// Which `status` view to build: [`Mode::Light`] reads only state files and
-/// the index; [`Mode::Full`] also walks the project for [`Coverage`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Light,
-    Full,
-}
-
-/// The index against the project on disk, from one gitignore-aware walk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Coverage {
-    /// Source files found on disk now - the denominator of coverage.
-    pub discovered: usize,
-    /// How many of those the index has a `File` node for.
-    pub indexed: usize,
-    /// Files the index still owes work for: never indexed, or indexed against
-    /// a recorded baseline that no longer matches the file on disk.
-    ///
-    /// A bulk-indexed file with no `indexed_files` row is *not* counted: the
-    /// walk leaves no baseline when it cannot prove it saw the current bytes
-    /// (`watcher::staleness::record_walk_baselines`), and older indexes have
-    /// none at all, so a missing baseline means "not checked since", not
-    /// "stale".
-    pub dirty: usize,
-}
-
-impl Coverage {
-    /// Indexed files over discovered files. A project with no source files at
-    /// all is fully covered rather than a division by zero.
-    pub fn ratio(&self) -> f64 {
-        if self.discovered == 0 {
-            return 1.0;
-        }
-        self.indexed as f64 / self.discovered as f64
-    }
-}
-
-/// What the index records per language, as far as this index can say.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LanguageSection {
-    /// No `index.db` yet.
-    NoIndex,
-    /// The directory is a front (D11): there is no index to read.
-    Front,
-    /// The index has no `language_outcome` table: it was built by a schema
-    /// before per-language outcomes, and the next daemon start rebuilds it.
-    /// `schema_version` is `meta.schema_version` when readable.
-    PredatesOutcomes { schema_version: Option<String> },
-    /// No outcome recorded, and a live daemon is walking (or about to walk)
-    /// the project: the walk records them when it finishes.
-    WalkInProgress,
-    /// No outcome recorded and no walk under way.
-    NoneRecorded,
-    /// The last walk's outcomes, sorted by language
-    /// (`storage::schema::language_outcomes`).
-    Recorded(Vec<(String, LanguageOutcome)>),
-}
-
 /// The languages part of the report: the index's outcomes and the plugins
-/// installed now (`manifest::discover`).
+/// installed now (`plugin_manifest::discover`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanguagesReport {
     pub section: LanguageSection,
@@ -353,13 +255,13 @@ fn rerank_status(core: CoreState, state_dir: &Path) -> RerankStatus {
         CoreState::Running { pid } | CoreState::NotAccepting { pid } | CoreState::Wedged { pid } => Some(pid),
         CoreState::NotRunning => None,
     };
-    match OutcomeRecord::read(&daemon::rerank_outcome_path_in(state_dir))
+    match OutcomeRecord::read(&StateDir::at(state_dir).rerank_outcome_file())
         .filter(|record| Some(record.pid) == live_pid)
     {
         Some(record) => RerankStatus::Daemon(record),
         None => RerankStatus::OnDisk {
             daemon_alive: live_pid.is_some(),
-            state: RerankModelState::from_environment(),
+            state: RerankModelState::of(crate::config::embedding::rerank_settings()),
         },
     }
 }
@@ -397,21 +299,22 @@ pub fn run(full: bool, json: bool) -> Result<()> {
 /// Gathers every field of the report for `project_root`. Only
 /// [`Mode::Full`] walks the project's files.
 pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
-    let state_dir = project_dir(project_root).context("failed to resolve the project's state directory")?;
+    let sd = StateDir::of(project_root).context("failed to resolve the project's state directory")?;
+    let state_dir = sd.path().to_path_buf();
     let project_id =
         state_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
     let core = core_state(project_root)?;
-    let phase = daemon::read_phase_in(&state_dir);
+    let phase = sd.read_phase();
     let front = (phase.as_deref() == Some(daemon::front::FRONT_PHASE)).then(|| {
-        let walk = daemon::candidates::walk(project_root, daemon::candidates::Limits::default());
+        let walk = crate::project_detect::walk(project_root, crate::project_detect::Limits::default());
         FrontSummary { projects: walk.candidates.len(), truncated: walk.truncated }
     });
     // The same discovery the daemon runs at startup, so the files counted
     // here are the files the discovered plugins index, in every language.
     // A failure is reported rather than fatal, except where the walk needs
     // the plugins to know which files count.
-    let discovered = manifest::discover(&manifest::default_roots());
+    let discovered = plugin_manifest::discover(&plugin_manifest::default_roots());
     if mode == Mode::Full && front.is_none() {
         if let Err(err) = &discovered {
             anyhow::bail!("failed to discover language plugins: {err:#}");
@@ -427,7 +330,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
     };
     let plugins = discovered.unwrap_or_default();
 
-    let db_path = state_dir.join("index.db");
+    let db_path = sd.index_db();
     let (index, section) = if front.is_some() {
         let index = IndexStatus {
             bulk_indexed: false,
@@ -465,7 +368,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
         index,
         phase,
         front,
-        progress: daemon::read_progress_in(&state_dir),
+        progress: crate::indexing_status::read_progress(&sd),
         languages: LanguagesReport { section, installed, retries },
         rerank_model: rerank_status(core, &state_dir),
         project_root: project_root.to_path_buf(),
@@ -473,87 +376,20 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
     })
 }
 
-/// What the index at `db_path` records per language. `walk_live` is whether
-/// a live daemon's phase is `walking` or `unindexed`, which tells "not
-/// recorded yet" from "none recorded" on an index with no outcome rows.
-/// Probes for the table first: an index from before per-language outcomes
-/// has none, and says so rather than looking like an empty list.
-pub fn language_section(db_path: &Path, walk_live: bool) -> Result<LanguageSection> {
-    if !db_path.exists() {
-        return Ok(LanguageSection::NoIndex);
-    }
-    let conn = open_index(db_path)?;
-    let has_table: bool = conn
-        .query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'language_outcome')",
-            [],
-            |row| row.get(0),
-        )
-        .context("failed to look for the language outcome table")?;
-    if !has_table {
-        use rusqlite::OptionalExtension as _;
-        let schema_version = conn
-            .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get::<_, String>(0))
-            .optional()
-            .ok()
-            .flatten();
-        return Ok(LanguageSection::PredatesOutcomes { schema_version });
-    }
-    let outcomes = crate::storage::schema::language_outcomes(&conn)?;
-    Ok(if !outcomes.is_empty() {
-        LanguageSection::Recorded(outcomes)
-    } else if walk_live {
-        LanguageSection::WalkInProgress
-    } else {
-        LanguageSection::NoneRecorded
-    })
-}
-
-/// Each language's automatic retries (`language_retry`), empty when the index
-/// has no such table yet or cannot be read: the count only adds to a failed
-/// line, so a failure to read it costs that clause, not the report.
-pub fn language_retries(db_path: &Path) -> BTreeMap<String, u32> {
-    let read = || -> Result<BTreeMap<String, u32>> {
-        let conn = open_index(db_path)?;
-        let has_table: bool = conn
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'language_retry')",
-                [],
-                |row| row.get(0),
-            )
-            .context("failed to look for the language retry table")?;
-        if !has_table {
-            return Ok(BTreeMap::new());
-        }
-        crate::storage::schema::language_retries(&conn)
-    };
-    read().unwrap_or_default()
-}
-
-/// Opens an existing index for reading. Read-write without CREATE, for the
-/// same reason `gc::last_used` uses it: recovering a WAL an abandoned daemon
-/// left behind needs write access, and a missing database must never be
-/// conjured into existence by a command that only reports. Nothing here
-/// writes.
-pub(crate) fn open_index(db_path: &Path) -> Result<Connection> {
-    Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
-        .with_context(|| format!("failed to open the project index at {}", db_path.display()))
-}
-
 fn core_state(project_root: &Path) -> Result<CoreState> {
-    let recorded =
-        daemon::read_pid_file(&daemon::pid_path(project_root)?).filter(|&pid| daemon::is_process_alive(pid));
+    let state_dir = StateDir::of(project_root)?;
+    let recorded = read_pid_file(&state_dir.pid_file()).filter(|&pid| crate::process::is_alive(pid));
     let Some(pid) = recorded else {
         // No live pid file does not end the enquiry: a daemon that removed its
         // pid file and failed to exit still holds the singleton lock. The lock
         // is what `daemon::acquire_singleton_lock` acts on, so this report and
         // the next bootstrap cannot disagree.
-        return Ok(match daemon::inspect_daemon_lock(project_root)? {
-            daemon::DaemonLock::Wedged { pid } => CoreState::Wedged { pid },
+        return Ok(match lock::inspect_daemon_lock(project_root)? {
+            DaemonLock::Wedged { pid } => CoreState::Wedged { pid },
             _ => CoreState::NotRunning,
         });
     };
-    Ok(if daemon::is_listening(project_root)? {
+    Ok(if lock::is_listening(&state_dir)? {
         CoreState::Running { pid }
     } else {
         CoreState::NotAccepting { pid }
@@ -572,7 +408,7 @@ fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
     let Ok(ours) = build_stamp::of_running_process() else {
         return BuildState::Unknown;
     };
-    let published = build_stamp::read(&daemon::build_stamp_path_in(state_dir));
+    let published = build_stamp::read(&StateDir::at(state_dir).build_stamp_file());
     match build_stamp::vintage(published.as_ref(), &ours) {
         Vintage::Current => BuildState::Current,
         Vintage::Outdated => BuildState::Outdated,
@@ -582,13 +418,14 @@ fn build_state(core: CoreState, state_dir: &Path) -> BuildState {
 }
 
 /// Every language with a live pid file in `state_dir`, sorted by language
-/// (the order `discovered_pid_files` returns). A pid file naming a dead
+/// (the order `StateDir::plugin_pid_files` returns). A pid file naming a dead
 /// process is dropped, as in every pid-file read in this daemon.
 fn plugin_reports(state_dir: &Path, core: CoreState) -> Vec<PluginReport> {
-    crate::daemon::registry::discovered_pid_files(state_dir)
+    StateDir::at(state_dir)
+        .plugin_pid_files()
         .into_iter()
         .filter_map(|(language, path)| {
-            let pid = daemon::read_pid_file(&path).filter(|&pid| daemon::is_process_alive(pid))?;
+            let pid = read_pid_file(&path).filter(|&pid| crate::process::is_alive(pid))?;
             Some(PluginReport { language, state: classify_plugin(pid, core) })
         })
         .collect()
@@ -598,7 +435,8 @@ fn plugin_reports(state_dir: &Path, core: CoreState) -> Vec<PluginReport> {
 /// [`plugin_reports`] it does not depend on `core`: a suspension is a fact
 /// about the state directory, not about a running daemon.
 fn suspended_language_reports(state_dir: &Path) -> Vec<SuspendedLanguage> {
-    crate::daemon::registry::discovered_suspended_markers(state_dir)
+    StateDir::at(state_dir)
+        .suspended_markers()
         .into_iter()
         .map(|(language, reason)| SuspendedLanguage { language, reason })
         .collect()
@@ -614,295 +452,6 @@ fn classify_plugin(pid: u32, core: CoreState) -> PluginState {
         CoreState::NotRunning | CoreState::Wedged { .. } => PluginState::Orphaned { pid },
         CoreState::Running { .. } | CoreState::NotAccepting { .. } => PluginState::Active { pid },
     }
-}
-
-/// What the index knows, and in [`Mode::Full`] how it compares with what is
-/// on disk. Takes the database path explicitly so it can be tested against a
-/// hand-built index.
-pub fn index_status(
-    project_root: &Path,
-    db_path: &Path,
-    plugins: &DiscoveredPlugins,
-    mode: Mode,
-) -> Result<IndexStatus> {
-    let discovered = match mode {
-        Mode::Full => Some(discover_source_files(project_root, plugins)?),
-        Mode::Light => None,
-    };
-
-    // No index yet (never bootstrapped, or deleted by hand): everything on
-    // disk is owed work, and none of it is covered.
-    if !db_path.exists() {
-        return Ok(IndexStatus {
-            bulk_indexed: false,
-            semantic_pass_completed: false,
-            semantic_pass_owed: Vec::new(),
-            semantic_pass_failures: Vec::new(),
-            pending_reindex: Vec::new(),
-            semantic_pending: Vec::new(),
-            semantic_stale: Vec::new(),
-            semantic_leftovers: Vec::new(),
-            coverage: discovered.map(|files| Coverage {
-                discovered: files.len(),
-                indexed: 0,
-                dirty: files.len(),
-            }),
-            syntax_error_files: Vec::new(),
-        });
-    }
-
-    let conn = open_index(db_path)?;
-    let coverage = match discovered {
-        Some(files) => Some(coverage(&conn, &files)?),
-        None => None,
-    };
-
-    let capable: HashSet<String> =
-        manifest::semantic_pass_capable_languages(&plugins.manifests).into_iter().collect();
-    let (semantic_pass_owed, semantic_pass_failures) = semantic_pass_state(&conn, &capable)?;
-    Ok(IndexStatus {
-        bulk_indexed: crate::storage::schema::bulk_index_completed(&conn)
-            .context("failed to read whether the project has been fully walked")?,
-        semantic_pass_completed: crate::storage::schema::semantic_pass_completed(&conn)
-            .context("failed to read whether the project's semantic pass has completed")?,
-        semantic_pass_owed,
-        semantic_pass_failures,
-        pending_reindex: crate::storage::schema::pending_reindexes(&conn)
-            .context("failed to read the interrupted workspace reindexes")?,
-        semantic_pending: semantic_pending(&conn, &capable)?,
-        semantic_stale: semantic_stale(&conn, &capable)?,
-        semantic_leftovers: crate::storage::schema::semantic_leftovers(&conn)
-            .context("failed to read the semantic residual and never-answered files")?
-            .into_iter()
-            .filter(|leftover| capable.contains(&leftover.language))
-            .collect(),
-        coverage,
-        syntax_error_files: syntax_error_files(&conn)?,
-    })
-}
-
-/// Cross-references the files a project walk found against the index's
-/// `File` nodes and `indexed_files` baselines.
-fn coverage(conn: &Connection, discovered: &[SourceFile]) -> Result<Coverage> {
-    let indexed_files = indexed_file_paths(conn)?;
-    let baselines = recorded_baselines(conn)?;
-
-    let mut indexed = 0;
-    let mut dirty = 0;
-    for file in discovered {
-        if !indexed_files.contains(&file.relative) {
-            // Never indexed - the one case that is both uncovered and dirty.
-            dirty += 1;
-            continue;
-        }
-        indexed += 1;
-        if let Some(&recorded_mtime) = baselines.get(&file.relative) {
-            if recorded_mtime != file.mtime_millis {
-                dirty += 1;
-            }
-        }
-    }
-    Ok(Coverage { discovered: discovered.len(), indexed, dirty })
-}
-
-/// The semantic-pending languages a reader should believe: capable, and whose
-/// pass is not recorded done.
-fn semantic_pending(conn: &Connection, capable: &HashSet<String>) -> Result<Vec<(String, String, usize)>> {
-    let pending = crate::storage::schema::semantic_pending(conn)
-        .context("failed to read the semantic-pending languages")?;
-    let mut believed = Vec::new();
-    for (language, since, files) in pending {
-        if capable.contains(&language)
-            && !crate::storage::schema::language_semantic_pass_done(conn, &language)
-                .context("failed to read whether a pending semantic pass completed")?
-        {
-            believed.push((language, since, files));
-        }
-    }
-    Ok(believed)
-}
-
-/// The stale-file counts a reader should believe: capable languages whose
-/// pass is not recorded done, as [`semantic_pending`] filters.
-fn semantic_stale(conn: &Connection, capable: &HashSet<String>) -> Result<Vec<(String, usize)>> {
-    let stale = crate::storage::schema::semantic_stale_files(conn)
-        .context("failed to read the stale semantic files")?;
-    let mut believed = Vec::new();
-    for (language, files) in stale {
-        if capable.contains(&language)
-            && !crate::storage::schema::language_semantic_pass_done(conn, &language)
-                .context("failed to read whether a semantic pass completed")?
-        {
-            believed.push((language, files));
-        }
-    }
-    Ok(believed)
-}
-
-/// `(language, reason)` per language whose last semantic pass failed.
-type SemanticPassFailures = Vec<(String, String)>;
-
-/// The languages still owed a semantic pass, and the recorded failures -
-/// what [`semantic_pass_lines`] reports.
-pub(crate) fn semantic_pass_state(
-    conn: &Connection,
-    capable: &HashSet<String>,
-) -> Result<(Vec<String>, SemanticPassFailures)> {
-    let owed = crate::storage::schema::owed_semantic_pass_languages(conn, capable)
-        .context("failed to read which languages still owe a semantic pass")?;
-    let failures = crate::storage::schema::semantic_pass_failures(conn)
-        .context("failed to read the recorded semantic-pass failures")?;
-    Ok((owed, failures))
-}
-
-/// The report's semantic-pass lines: one per language whose last pass
-/// failed, with its reason, and the "never completed" advice only while some
-/// owed language has no recorded failure or residual to explain it and no
-/// live daemon is working on the index. `in_progress` is what to say instead
-/// while one is. Then, per `leftovers` entry, the files an owed residual
-/// language's next start asks (GM-521) and the files no pass ever answered.
-pub(crate) fn semantic_pass_lines(
-    completed: bool,
-    owed: &[String],
-    failures: &[(String, String)],
-    leftovers: &[SemanticLeftover],
-    in_progress: Option<&str>,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    let residual = |language: &String| {
-        leftovers.iter().any(|leftover| &leftover.language == language && leftover.residual_files.is_some())
-    };
-    if completed {
-        lines.push("  semantic pass:   complete".to_string());
-    } else if let Some(in_progress) = in_progress {
-        lines.push(format!("  semantic pass:   {in_progress}"));
-    } else {
-        let unexplained = owed
-            .iter()
-            .any(|language| !failures.iter().any(|(failed, _)| failed == language) && !residual(language));
-        if unexplained || (failures.is_empty() && !owed.iter().any(residual)) {
-            lines.push("  semantic pass:   never completed - run `g-mesh reindex` to repair it".to_string());
-        }
-    }
-    for leftover in leftovers {
-        let language = &leftover.language;
-        if let Some(files) = leftover.residual_files.filter(|_| owed.contains(language)) {
-            let asks =
-                if in_progress.is_some() { "the running daemon asks" } else { "the next daemon start asks" };
-            lines.push(format!(
-                "  semantic pass:   {language} incomplete - {files} file(s) left, {asks} only those"
-            ));
-        }
-        if leftover.never_answered > 0 {
-            lines.push(format!(
-                "  semantic pass:   {language}: {} file(s) never answered - asked again when they change",
-                leftover.never_answered
-            ));
-        }
-    }
-    for (language, reason) in failures {
-        // A pass deferred because its plugin was asleep has not failed: it is
-        // still owed and will be asked again.
-        // While a live daemon is working, it is the one that asks again, so
-        // the line carries no repair advice.
-        if reason == daemon::semantic::NOT_RUN_REASON {
-            let asks_again = if in_progress.is_some() {
-                "the running daemon asks again"
-            } else {
-                "the next daemon start or `g-mesh reindex` asks again"
-            };
-            lines.push(format!(
-                "  semantic pass:   {language} pending - its plugin was asleep or memory-suspended; {asks_again}"
-            ));
-            continue;
-        }
-        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-        lines.push(format!("  semantic pass:   {language} failed - {reason}"));
-    }
-    lines
-}
-
-struct SourceFile {
-    /// Project-relative, forward-slash separated - the same spelling the
-    /// `filePath` columns and the wire protocol use.
-    relative: String,
-    mtime_millis: i64,
-}
-
-/// Walks `project_root` for files some discovered plugin would index, through
-/// the walker [`project_walk::project_files`] shares with the bulk walk's
-/// absent-plugin count: `.gitignore`, the baseline exclusions and each
-/// language's `[plugin.workspace] exclude_dirs`; the per-file decision is
-/// [`DiscoveredPlugins::indexing_language`], the watcher's filter. Each
-/// plugin walks in its own process with the same walk (`g_mesh_walk`), so
-/// a file reached only through a followed link is discovered under the
-/// link's spelling, as the plugin indexes it, and its mtime is read through
-/// the link, as the plugin's baseline records it. A file under a link whose
-/// target one language excludes is not that language's (both spellings are
-/// checked). Unreadable metadata is skipped, which cannot make a broken
-/// index look healthy.
-fn discover_source_files(project_root: &Path, plugins: &DiscoveredPlugins) -> Result<Vec<SourceFile>> {
-    // Pruned outright: the baseline (always, by the walker), plus any
-    // directory *every* discovered language excludes. A directory only some
-    // languages exclude is still walked (`dist/app.py` is Python's even though
-    // TypeScript skips `dist`), and its files are filtered one by one below.
-    let pruned = plugins.excluded_by_every_language();
-
-    let mut files = Vec::new();
-    for walked in project_walk::project_files(project_root, &pruned) {
-        if plugins.indexing_language(&walked.relative, walked.real_relative.as_deref()).is_none() {
-            continue;
-        }
-        let Ok(metadata) = fs::metadata(&walked.path) else {
-            continue;
-        };
-        let Ok(mtime_millis) = mtime_millis(&metadata) else {
-            continue;
-        };
-        files.push(SourceFile { relative: walked.relative, mtime_millis });
-    }
-    Ok(files)
-}
-
-/// Every file the index has a `File` node for. The plugin emits exactly one
-/// per file it parsed, which makes this the honest answer to "which files
-/// does the graph actually cover?" - unlike `indexed_files`, which only the
-/// incremental path writes, and unlike `DISTINCT filePath`, which a file with
-/// no symbols in it would be missing from.
-fn indexed_file_paths(conn: &Connection) -> Result<HashSet<String>> {
-    let mut statement = conn
-        .prepare("SELECT filePath FROM nodes WHERE kind = 'File'")
-        .context("failed to query indexed files")?;
-    let paths = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .context("failed to read indexed files")?
-        .collect::<rusqlite::Result<HashSet<String>>>()
-        .context("failed to read indexed files")?;
-    Ok(paths)
-}
-
-fn recorded_baselines(conn: &Connection) -> Result<std::collections::HashMap<String, i64>> {
-    let mut statement = conn
-        .prepare("SELECT filePath, mtimeMillis FROM indexed_files")
-        .context("failed to query indexed_files baselines")?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-        .context("failed to read indexed_files baselines")?
-        .collect::<rusqlite::Result<std::collections::HashMap<String, i64>>>()
-        .context("failed to read indexed_files baselines")?;
-    Ok(rows)
-}
-
-fn syntax_error_files(conn: &Connection) -> Result<Vec<String>> {
-    let mut statement = conn
-        .prepare("SELECT DISTINCT filePath FROM nodes WHERE hasSyntaxErrors = 1 ORDER BY filePath")
-        .context("failed to query files with syntax errors")?;
-    let files = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .context("failed to read files with syntax errors")?
-        .collect::<rusqlite::Result<Vec<String>>>()
-        .context("failed to read files with syntax errors")?;
-    Ok(files)
 }
 
 /// Renders a report as the text the command prints.
@@ -1129,7 +678,7 @@ fn describe_language_row(row: &LanguageRow<'_>, discovery_failed: bool) -> Strin
             format!(
                 "failed{} - not in the index: {}{retry}",
                 version(),
-                crate::languages::error_on_one_line(error)
+                crate::storage::language_outcome::error_on_one_line(error)
             )
         }
         Some(LanguageOutcome::PluginAbsent { files }) => {

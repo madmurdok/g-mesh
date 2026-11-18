@@ -284,7 +284,7 @@ const DEFAULT_FLOOR: f64 = 0.53;
 /// the full table, the sample, and the held-out check.
 ///
 /// Matched on the manifest's own `language` id, spelled exactly as
-/// `nodes.language` and `daemon::manifest` spell it, for the reason
+/// `nodes.language` and `plugin_manifest` spell it, for the reason
 /// `provenance::Provenance::language` gives: an agent cross-referencing the
 /// two must never meet two spellings of one language.
 pub(crate) fn floor(language: &str) -> f64 {
@@ -429,7 +429,7 @@ pub(super) fn partial_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::manifest::NonSymbolShapes;
+    use crate::plugin_manifest::NonSymbolShapes;
 
     fn shipped() -> &'static QueryShapes {
         QueryShapes::shipped()

@@ -426,7 +426,7 @@ impl Declarer<'_, '_> {
                 NodeKind::Variable,
                 name.to_string(),
                 module.qualified_path(&field_tail_path(type_name, name)),
-                self.emitter.positions().range(field),
+                self.emitter.positions().node_range(field),
             )
             .native_kind("field")
             .visibility(own.clone())
@@ -474,7 +474,7 @@ impl Declarer<'_, '_> {
                 kind,
                 name.to_string(),
                 module.qualified_path(&tail_path),
-                self.emitter.positions().range(variant),
+                self.emitter.positions().node_range(variant),
             )
             .native_kind("variant")
             .visibility(own.clone())
@@ -524,8 +524,8 @@ impl Declarer<'_, '_> {
             let own = modifier_visibility(modifier, module, self.source);
             let start = modifier.unwrap_or(child);
             let range = g_mesh_plugin_sdk::wire::Range {
-                start: self.emitter.positions().at(start.start_position()),
-                end: self.emitter.positions().at(child.end_position()),
+                start: self.emitter.positions().point(start.start_position()),
+                end: self.emitter.positions().point(child.end_position()),
             };
             let mut spec = NodeSpec::with_path(
                 NodeKind::Variable,
@@ -608,10 +608,11 @@ impl Declarer<'_, '_> {
         let name = item_name(item, self.source)?.to_string();
         let tail = member_tail(block, &name);
         let path = module.qualified_path(&member_tail_path(block, &name));
-        let mut spec = NodeSpec::with_path(kind, name.clone(), path, self.emitter.positions().range(item))
-            .native_kind(native_kind)
-            .visibility(own.clone())
-            .in_container(module.key.clone(), module.parent.clone());
+        let mut spec =
+            NodeSpec::with_path(kind, name.clone(), path, self.emitter.positions().node_range(item))
+                .native_kind(native_kind)
+                .visibility(own.clone())
+                .in_container(module.key.clone(), module.parent.clone());
         if let Some(alias) = block.and_then(|block| block.alias_tail_path(&name)) {
             spec = spec.alias(module.qualified_path(&alias));
         }
@@ -665,7 +666,7 @@ impl Declarer<'_, '_> {
             NodeKind::Module,
             name.clone(),
             module.qualified_path(&QualifiedPath::root(name.clone())),
-            self.emitter.positions().range(item),
+            self.emitter.positions().node_range(item),
         )
         .native_kind("module")
         .visibility(own.clone())
@@ -688,7 +689,7 @@ impl Declarer<'_, '_> {
     /// still written for `alloc`/`test` and in macro-exporting crates.
     fn extern_crate(&mut self, item: Node, module: &ModuleCtx) {
         let Some(name) = item_name(item, self.source) else { return };
-        let range = self.emitter.positions().range(item);
+        let range = self.emitter.positions().node_range(item);
         let target = resolve_module_path(&[Seg::Name(name)], module, self.model, self.project);
         self.import_edge(target, name, range);
     }
@@ -707,7 +708,7 @@ impl Declarer<'_, '_> {
     }
 
     fn use_leaf(&mut self, leaf: &UseLeaf<'_>, module: &ModuleCtx, republishes: bool) {
-        let range = self.emitter.positions().range(leaf.node);
+        let range = self.emitter.positions().node_range(leaf.node);
         // A leaf with no prefix is a bare `use some_crate;` - the path is the
         // name itself, and there is nothing inside it to place.
         if leaf.prefix.is_empty() {
@@ -826,18 +827,7 @@ impl Declarer<'_, '_> {
     /// The `IMPORTS` edge from this file onto whatever a `use` prefix named,
     /// carrying `specifier`, the path as written ([`spell`]).
     fn import_edge(&mut self, target: PathTarget, specifier: &str, range: g_mesh_plugin_sdk::wire::Range) {
-        let file = self.emitter.file_id().to_string();
-        let to = match target {
-            PathTarget::Container(container) => self.emitter.placeholder(
-                PlaceholderKind::ResolvedModule,
-                container.rsplit("::").next().unwrap_or(&container),
-                container_target(&container, TargetKey::Name("*".to_string()), &container),
-                range,
-            ),
-            PathTarget::ExternalCrate(krate) => self.emitter.external_module(&krate, range),
-            PathTarget::Unresolved => return,
-        };
-        self.emitter.import_edge(&file, &to, specifier);
+        self.emitter.module_import(target, specifier, range);
     }
 }
 
@@ -845,7 +835,7 @@ impl Declarer<'_, '_> {
 /// the `IMPORTS` edge it draws. Matched by a resolution delta only for a path
 /// rooted at a crate name; an in-crate path (`crate::`, `self::`, `super::`)
 /// is matched by its stored target key instead (GM-509 design, section 3.6).
-fn spell(segments: &[Seg<'_>]) -> String {
+pub(crate) fn spell(segments: &[Seg<'_>]) -> String {
     segments
         .iter()
         .map(|seg| match seg {
@@ -856,6 +846,46 @@ fn spell(segments: &[Seg<'_>]) -> String {
         })
         .collect::<Vec<_>>()
         .join("::")
+}
+
+/// The `IMPORTS` edges of a `use` written inside a block (a fn body, a
+/// closure, a nested `{ }`), resolved against the enclosing `module` as Rust
+/// resolves them. Only the edges: the names such a `use` binds are scoped to
+/// its block, so they are not recorded in the module's imports, and no
+/// `reexport` row is written for them.
+pub(crate) fn block_use_imports(
+    item: Node,
+    module: &ModuleCtx,
+    source: &str,
+    model: &FileModel,
+    project: &ProjectContext,
+    emitter: &mut Emitter<'_>,
+) {
+    let Some(argument) = item.child_by_field_name("argument") else { return };
+    let mut leaves = Vec::new();
+    collect_use_leaves(argument, &[], &mut leaves, source);
+    for leaf in leaves {
+        let range = emitter.positions().node_range(leaf.node);
+        if leaf.prefix.is_empty() {
+            if let LeafKind::Named { name, .. } = leaf.kind {
+                emitter.module_import(
+                    resolve_module_path(&[Seg::Name(name)], module, model, project),
+                    name,
+                    range,
+                );
+            }
+            continue;
+        }
+        let target = resolve_module_path(&leaf.prefix, module, model, project);
+        if let (PathTarget::Container(container), LeafKind::Named { name, .. }) = (&target, leaf.kind) {
+            let submodule = format!("{container}::{name}");
+            if project.has_container(&submodule) {
+                let specifier = format!("{}::{name}", spell(&leaf.prefix));
+                emitter.module_import(PathTarget::Container(submodule), &specifier, range);
+            }
+        }
+        emitter.module_import(target, &spell(&leaf.prefix), range);
+    }
 }
 
 /// `std::io` for an external `use std::io::Error;`'s prefix: the path as

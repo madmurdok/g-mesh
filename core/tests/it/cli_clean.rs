@@ -17,8 +17,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use g_mesh::daemon;
 use g_mesh::daemon::identity::project_hash;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::paths::HOME_ENV;
 
 use crate::common;
@@ -51,11 +51,11 @@ impl Project {
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path_in(&self.state_dir())
+        StateDir::at(self.state_dir()).pid_file()
     }
 
     fn plugin_pid_file(&self) -> PathBuf {
-        daemon::plugin_pid_path_in(&self.state_dir())
+        StateDir::at(self.state_dir()).plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)
     }
 
     /// Bootstraps a detached daemon through the shim, so the state directory
@@ -217,7 +217,7 @@ fn clean_and_clean_orphaned_handle_a_front_state_dir() {
     project.bootstrap_daemon();
     let state_dir = project.state_dir();
     wait_for("the fixture's daemon to be a front", || {
-        daemon::read_phase_in(&state_dir).as_deref() == Some("front")
+        StateDir::at(&state_dir).read_phase().as_deref() == Some("front")
     });
     assert!(!state_dir.join("index.db").exists(), "a front has no index.db");
 

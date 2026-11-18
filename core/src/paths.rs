@@ -7,6 +7,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+pub mod state_dir;
+
 use anyhow::{Context, Result};
 
 /// Points g-mesh's state somewhere other than `~/.g-mesh`.
@@ -17,7 +19,7 @@ use anyhow::{Context, Result};
 /// project directories a day under the real `~/.g-mesh/projects/`, and one
 /// `cli_init` test failed against state an unrelated benchmark run was
 /// mutating at the same time.
-pub const HOME_ENV: &str = "G_MESH_HOME";
+pub const HOME_ENV: &str = crate::knobs::HOME.name;
 
 /// `~/.g-mesh`, or `$G_MESH_HOME` if set.
 ///
@@ -29,11 +31,11 @@ pub const HOME_ENV: &str = "G_MESH_HOME";
 ///   per-run state. Pointing it at a test root would mean re-downloading it
 ///   rather than reusing what is already on disk, which is why it keeps its
 ///   own, older `G_MESH_MODEL_DIR` override
-///   ([`crate::embedding::model::default_model_dir`]).
+///   ([`crate::config::embedding::model_dir`]).
 /// - `bin/` - written by `scripts/install.sh`, which this binary never reads.
 ///   `G_MESH_HOME` moves where g-mesh *works*, not where it is installed.
 pub fn g_mesh_home() -> Result<PathBuf> {
-    home_from(std::env::var_os(HOME_ENV))
+    home_from(crate::knobs::os_non_empty(&crate::knobs::HOME))
 }
 
 /// The resolution itself, with the override passed in rather than read.

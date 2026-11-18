@@ -36,13 +36,14 @@
 //! pattern this crate already uses for its `serde_json` types, just fed
 //! through the `toml` crate's (de)serializer instead of JSON's.
 //!
-//! # Not wired to runtime behavior yet
+//! # Who reads them
 //!
-//! Reading/writing/round-tripping these files is what this module is for.
-//! Nothing here changes how long a plugin process actually stays alive or
-//! which embedding model actually runs - that is each field's own
-//! consumer's job (e.g. task #38 for `plugin.idleTimeoutMinutes`), wiring up
-//! later against a config surface that already round-trips correctly today.
+//! The daemon's startup and the CLI commands read these files and hand plain
+//! values to the modules that use them. [`embedding`] turns the embedding
+//! sections plus their environment overrides into
+//! [`crate::embedding::EmbeddingSettings`], once per daemon or CLI run.
+
+pub mod embedding;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,9 +52,7 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::storage::connection::project_dir;
-
-const CONFIG_FILE_NAME: &str = "config.toml";
+use crate::paths::state_dir::StateDir;
 
 // ---------------------------------------------------------------------------
 // Per-project config
@@ -106,8 +105,8 @@ impl Default for PluginConfig {
 }
 
 /// `[daemon]`: how long the daemon core is allowed to sit idle (zero MCP
-/// requests) before it exits cleanly. Not wired to the real daemon lifecycle
-/// yet.
+/// requests) before it exits cleanly. Read by
+/// `daemon::lifecycle::IdleTimeouts::from_config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct DaemonConfig {
@@ -122,8 +121,7 @@ impl Default for DaemonConfig {
     }
 }
 
-/// `[embedding]`: which embedding model this project's semantic search
-/// (not yet shipped - see architecture doc's Open Questions) should use.
+/// `[embedding]`: which embedding model this project's semantic search uses.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EmbeddingConfig {
@@ -132,9 +130,7 @@ pub struct EmbeddingConfig {
 
 impl Default for EmbeddingConfig {
     fn default() -> Self {
-        // Documented default: architecture doc's planned default
-        // (`meta.embedding_model` / jina-embeddings-v2-base-code).
-        Self { model: "jina-embeddings-v2-base-code".to_string() }
+        Self { model: crate::embedding::DEFAULT_MODEL_NAME.to_string() }
     }
 }
 
@@ -154,8 +150,8 @@ pub struct GlobalConfig {
 
 /// `[rerank]`: whether `search_code` reorders its top rows with the
 /// cross-encoder (`embedding::rerank`). The environment variable
-/// `G_MESH_RERANK=off` overrides `enabled`. Read once per daemon, on the
-/// first search that would rerank.
+/// `G_MESH_RERANK=off` overrides `enabled`. Read once per daemon or CLI run,
+/// at its start ([`embedding::embedding_settings`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RerankConfig {
@@ -222,12 +218,12 @@ impl Default for CleanupConfig {
 /// `storage::connection::project_dir` computes for `index.db`, so a
 /// project's config and its index always agree on where they live.
 pub fn project_config_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(CONFIG_FILE_NAME))
+    Ok(StateDir::of(root)?.config_file())
 }
 
 /// `~/.g-mesh/config.toml`, or `$G_MESH_HOME/config.toml`.
 pub fn global_config_path() -> Result<PathBuf> {
-    Ok(crate::paths::g_mesh_home()?.join(CONFIG_FILE_NAME))
+    Ok(crate::paths::state_dir::global_config_file(&crate::paths::g_mesh_home()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +244,7 @@ pub fn read_project_config(root: &Path) -> Result<ProjectConfig> {
 /// never indexed still records which root it belongs to - otherwise it would
 /// be the one kind of state directory `clean orphaned` could never judge.
 pub fn write_project_config(root: &Path, config: &ProjectConfig) -> Result<()> {
-    crate::storage::connection::ensure_project_dir(root)?;
+    StateDir::ensure(root)?;
     write_toml(&project_config_path(root)?, config)
 }
 
@@ -291,6 +287,7 @@ fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::state_dir::project_dir;
 
     #[test]
     fn a_missing_project_config_reads_as_documented_defaults() {

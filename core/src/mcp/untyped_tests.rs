@@ -2,24 +2,23 @@
 //! then both handlers. The end-to-end cases through the rust plugin sit
 //! beside `unlinkedUsages`' in `unlinked_tests.rs`, which owns that fixture.
 
+use crate::mcp::context::QueryCtx;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
 use super::*;
-use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
-use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::MAX_RESPONSE_BYTES;
 use crate::graph::queries;
-use crate::mcp::query_shapes::QueryShapes;
-use crate::mcp::session_hints::SessionHints;
+use crate::mcp::query::test_support::Rendered;
+use crate::mcp::response_bound::MAX_RESPONSE_BYTES;
 use crate::mcp::{find_callers_callees, find_references, SymbolQueryParams};
+use crate::model::{Diff, EdgeRecord};
+use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::protocol::types::{PathSegment, QualifiedPath};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::{apply_diff, Diff, EdgeRecord};
+use crate::storage::write::apply_diff;
 
 /// `unlinked::MAX_UNLINKED_FILE_TALLY`, private to that module; the design
 /// doc's cap of 20 (§3).
@@ -154,7 +153,7 @@ fn a_free_function_never_qualifies() {
     assert!(probe(&conn, &bare, &["CALLS"], &[]).is_none(), "a one-segment path");
 }
 
-// --- which rows count (`candidate_sql`) -------------------------------------
+// --- which rows count (`graph::queries::untyped_calls_sql`) -------------------------------------
 
 /// A row counts only under the anchor's own name and language. Controls:
 /// drop `u.name = ?1` (`other` counts); drop `f.language = ?2` (the python
@@ -257,7 +256,7 @@ fn count_is_calling_functions_summed_over_files() {
 fn the_candidate_lookup_seeks_the_name_key() {
     let conn = setup();
     let plan: Vec<String> = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {}", candidate_sql(3, 2)))
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", crate::graph::queries::untyped_calls_sql(3, 2)))
         .unwrap()
         .query_map(rusqlite::params_from_iter(["x"; 8]), |row| row.get(3))
         .unwrap()
@@ -316,12 +315,13 @@ fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
             resolution_delta: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
-            member_overrides: crate::daemon::manifest::MemberOverrides::None,
+            member_overrides: crate::plugin_manifest::MemberOverrides::None,
         },
     )])
 }
 
-fn body(result: &CallToolResult) -> (serde_json::Value, usize) {
+fn body(result: &impl Rendered) -> (serde_json::Value, usize) {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => (serde_json::from_str(&text.text).unwrap(), text.text.len()),
@@ -335,29 +335,17 @@ fn by_id(id: &str, limit: Option<u32>) -> SymbolQueryParams {
 
 fn callers(store: &Arc<IndexStore>, params: SymbolQueryParams) -> (serde_json::Value, usize) {
     body(
-        &find_callers_callees::handle_callers(
-            store,
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &rust_with_a_semantic_tier(),
-            &SessionHints::default(),
-            params,
-        )
-        .unwrap(),
+        &QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+            .resolve_lazily(find_callers_callees::handle_callers, params)
+            .unwrap(),
     )
 }
 
 fn references(store: &Arc<IndexStore>, params: SymbolQueryParams) -> (serde_json::Value, usize) {
     body(
-        &find_references::handle(
-            store,
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &rust_with_a_semantic_tier(),
-            &SessionHints::default(),
-            params,
-        )
-        .unwrap(),
+        &QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+            .resolve_lazily(find_references::handle, params)
+            .unwrap(),
     )
 }
 

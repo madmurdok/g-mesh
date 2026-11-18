@@ -1748,7 +1748,7 @@ fn an_annotated_assignment_with_a_value_is_a_store() {
 /// chars of the last line)` - and so are equal. Never the empty line after a
 /// final newline, which is where a reader of the file runs out of lines.
 ///
-/// Control: restore the old body of `Positions::file_range` (emit.rs:
+/// Control: restore the old body of `CharColumns::file_range` (sdk columns.rs:
 /// `(split('\n').count() - 1, chars after the last '\n')`); every row ending
 /// in whitespace fails, for the File and the Module alike.
 #[test]

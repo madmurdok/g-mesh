@@ -1,11 +1,11 @@
 package main
 
-// Wire v2 mirror of core/src/protocol/types.rs's WireNode/WireEdge/
-// ControlEnvelope/FileChangeDiff/Handshake - field names and JSON shapes
-// must match what serde actually produces there (see that file's own
-// `#[serde(rename_all = ...)]` attributes and its test module), not a
-// naive reading of the Rust field names. plugins/sdk/src/graph.rs
-// and wire/src/lib.rs are the Rust plugins' own copy of the same mirror; this
+// Wire v2 mirror of wire/src/lib.rs's WireNode/WireEdge/ControlEnvelope/
+// FileChangeDiff/Handshake - field names and JSON shapes must match what
+// serde actually produces there (see that file's own
+// `#[serde(rename_all = ...)]` attributes), not a naive reading of the Rust
+// field names. testdata/wire.json, written by wire/tests/go_corpus.rs and
+// read by wire_corpus_test.go, fails when the two drift. This
 // file is this plugin's independent copy, not a shared one - Go and Rust
 // have no code-sharing mechanism between them, and the two are kept honest
 // against drift by core/src/cli/plugin_check (the conformance kit both
@@ -24,7 +24,7 @@ const (
 	// compares the two (unlike protocol_version, which `handshake::verify`
 	// does check), so manifest_test.go's
 	// TestPluginVersionMatchesTheManifest is what keeps them from drifting -
-	// the Go-side equivalent of the test daemon::manifest has for the TS
+	// the Go-side equivalent of the test plugin_manifest has for the TS
 	// plugin's package.json/plugin.toml pair.
 	//
 	// 0.2.0 is GM-281: the plugin grew a second tier (go/types through
@@ -185,7 +185,7 @@ func joinPath(path []pathSegment) string {
 }
 
 // wireNode mirrors core's WireNode, field for field and in the same order
-// (core/src/protocol/types.rs), minus `declarations` - Go has no overload
+// (wire/src/lib.rs), minus `declarations` - Go has no overload
 // sets or merged declarations, so no Go symbol is ever written as more than
 // one declaration, and the field is omitted from this struct rather than
 // modelled as an always-nil pointer.
@@ -256,7 +256,7 @@ type fileChangeDiff struct {
 // empty - never nil. encoding/json marshals a nil slice as `null`, but
 // core's `Vec<...>` fields always serialize as `[]` (there is no
 // `skip_serializing_if` on any of FileChangeDiff's four fields in
-// core/src/protocol/types.rs), and plugins/sdk/src/diff.rs's empty diff
+// wire/src/lib.rs), and plugins/sdk/src/diff.rs's empty diff
 // makes the same choice for the same reason.
 func emptyDiff() fileChangeDiff {
 	return fileChangeDiff{
@@ -328,7 +328,7 @@ type bulkFactsLine struct {
 
 // filePathsParams mirrors ControlMessage::SemanticPass's plural
 // `params: { filePaths }` - see that variant's own doc comment in
-// core/src/protocol/types.rs for why an empty list means "the whole
+// wire/src/lib.rs for why an empty list means "the whole
 // project", not "nothing".
 type filePathsParams struct {
 	FilePaths []string `json:"filePaths"`
@@ -361,13 +361,7 @@ type fileChangeResponse struct {
 }
 
 // ackResponse is the `{ acknowledged: true }` shape this plugin answers a
-// `reindex`/`status` request with, mirroring
-// plugins/sdk/src/run.rs's `acknowledge`. Core has
-// no named Rust type for this (those two methods are effectively no-ops on
-// the daemon side today - see ControlMessage::Reindex/Status's own doc
-// comments), so there is nothing in core/src/protocol/types.rs for this to
-// mirror field-for-field; the shape only has to be valid, parseable JSON
-// that is not mistaken for a FileChangeResponse.
+// `reindex`/`status` request with, mirroring wire/src/lib.rs's AckResponse.
 type ackResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id"`

@@ -18,16 +18,18 @@
 //! qualifies only when the anchor is not a member of a type, since a bare
 //! name never reaches a member. A key with no segments recorded (`keyPath`
 //! NULL) is treated as a one-segment key. Segments come from the plugin's
-//! paths (`storage::qualified_path`); no display string is split here.
+//! paths (`model::qualified_path`); no display string is split here.
 
 use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::graph::pagination::{self, FileTally};
-use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
+use crate::graph::queries;
+use crate::mcp::response_bound;
+use crate::model::qualified_path;
+use crate::model::NodeRecord;
 use crate::protocol::types::PathSegment;
-use crate::storage::qualified_path;
-use crate::storage::write::NodeRecord;
+use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 
 /// Ceiling on how many files the tally names, at ~40 bytes an entry.
 const MAX_UNLINKED_FILE_TALLY: usize = 20;
@@ -47,7 +49,7 @@ const UNLINKED_USAGES_HINT: &str =
 /// (`super::untyped`), which differ only in what they count and in `hint`.
 /// Absent from a response, not zero, when there is no candidate: most anchors
 /// have none, and they must not grow a byte to say so.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CandidateTally {
     /// Every candidate, uncapped. Its unit is the field's: a usage edge for
@@ -88,7 +90,7 @@ impl CandidateTally {
         by_file.truncate(MAX_UNLINKED_FILE_TALLY);
         let mut files: Vec<FileTally> =
             by_file.into_iter().map(|(path, refs)| FileTally { path, refs }).collect();
-        let over_bytes = pagination::truncate_to_bytes(&mut files, MAX_UNLINKED_FILE_TALLY_BYTES);
+        let over_bytes = response_bound::truncate_to_bytes(&mut files, MAX_UNLINKED_FILE_TALLY_BYTES);
         let files_truncated = over_count || over_bytes;
         Some(Self { count, files, files_truncated, hint })
     }
@@ -162,38 +164,7 @@ fn candidate_rows(
     edge_kinds: &[&str],
     file_paths: &[&str],
 ) -> rusqlite::Result<Vec<(String, Option<String>)>> {
-    let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&anchor.name, &anchor.language];
-    sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
-    sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
-
-    let mut stmt = conn.prepare(&candidate_sql(edge_kinds.len(), file_paths.len()))?;
-    let rows = stmt.query_map(sql_params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))?;
-    rows.collect()
-}
-
-/// `?1` is the name and `?2` the language, then `kinds` edge kinds, then
-/// `paths` scope paths. The placeholder kind is a literal so the planner can
-/// use the partial `idx_nodes_pending_name`; without it this is a scan of
-/// every node of the language on every call.
-fn candidate_sql(kinds: usize, paths: usize) -> String {
-    let kind_params: Vec<String> = (0..kinds).map(|i| format!("?{}", i + 3)).collect();
-    let scope_filter = if paths == 0 {
-        "1 = 1".to_string()
-    } else {
-        let params: Vec<String> = (0..paths).map(|i| format!("?{}", i + 3 + kinds)).collect();
-        format!("f.filePath IN ({})", params.join(", "))
-    };
-    format!(
-        "SELECT f.filePath, p.keyPath \
-         FROM nodes t \
-         JOIN placeholder_targets p ON p.nodeId = t.id \
-         JOIN edges e ON e.toId = t.id \
-         JOIN nodes f ON f.id = e.fromId \
-         WHERE t.name = ?1 AND t.language = ?2 AND t.nativeKind = '{PENDING_SYMBOL_NATIVE_KIND}' \
-           AND e.kind IN ({}) \
-           AND {scope_filter}",
-        kind_params.join(", ")
-    )
+    queries::placeholder_usages(conn, &anchor.name, &anchor.language, edge_kinds, file_paths)
 }
 
 /// Whether the anchor's parent path names a `Type` node of its language. An
@@ -211,12 +182,7 @@ pub(super) fn is_type_member(
         parent.push_str(segment.sep.as_deref().unwrap_or(""));
         parent.push_str(&segment.name);
     }
-    conn.query_row(
-        "SELECT 1 FROM nodes WHERE qualifiedName = ?1 AND language = ?2 AND kind = 'Type' LIMIT 1",
-        rusqlite::params![parent, anchor.language],
-        |_| Ok(()),
-    )
-    .is_ok()
+    queries::has_type_named(conn, &parent, &anchor.language)
 }
 
 #[cfg(test)]

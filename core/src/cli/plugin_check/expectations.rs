@@ -4,16 +4,14 @@
 //!
 //! # What "the same handler code" means here
 //!
-//! Every expectation is answered by literally calling an MCP tool's own
-//! handler function - [`find_callers_callees::handle_callers`],
-//! [`find_references::handle`], [`find_implementations::dispatch`],
-//! [`get_dependencies::handle`], [`find_definition::handle`] - the exact
-//! functions `mcp::mod`'s `#[tool]` methods call, given the exact parameter
-//! structs a real MCP client would send. This module never re-walks an edge
-//! or re-runs a query of its own: it drives those five functions and reads
-//! back their *wire JSON*, the same bytes a client would receive
-//! (`rmcp::model::CallToolResult`'s `ContentBlock::Text`). That is also why
-//! ambiguity is answered for free rather than needing its own code path: an
+//! Every expectation is answered by calling the same `mcp::query` function
+//! the server's `#[tool]` methods call - `callers`, `references`,
+//! `implementations`, `dependencies`, `definition` - given the exact
+//! parameter structs a real MCP client would send. This module never
+//! re-walks an edge or re-runs a query of its own: it drives those five
+//! functions and reads back their typed answers, serialized as a client sees
+//! them. That is also why ambiguity is answered for free rather than
+//! needing its own code path: an
 //! ambiguous `symbol_name` already makes four of these five handlers return
 //! `find_definition`'s own ranked candidate page in place of their usual
 //! result (`mcp::anchor`'s module doc), and this module only has to
@@ -341,7 +339,7 @@
 //!
 //! **What a `[[refusal]]` must not accept**, which is the whole of its
 //! value. It passes on exactly one shape - a *tool-level* refusal
-//! (`CallToolResult` with `is_error: true`) whose text carries every phrase
+//! (`ToolAnswer::Refused`) whose text carries every phrase
 //! in `contains` - and fails on all four of the others:
 //!
 //! - **A protocol-level failure** - `ErrorData`, i.e. the outer `Err` that
@@ -495,7 +493,7 @@
 //!   declaration at all - `stream-order` requires both endpoints to be nodes
 //!   of the edge's own file - so it travels as a placeholder, and a
 //!   placeholder edge the linker repoints is set `resolved = 1` by
-//!   `graph::symbol_links` whatever the plugin said. Measured: flipping all
+//!   `link::symbol_links` whatever the plugin said. Measured: flipping all
 //!   ten edges the Go plugin's `go/types` tier answers with changes nothing
 //!   in the index, because every one of them lands on a placeholder core
 //!   then resolves.
@@ -514,7 +512,7 @@
 //!
 //! `find_callers`/`find_references` attach `files` exactly when it says
 //! something `results` does not: the page is incomplete, or its rows repeat
-//! a file (`pagination::tally_is_worth_sending`). Decision 4 has already
+//! a file (`response_bound::tally_is_worth_sending`). Decision 4 has already
 //! ruled the first half out here, so within this kit the field is present
 //! precisely when the rows repeat a file - which makes both of its states
 //! worth pinning:
@@ -584,7 +582,7 @@
 //!
 //! `count` is asserted beside `files` rather than derived from it because
 //! the wire keeps them apart for a reason: the count is exact and uncapped,
-//! the tally is cut at `pagination::MAX_EXCLUDED_FILE_TALLY`, and
+//! the tally is cut at `response_bound::MAX_EXCLUDED_FILE_TALLY`, and
 //! understating the gap is the one thing this disclosure must never do. A
 //! response that sets `filesTruncated` fails the entry rather than being
 //! compared against a capped list - decision 4's rule once more, and no
@@ -614,27 +612,21 @@
 //! plugin whose manifest declares `files_created` but whose expectations
 //! file has no such table gets that check as `Skip`, not `Fail`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
-use crate::daemon::manifest::Capabilities;
-use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, Direction};
-use crate::mcp::query_shapes::QueryShapes;
+use crate::graph::pagination;
+use crate::graph::Direction;
+use crate::mcp::context::QueryCtx;
+use crate::mcp::query::{self, ToolAnswer};
 use crate::mcp::session_hints::SessionHints;
-use crate::mcp::{
-    find_callers_callees, find_definition, find_implementations, find_references, get_dependencies,
-    FindDefinitionParams, FindImplementationsParams, GetDependenciesParams, SymbolQueryParams,
-};
-use crate::storage::index_store::IndexStore;
+use crate::mcp::{FindDefinitionParams, FindImplementationsParams, GetDependenciesParams, SymbolQueryParams};
 
 /// The whole `--expect` file. Every list defaults to empty, so a fixture
 /// that only cares about, say, `[[callers]]` never has to spell out the
@@ -926,29 +918,25 @@ pub(crate) fn parse(path: &Path) -> Result<ExpectFile> {
     toml::from_str(&text).with_context(|| format!("failed to parse the expectations file {}", path.display()))
 }
 
-/// Everything [`evaluate`] needs to drive the five handlers - one connection
-/// (decision 1), the disabled embedding pipeline every other step of this
-/// kit already uses (semantic-neighbour candidates never enter the picture,
-/// which keeps ambiguity handling to the two rungs decision 3 documents),
-/// the fixture's scratch root (`find_definition::handle`'s `project_root`,
-/// unused here since every call passes `include_source: false`, but still a
-/// required argument of the real handler), and the manifest's own declared
-/// entry points (`get_dependencies`' miss-path fallback).
-pub(crate) struct EvalContext<'a> {
-    pub(crate) conn: &'a Arc<IndexStore>,
-    pub(crate) embedding: &'a EmbeddingPipeline,
-    pub(crate) project_root: &'a Path,
-    pub(crate) entry_points: &'a [String],
-    /// The manifest's own `[plugin.capabilities]`, keyed by language -
-    /// what the four edge-walking handlers need to decide whether this
-    /// plugin declares a semantic tier at all (`mcp::provenance::resolve`).
-    /// A one-entry map, because a check run is always about exactly one
-    /// plugin; built from `manifest.capabilities` rather than from a
-    /// registry, since the kit discovers no registry.
-    pub(crate) capabilities: &'a HashMap<String, Capabilities>,
-    /// The manifest's own `[plugin.non_symbol_queries]`, keyed by language,
-    /// for the same reason as `capabilities`.
-    pub(crate) shapes: &'a QueryShapes,
+/// Everything [`evaluate`] needs to drive the five handlers: one tool-call
+/// context over one connection (decision 1), with the disabled embedding
+/// pipeline (semantic-neighbour candidates never enter the picture, which
+/// keeps ambiguity handling to the two rungs decision 3 documents), the
+/// fixture's scratch root as `project_root`, and the manifest's own entry
+/// points, `[plugin.capabilities]` and `[plugin.non_symbol_queries]`, each
+/// keyed by its one language (a check run is about exactly one plugin, and
+/// the kit discovers no registry).
+pub(crate) struct EvalContext {
+    pub(crate) query: QueryCtx,
+}
+
+impl EvalContext {
+    /// The context of one handler call: every call sees a fresh session's
+    /// hints, so an expectation's JSON never depends on which calls ran
+    /// before it.
+    fn query_ctx(&self) -> QueryCtx {
+        QueryCtx { hints: SessionHints::default(), ..self.query.clone() }
+    }
 }
 
 /// Runs every expectation in `expect`, in file order, and returns one
@@ -1051,31 +1039,14 @@ impl SymbolTool {
     /// says defers *entirely* to the unmodified single-hop `handle`, so this
     /// is not a second, weaker path into that module.
     fn call(&self, ctx: &EvalContext, params: SymbolQueryParams) -> Result<ToolOutcome, String> {
-        let result = match self {
-            SymbolTool::Callers => find_callers_callees::handle_callers(
-                ctx.conn,
-                ctx.embedding,
-                ctx.shapes,
-                ctx.capabilities,
-                &SessionHints::default(),
-                params,
-            ),
-            SymbolTool::References => find_references::handle(
-                ctx.conn,
-                ctx.embedding,
-                ctx.shapes,
-                ctx.capabilities,
-                &SessionHints::default(),
-                params,
-            ),
+        match self {
+            SymbolTool::Callers => tool_outcome(query::callers(&ctx.query_ctx(), params)),
+            SymbolTool::References => tool_outcome(query::references(&ctx.query_ctx(), params)),
             SymbolTool::Implementations => {
                 let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: _ } =
                     params;
-                find_implementations::dispatch(
-                    ctx.conn,
-                    ctx.embedding,
-                    ctx.shapes,
-                    ctx.capabilities,
+                tool_outcome(query::implementations(
+                    &ctx.query_ctx(),
                     FindImplementationsParams {
                         symbol_id,
                         symbol_name,
@@ -1086,10 +1057,9 @@ impl SymbolTool {
                         max_depth: None,
                         resume_token: None,
                     },
-                )
+                ))
             }
-        };
-        tool_outcome(result)
+        }
     }
 }
 
@@ -1098,7 +1068,7 @@ impl SymbolTool {
 /// through the same parameters.
 fn call_definition(ctx: &EvalContext, symbol_name: String) -> Result<ToolOutcome, String> {
     let params = FindDefinitionParams { symbol_name: Some(symbol_name), ..definition_params() };
-    tool_outcome(find_definition::handle(ctx.conn, ctx.project_root, ctx.embedding, ctx.shapes, params))
+    tool_outcome(query::definition(&ctx.query_ctx(), params))
 }
 
 /// Every `find_definition` call here addresses one symbol and wants no source.
@@ -1261,12 +1231,7 @@ fn dependency_walk(ctx: &EvalContext, file: &str, direction: Direction) -> Resul
         max_fanout: Some(pagination::MAX_PAGE_SIZE as u32),
         resume_token: None,
     };
-    tool_json(tool_outcome(get_dependencies::handle(
-        ctx.conn,
-        ctx.entry_points,
-        &SessionHints::default(),
-        params,
-    )))
+    tool_json(tool_outcome(query::dependencies(&ctx.query_ctx(), params)))
 }
 
 /// The set comparison both walk categories share, with decision 8's
@@ -1389,7 +1354,7 @@ fn files_finding(value: &Value, expected: Option<&[String]>) -> Option<String> {
         )),
         (Some(expected), None) => Some(format!(
             "files = {{{}}}, but the response carries no files tally at all: it is claiming its \
-             rows already sit one per file (pagination::tally_is_worth_sending), which is the \
+             rows already sit one per file (response_bound::tally_is_worth_sending), which is the \
              opposite of what this entry says (decision 12)",
             format_set(&expected.iter().cloned().collect())
         )),
@@ -1430,7 +1395,7 @@ fn excluded_references_finding(value: &Value, expected: Option<&ExcludedExpectat
             if block.get("filesTruncated").and_then(Value::as_bool) == Some(true) {
                 return Some(
                     "the response set excludedReferences.filesTruncated - its tally was cut at \
-                     pagination::MAX_EXCLUDED_FILE_TALLY, so decision 13 will not compare it \
+                     response_bound::MAX_EXCLUDED_FILE_TALLY, so decision 13 will not compare it \
                      against a fixture's whole list; narrow the fixture"
                         .to_string(),
                 );
@@ -1547,14 +1512,7 @@ fn resolve_definition(ctx: &EvalContext, symbol: &str, narrowing: Narrowing) -> 
         candidate.get("id").and_then(Value::as_str).unwrap_or_default().to_string()
     };
     let retry = FindDefinitionParams { symbol_id: Some(candidate_id), ..definition_params() };
-    let retried = tool_json(tool_outcome(find_definition::handle(
-        ctx.conn,
-        ctx.project_root,
-        ctx.embedding,
-        ctx.shapes,
-        retry,
-    )))
-    .map_err(|e| vec![e])?;
+    let retried = tool_json(tool_outcome(query::definition(&ctx.query_ctx(), retry))).map_err(|e| vec![e])?;
     if is_candidate_page(&retried) {
         return Err(vec![
             "re-querying find_definition by the disambiguated candidate's own id still returned a candidate \
@@ -1812,30 +1770,26 @@ fn candidate_lines(value: &Value) -> Vec<String> {
 /// that is not JSON). Those are never a refusal, whatever they say.
 #[derive(Debug)]
 enum ToolOutcome {
-    /// `is_error` unset or false: the parsed wire JSON. May still be a
-    /// candidate page - [`is_candidate_page`] is a separate question.
+    /// A page or a candidate list, as the JSON a client would read. May still
+    /// be a candidate page - [`is_candidate_page`] is a separate question.
     Answer(Value),
-    /// `is_error: true`: a tool-level refusal, carrying prose rather than
-    /// JSON ("g-mesh: no symbol named 'X' found", GM-367's import-only
+    /// A tool-level refusal, carrying prose rather than JSON ("g-mesh: no symbol named 'X' found", GM-367's import-only
     /// message, a bad parameter combination).
     Refusal(String),
 }
 
-/// Extracts an MCP tool's answer, keeping [`ToolOutcome`]'s distinction:
-/// `ErrorData` and an unusable body stay `Err`, `is_error: true` becomes
-/// `Refusal` with the prose it carried, and anything else is parsed as JSON.
-fn tool_outcome(result: Result<CallToolResult, ErrorData>) -> Result<ToolOutcome, String> {
-    let result = result.map_err(|e| e.to_string())?;
-    let text = match result.content.first() {
-        Some(ContentBlock::Text(text)) => text.text.clone(),
-        other => return Err(format!("tool returned no text content: {other:?}")),
+/// Extracts a tool's typed answer, keeping [`ToolOutcome`]'s distinction:
+/// `ErrorData` and a page that does not serialize stay `Err`, a refusal
+/// becomes `Refusal` with its message, and a page or a candidate list becomes
+/// `Answer` with the value a client would parse from the wire.
+fn tool_outcome<P: Serialize>(result: Result<ToolAnswer<P>, ErrorData>) -> Result<ToolOutcome, String> {
+    let answer = result.map_err(|e| e.to_string())?;
+    let value = match &answer {
+        ToolAnswer::Refused(refusal) => return Ok(ToolOutcome::Refusal(refusal.message().to_owned())),
+        ToolAnswer::Page(page) => serde_json::to_value(page),
+        ToolAnswer::Candidates(candidates) => serde_json::to_value(candidates),
     };
-    if result.is_error == Some(true) {
-        return Ok(ToolOutcome::Refusal(text));
-    }
-    serde_json::from_str(&text)
-        .map(ToolOutcome::Answer)
-        .map_err(|e| format!("tool returned content that is not JSON: {e}"))
+    value.map(ToolOutcome::Answer).map_err(|e| format!("tool answer does not serialize: {e}"))
 }
 
 /// The view every category except `[[refusal]]` wants: a refusal is simply a

@@ -25,16 +25,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::candidates::Detection;
 use super::lifecycle::{self, CoreActivity, IdleTimeouts};
-use super::manifest::DiscoveredPlugins;
 use super::registry::PluginRegistry;
-use super::{
-    endpoint_in, phase_path_in, record_serving_owner, write_pid_file, write_state_file_atomic, PID_FILE,
-};
 use crate::embedding::EmbeddingPipeline;
 use crate::ipc;
 use crate::mcp;
+use crate::paths::state_dir::{write_pid_file, write_state_file_atomic, StateDir};
+use crate::plugin_manifest::DiscoveredPlugins;
+use crate::project_detect::Detection;
 
 /// What a front writes to `index.phase`.
 pub const FRONT_PHASE: &str = "front";
@@ -46,31 +44,31 @@ pub const FRONT_CORE_IDLE: Duration = Duration::from_secs(60);
 
 /// Overrides [`FRONT_CORE_IDLE`] for the test suite, in milliseconds; `0`
 /// turns the timer off. Same parsing as `lifecycle::CORE_IDLE_ENV`.
-pub const FRONT_IDLE_ENV: &str = "G_MESH_FRONT_IDLE_MS";
+pub const FRONT_IDLE_ENV: &str = crate::knobs::FRONT_IDLE_MS.name;
 
 fn front_core_idle() -> Option<Duration> {
-    lifecycle::parse_timeout(std::env::var(FRONT_IDLE_ENV).ok().as_deref(), FRONT_CORE_IDLE, FRONT_IDLE_ENV)
+    crate::knobs::millis(&crate::knobs::FRONT_IDLE_MS, crate::knobs::ZeroIs::Off, FRONT_CORE_IDLE)
 }
 
 /// Serves `root` as a front until it idles out or is orphaned. Called by
 /// `daemon::run` right after the mode decision, holding the singleton lock.
-pub(super) fn run(root: &Path, dir: &Path, singleton: File, detection: Detection) -> Result<()> {
+pub(super) fn run(root: &Path, state_dir: &StateDir, singleton: File, detection: Detection) -> Result<()> {
     let canonical_root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
 
     // The normal daemon's publish sequence, in its order (`daemon::run`).
-    let endpoint = endpoint_in(dir)
-        .with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))?;
+    let dir = state_dir.path();
+    let endpoint = crate::control::lock::endpoint(state_dir)?;
     endpoint.clear_stale();
     let listener = ipc::Listener::bind(&endpoint)
         .with_context(|| format!("failed to bind the daemon endpoint at {endpoint}"))?;
-    write_pid_file(&dir.join(PID_FILE), std::process::id());
-    write_state_file_atomic(&phase_path_in(dir), &format!("{FRONT_PHASE}\n"), "phase file");
-    record_serving_owner(dir);
+    write_pid_file(&state_dir.pid_file(), std::process::id());
+    write_state_file_atomic(&state_dir.phase_file(), &format!("{FRONT_PHASE}\n"), "phase file");
+    state_dir.record_serving_owner(std::process::id());
 
-    crate::log_line!(
-        "g-mesh daemon: {} is a folder of {} projects - serving the front (no index)",
+    crate::log_role!(
+        "{} is a folder of {} projects - serving the front (no index)",
         canonical_root.display(),
         detection.candidates.len()
     );
@@ -131,7 +129,7 @@ fn serve_forever(
             tokio::spawn(async move {
                 let _attached = attached;
                 if let Err(err) = mcp::front::serve_connection(stream, front, core_activity).await {
-                    crate::log_line!("g-mesh daemon: front connection ended: {err:#}");
+                    crate::log_role!("front connection ended: {err:#}");
                 }
             });
         }

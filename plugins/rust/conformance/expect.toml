@@ -604,7 +604,12 @@ file = "crates/alpha/src/gaps.rs"
 # container whose last member went with it is GC'd, taking every `IMPORTS`
 # edge pointing at it along. Neither `alpha` nor `alpha::nested` has a member
 # in that file.
-expect = ["container:alpha", "container:alpha::nested"]
+#
+# The third row is `measure`'s bound `S: crate::prelude::Shape`: a path
+# through a module is an import of that module as a `use` of it would be.
+# `prelude` declares nothing, so its container has no row and the edge stays
+# on its unresolved placeholder, which renders as `alpha::prelude::*`.
+expect = ["container:alpha", "container:alpha::nested", "container:alpha::prelude::*"]
 
 # --- importers: the incoming direction (GM-356, expectations.rs decision 7) --
 

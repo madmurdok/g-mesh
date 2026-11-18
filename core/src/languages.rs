@@ -1,7 +1,7 @@
 //! The language catalogue: what core knows about a language *without* its
 //! plugin.
 //!
-//! Discovery (`daemon::manifest::discover`) only knows the languages whose
+//! Discovery (`plugin_manifest::discover`) only knows the languages whose
 //! plugin is installed, and the index only holds files some plugin claimed.
 //! So without this table core cannot even name a language it has no plugin
 //! for, let alone tell a person how to get one. The catalogue ships with core,
@@ -15,7 +15,7 @@
 //! together say which files the absent plugin *would* index, so core can count
 //! them ([`count_absent_files`]); neither says what the plugin can do.
 //! Nothing else. In particular it holds **no capability fields**: capabilities
-//! belong to the plugin manifest alone (`daemon::manifest::Capabilities`).
+//! belong to the plugin manifest alone (`plugin_manifest::Capabilities`).
 //! The moment the catalogue holds a capability, someone reads it from here
 //! instead of from the manifest, and core has two sources of truth about a
 //! live plugin that will drift apart. The catalogue describes only a plugin
@@ -39,8 +39,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::daemon::manifest::{extension_of, under_excluded_dir, DiscoveredPlugins};
-use crate::project_walk;
+use crate::project_walk::{self, extension_of, under_excluded_dir};
+pub use crate::storage::language_outcome::{error_on_one_line, failed_error, LanguageOutcome};
 
 /// One catalogued language: what core may say about it while its plugin is
 /// absent. See the module doc for why there is nothing more here.
@@ -72,46 +72,12 @@ impl CatalogueEntry {
     }
 }
 
-/// What a bulk walk did for one language (ADR 0021). The install command is
-/// not stored: [`CatalogueEntry::install_command`] derives it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LanguageOutcome {
-    /// A discovered plugin walked it to the end. `files` is its `File`-node
-    /// count; a discovered language with no files is `Indexed { files: 0 }`.
-    Indexed { files: usize },
-    /// A catalogue language with no discovered plugin and at least one file
-    /// in the project. Not an error. `files` is `None` when it was not counted.
-    PluginAbsent { files: Option<usize> },
-    /// A discovered plugin that could not be used; nothing of the language is
-    /// in the index. `error` is the full error chain, one cause per line,
-    /// outermost first ([`failed_error`]); [`error_on_one_line`] renders it
-    /// for a one-line message.
-    Failed { error: String },
-}
-
-/// The stored form of a failed language's error: every cause of `err`'s
-/// chain on its own line, outermost first. A newline inside one cause's
-/// message becomes a space, so one line is always one cause and the innermost
-/// cause is the last non-empty line - no guessing at a separator that a
-/// cause's own text may contain.
-pub fn failed_error(err: &anyhow::Error) -> String {
-    err.chain()
-        .map(|cause| {
-            cause
-                .to_string()
-                .split(['\r', '\n'])
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// A stored error ([`failed_error`]) on one line: its causes joined by ": ",
-/// as anyhow's `{:#}` renders a chain.
-pub fn error_on_one_line(error: &str) -> String {
-    error.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(": ")
+/// The plugins a walk found, as the catalogue needs them.
+pub trait DiscoveredLanguages {
+    /// Whether a plugin for `language` was discovered.
+    fn has_plugin(&self, language: &str) -> bool;
+    /// The language whose plugin claims `file_path` by extension.
+    fn routed_language(&self, file_path: &str) -> Option<&str>;
 }
 
 /// Every catalogued language, in a fixed order. Adding a language is adding
@@ -154,7 +120,7 @@ pub fn entry_for_path(file_path: &str) -> Option<&'static CatalogueEntry> {
 /// **no** discovered manifest, in catalogue order. A language discovery found
 /// is never returned, whatever its manifest says, because the manifest is the
 /// only source of truth about a present plugin.
-pub fn missing(discovered: &DiscoveredPlugins) -> Vec<&'static CatalogueEntry> {
+pub fn missing(discovered: &impl DiscoveredLanguages) -> Vec<&'static CatalogueEntry> {
     missing_in(CATALOGUE, discovered)
 }
 
@@ -171,7 +137,10 @@ pub fn missing(discovered: &DiscoveredPlugins) -> Vec<&'static CatalogueEntry> {
 ///   (`venv/x.py`): installing the plugin would not index it either, so
 ///   naming the install command there would be a false promise.
 ///   Only that language's exclusions count, as in [`count_absent_files`].
-pub fn absent_for_path(discovered: &DiscoveredPlugins, file_path: &str) -> Option<&'static CatalogueEntry> {
+pub fn absent_for_path(
+    discovered: &impl DiscoveredLanguages,
+    file_path: &str,
+) -> Option<&'static CatalogueEntry> {
     let entry = absent_for_path_in(CATALOGUE, discovered, file_path)?;
     let exclude_dirs: Vec<String> = entry.exclude_dirs.iter().map(|dir| (*dir).to_string()).collect();
     (!under_excluded_dir(file_path, &exclude_dirs)).then_some(entry)
@@ -184,7 +153,10 @@ pub fn absent_for_path(discovered: &DiscoveredPlugins, file_path: &str) -> Optio
 /// which would hide `dist/app.py` from an absent Python. Walks with the same
 /// walker as `g-mesh status`, pruning the baseline plus the directories every
 /// absent language excludes. Empty, without walking, when no plugin is absent.
-pub fn count_absent_files(root: &Path, discovered: &DiscoveredPlugins) -> BTreeMap<&'static str, usize> {
+pub fn count_absent_files(
+    root: &Path,
+    discovered: &impl DiscoveredLanguages,
+) -> BTreeMap<&'static str, usize> {
     count_absent_files_in(CATALOGUE, root, discovered)
 }
 
@@ -201,20 +173,23 @@ fn entry_for_path_in<'a>(table: &'a [CatalogueEntry], file_path: &str) -> Option
     table.iter().find(|entry| entry.extensions.contains(&extension.as_str()))
 }
 
-fn missing_in<'a>(table: &'a [CatalogueEntry], discovered: &DiscoveredPlugins) -> Vec<&'a CatalogueEntry> {
-    table.iter().filter(|entry| !discovered.manifests.contains_key(entry.language)).collect()
+fn missing_in<'a>(
+    table: &'a [CatalogueEntry],
+    discovered: &impl DiscoveredLanguages,
+) -> Vec<&'a CatalogueEntry> {
+    table.iter().filter(|entry| !discovered.has_plugin(entry.language)).collect()
 }
 
 fn absent_for_path_in<'a>(
     table: &'a [CatalogueEntry],
-    discovered: &DiscoveredPlugins,
+    discovered: &impl DiscoveredLanguages,
     file_path: &str,
 ) -> Option<&'a CatalogueEntry> {
-    if discovered.language_for(file_path).is_some() {
+    if discovered.routed_language(file_path).is_some() {
         return None;
     }
     let entry = entry_for_path_in(table, file_path)?;
-    if discovered.manifests.contains_key(entry.language) {
+    if discovered.has_plugin(entry.language) {
         return None;
     }
     Some(entry)
@@ -223,7 +198,7 @@ fn absent_for_path_in<'a>(
 fn count_absent_files_in<'a>(
     table: &'a [CatalogueEntry],
     root: &Path,
-    discovered: &DiscoveredPlugins,
+    discovered: &impl DiscoveredLanguages,
 ) -> BTreeMap<&'a str, usize> {
     let mut counts = BTreeMap::new();
     let absent = missing_in(table, discovered);

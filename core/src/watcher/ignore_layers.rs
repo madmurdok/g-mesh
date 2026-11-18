@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::Match;
 
-use super::BASELINE_EXCLUDED_DIRS;
 use crate::project_walk::{excluded_names, LinkTable, Remap};
+use g_mesh_walk::BASELINE_EXCLUDED_DIRS;
 
 /// The file name every layer is read from.
 pub const GITIGNORE_FILE_NAME: &str = ".gitignore";

@@ -3,210 +3,49 @@
 mod activation;
 pub mod build_stamp;
 pub mod bulk_index;
-pub mod candidates;
+mod startup;
+pub(crate) mod watch_loop;
+pub use crate::project_detect as candidates;
 pub mod client;
 pub(crate) mod config_reindex;
 pub mod front;
 pub mod identity;
-pub mod indexing_status;
+pub use crate::indexing_status;
 pub mod lifecycle;
-pub mod manifest;
+pub(crate) mod mcp_host;
+pub use crate::plugin_manifest as manifest;
 pub mod memory;
 pub(crate) mod path_case;
 pub mod plugin;
 pub mod registry;
 pub mod seed;
 pub mod semantic;
-/// A fake, protocol-speaking plugin for unit tests that need two languages.
-#[cfg(test)]
-pub(crate) mod test_plugin;
 pub mod workspace_reindex;
 
-use std::fs::{self, File, TryLockError};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::fs::{File, TryLockError};
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
-use crate::daemon::indexing_status::{ColdCause, IndexingStatus};
-use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts};
+use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::registry::PluginRegistry;
-use crate::gc::last_used;
+use crate::daemon::startup::StartupPlan;
+use crate::indexing_status::IndexingStatus;
 use crate::ipc;
 use crate::mcp;
-use crate::storage::connection::{self, ensure_project_dir, project_dir};
+use crate::paths::state_dir::{OnUnreadable, StateDir};
 use crate::storage::index_store::IndexStore;
-use crate::storage::schema;
-use crate::watcher::batch::{classify_settled, order_for_routing};
-use crate::watcher::debounce::Debouncer;
-use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
-use crate::watcher::rescan::RescanScheduler;
-use crate::watcher::{Change, ProjectWatcher};
 
-/// Unix only: on Windows the endpoint is a pipe name (see `ipc::windows`).
-#[cfg(unix)]
-const SOCKET_FILE: &str = "daemon.sock";
-const PID_FILE: &str = "daemon.pid";
-/// The build the live daemon started from (see `daemon::build_stamp`).
-const BUILD_STAMP_FILE: &str = "daemon.build";
-/// Held by a shim while it bootstraps a daemon (`shim::connect_or_bootstrap`).
-const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
-/// Held by a running daemon for its whole lifetime: its holder owns the
-/// project's socket. Not the bootstrap lock: the shim holds that one while
-/// spawning the daemon, so sharing it would deadlock.
-const DAEMON_LOCK_FILE: &str = "daemon.lock";
-/// Written by `g-mesh reindex` and `g-mesh init` for as long as they rebuild
-/// the project's index: their pid, start time and command, one per line.
-const REBUILD_MARKER_FILE: &str = "reindex.pid";
+pub use crate::control::lock::{inspect_daemon_lock, DaemonLock};
+pub use crate::paths::state_dir::{read_pid_file, read_pid_file_result, write_pid_file};
 
-/// Where the lock's holder records that it has begun serving. Beside the lock,
-/// not inside it: on Windows a second handle cannot read a locked file. Only
-/// the holder writes it: after taking the lock, and the next taker clears it.
-const DAEMON_SERVING_FILE: &str = "daemon.serving";
-
-/// The cold-start phase, one lowercased [`indexing_status::Phase`] word (D13 in
-/// `docs/architecture/lazy-indexing.md`). Written on every transition, removed
-/// on the way out, so outside readers tell "never indexed" from "building".
-const PHASE_FILE: &str = "index.phase";
-
-/// The progress counters as JSON, written atomically and throttled by
-/// [`indexing_status::IndexingStatus`]. A killed daemon leaves it behind, so a
-/// reader must check its `pid` against the live daemon before trusting it.
-const PROGRESS_FILE: &str = "index.progress";
-
-/// How the daemon resolved its rerank (`embedding::rerank::OutcomeRecord`),
-/// written once, on the first `search_code` call that asks. A killed daemon
-/// leaves it behind, so a reader checks its `pid` against the live daemon.
-const RERANK_FILE: &str = "rerank.outcome";
-
-/// The watcher's debounce window and its loop's poll bound: a path is reparsed
-/// once quiet this long, and a settled burst is drained only when the loop
-/// wakes, so this must stay short. Unrelated to the idle timeouts.
-const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
-
-/// Where a project's daemon listens; the shim derives the same endpoint from
-/// its cwd. A socket file on Unix, a pipe name on Windows (`ipc::windows`).
-pub fn endpoint(root: &Path) -> Result<ipc::Endpoint> {
-    let dir = project_dir(root)?;
-    endpoint_in(&dir).with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))
-}
-
-/// [`endpoint`] from an already-known state directory, which is named after
-/// the project hash. `None` only for a path with no final component.
-pub fn endpoint_in(state_dir: &Path) -> Option<ipc::Endpoint> {
-    #[cfg(unix)]
-    {
-        Some(ipc::Endpoint::at_path(state_dir.join(SOCKET_FILE)))
-    }
-    #[cfg(windows)]
-    {
-        Some(ipc::Endpoint::named(state_dir.file_name()?.to_str()?))
-    }
-}
-
-/// The AF_UNIX socket file a project's daemon listens on. Callers that only
-/// need to reach the daemon use [`endpoint`].
-#[cfg(unix)]
-pub fn socket_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(SOCKET_FILE))
-}
-
-/// Records the live daemon's pid next to its socket, so tooling can tell a
-/// stale socket file from a running daemon.
-pub fn pid_path(root: &Path) -> Result<PathBuf> {
-    Ok(pid_path_in(&project_dir(root)?))
-}
-
-/// The bundled JS/TS plugin's pid file. Multi-language tooling lists every
-/// `plugin-*.pid` instead (`daemon::registry::discovered_pid_files`).
-pub fn plugin_pid_path(root: &Path) -> Result<PathBuf> {
-    Ok(plugin_pid_path_in(&project_dir(root)?))
-}
-
-/// The same paths from an already-known state directory, for callers whose
-/// project root may no longer exist (`cli::clean`).
-pub fn pid_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(PID_FILE)
-}
-
-pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(registry::plugin_pid_file_name(plugin::BUNDLED_LANGUAGE))
-}
-
-/// Where [`PHASE_FILE`] lives for a given state directory.
-pub fn phase_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(PHASE_FILE)
-}
-
-/// Where [`RERANK_FILE`] lives for a given state directory.
-pub fn rerank_outcome_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(RERANK_FILE)
-}
-
-/// Where [`PROGRESS_FILE`] lives for a given state directory.
-pub fn progress_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(PROGRESS_FILE)
-}
-
-/// The progress snapshot a daemon last published for this state directory,
-/// whoever wrote it: `None` for a missing or unparseable file. The snapshot's
-/// `pid` says which daemon wrote it; this does not check that it is alive.
-pub fn read_progress_in(state_dir: &Path) -> Option<indexing_status::ProgressSnapshot> {
-    let contents = fs::read_to_string(progress_path_in(state_dir)).ok()?;
-    serde_json::from_str(&contents).ok()
-}
-
-/// The phase word a running daemon published here; `None` when no daemon is
-/// running (it removes the file on exit) or none ever ran.
-pub fn read_phase_in(state_dir: &Path) -> Option<String> {
-    fs::read_to_string(phase_path_in(state_dir)).ok().map(|contents| contents.trim().to_string())
-}
-
-/// Where the live daemon records the build it started from.
-pub fn build_stamp_path(root: &Path) -> Result<PathBuf> {
-    Ok(build_stamp_path_in(&project_dir(root)?))
-}
-
-pub fn build_stamp_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(BUILD_STAMP_FILE)
-}
-
-/// The file shims serialize their bootstrap on, derived exactly like the
-/// socket and pid paths so every process agrees on it without configuration.
-pub fn lock_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(BOOTSTRAP_LOCK_FILE))
-}
-
-/// [`lock_path`] inside an already-known state directory, for a caller whose
-/// project root may be gone (`project_hash` cannot be computed for it then).
-pub(crate) fn bootstrap_lock_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(BOOTSTRAP_LOCK_FILE)
-}
-
-/// [`lock_path`] under the g-mesh home `home` rather than the one the
-/// environment names (see `storage::connection::project_dir_under`).
-pub(crate) fn lock_path_under(home: &Path, root: &Path) -> Result<PathBuf> {
-    Ok(crate::storage::connection::project_dir_under(home, root)?.join(BOOTSTRAP_LOCK_FILE))
-}
-
-/// The singleton lock a running daemon holds for its whole lifetime.
-pub fn daemon_lock_path(root: &Path) -> Result<PathBuf> {
-    Ok(project_dir(root)?.join(DAEMON_LOCK_FILE))
-}
-
-pub fn daemon_lock_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(DAEMON_LOCK_FILE)
-}
-
-fn serving_owner_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(DAEMON_SERVING_FILE)
-}
-
-pub fn rebuild_marker_path_in(state_dir: &Path) -> PathBuf {
-    state_dir.join(REBUILD_MARKER_FILE)
+/// Whether a process with this pid exists: a snapshot, and pids are reused, so
+/// callers that care corroborate it with the endpoint.
+pub fn is_process_alive(pid: u32) -> bool {
+    crate::process::is_alive(pid)
 }
 
 /// A CLI rebuild of a project's index in progress, as its marker records it.
@@ -218,86 +57,27 @@ pub struct Rebuild {
     pub command: String,
 }
 
-/// Records that this process is rebuilding the index whose state directory
-/// holds `path`, on behalf of `g-mesh <command>`.
-pub(crate) fn write_rebuild_marker(path: &Path, command: &str) -> Result<()> {
-    let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    fs::write(path, format!("{}\n{started}\n{command}\n", std::process::id()))
-        .with_context(|| format!("failed to write the rebuild marker {}", path.display()))
-}
-
 /// The rebuild holding `root`'s index, if one is running. A marker counts only
 /// while its pid is alive and the daemon lock is held: a rebuild that crashed
 /// leaves a marker naming a dead (or reused) pid, and the kernel has already
 /// released its lock, so the project reads as free.
 pub fn rebuild_in_progress(root: &Path) -> Result<Option<Rebuild>> {
-    rebuild_in_progress_in(&project_dir(root)?)
+    rebuild_in_progress_in(&StateDir::of(root)?)
 }
 
-fn rebuild_in_progress_in(state_dir: &Path) -> Result<Option<Rebuild>> {
-    let Ok(contents) = fs::read_to_string(rebuild_marker_path_in(state_dir)) else {
+/// An unopenable lock file reads as free (no rebuild), so the shim may bootstrap.
+fn rebuild_in_progress_in(state_dir: &StateDir) -> Result<Option<Rebuild>> {
+    let Some(marker) = state_dir.rebuild_marker() else {
         return Ok(None);
     };
-    let mut lines = contents.lines();
-    let (Some(Ok(pid)), Some(Ok(started))) =
-        (lines.next().map(str::parse::<u32>), lines.next().map(str::parse::<u64>))
-    else {
-        return Ok(None);
-    };
-    let command = lines.next().unwrap_or("reindex").to_string();
-    if !is_process_alive(pid) || !daemon_lock_is_held(state_dir)? {
+    if !crate::process::is_alive(marker.pid) || !state_dir.daemon_lock_held(OnUnreadable::Free)? {
         return Ok(None);
     }
-    Ok(Some(Rebuild { pid, started: UNIX_EPOCH + Duration::from_secs(started), command }))
-}
-
-/// Reads a pid from one of the files above; `None` for "nothing recorded". See
-/// [`read_pid_file_result`] where "could not tell" must differ from that.
-pub fn read_pid_file(path: &Path) -> Option<u32> {
-    read_pid_file_result(path).ok().flatten()
-}
-
-/// Like [`read_pid_file`], but an unreadable file is an error: a caller deciding
-/// a deletion must not read "could not tell" as "safe". A present but
-/// unparseable file stays `Ok(None)`, which callers depend on.
-pub fn read_pid_file_result(path: &Path) -> std::io::Result<Option<u32>> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(contents.trim().parse().ok()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-/// Records a pid atomically (a per-process temporary renamed into place), so a
-/// reader never sees a truncated file, which reads as "no daemon". Best-effort:
-/// every reader handles "nothing recorded".
-pub fn write_pid_file(path: &Path, pid: u32) {
-    write_state_file_atomic(path, &format!("{pid}\n"), "pid file");
-}
-
-/// The temp-then-rename write behind [`write_pid_file`], also used for the phase file.
-pub(crate) fn write_state_file_atomic(path: &Path, contents: &str, what: &str) {
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    if let Err(err) = fs::write(&temporary, contents) {
-        crate::log_line!("g-mesh daemon: failed to write {what} {}: {err}", temporary.display());
-        return;
-    }
-    if let Err(err) = fs::rename(&temporary, path) {
-        crate::log_line!("g-mesh daemon: failed to put {what} {} in place: {err}", path.display());
-        let _ = fs::remove_file(&temporary);
-    }
-}
-
-/// Whether a process with this pid exists: a snapshot, and pids are reused, so
-/// callers that care corroborate it with the endpoint.
-pub fn is_process_alive(pid: u32) -> bool {
-    crate::process::is_alive(pid)
-}
-
-/// Whether something accepts connections on this project's endpoint now; not
-/// fooled by a recycled pid. The probe connection is dropped at once.
-pub fn is_listening(root: &Path) -> Result<bool> {
-    Ok(ipc::Stream::connect(&endpoint(root)?).is_ok())
+    Ok(Some(Rebuild {
+        pid: marker.pid,
+        started: UNIX_EPOCH + Duration::from_secs(marker.started_unix_secs),
+        command: marker.command,
+    }))
 }
 
 /// Per-project daemon core: opens the index, binds the endpoint, and serves an
@@ -306,298 +86,36 @@ pub fn is_listening(root: &Path) -> Result<bool> {
 /// races the socket appearing); a tool call that needs the graph waits for it
 /// (`daemon::indexing_status`), so no one is served off a partial graph.
 pub fn run(root: &Path) -> Result<()> {
-    // `ensure_project_dir`: a state directory without its `project.root` file
+    // `StateDir::ensure`: a state directory without its `project.root` file
     // is invisible to `clean orphaned` forever.
-    let dir = ensure_project_dir(root)?;
-
-    // Singleton guard, before anything else touches the project's files.
-    // Losing it is the healthy outcome: the caller connects to the incumbent.
-    let singleton = match acquire_singleton_lock(&dir)? {
-        Some(lock) => lock,
-        None => return stand_down(root),
+    let dir = StateDir::ensure(root)?;
+    let Some(singleton) = startup::claim(&dir)? else {
+        return stand_down(root);
     };
-    // A daemon holding the lock means no rebuild holds it (a rebuild takes
-    // the same lock), so any marker left here is a crashed rebuild's: once
-    // its pid is reused it would read as live and turn every shim away.
-    clear_stale_rebuild_marker(&dir);
-
-    // After the singleton lock, before the bind (never transiently missing).
-    // Not fatal: a daemon that reads as outdated gets replaced.
-    match build_stamp::of_running_process() {
-        Ok(stamp) => {
-            if let Err(err) = build_stamp::write(&build_stamp_path_in(&dir), &stamp) {
-                crate::log_line!("g-mesh daemon: could not publish its build stamp: {err:#}");
-            }
-        }
-        Err(err) => crate::log_line!("g-mesh daemon: could not describe its own build: {err:#}"),
-    }
 
     // D10/D11: a folder of projects is served by the front, which needs no
     // plugin discovery and never creates an `index.db`.
-    let detection = candidates::detect_in(root, &dir, candidates::Limits::default());
+    let detection = candidates::detect_in(root, dir.path(), candidates::Limits::default());
     if detection.mode == candidates::Mode::Multi {
         return front::run(root, &dir, singleton, detection);
     }
 
-    // Discovery comes before the index (the generation check below needs it)
-    // and before the bind, so a malformed manifest or two plugins claiming one
-    // extension fail startup before a socket or pid file is published.
-    let discovered =
-        manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
-
-    // Before the index is opened and before any reindex can run: a staging
-    // file left here belongs to a reindex that died.
-    workspace_reindex::remove_stale_staging(&dir);
-    seed::remove_stale_seed_tmp(&dir);
-    // Before `connection::open`, which would create an empty `index.db`.
-    if let Some(origin) = seed::seed_if_eligible(root, &dir, &registry::indexer_version(&discovered)) {
-        crate::log_line!(
-            "g-mesh daemon: index seeded from {} in {} ms",
-            origin.source_root.display(),
-            origin.copy_ms
-        );
-    }
-    let conn = connection::open(root).context("failed to open the project's SQLite index")?;
-    // Read before `ensure_current`, whose reset would hide that one existed:
-    // the session instructions say whether a cold start throws an index away.
-    let had_generation = schema::stored_generation(&conn).is_some();
-    // The generation names every discovered plugin's build and core's
-    // pipeline, so an index built by a since-rebuilt plugin is thrown away.
-    let reinitialized = schema::ensure_current(&conn, &registry::indexer_version(&discovered))
-        .context("failed to check the index's schema and indexer versions")?;
-    if reinitialized {
-        crate::log_line!("g-mesh daemon: index (re)initialized - a full reindex is needed");
-    }
-    let cold_cause = match (had_generation, reinitialized) {
-        (false, _) => ColdCause::Fresh,
-        (true, true) => ColdCause::Discarded,
-        (true, false) => ColdCause::Incomplete,
-    };
-    // Next to the staging cleanup above, once the tables exist: pending rows
-    // no pass will clear (a removed plugin, a clear that failed) go.
-    workspace_reindex::remove_stale_semantic_pending(&conn, &discovered.manifests);
-    // Recorded at open, not once serving: a long cold walk must not read as
-    // idleness to a concurrent GC scan.
-    last_used::touch(&conn).context("failed to record that the project was used")?;
-    // A recorded fact, not schema freshness: a walk killed half way leaves a
-    // current schema behind a partial graph.
-    let needs_bulk_index = !schema::bulk_index_completed(&conn)
-        .context("failed to check whether the project has been indexed")?;
-    // A walked project can still owe its semantic pass, if an earlier attempt
-    // was interrupted after `bulkIndexedAt` was recorded (`daemon::semantic`).
-    let needs_semantic_pass_retry = !needs_bulk_index
-        && !schema::semantic_pass_completed(&conn)
-            .context("failed to check whether the project's semantic pass has completed")?;
-    // The languages the last full walk failed that a start still retries
-    // (ADR 0021): only on a walked project, whose walk would otherwise never
-    // revisit them. Unreadable, nothing is retried this start.
-    let retry_languages = if needs_bulk_index {
-        Vec::new()
-    } else {
-        let discovered_languages: Vec<&str> = discovered.manifests.keys().map(String::as_str).collect();
-        schema::languages_owed_a_retry(&conn, &discovered_languages).unwrap_or_else(|err| {
-            crate::log_line!(
-                "g-mesh daemon: could not read which failed languages to retry - none is: {err:#}"
-            );
-            Vec::new()
-        })
-    };
-    // A seed copied before this open (or by a start that died before its
-    // reconcile finished) is served only after that reconcile.
-    let seeded = !needs_bulk_index
-        && schema::seed_pending(&conn).unwrap_or_else(|err| {
-            crate::log_line!(
-                "g-mesh daemon: could not read whether the index is an unreconciled seed: {err:#}"
-            );
-            false
-        });
-    if seeded {
-        crate::log_line!(
-            "g-mesh daemon: the index is a seed - reconciling it with this worktree before tool calls answer"
-        );
-    }
-    let conn =
-        Arc::new(IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())));
-
-    // Canonicalized like `ProjectWatcher`'s paths, so `relative_wire_path` can strip it.
-    let canonical_root = root
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
-
-    let endpoint = endpoint_in(&dir)
-        .with_context(|| format!("failed to derive the daemon endpoint from {}", dir.display()))?;
-    // A socket file left by a crashed daemon makes bind() fail forever; the
-    // singleton lock guarantees any socket here is a dead one's.
-    endpoint.clear_stale();
-    // Suspension lasts until the daemon restarts, and this is that restart:
-    // every stale marker is cleared, like the socket.
-    registry::clear_stale_suspension_markers(&dir);
-    // From here a shim's `connect()` succeeds (queued on the backlog until the
-    // accept loop is up), which is what its bootstrap timeout waits for.
-    let listener = ipc::Listener::bind(&endpoint)
-        .with_context(|| format!("failed to bind the daemon endpoint at {endpoint}"))?;
-
-    // Right after the bind, so "the pid file exists" means "something is
-    // listening"; `meta.bulkIndexedAt`, not this, records a complete index.
-    let pid_file = dir.join(PID_FILE);
-    write_pid_file(&pid_file, std::process::id());
-
-    // Unwalked: `Unindexed` until the first index-needing tool call; walked:
-    // `Structural` (the embedding backfill is still owed); an unreconciled
-    // seed: `Walking` until its reconcile opens the gate. The phase file is
-    // published next to the pid file, before its absence could mean anything.
-    let indexing = if needs_bulk_index {
-        IndexingStatus::unindexed_because(cold_cause)
-    } else if seeded {
-        IndexingStatus::walking_because(ColdCause::Seeded)
-    } else {
-        IndexingStatus::structural()
-    };
-    indexing.attach_phase_file(phase_path_in(&dir));
-    indexing.attach_progress_file(progress_path_in(&dir));
-    // Attached before the accept loop can hand `indexing` to any session, so
-    // no tool call ever finds it with nothing to trigger.
-    let activation_trigger = indexing.attach_activation();
-
-    // After the bind: the record means the holder got as far as serving.
-    record_serving_owner(&dir);
-
-    // Resolved once, from config.toml or its defaults (`daemon::lifecycle`).
-    let project_config =
-        crate::config::read_project_config(root).context("failed to read the project's config.toml")?;
-    let timeouts = IdleTimeouts::from_config(&project_config);
-
-    // Not loaded here, not even in the background (a startup thread broke the
-    // restart budgets): the first `apply` pays for it on its own thread. A
-    // missing model does not stop the daemon, which never fetches one.
-    let embedding = Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
-    let _ = fs::remove_file(rerank_outcome_path_in(&dir));
-    embedding.reranker().record_outcome_to(rerank_outcome_path_in(&dir));
-
-    // The bulk walk spawns one-shot processes from the manifests, not the
-    // registry's supervisors, so it takes its own copy before `discovered` moves.
-    let discovered_for_bulk_index = discovered.clone();
-
-    // Spawns nothing: each language's plugin starts lazily (`daemon::registry`).
-    let registry = Arc::new(PluginRegistry::new(
-        &canonical_root,
-        dir.clone(),
-        discovered,
-        timeouts.plugin,
-        project_config.plugin.memory_limit_mb,
-        Arc::clone(&embedding),
-    ));
-    // Before the tool listener and the watcher's consumer below: both route
-    // files, and neither may reach a language the last walk failed (ADR 0021,
-    // section 2).
-    registry.seed_failed_languages(&conn);
-
-    // Starts ticking now, so a daemon nobody connects to still exits.
-    let core_activity = CoreActivity::new();
-
-    // The accept loop and activation get threads of their own; this thread
-    // supervises. The accept outcome comes over a channel, not `join`, so the
-    // supervisor can wake on its own schedule.
-    let (accept_result, accept_loop) = mpsc::channel();
-    {
-        let conn = Arc::clone(&conn);
-        let registry = Arc::clone(&registry);
-        let core_activity = Arc::clone(&core_activity);
-        let indexing = indexing.clone();
-        let embedding = Arc::clone(&embedding);
-        thread::spawn(move || {
-            let _ = accept_result.send(serve_forever(
-                listener,
-                conn,
-                registry,
-                core_activity,
-                indexing,
-                embedding,
-            ));
-        });
-    }
-
-    // The watcher (D8 in `docs/architecture/lazy-indexing.md`): an unindexed
-    // project gets it from activation, right before its walk. A walked one gets
-    // it now, and its consumer too unless a semantic-pass retry is owed, which
-    // must run before any incremental pass, or a failed language's retry is,
-    // so that no edit of it routes while it is still failed (activation
-    // starts the consumer after those).
-    // A watcher failure here is fatal: this is startup, with no session to lose.
-    // A seeded start's gate goes with the watcher to whoever starts its
-    // consumer; the activation waits on `seed_reconciled` before its backfill.
-    let (mut seed_gate, seed_reconciled) = if seeded {
-        let (gate, reconciled) = seed::SeedGate::new(indexing.clone());
-        (Some(gate), Some(reconciled))
-    } else {
-        (None, None)
-    };
-    let pending_watcher = if needs_bulk_index {
-        None
-    } else {
-        let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
-        if needs_semantic_pass_retry || !retry_languages.is_empty() {
-            Some(watcher)
-        } else {
-            let start = match seed_gate.take() {
-                Some(gate) => ConsumerStart::Seeded(gate),
-                None => ConsumerStart::Reconcile,
-            };
-            spawn_watch_consumer(
-                watcher,
-                Arc::clone(&conn),
-                Arc::clone(&registry),
-                canonical_root.clone(),
-                start,
-            );
-            None
-        }
-    };
-
-    // Kept for `supervise`, which detaches the state files before releasing
-    // them (GM-605); the original moves into the activation thread.
-    let indexing_for_teardown = indexing.clone();
-    // Parked until the first tool call - see `daemon::activation`.
-    activation::spawn(
-        activation::ActivationCtx {
-            conn: Arc::clone(&conn),
-            registry: Arc::clone(&registry),
-            embedding: Arc::clone(&embedding),
-            discovered_for_bulk_index,
-            canonical_root: canonical_root.clone(),
-            root: root.to_path_buf(),
-            indexing,
-            core_activity: Arc::clone(&core_activity),
-            needs_walk: needs_bulk_index,
-            needs_semantic_pass_retry,
-            retry_languages,
-            watcher: pending_watcher,
-            seed_gate,
-            seed_reconciled,
-        },
+    let opened = startup::open_index(root, &dir)?;
+    let plan = StartupPlan::decide(&opened.facts);
+    let canonical_root = startup::canonical_root(root)?;
+    let startup::Published { listener, indexing, activation_trigger } = startup::publish(&dir, &plan)?;
+    let (services, discovered_for_bulk_index) =
+        startup::start_services(root, &dir, opened, &canonical_root, listener, &indexing)?;
+    let indexing_for_teardown = startup::start_watcher_and_activation(
+        root,
+        plan,
+        &services,
+        discovered_for_bulk_index,
+        indexing,
         activation_trigger,
-    )?;
-
-    // `canonical_root`: the orphan check must stat the same spelling
-    // everything else resolved against.
-    let outcome = lifecycle::supervise(
         &canonical_root,
-        &dir,
-        &registry,
-        &core_activity,
-        Some(&indexing_for_teardown),
-        timeouts,
-        accept_loop,
-    );
-
-    // Released explicitly: the lock is now the only claim on this project, and
-    // a slow teardown while holding it would wedge the project.
-    drop(singleton);
-    let exit = outcome?;
-    // After the lock, so the purge judges the directory as `clean` would; the
-    // index this process still has open is no obstacle (see the function).
-    lifecycle::purge_state_dir(&dir, &exit);
-    Ok(())
+    )?;
+    startup::supervise_and_tear_down(&canonical_root, &dir, singleton, services, &indexing_for_teardown)
 }
 
 /// What a daemon that lost the singleton race does: quiet success against a
@@ -614,222 +132,9 @@ fn stand_down(root: &Path) -> Result<()> {
         // `Free`: the incumbent released the lock after the failed attempt; the
         // next bootstrap wins.
         DaemonLock::Free | DaemonLock::Serving | DaemonLock::Starting => {
-            crate::log_line!("g-mesh daemon: another daemon already serves {} - exiting", root.display());
+            crate::log_role!("another daemon already serves {} - exiting", root.display());
             Ok(())
         }
-    }
-}
-
-/// What the watcher's consumer does before its first batch.
-pub(crate) enum ConsumerStart {
-    /// The index was walked in this process: only the `.gitignore` re-check.
-    AfterWalk,
-    /// The index may predate the files on disk (no walk in this process):
-    /// the `.gitignore` re-check, then the plain reconcile.
-    Reconcile,
-    /// The index is an unreconciled seed (`daemon::seed`): the seeded
-    /// reconcile, no `.gitignore` re-check (every `.gitignore` of a fresh
-    /// checkout is newer than the copied walk), then the gate opens, the
-    /// watch files are compared with the seed's source, and the seed is
-    /// stamped reconciled.
-    Seeded(seed::SeedGate),
-}
-
-/// Starts the watcher's consumer thread, once no structural walk or
-/// whole-project semantic pass can still race it; `start` says what it does
-/// before its first batch, after which every start runs the scoped semantic
-/// pass over the semantic-pending files still owed
-/// ([`PluginRegistry::owed_semantic_file_passes`]).
-fn spawn_watch_consumer(
-    watcher: ProjectWatcher,
-    conn: Arc<IndexStore>,
-    registry: Arc<PluginRegistry>,
-    root: PathBuf,
-    start: ConsumerStart,
-) {
-    thread::spawn(move || {
-        // Taken before the start's own `.gitignore` recheck and reconcile,
-        // which count as the first run for a later Rescan's recheck.
-        let mut rescans = Rescans::new();
-        // On this thread, before the first batch, as an in-session edit would
-        // be; events meanwhile queue in the watcher's channel.
-        match start {
-            ConsumerStart::AfterWalk => registry.recheck_gitignores_since_index(&conn),
-            ConsumerStart::Reconcile => {
-                // `.gitignore` edits made while no daemon watched, then every
-                // other file changed meanwhile.
-                registry.recheck_gitignores_since_index(&conn);
-                registry.reconcile_since_index(
-                    &conn,
-                    registry::ReconcileMode::Plain,
-                    registry::ReconcileScope::Start,
-                );
-            }
-            ConsumerStart::Seeded(gate) => {
-                seed::hold_the_seeded_reconcile_for_tests();
-                // The reparsed files are recorded semantic-pending; the
-                // start's scoped pass below reads them back.
-                registry.reconcile_since_index(
-                    &conn,
-                    registry::ReconcileMode::Seeded,
-                    registry::ReconcileScope::Start,
-                );
-                gate.open();
-                // After the gate, as the watcher's reindex of a live edit
-                // serves the old graph until its swap; before the stamp, so a
-                // daemon killed meanwhile compares them again.
-                registry.reconcile_watch_files_with_seed(&conn);
-                // A daemon killed before this line repeats the seeded
-                // reconcile, which finds the files fresh.
-                if let Err(err) = conn.with(schema::record_seed_reconciled) {
-                    crate::log_line!(
-                        "g-mesh daemon: could not record that the seeded index was reconciled - the next start \
-                         reconciles it again: {err:#}"
-                    );
-                }
-            }
-        }
-        // Any start: files a per-file pass still owes (a seeded reparse, or
-        // one an earlier start's death left semantic-pending).
-        registry.owed_semantic_file_passes(&conn);
-        let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
-        loop {
-            watch_and_route_once(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry);
-        }
-    });
-}
-
-/// The watcher loop's dropped-event state (GM-616), beside its
-/// [`Debouncer`]: the scheduler holding the subtrees to reconcile, and the
-/// `.gitignore` watermark.
-pub(crate) struct Rescans {
-    pub(crate) scheduler: RescanScheduler,
-    /// Unix seconds when the previous reconcile started (at first, the
-    /// consumer's start): a `.gitignore` with a newer mtime goes through
-    /// [`PluginRegistry::gitignore_changed`] at the next Rescan run.
-    pub(crate) gitignores_since: i64,
-}
-
-impl Rescans {
-    /// The daemon's timings, the watermark at now.
-    pub(crate) fn new() -> Self {
-        Self::with_scheduler(RescanScheduler::new())
-    }
-
-    /// `scheduler`, the watermark at now.
-    pub(crate) fn with_scheduler(scheduler: RescanScheduler) -> Self {
-        Self { scheduler, gitignores_since: gitignore_watermark() }
-    }
-}
-
-/// The `.gitignore` watermark for a reconcile starting now: one second before
-/// now. mtimes are compared in whole seconds and strictly, so a `.gitignore`
-/// written in the same second the run starts, after the run has read it, is
-/// still newer than the next run's watermark. The cost is rechecking a file
-/// once more, which the gate in [`PluginRegistry::gitignore_changed`] absorbs.
-fn gitignore_watermark() -> i64 {
-    unix_now_secs() - 1
-}
-
-/// Whole seconds since the epoch, now (0 if the clock is before it).
-fn unix_now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
-}
-
-/// A path as a timing line names it (GM-435): project-relative when it is
-/// inside `root`, as given otherwise.
-fn timing_path(root: &Path, path: &Path) -> String {
-    relative_wire_path(root, path).unwrap_or_else(|| path.display().to_string())
-}
-
-/// One iteration of the watcher loop: waits up to [`DEBOUNCE_WINDOW`] for a
-/// raw change, records it, then routes every settled path to `registry` in
-/// [`order_for_routing`]'s order (deletions, creations, modifications; ADR 0023).
-/// Between the deletions and the creations, the batch's created paths are
-/// announced per language ([`PluginRegistry::announce_created`]), so a plugin
-/// knows all of them before it extracts the first; each is still routed once.
-///
-/// A settled `.gitignore`, directory or link first reloads the watcher's
-/// layers and link table; the batch is then filtered again under the current
-/// ones, a file link's own path placed as the walk lists it; after
-/// routing, the batch's `.gitignore` paths and the links whose row the reload
-/// changed go through [`PluginRegistry::gitignore_changed`], which reindexes
-/// each language whose indexed files they changed.
-///
-/// A Rescan (events the OS dropped, GM-616) skips the debouncer: it goes to
-/// `rescans`' scheduler, and after the batch, when the scheduler says a run is
-/// due, [`PluginRegistry::rescan_subtrees`] reconciles the pending subtrees
-/// with the disk.
-fn watch_and_route_once(
-    watcher: &ProjectWatcher,
-    debouncer: &mut Debouncer,
-    rescans: &mut Rescans,
-    root: &Path,
-    conn: &IndexStore,
-    registry: &PluginRegistry,
-) {
-    match watcher.next_change(DEBOUNCE_WINDOW) {
-        Some(Change::Path(path)) => {
-            crate::log_timing!("fs_event path={}", timing_path(root, &path));
-            debouncer.record(path)
-        }
-        // `next_change` widens a Rescan outside the root to the root; `""`
-        // is the root here as well.
-        Some(Change::Rescan(path)) => {
-            rescans.scheduler.record(relative_wire_path(root, &path).unwrap_or_default())
-        }
-        None => {}
-    }
-    let mut settled_paths = debouncer.drain_ready();
-    if !settled_paths.is_empty() && crate::log::timing_enabled() {
-        let names: Vec<String> = settled_paths.iter().map(|path| timing_path(root, path)).collect();
-        crate::log_timing!("settled paths={} names={}", names.len(), names.join(","));
-    }
-    let mut links = Vec::new();
-    if let Some(changed_links) = watcher.reload_ignores_if_changed(&settled_paths) {
-        links = changed_links;
-    }
-    // Always, not only after a reload: it also places a file link's own path
-    // (kept by `next_change`) where the walk lists it.
-    watcher.retain_unignored(&mut settled_paths);
-    let mut gitignores = Vec::new();
-    let mut batch = Vec::new();
-    for settled in settled_paths {
-        let Some(file_path) = relative_wire_path(root, &settled) else {
-            // Outside the project root: nothing to route.
-            continue;
-        };
-        if file_path.is_empty() {
-            // The project root itself (macOS reports it for a write inside it): not
-            // a file, and must not enter a sleeping plugin's replay queue.
-            continue;
-        }
-        if settled.file_name() == Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME)) {
-            gitignores.push(file_path.clone());
-        }
-        batch.push((classify_settled(conn, &settled, &file_path), file_path));
-    }
-    let order = order_for_routing(batch);
-    // A watch file (`[plugin.workspace] watch_files`, or a stored watch path)
-    // triggers that language's reindex; anything else is applied or queued by
-    // its supervisor.
-    for file_path in order.deleted {
-        registry.route_settled_path(conn, file_path);
-    }
-    registry.announce_created(conn, &order.created);
-    for file_path in order.created.into_iter().chain(order.modified) {
-        registry.route_settled_path(conn, file_path);
-    }
-    // After routing: a file deleted or created in this batch is already in
-    // the graph's new state, so the gate compares against it.
-    if !gitignores.is_empty() || !links.is_empty() {
-        registry.gitignore_changed(conn, &gitignores, &links);
-    }
-    if let Some(subtrees) = rescans.scheduler.due() {
-        let started = std::time::Instant::now();
-        let gitignores_since = std::mem::replace(&mut rescans.gitignores_since, gitignore_watermark());
-        registry.rescan_subtrees(conn, &subtrees, watcher, gitignores_since);
-        rescans.scheduler.ran(started.elapsed());
     }
 }
 
@@ -856,39 +161,28 @@ fn serve_forever(
         let mut listener =
             listener.into_async().context("failed to register the daemon endpoint with the async runtime")?;
 
+        // One host for the daemon's lifetime, shared by every connection.
+        let host: Arc<dyn mcp::McpHost> =
+            Arc::new(mcp_host::DaemonHost::new(Arc::clone(&registry), Arc::clone(&core_activity)));
         loop {
             let stream = listener.accept().await.context("failed to accept a daemon connection")?;
             let conn = Arc::clone(&conn);
-            let registry = Arc::clone(&registry);
+            let host = Arc::clone(&host);
             let indexing = indexing.clone();
             let embedding = Arc::clone(&embedding);
             // Taken before the task spawns, so the count rises before the core can
             // be judged unattended.
             let attached = core_activity.connection_opened();
-            let core_activity = Arc::clone(&core_activity);
             tokio::spawn(async move {
                 // Dropped when this session ends, whichever way it ends, which
                 // is also what restarts the core's idle clock.
                 let _attached = attached;
-                if let Err(err) =
-                    mcp::serve_connection(stream, conn, registry, core_activity, indexing, embedding).await
-                {
-                    crate::log_line!("g-mesh daemon: connection ended: {err:#}");
+                if let Err(err) = mcp::serve_connection(stream, conn, host, indexing, embedding).await {
+                    crate::log_role!("connection ended: {err:#}");
                 }
             });
         }
     })
-}
-
-/// An absolute, canonicalized path as the project-relative, forward-slash
-/// wire path (like the plugin's `toPosixPath`); `None` outside `root`.
-fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {
-    let rel = absolute.strip_prefix(root).ok()?;
-    let mut parts = Vec::new();
-    for component in rel.components() {
-        parts.push(component.as_os_str().to_str()?.to_string());
-    }
-    Some(parts.join("/"))
 }
 
 /// How long [`acquire_singleton_lock`] retries a contended lock: well under
@@ -903,8 +197,8 @@ const SINGLETON_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// returned `File` must live as long as the daemon: the lock is tied to the
 /// open file, so exit or death releases it. A contended lock is retried because
 /// the kernel releases a `kill -9`'d holder's `flock` slightly after it dies.
-pub(crate) fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
-    let path = dir.join(DAEMON_LOCK_FILE);
+pub(crate) fn acquire_singleton_lock(dir: &StateDir) -> Result<Option<File>> {
+    let path = dir.daemon_lock_file();
     let file = File::options()
         .create(true)
         .write(true)
@@ -918,7 +212,7 @@ pub(crate) fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
             Ok(()) => {
                 // Cleared as soon as the lock is taken, so the state reads "not
                 // serving yet" for exactly as long as that is true.
-                clear_serving_owner(dir);
+                dir.clear_serving_owner();
                 return Ok(Some(file));
             }
             Err(TryLockError::WouldBlock) => {
@@ -932,106 +226,6 @@ pub(crate) fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
             }
         }
     }
-}
-
-/// What holds a project's daemon lock right now, judged from outside the
-/// holder. The lock alone decides who may serve a project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DaemonLock {
-    /// Nobody holds it: the project has no daemon and a bootstrap may go ahead.
-    Free,
-    /// Held by a daemon answering on the project's socket: the only state in
-    /// which another daemon must stand down.
-    Serving,
-    /// Held, but the holder has not published itself as serving yet. Entitled to
-    /// a moment: nothing may evict it on this alone.
-    Starting,
-    /// Held by a live process that published itself as serving and no longer
-    /// answers: no client can reach it, and it keeps the project until it exits.
-    Wedged { pid: u32 },
-}
-
-/// Diagnoses [`DaemonLock`] for `root`: the socket first (an answer means
-/// healthy), then the lock, probed by taking and dropping it. A daemon racing
-/// for the lock does not notice the probe only because it retries for
-/// `SINGLETON_LOCK_RETRY_BUDGET`, orders of magnitude longer than the probe
-/// holds it.
-pub fn inspect_daemon_lock(root: &Path) -> Result<DaemonLock> {
-    let listening = is_listening(root)?;
-    inspect_daemon_lock_in(&project_dir(root)?, listening)
-}
-
-/// [`inspect_daemon_lock`] with the state directory and "is anything
-/// listening" given, so the judgement is testable without a real socket.
-fn inspect_daemon_lock_in(state_dir: &Path, listening: bool) -> Result<DaemonLock> {
-    if listening {
-        return Ok(DaemonLock::Serving);
-    }
-    if !daemon_lock_is_held(state_dir)? {
-        return Ok(DaemonLock::Free);
-    }
-    match serving_owner_in(state_dir).filter(|&pid| is_process_alive(pid)) {
-        Some(pid) => Ok(DaemonLock::Wedged { pid }),
-        None => Ok(DaemonLock::Starting),
-    }
-}
-
-/// Whether anything holds the project's daemon lock. A lock file that cannot be
-/// opened reads as "not held": eviction must fail towards leaving processes alone.
-fn daemon_lock_is_held(state_dir: &Path) -> Result<bool> {
-    let path = daemon_lock_path_in(state_dir);
-    let Ok(file) = File::options().write(true).truncate(false).open(&path) else {
-        return Ok(false);
-    };
-    match file.try_lock() {
-        // Held by nobody: taken here for an instant and released by this drop.
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(err)) => {
-            Err(err).with_context(|| format!("failed to probe {}", path.display()))
-        }
-    }
-}
-
-/// Records that the lock's holder is now serving: its pid, beside the lock.
-/// Called after the socket is bound, never before: a holder with no pid
-/// recorded is starting up and must be left alone; one whose recorded pid is
-/// alive while nothing answers is wedged and can be evicted. The record is
-/// newline-terminated and [`serving_owner_in`] refuses one without it: a
-/// reader may signal the pid it reads, so a partial record must read as
-/// nothing. Best-effort: a failure reads as `Starting`, which is left alone.
-fn record_serving_owner(state_dir: &Path) {
-    write_pid_file(&serving_owner_path_in(state_dir), std::process::id());
-}
-
-/// Removes the rebuild marker a crashed `g-mesh reindex`/`init` left behind.
-/// Only a normal daemon calls this, after taking the singleton lock; never
-/// `acquire_singleton_lock` itself, which the rebuild also goes through.
-fn clear_stale_rebuild_marker(state_dir: &Path) {
-    let path = rebuild_marker_path_in(state_dir);
-    match fs::remove_file(&path) {
-        Ok(()) => crate::log_line!("g-mesh daemon: removed a stale rebuild marker {}", path.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => crate::log_line!("g-mesh daemon: failed to remove {}: {err}", path.display()),
-    }
-}
-
-/// Removes the record, so a fresh holder does not inherit its predecessor's
-/// claim. Called under the lock, which keeps "only the holder writes this" true.
-fn clear_serving_owner(state_dir: &Path) {
-    let path = serving_owner_path_in(state_dir);
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => crate::log_line!("g-mesh daemon: failed to clear {}: {err}", path.display()),
-    }
-}
-
-/// The pid the lock's holder recorded once serving. `None` for a missing,
-/// empty, unparseable or newline-less record: all mean "nothing recorded".
-pub fn serving_owner_in(state_dir: &Path) -> Option<u32> {
-    let recorded = fs::read_to_string(serving_owner_path_in(state_dir)).ok()?;
-    recorded.strip_suffix('\n')?.trim().parse().ok()
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 #
 # GM-613: "can this machine execute what it just built, and is it really the
 # architecture it claims to be". Sourced by scripts/build-targets.sh and the
-# four scripts/bundle-*-plugin.sh scripts, which used to each decide this with
+# scripts/bundle-*-plugin.sh scripts, which used to each decide this with
 # `[ "$target" = "$host" ]` on their own.
 #
 # Since GM-613 release.yml builds x86_64-apple-darwin on an arm64 `macos-15`

@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::cli::stop;
+use crate::control::lock::{inspect_daemon_lock, DaemonLock};
+use crate::control::stop;
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
-use crate::daemon::candidates;
 use crate::ipc;
+use crate::paths::state_dir::StateDir;
 use crate::process;
-use crate::storage::connection::{ensure_project_dir, ensure_project_dir_under};
+use crate::project_detect as candidates;
 
 mod router;
 
@@ -35,16 +36,6 @@ pub(crate) use router::Rebuilding;
 /// ten seconds is generous rather than nearly enough.
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(20);
-
-/// Shortens [`BOOTSTRAP_TIMEOUT`] for the test suite. Real installs never set
-/// it: the point of the constant is to be longer than any honest bind, and
-/// nothing outside a test wants it shorter.
-///
-/// It exists so that "a project whose cold-start walk outlasts the shim's
-/// bootstrap timeout still gets served" can be asserted in a couple of
-/// seconds - shrinking the timeout below the walk, rather than stretching the
-/// walk past ten real seconds on every commit.
-const BOOTSTRAP_TIMEOUT_ENV: &str = "G_MESH_BOOTSTRAP_TIMEOUT_MS";
 
 /// Set by Claude Code on every stdio MCP server it spawns, in every
 /// registration scope (local/project/user) - unlike the process's cwd, which
@@ -76,11 +67,11 @@ pub const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 /// Sharing is safe because every writer to this file - the daemon
 /// (`g_mesh::log_line!`) and each plugin (`g_mesh_plugin_sdk::log_line!`) -
 /// emits a whole line in one `write`, which `O_APPEND` keeps intact.
-pub const DAEMON_LOG_ENV: &str = "G_MESH_DAEMON_LOG";
+pub const DAEMON_LOG_ENV: &str = crate::knobs::DAEMON_LOG.name;
 
 /// The file in the project's state directory a shim-bootstrapped daemon's
 /// stderr is appended to when [`DAEMON_LOG_ENV`] is unset.
-pub const DAEMON_LOG_FILE: &str = "daemon.log";
+pub use crate::paths::state_dir::DAEMON_LOG_FILE;
 
 /// Size past which [`DAEMON_LOG_FILE`] is rotated when the next daemon is
 /// spawned: renamed to `daemon.log.1`, replacing the previous one, so a
@@ -138,8 +129,8 @@ pub fn run() -> Result<()> {
 }
 
 /// Starts the sweep of orphaned state directories (GM-524 D1, option (c)) on
-/// a background thread: `cli::clean::sweep_orphaned_if_due`, at most once per
-/// `cli::clean::ORPHAN_SWEEP_INTERVAL` across every shim on the machine. It
+/// a background thread: `control::sweep::sweep_orphaned_if_due`, at most once per
+/// `control::sweep::ORPHAN_SWEEP_INTERVAL` across every shim on the machine. It
 /// cleans up after the daemons that could not purge their own state - one
 /// killed with `-9`, or any on Windows. The process may exit mid-sweep; the
 /// sweep deletes each directory's root record last so a cut-short delete is
@@ -149,7 +140,7 @@ fn spawn_orphan_sweep() {
         return;
     };
     let _ = thread::Builder::new().name("orphan-sweep".into()).spawn(move || {
-        use crate::cli::clean::{sweep_orphaned_if_due, Sweep, ORPHAN_SWEEP_INTERVAL};
+        use crate::control::sweep::{sweep_orphaned_if_due, Sweep, ORPHAN_SWEEP_INTERVAL};
         match sweep_orphaned_if_due(&home, ORPHAN_SWEEP_INTERVAL) {
             Ok(Sweep::Swept(deleted)) if deleted > 0 => eprintln!(
                 "g-mesh mcp-shim: deleted the index and state of {deleted} project(s) whose directory no \
@@ -244,7 +235,7 @@ enum Incumbent {
 /// `origin` says where `root` came from (see [`launch_origin`] and
 /// [`selected_origin`]); it only colors the cold-start line.
 pub(crate) fn connect_or_bootstrap(root: &Path, origin: &str) -> Result<ipc::Stream> {
-    let endpoint = daemon::endpoint(root)?;
+    let endpoint = crate::control::lock::endpoint(&StateDir::of(root)?)?;
     // Checked before anything is attempted, because every step below assumes
     // the endpoint is one a daemon could listen on. An over-long AF_UNIX path
     // fails only at the daemon's `bind`, in a detached child whose stderr
@@ -343,7 +334,7 @@ fn incumbent(root: &Path, endpoint: &ipc::Endpoint) -> Result<Incumbent> {
         return Ok(Incumbent::Reusable(stream));
     };
 
-    let published = build_stamp::read(&daemon::build_stamp_path(root)?);
+    let published = build_stamp::read(&StateDir::of(root)?.build_stamp_file());
     match build_stamp::vintage(published.as_ref(), &ours) {
         Vintage::Current => Ok(Incumbent::Reusable(stream)),
         // Dropped rather than kept for a possible fallback: the retirement
@@ -359,7 +350,7 @@ fn incumbent(root: &Path, endpoint: &ipc::Endpoint) -> Result<Incumbent> {
 /// Stops a daemon this build supersedes, so the bootstrap below can put a
 /// current one in its place. Reports whether it is safe to bootstrap over.
 ///
-/// `cli::stop::stop` rather than a shutdown path of this module's own: it
+/// `control::stop::stop` rather than a shutdown path of this module's own: it
 /// already escalates `SIGTERM` to `SIGKILL`, already waits for the plugin the
 /// daemon leaves behind, and already promises not to return until everything
 /// it stopped is genuinely gone - which is exactly the guarantee bootstrapping
@@ -391,7 +382,7 @@ fn retire_outdated_daemon(root: &Path, vintage: Vintage) -> bool {
 /// to start serving before it is evicted.
 ///
 /// It only has to cover the gap between a daemon publishing itself as serving
-/// (`daemon::record_serving_owner`, written immediately after the bind) and
+/// (`StateDir::record_serving_owner`, written immediately after the bind) and
 /// that socket being connectable, which is a scheduling hiccup rather than any
 /// real work - a daemon that has not got that far reads as
 /// `DaemonLock::Starting` and is never a candidate here in the first place.
@@ -422,7 +413,7 @@ const WEDGE_CONFIRMATION: Duration = Duration::from_millis(500);
 ///   the same serialization that already stops two shims from bootstrapping
 ///   two daemons, and the reason this lives in the shim rather than in the
 ///   daemon: the daemon deliberately never takes the bootstrap lock, because
-///   the shim holds it *while* spawning one (see `daemon::DAEMON_LOCK_FILE`'s
+///   the shim holds it *while* spawning one (see `paths::state_dir::DAEMON_LOCK_FILE`'s
 ///   own note on why the two locks are separate files).
 ///
 /// Even if all of that failed, the daemon that follows still has to take the
@@ -434,11 +425,11 @@ const WEDGE_CONFIRMATION: Duration = Duration::from_millis(500);
 /// anyway, which lands back on today's behaviour (the new daemon exits on the
 /// lock and the caller is told why) rather than on a worse one.
 fn evict_wedged_daemon(root: &Path) {
-    let daemon::DaemonLock::Wedged { pid } = lock_state(root) else {
+    let DaemonLock::Wedged { pid } = lock_state(root) else {
         return;
     };
     thread::sleep(WEDGE_CONFIRMATION);
-    let daemon::DaemonLock::Wedged { pid: confirmed } = lock_state(root) else {
+    let DaemonLock::Wedged { pid: confirmed } = lock_state(root) else {
         return;
     };
     if confirmed != pid {
@@ -460,10 +451,10 @@ fn evict_wedged_daemon(root: &Path) {
     }
 }
 
-/// [`daemon::inspect_daemon_lock`], with a failure to inspect reading as
+/// [`inspect_daemon_lock`], with a failure to inspect reading as
 /// "nothing to act on" - the direction that leaves processes alone.
-fn lock_state(root: &Path) -> daemon::DaemonLock {
-    daemon::inspect_daemon_lock(root).unwrap_or(daemon::DaemonLock::Free)
+fn lock_state(root: &Path) -> DaemonLock {
+    inspect_daemon_lock(root).unwrap_or(DaemonLock::Free)
 }
 
 /// Opens (creating if absent) the project's bootstrap lock file and blocks
@@ -482,18 +473,17 @@ pub(crate) fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
 /// one the environment names, so a test can use a temp home without writing
 /// `G_MESH_HOME` for every other thread in the process.
 fn acquire_bootstrap_lock_under(home: &Path, root: &Path) -> Result<File> {
-    let path = daemon::lock_path_under(home, root)?;
     // First shim for a project gets here before anything has created the
     // per-project state directory (the daemon is what usually creates it) -
     // and this is the earliest of all the paths that can create it, so it is
     // the one that most often decides whether the directory ever gets a
-    // `project.root`. Through `ensure_project_dir` rather than a bare
+    // `project.root`. Through `StateDir::ensure_under` rather than a bare
     // `create_dir_all` for that reason: a directory created without that file
     // is classed `Legacy` by `clean orphaned` and left alone forever, because
     // `project_hash` is one-way and nothing can recover the root afterwards.
     // Measured on this machine's own test home: 707 of 775 state directories
     // were unsweepable for exactly this reason.
-    ensure_project_dir_under(home, root)?;
+    let path = StateDir::ensure_under(home, root)?.bootstrap_lock_file();
 
     let file = File::options()
         .create(true)
@@ -505,15 +495,12 @@ fn acquire_bootstrap_lock_under(home: &Path, root: &Path) -> Result<File> {
     Ok(file)
 }
 
-/// [`BOOTSTRAP_TIMEOUT`], unless [`BOOTSTRAP_TIMEOUT_ENV`] names a shorter
+/// [`BOOTSTRAP_TIMEOUT`], unless [`crate::knobs::BOOTSTRAP_TIMEOUT_MS`] names a shorter
 /// one. An unparseable value is ignored rather than fatal - a malformed knob
 /// nobody in production sets must not be a reason an MCP client fails to
 /// start.
 fn bootstrap_timeout() -> Duration {
-    std::env::var(BOOTSTRAP_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .map_or(BOOTSTRAP_TIMEOUT, Duration::from_millis)
+    crate::knobs::millis_lenient(&crate::knobs::BOOTSTRAP_TIMEOUT_MS, BOOTSTRAP_TIMEOUT)
 }
 
 fn wait_until_listening(endpoint: &ipc::Endpoint) -> Result<ipc::Stream> {
@@ -598,7 +585,7 @@ fn spawn_daemon_reaper(mut child: Child) {
 /// write it does not know is unread. A file and `/dev/null` both absorb writes unconditionally, which is
 /// the property the detached daemon's stderr has to keep.
 fn daemon_stderr(root: &Path) -> Stdio {
-    let path = match std::env::var_os(DAEMON_LOG_ENV).filter(|value| !value.is_empty()) {
+    let path = match crate::knobs::os_non_empty(&crate::knobs::DAEMON_LOG) {
         Some(path) => PathBuf::from(path),
         None => match project_daemon_log(root) {
             Ok(path) => path,
@@ -627,7 +614,7 @@ fn daemon_stderr(root: &Path) -> Stdio {
 /// past [`DAEMON_LOG_ROTATE_BYTES`]. Called only while the bootstrap lock is
 /// held and no daemon serves the project, so nothing is writing to it.
 fn project_daemon_log(root: &Path) -> Result<PathBuf> {
-    let path = ensure_project_dir(root)?.join(DAEMON_LOG_FILE);
+    let path = StateDir::ensure(root)?.daemon_log_file();
     rotate_if_over(&path, DAEMON_LOG_ROTATE_BYTES);
     Ok(path)
 }
@@ -664,8 +651,8 @@ fn link(stream: ipc::Stream) -> Result<router::Link> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::identity::read_project_root;
-    use crate::storage::connection::{project_dir, project_dir_under};
+    use crate::paths::state_dir::read_project_root;
+    use crate::paths::state_dir::{project_dir, project_dir_under};
 
     /// A log past its limit moves aside to `.1`, replacing the previous one;
     /// one at or under it is left to be appended to.

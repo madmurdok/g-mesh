@@ -2,7 +2,7 @@
 //! that language is actually touched.
 //!
 //! This is the piece that turns "the daemon has a plugin" into "the daemon
-//! has plugins": it owns discovery's results (see `daemon::manifest`) and
+//! has plugins": it owns discovery's results (see `plugin_manifest`) and
 //! answers the only two questions the rest of the daemon has about them -
 //! *which* plugin claims this file, and *is it running yet* - while
 //! `PluginSupervisor` and `PluginProcess` keep doing exactly what they
@@ -76,7 +76,7 @@
 //! languages can never step on each other's record, on a crash relaunch any
 //! more than on an ordinary sleep. `cli::status`/`cli::stop`/`cli::clean`
 //! read every `plugin-<language>.pid` file present
-//! ([`discovered_pid_files`]) rather than assuming exactly one.
+//! ([`StateDir::plugin_pid_files`]) rather than assuming exactly one.
 //!
 //! # The index's generation string (task 163)
 //!
@@ -98,142 +98,19 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::manifest::{self, extension_of, under_excluded_dir, DiscoveredPlugins};
+use crate::daemon::watch_loop::WatcherClock;
 use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
-use crate::languages::LanguageOutcome;
+use crate::ingest::staleness::{self, StalenessOutcome};
+use crate::mcp::PathCoverage;
+use crate::model::Diff;
+use crate::paths::state_dir::StateDir;
+use crate::plugin_manifest::{self, DiscoveredPlugins};
+use crate::project_walk::{extension_of, under_excluded_dir};
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{self, IndexStore, Unit};
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
-use crate::storage::write::Diff;
-use crate::watcher::staleness::{self, StalenessOutcome};
-
-/// Where a language's plugin pid is recorded, relative to the project's state
-/// directory: one file per language, unlike the single legacy `plugin.pid`
-/// (see `daemon::plugin_pid_path_in`'s doc comment for what still uses that
-/// name). `pub(crate)` rather than private so `daemon::mod`'s own
-/// bundled-plugin pid-path alias can build the same filename instead of
-/// duplicating the `"plugin-<language>.pid"` convention as a second literal.
-pub(crate) fn plugin_pid_file_name(language: &str) -> String {
-    format!("plugin-{language}.pid")
-}
-
-/// Every `plugin-<language>.pid` file currently present in `state_dir`,
-/// paired with the language its name encodes - [`PluginRegistry::pid_file_for`]'s
-/// naming convention, reversed.
-///
-/// For tooling that has no running daemon (or `PluginRegistry`) to ask:
-/// `cli::status`, `cli::stop` and `cli::clean` all run *after* the fact,
-/// against a project whose daemon may or may not still be alive, so "list
-/// what is on disk" is the only source of truth available to them - unlike
-/// `daemon::lifecycle::supervise`, which asks a live registry directly for
-/// exactly this reason wherever one exists (see
-/// [`PluginRegistry::active_supervisors`]).
-///
-/// Empty - not an error - for a state directory that does not exist or
-/// cannot be listed, matching every other pid-file helper in this daemon's
-/// "unreadable means nothing recorded" convention.
-pub fn discovered_pid_files(state_dir: &Path) -> Vec<(String, PathBuf)> {
-    let mut files = Vec::new();
-    let Ok(entries) = fs::read_dir(state_dir) else { return files };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if let Some(language) = name.strip_prefix("plugin-").and_then(|n| n.strip_suffix(".pid")) {
-            files.push((language.to_string(), entry.path()));
-        }
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
-}
-
-/// Where a language's memory-limit suspension marker is recorded, relative to
-/// the project's state directory (task GM-274, decision 6) - the same
-/// per-language naming convention as [`plugin_pid_file_name`], so
-/// `daemon::lifecycle::PluginSupervisor::suspended_marker_path` can build it
-/// next to that language's own pid file without a second lookup.
-pub(crate) fn plugin_suspended_marker_file_name(language: &str) -> String {
-    format!("plugin-{language}.suspended")
-}
-
-/// Every `plugin-<language>.suspended` marker currently present in
-/// `state_dir`, paired with the language its name encodes and the reason
-/// text `daemon::lifecycle::PluginSupervisor::write_suspended_marker` wrote
-/// into it - [`discovered_pid_files`]'s counterpart for suspension rather
-/// than liveness.
-///
-/// Deliberately independent of [`discovered_pid_files`]: a language
-/// suspended by `[plugin] memoryLimitMb` has *no* pid file by the time
-/// anyone reads this (`PluginSupervisor::check_memory_limit` puts the plugin
-/// to sleep through the same path idle-sleep uses, which removes it - see
-/// `PluginSupervisor::put_to_sleep`), so `cli::status` needs its own listing
-/// to find a suspended language at all, not a field bolted onto a pid-file
-/// row that will already be gone.
-///
-/// Empty - not an error - for a state directory that does not exist or
-/// cannot be listed, matching [`discovered_pid_files`]'s own convention. A
-/// marker that exists but cannot be read is skipped, its reason reported as
-/// `"(unreadable)"` rather than dropping the whole row - unlike a dead pid
-/// (which really does mean "nothing to report"), a marker on disk with no
-/// readable reason is still evidence *something* suspended this language,
-/// and `g-mesh status` should say so rather than silently agreeing with a
-/// stat/read failure.
-pub fn discovered_suspended_markers(state_dir: &Path) -> Vec<(String, String)> {
-    let mut markers = Vec::new();
-    let Ok(entries) = fs::read_dir(state_dir) else { return markers };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if let Some(language) = name.strip_prefix("plugin-").and_then(|n| n.strip_suffix(".suspended")) {
-            let reason = fs::read_to_string(entry.path())
-                .map(|contents| contents.trim().to_string())
-                .unwrap_or_else(|_| "(unreadable)".to_string());
-            markers.push((language.to_string(), reason));
-        }
-    }
-    markers.sort_by(|a, b| a.0.cmp(&b.0));
-    markers
-}
-
-/// Removes every `plugin-<language>.suspended` marker in `state_dir` -
-/// decision 4/5's honest consequence: since config is read once at daemon
-/// startup and never hot-reloaded, "suspended until the daemon restarts or
-/// the config changes" only ever actually clears on a restart in practice
-/// (see `daemon::lifecycle::PluginSupervisor`'s own doc comment on
-/// `semantic_suspended`). This is where that restart takes effect on disk -
-/// called once, early in `daemon::run`, while the project's singleton lock
-/// guarantees no other daemon is serving it (the same guarantee
-/// `endpoint.clear_stale()` right beside it already relies on) - and again by
-/// `cli::stop`'s own state-file cleanup, so a project nothing is serving
-/// never keeps reporting a suspension no daemon remembers deciding.
-///
-/// Best-effort, like every other state-file removal in this daemon: a marker
-/// this fails to remove is stale, not incorrect - the next successful call
-/// (the next start, or the next `stop`) clears it.
-pub fn clear_stale_suspension_markers(state_dir: &Path) {
-    for (_, path) in discovered_suspended_marker_paths(state_dir) {
-        let _ = fs::remove_file(path);
-    }
-}
-
-/// [`discovered_suspended_markers`]'s sibling for callers that need the path
-/// to remove rather than the reason to display - kept as its own small walk
-/// (rather than reusing `discovered_suspended_markers` and discarding the
-/// reason) so [`clear_stale_suspension_markers`] does not pay for reading
-/// every marker's contents just to delete the file.
-fn discovered_suspended_marker_paths(state_dir: &Path) -> Vec<(String, PathBuf)> {
-    let mut files = Vec::new();
-    let Ok(entries) = fs::read_dir(state_dir) else { return files };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if let Some(language) = name.strip_prefix("plugin-").and_then(|n| n.strip_suffix(".suspended")) {
-            files.push((language.to_string(), entry.path()));
-        }
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
-}
 
 /// The generation string an index is stamped with, and the thing
 /// `storage::schema::ensure_current` compares: core's hand-maintained pipeline
@@ -242,7 +119,7 @@ fn discovered_suspended_marker_paths(state_dir: &Path) -> Vec<(String, PathBuf)>
 ///
 /// Both halves have to be in it. The constant alone misses every plugin-side
 /// change (the failure task 116 fixes); the plugin half alone would miss every
-/// change in `graph::imports` / `graph::symbol_links`, which run in core and
+/// change in `link::imports` / `link::symbol_links`, which run in core and
 /// leave every plugin's bytes untouched.
 ///
 /// # Why every discovered plugin, and not just the one that was spawned
@@ -279,10 +156,7 @@ fn discovered_suspended_marker_paths(state_dir: &Path) -> Vec<(String, PathBuf)>
 /// version check needs only discovery's output and has to run before anything
 /// trusts the index at all), and `cli::init`/`cli::reindex` never build a
 /// registry in the first place. Taking `&DiscoveredPlugins` directly removes
-/// that ordering problem rather than working around it - the same shape, and
-/// for the same reason, as [`discovered_pid_files`] above: a fact about
-/// plugins that callers with no live registry still have to be able to ask
-/// for.
+/// that ordering problem rather than working around it.
 pub fn indexer_version(discovered: &DiscoveredPlugins) -> String {
     format!("{CURRENT_INDEXER_VERSION}+{}", plugins_digest(discovered))
 }
@@ -348,22 +222,15 @@ fn indexed_files_under(
     conn: &rusqlite::Connection,
     subtrees: &[String],
 ) -> Result<BTreeMap<String, HashSet<String>>> {
-    let mut statement = conn
-        .prepare("SELECT language, filePath FROM nodes WHERE kind = 'File'")
-        .context("failed to query indexed files")?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-        .context("failed to read indexed files")?;
     let mut files: BTreeMap<String, HashSet<String>> = BTreeMap::new();
-    for row in rows {
-        let (language, file_path) = row.context("failed to read indexed files")?;
+    crate::graph::files::for_each_file_node(conn, |language, file_path| {
         let under = subtrees.iter().any(|dir| {
             dir.is_empty() || file_path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/'))
         });
         if under {
             files.entry(language).or_default().insert(file_path);
         }
-    }
+    })?;
     Ok(files)
 }
 
@@ -390,17 +257,6 @@ pub(crate) enum ReconcileScope<'a> {
     /// The subtrees whose events the OS dropped (GM-616): project-relative
     /// directories, forward-slash separated, `""` being the root.
     Rescan(&'a [String]),
-}
-
-/// Every file the index holds anything for: an `indexed_files` baseline or a
-/// `File` node. The live side of [`PluginRegistry::reconcile_since_index`].
-fn live_file_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>> {
-    let mut statement = conn
-        .prepare("SELECT filePath FROM indexed_files UNION SELECT filePath FROM nodes WHERE kind = 'File'")
-        .context("failed to query indexed files")?;
-    let rows =
-        statement.query_map([], |row| row.get::<_, String>(0)).context("failed to read indexed files")?;
-    rows.collect::<rusqlite::Result<HashSet<String>>>().context("failed to read indexed files")
 }
 
 /// [`indexer_version`] for a discovery that found nothing - the generation
@@ -573,18 +429,6 @@ impl Drop for SpawnReservation<'_> {
     }
 }
 
-/// Why a path-anchored answer about one file can be empty while the file
-/// exists: [`PluginRegistry::path_coverage`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PathCoverage {
-    /// No discovered plugin claims the file; the catalogue entry of the
-    /// plugin that would index it.
-    Absent(&'static crate::languages::CatalogueEntry),
-    /// The discovered plugin for this language failed its bulk walk, so
-    /// nothing of the language is in the index (ADR 0021, section 2).
-    Failed(String),
-}
-
 /// The daemon's plugins: what was discovered, and which of them are running.
 pub struct PluginRegistry {
     /// Canonicalized, exactly as [`PluginSupervisor`] wants it - every
@@ -608,7 +452,7 @@ pub struct PluginRegistry {
     /// (which read `dir`, not this type) would never find them.
     state_dir: PathBuf,
     /// Discovery's output, taken as a finished value rather than produced
-    /// here: scanning roots and validating manifests is `daemon::manifest`'s
+    /// here: scanning roots and validating manifests is `plugin_manifest`'s
     /// job and happens once at startup, before this registry (or the schema
     /// staleness check that also consumes it) exists. Never re-read while the
     /// daemon runs - a plugin install takes effect on the next start, per the
@@ -645,6 +489,8 @@ pub struct PluginRegistry {
     /// update would put part of a language into an index that holds it wholly
     /// or not at all (ADR 0021).
     failed_languages: Mutex<HashSet<String>>,
+    /// When the watcher's consumer last took an event; read by the MCP host.
+    watcher_clock: WatcherClock,
 }
 
 impl PluginRegistry {
@@ -698,7 +544,13 @@ impl PluginRegistry {
             supervisors: Mutex::new(HashMap::new()),
             unroutable: Mutex::new(HashSet::new()),
             failed_languages: Mutex::new(HashSet::new()),
+            watcher_clock: WatcherClock::new(),
         }
+    }
+
+    /// When the watcher's consumer last took an event off the watcher.
+    pub(crate) fn watcher_clock(&self) -> &WatcherClock {
+        &self.watcher_clock
     }
 
     /// Records the languages the bulk walk failed, replacing any earlier set.
@@ -725,8 +577,8 @@ impl PluginRegistry {
                     matches!(outcome, LanguageOutcome::Failed { .. }).then_some(language)
                 }))
             }
-            Err(err) => crate::log_line!(
-                "g-mesh daemon: could not read the recorded language outcomes - failed languages are not \
+            Err(err) => crate::log_role!(
+                "could not read the recorded language outcomes - failed languages are not \
                  excluded from incremental updates until the next walk: {err:#}"
             ),
         }
@@ -783,7 +635,7 @@ impl PluginRegistry {
     /// TypeScript file on a case-insensitive filesystem, and nothing upstream
     /// normalizes what the watcher reports), while the routing table's keys
     /// are already lowercase-with-leading-dot by the manifest convention
-    /// `daemon::manifest` documents.
+    /// `plugin_manifest` documents.
     pub fn language_for(&self, file_path: &str) -> Option<&str> {
         self.discovered.language_for(file_path)
     }
@@ -795,12 +647,12 @@ impl PluginRegistry {
     /// `workspaceChanged` -> per-language reindex".
     ///
     /// A language is in the result when **both** hold:
-    ///  - its `[plugin.workspace] watch_files` (`daemon::manifest::
+    ///  - its `[plugin.workspace] watch_files` (`plugin_manifest::
     ///    WorkspaceConfig::watch_files`, already-compiled globs) matches
     ///    `file_path`'s **file name alone** - "exact file names (any
     ///    directory)" per the architecture doc's `plugin.toml additions`
     ///    section, which is exactly what an exact name is as a `Glob`
-    ///    (`daemon::manifest`'s own doc comment: an exact name needs no
+    ///    (`plugin_manifest`'s own doc comment: an exact name needs no
     ///    separate code path from a genuine glob like `*.csproj`, since both
     ///    compile through the same `Glob::compile_matcher`);
     ///  - `file_path` is not [`under_excluded_dir`] of *that same manifest's*
@@ -853,9 +705,7 @@ impl PluginRegistry {
         let stored = match conn.with(|conn| schema::watch_path_languages(conn, &key)) {
             Ok(stored) => stored,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not look up {file_path} among the plugins' watch paths: {err:#}"
-                );
+                crate::log_role!("could not look up {file_path} among the plugins' watch paths: {err:#}");
                 Vec::new()
             }
         };
@@ -887,7 +737,7 @@ impl PluginRegistry {
     }
 
     /// The union of every discovered plugin's own `[plugin.workspace]
-    /// entry_points` (`daemon::manifest::WorkspaceConfig::entry_points`),
+    /// entry_points` (`plugin_manifest::WorkspaceConfig::entry_points`),
     /// deduplicated - what `mcp::get_dependencies` feeds
     /// `graph::queries::find_files_under`/`find_files_ending_in_dir` (via
     /// `entry_point_rank_expr`) so a miss-path directory lookup ranks each
@@ -927,7 +777,7 @@ impl PluginRegistry {
     }
 
     /// Every discovered manifest's `[plugin.capabilities]`
-    /// (`daemon::manifest::Capabilities`), keyed by language - what
+    /// (`plugin_manifest::Capabilities`), keyed by language - what
     /// `mcp::instructions` (GM-262) reads to decide, per language present in
     /// the index, whether its receiver-call gap
     /// (`Capabilities::receiver_calls`/`receiver_calls_structural`) is still
@@ -944,7 +794,7 @@ impl PluginRegistry {
     /// same reason: this registry has no per-project presence to consult, and
     /// the caller (`mcp::instructions::build`) already filters by what the
     /// index reports present before this map is ever indexed into.
-    pub fn receiver_call_capabilities(&self) -> HashMap<String, manifest::Capabilities> {
+    pub fn receiver_call_capabilities(&self) -> HashMap<String, plugin_manifest::Capabilities> {
         self.discovered.manifests.iter().map(|(language, m)| (language.clone(), m.capabilities)).collect()
     }
 
@@ -955,10 +805,10 @@ impl PluginRegistry {
         crate::languages::missing(&self.discovered).into_iter().map(|entry| entry.language).collect()
     }
 
-    /// Every discovered language's `[plugin.non_symbol_queries]`, for the
-    /// semantic rung. Fixed for the daemon's lifetime, as discovery is.
-    pub(crate) fn query_shapes(&self) -> crate::mcp::query_shapes::QueryShapes {
-        crate::mcp::query_shapes::QueryShapes::from_manifests(self.discovered.manifests.values())
+    /// Every discovered plugin's manifest, for the MCP server's query shapes.
+    /// Fixed for the daemon's lifetime, as discovery is.
+    pub(crate) fn manifests(&self) -> impl Iterator<Item = &plugin_manifest::PluginManifest> {
+        self.discovered.manifests.values()
     }
 
     /// Whether `language`'s manifest declares both `semantic_pass` and
@@ -978,12 +828,12 @@ impl PluginRegistry {
     /// language's whole-project semantic pass, generalized (GM-270) from the
     /// single hardcoded `plugin::BUNDLED_LANGUAGE` question it replaces.
     ///
-    /// A thin wrapper over `daemon::manifest::semantic_pass_capable_languages`,
+    /// A thin wrapper over `plugin_manifest::semantic_pass_capable_languages`,
     /// which owns the filter and the sort order (see that function's own doc
     /// comment) - both shared with `daemon::semantic::run_once`, which has a
     /// bare `&DiscoveredPlugins` and no registry to ask this of.
     pub fn semantic_pass_languages(&self) -> Vec<String> {
-        manifest::semantic_pass_capable_languages(&self.discovered.manifests)
+        plugin_manifest::semantic_pass_capable_languages(&self.discovered.manifests)
     }
 
     /// The supervisor for `language`, spawning its plugin if this is the
@@ -1147,8 +997,8 @@ impl PluginRegistry {
             let running = self.supervisors.lock().unwrap().get(&language).and_then(SupervisorSlot::running);
             let Some(supervisor) = running else { continue };
             if let Err(err) = supervisor.files_created(&file_paths) {
-                crate::log_line!(
-                    "g-mesh daemon: could not tell the {language} plugin about {} created files: {err:#}",
+                crate::log_role!(
+                    "could not tell the {language} plugin about {} created files: {err:#}",
                     file_paths.len()
                 );
             }
@@ -1207,8 +1057,8 @@ impl PluginRegistry {
                 supervisor.file_changed(conn, file_path);
                 self.run_owed_reindex(conn, &supervisor);
             }
-            Err(err) => crate::log_line!(
-                "g-mesh daemon: could not start the {language} plugin for {file_path}: {err:#} - \
+            Err(err) => crate::log_role!(
+                "could not start the {language} plugin for {file_path}: {err:#} - \
                  the change was not indexed"
             ),
         }
@@ -1222,10 +1072,10 @@ impl PluginRegistry {
     fn run_owed_reindex(&self, conn: &IndexStore, supervisor: &Arc<PluginSupervisor>) {
         let Some((trigger, reason)) = supervisor.take_owed_reindex() else { return };
         let language = supervisor.language();
-        crate::log_line!("g-mesh daemon: reindexing all of {language} after {trigger} changed: {reason}");
+        crate::log_role!("reindexing all of {language} after {trigger} changed: {reason}");
         if let Err(err) = crate::daemon::workspace_reindex::run(self, supervisor, conn, &trigger) {
-            crate::log_line!(
-                "g-mesh daemon: failed to reindex the {language} workspace after {trigger} changed: \
+            crate::log_role!(
+                "failed to reindex the {language} workspace after {trigger} changed: \
                  {err:#} - {language}'s previous graph keeps serving, and the reindex runs again on \
                  the next daemon start"
             );
@@ -1259,15 +1109,15 @@ impl PluginRegistry {
                     crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
                 };
                 if let Err(err) = reindexed {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to reindex the {language} workspace after \
+                    crate::log_role!(
+                        "failed to reindex the {language} workspace after \
                          {changed_file} changed: {err:#} - {language}'s previous graph keeps \
                          serving, and the reindex runs again on the next daemon start"
                     );
                 }
             }
-            Err(err) => crate::log_line!(
-                "g-mesh daemon: could not start the {language} plugin to reindex its workspace \
+            Err(err) => crate::log_role!(
+                "could not start the {language} plugin to reindex its workspace \
                  after {changed_file} changed: {err:#}"
             ),
         }
@@ -1292,8 +1142,8 @@ impl PluginRegistry {
         let live = match conn.with(|conn| indexed_files_under(conn, &subtrees)) {
             Ok(live) => live,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not read the indexed files to compare after {trigger} changed: {err:#}"
+                crate::log_role!(
+                    "could not read the indexed files to compare after {trigger} changed: {err:#}"
                 );
                 return;
             }
@@ -1322,15 +1172,15 @@ impl PluginRegistry {
                 continue;
             }
             if added > GITIGNORE_REINDEX_GUARD {
-                crate::log_line!(
-                    "g-mesh daemon: {trigger} changed would add {added} {language} files to the index - \
+                crate::log_role!(
+                    "{trigger} changed would add {added} {language} files to the index - \
                      more than {GITIGNORE_REINDEX_GUARD}, so nothing was reindexed; run `g-mesh reindex` \
                      to index them"
                 );
                 continue;
             }
-            crate::log_line!(
-                "g-mesh daemon: {trigger} changed which {language} files are indexed (+{added}, \
+            crate::log_role!(
+                "{trigger} changed which {language} files are indexed (+{added}, \
                  -{removed}) - reindexing {language}"
             );
             // Whole-language: a resolution delta cannot say which files a
@@ -1356,7 +1206,7 @@ impl PluginRegistry {
             Ok(Some(indexed_at)) => indexed_at,
             Ok(None) => return,
             Err(err) => {
-                crate::log_line!("g-mesh daemon: could not read when the project was last walked: {err:#}");
+                crate::log_role!("could not read when the project was last walked: {err:#}");
                 return;
             }
         };
@@ -1466,16 +1316,16 @@ impl PluginRegistry {
             Ok(Some(_)) => {}
             Ok(None) => return reparsed,
             Err(err) => {
-                crate::log_line!("g-mesh daemon: could not read when the project was last walked: {err:#}");
+                crate::log_role!("could not read when the project was last walked: {err:#}");
                 return reparsed;
             }
         }
         let started = std::time::Instant::now();
-        let mut live = match conn.with(live_file_paths) {
+        let mut live = match conn.with(crate::graph::files::known_file_paths) {
             Ok(live) => live,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not read the indexed files - changes made while no daemon \
+                crate::log_role!(
+                    "could not read the indexed files - changes made while no daemon \
                      ran are not reconciled: {err:#}"
                 );
                 return reparsed;
@@ -1524,8 +1374,8 @@ impl PluginRegistry {
         }
         for file_path in &unwalked {
             if let Err(err) = self.retire_file(conn, file_path) {
-                crate::log_line!(
-                    "g-mesh daemon: could not drop {file_path}, which this worktree does not walk, from the \
+                crate::log_role!(
+                    "could not drop {file_path}, which this worktree does not walk, from the \
                      seeded index: {err:#}"
                 );
             }
@@ -1545,8 +1395,8 @@ impl PluginRegistry {
                     }
                 }
                 Ok(_) => {}
-                Err(err) => crate::log_line!(
-                    "g-mesh daemon: could not reconcile {file_path} with the disk: {err:#} - the next \
+                Err(err) => crate::log_role!(
+                    "could not reconcile {file_path} with the disk: {err:#} - the next \
                      query of it retries"
                 ),
             }
@@ -1555,9 +1405,7 @@ impl PluginRegistry {
             if let Err(err) =
                 conn.with(|conn| schema::record_semantic_pending_files(conn, language, file_paths))
             {
-                crate::log_line!(
-                    "g-mesh daemon: could not record {language}'s reparsed files as semantic-pending: {err:#}"
-                );
+                crate::log_role!("could not record {language}'s reparsed files as semantic-pending: {err:#}");
             }
         }
         let trigger = match scope {
@@ -1572,8 +1420,8 @@ impl PluginRegistry {
                     .join(", ")
             ),
         };
-        crate::log_line!(
-            "g-mesh daemon: reconciled {} files{} with the disk in {} ms: {} deleted, {} created, {} reindexed",
+        crate::log_role!(
+            "reconciled {} files{} with the disk in {} ms: {} deleted, {} created, {} reindexed",
             known.len() + created.len() + deleted.len() + unwalked.len(),
             trigger,
             started.elapsed().as_millis(),
@@ -1625,8 +1473,8 @@ impl PluginRegistry {
             Ok(Some(source_root)) => PathBuf::from(source_root),
             Ok(None) => return,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not read where the seeded index came from - its watch files are \
+                crate::log_role!(
+                    "could not read where the seeded index came from - its watch files are \
                      not compared: {err:#}"
                 );
                 return;
@@ -1643,8 +1491,8 @@ impl PluginRegistry {
         let theirs = if source_root.is_dir() {
             watch_files_under(&source_root)
         } else {
-            crate::log_line!(
-                "g-mesh daemon: {} (the seed's source) is gone - every watch file of this worktree counts as \
+            crate::log_role!(
+                "{} (the seed's source) is gone - every watch file of this worktree counts as \
                  changed",
                 source_root.display()
             );
@@ -1669,8 +1517,8 @@ impl PluginRegistry {
             if self.is_failed_language(&language) {
                 continue;
             }
-            crate::log_line!(
-                "g-mesh daemon: {trigger} differs from the seed's source - reindexing {language} as an edit of it would"
+            crate::log_role!(
+                "{trigger} differs from the seed's source - reindexing {language} as an edit of it would"
             );
             self.workspace_file_changed(conn, &language, &trigger);
         }
@@ -1681,18 +1529,18 @@ impl PluginRegistry {
     /// pass still owes ([`schema::owed_semantic_pending_files`]: the seeded
     /// reconcile's reparsed files, including those of an earlier start that
     /// died before their pass), plus the language's owed files. The rows
-    /// clear only when that pass completes ([`watcher::apply`]'s per-file
+    /// clear only when that pass completes ([`ingest::apply`]'s per-file
     /// settling); an unfinished or failed pass leaves them for the next
     /// start. Best-effort: a failure is logged and the files keep their
     /// structural edges.
     ///
-    /// [`watcher::apply`]: crate::watcher::apply
+    /// [`ingest::apply`]: crate::ingest::apply
     pub(crate) fn owed_semantic_file_passes(&self, conn: &IndexStore) {
         let owed = match conn.with(schema::owed_semantic_pending_files) {
             Ok(owed) => owed,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: could not read the semantic-pending files a pass still owes - none is \
+                crate::log_role!(
+                    "could not read the semantic-pending files a pass still owes - none is \
                      retried this start: {err:#}"
                 );
                 return;
@@ -1705,8 +1553,8 @@ impl PluginRegistry {
             let supervisor = match self.get_or_spawn(&language) {
                 Ok(supervisor) => supervisor,
                 Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: could not start the {language} plugin for the semantic pass over \
+                    crate::log_role!(
+                        "could not start the {language} plugin for the semantic pass over \
                          {} semantic-pending file(s): {err:#}",
                         file_paths.len()
                     );
@@ -1723,12 +1571,12 @@ impl PluginRegistry {
                 process.scoped_semantic_pass(conn, file_paths, embedding)
             });
             match passed.and_then(|passed| passed) {
-                Ok(()) => crate::log_line!(
-                    "g-mesh daemon: semantic pass over {count} semantic-pending {language} file(s) in {} ms",
+                Ok(()) => crate::log_role!(
+                    "semantic pass over {count} semantic-pending {language} file(s) in {} ms",
                     started.elapsed().as_millis()
                 ),
-                Err(err) => crate::log_line!(
-                    "g-mesh daemon: the semantic pass over {count} semantic-pending {language} file(s) failed \
+                Err(err) => crate::log_role!(
+                    "the semantic pass over {count} semantic-pending {language} file(s) failed \
                      ({err:#}) - their edges keep whatever the structural pass resolved, and the next start \
                      asks them again"
                 ),
@@ -1757,14 +1605,16 @@ impl PluginRegistry {
         }
         Some(match extension {
             Some(extension) => format!(
-                "g-mesh daemon: no installed plugin claims \"{extension}\" files (first seen: \
+                "{prefix}no installed plugin claims \"{extension}\" files (first seen: \
                  {file_path}) - changes to them are not indexed; further \"{extension}\" files \
-                 will not be reported again"
+                 will not be reported again",
+                prefix = crate::log::role_prefix()
             ),
             None => format!(
-                "g-mesh daemon: no installed plugin claims files without an extension (first \
+                "{prefix}no installed plugin claims files without an extension (first \
                  seen: {file_path}) - changes to them are not indexed; further extensionless \
-                 files will not be reported again"
+                 files will not be reported again",
+                prefix = crate::log::role_prefix()
             ),
         })
     }
@@ -1776,7 +1626,7 @@ impl PluginRegistry {
     /// from `self.project_root`; see this type's doc comment on `state_dir`
     /// for why those must not be conflated.
     fn pid_file_for(&self, language: &str) -> PathBuf {
-        self.state_dir.join(plugin_pid_file_name(language))
+        StateDir::at(&self.state_dir).plugin_pid_file(language)
     }
 
     /// Every discovered language, sorted - for error messages only, where a
@@ -1955,8 +1805,8 @@ impl PluginRegistry {
             self.run_owed_reindex(conn, &supervisor);
             match replay {
                 Ok(count) => replayed += count,
-                Err(err) => crate::log_line!(
-                    "g-mesh daemon: could not replay the changes queued while the {} plugin \
+                Err(err) => crate::log_role!(
+                    "could not replay the changes queued while the {} plugin \
                      slept: {err:#}",
                     supervisor.language()
                 ),

@@ -1,24 +1,26 @@
 //! The `pending` provenance block (ADR 0009) on the four edge-walking tools,
 //! through their real handlers.
 
-use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::context::QueryCtx;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
 use super::session_hints::SessionHints;
 use super::{find_callers_callees, find_implementations, find_references};
 use super::{FindImplementationsParams, SymbolQueryParams};
-use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
+use crate::embedding::text::TextRule;
 use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::MAX_RESPONSE_BYTES;
+use crate::mcp::query::test_support::Rendered;
+use crate::mcp::response_bound::MAX_RESPONSE_BYTES;
+use crate::model::{Diff, EdgeRecord, NodeRecord};
+use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::storage::connection::open_staging;
 use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
 use crate::storage::schema;
-use crate::storage::write::{apply_diff, Diff, EdgeRecord, NodeRecord};
+use crate::storage::write::apply_diff;
 
 fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
     HashMap::from([(
@@ -31,12 +33,13 @@ fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
             resolution_delta: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
-            member_overrides: crate::daemon::manifest::MemberOverrides::None,
+            member_overrides: crate::plugin_manifest::MemberOverrides::None,
         },
     )])
 }
 
-fn body(result: &CallToolResult) -> (serde_json::Value, usize) {
+fn body(result: &impl Rendered) -> (serde_json::Value, usize) {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => (serde_json::from_str(&text.text).unwrap(), text.text.len()),
@@ -96,7 +99,14 @@ fn after_a_swap() -> (tempfile::TempDir, Arc<IndexStore>) {
 
     let mut staging = open_staging(&staging_path).unwrap();
     apply_diff(&mut staging, &walk("fn a(x: u32)")).unwrap();
-    language_swap::plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+    language_swap::plan(
+        &mut staging,
+        live_path.to_str().unwrap(),
+        "rust",
+        &TextRule { version: "model" },
+        true,
+    )
+    .unwrap();
     drop(staging);
     let capable = HashSet::from(["rust".to_string()]);
     language_swap::swap(
@@ -119,52 +129,30 @@ fn by_id(id: &str) -> SymbolQueryParams {
 }
 
 fn callers(store: &Arc<IndexStore>, params: SymbolQueryParams) -> serde_json::Value {
-    let result = find_callers_callees::handle_callers(
-        store,
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        &rust_with_a_semantic_tier(),
-        &SessionHints::default(),
-        params,
-    )
-    .unwrap();
+    let result = QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+        .resolve_lazily(find_callers_callees::handle_callers, params)
+        .unwrap();
     body(&result).0
 }
 
 fn callees(store: &Arc<IndexStore>, id: &str) -> serde_json::Value {
-    let result = find_callers_callees::handle_callees(
-        store,
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        &rust_with_a_semantic_tier(),
-        by_id(id),
-    )
-    .unwrap();
+    let result = QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+        .resolve_lazily(find_callers_callees::handle_callees, by_id(id))
+        .unwrap();
     body(&result).0
 }
 
 fn references(store: &Arc<IndexStore>, id: &str) -> serde_json::Value {
-    let result = find_references::handle(
-        store,
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        &rust_with_a_semantic_tier(),
-        &SessionHints::default(),
-        by_id(id),
-    )
-    .unwrap();
+    let result = QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+        .resolve_lazily(find_references::handle, by_id(id))
+        .unwrap();
     body(&result).0
 }
 
 fn implementations(store: &Arc<IndexStore>, params: FindImplementationsParams) -> (serde_json::Value, usize) {
-    let result = find_implementations::dispatch(
-        store,
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        &rust_with_a_semantic_tier(),
-        params,
-    )
-    .unwrap();
+    let result = QueryCtx { capabilities: rust_with_a_semantic_tier(), ..QueryCtx::for_test(store) }
+        .resolve_lazily(find_implementations::dispatch, params)
+        .unwrap();
     body(&result)
 }
 
@@ -287,7 +275,7 @@ fn many_implementors(count: usize, name_bytes: usize, file: impl Fn(usize) -> St
 /// other 5 counted, and the whole response inside `MAX_RESPONSE_BYTES`. One
 /// implementor per file; the pending ones sort first by path, so all thirty
 /// are on the page. Controls: measure candidate pages without their
-/// `provenance` block (single-hop `find_implementations::handle_in`) -> over
+/// `provenance` block (single-hop `find_implementations::handle`) -> over
 /// budget; drop the entry cap -> 30 listed.
 #[test]
 fn the_pending_list_is_capped_and_the_page_keeps_its_budget() {
@@ -401,7 +389,6 @@ fn a_resumed_transitive_page_never_says_absent() {
 // the answers as once-per-session hints.
 // ---------------------------------------------------------------------------
 
-use super::find_definition;
 use super::session_hints::{ALL_UNRESOLVED, PROVENANCE, UNRESOLVED_ROW};
 
 /// Rust nodes with a declared semantic tier that has never run (so every
@@ -454,28 +441,27 @@ enum Tool {
 const TOOLS: [Tool; 4] = [Tool::Callers, Tool::References, Tool::Callees, Tool::Implementations];
 
 fn ask(store: &Arc<IndexStore>, hints: &SessionHints, tool: Tool, id: &str) -> serde_json::Value {
-    let capabilities = rust_with_a_semantic_tier();
-    let embedding = EmbeddingPipeline::disabled();
-    let shapes = QueryShapes::shipped();
+    let ctx = QueryCtx {
+        capabilities: rust_with_a_semantic_tier(),
+        hints: hints.clone(),
+        ..QueryCtx::for_test(store)
+    };
     let result = match tool {
-        Tool::Callers => {
-            find_callers_callees::handle_callers(store, &embedding, shapes, &capabilities, hints, by_id(id))
-        }
+        Tool::Callers => ctx
+            .resolve_lazily(find_callers_callees::handle_callers, by_id(id))
+            .map(|answer| answer.rendered()),
         Tool::References => {
-            find_references::handle(store, &embedding, shapes, &capabilities, hints, by_id(id))
+            ctx.resolve_lazily(find_references::handle, by_id(id)).map(|answer| answer.rendered())
         }
-        Tool::Callees => find_definition::resolve_lazily(&embedding, shapes, |semantic| {
-            find_callers_callees::handle_callees_in(store, semantic, &capabilities, hints, by_id(id))
-        }),
-        Tool::Implementations => find_definition::resolve_lazily(&embedding, shapes, |semantic| {
-            find_implementations::dispatch_in(
-                store,
-                semantic,
-                &capabilities,
-                hints,
+        Tool::Callees => ctx
+            .resolve_lazily(find_callers_callees::handle_callees, by_id(id))
+            .map(|answer| answer.rendered()),
+        Tool::Implementations => ctx
+            .resolve_lazily(
+                find_implementations::dispatch,
                 FindImplementationsParams { symbol_id: Some(id.to_string()), ..Default::default() },
             )
-        }),
+            .map(|answer| answer.rendered()),
     }
     .unwrap();
     body(&result).0
@@ -581,12 +567,12 @@ fn transitive(
     hints: &SessionHints,
     params: FindImplementationsParams,
 ) -> serde_json::Value {
-    let capabilities = rust_with_a_semantic_tier();
-    let embedding = EmbeddingPipeline::disabled();
-    let result = find_definition::resolve_lazily(&embedding, QueryShapes::shipped(), |semantic| {
-        find_implementations::dispatch_in(store, semantic, &capabilities, hints, params.clone())
-    })
-    .unwrap();
+    let ctx = QueryCtx {
+        capabilities: rust_with_a_semantic_tier(),
+        hints: hints.clone(),
+        ..QueryCtx::for_test(store)
+    };
+    let result = ctx.resolve_lazily(find_implementations::dispatch, params).unwrap();
     body(&result).0
 }
 
@@ -630,7 +616,7 @@ fn transitive_walks_send_the_provenance_sentence_once_per_session() {
 /// shorter than that field, a cut that ignored it would stop less than one
 /// row short of the ceiling, so adding the field would go over. With `provenance: absent` there is no pending
 /// list. Control: measure candidate pages with no `hint` (single-hop
-/// `find_implementations::handle_in`).
+/// `find_implementations::handle`).
 #[test]
 fn a_page_at_the_budget_edge_keeps_room_for_the_provenance_sentence() {
     let store = pending_index(&many_implementors(300, 4, |i| format!("m{i:03}.rs")), &[]);
@@ -667,31 +653,15 @@ fn a_page_at_the_budget_edge_keeps_room_for_the_provenance_sentence() {
 /// A server over `store` (no plugins discovered, index ready), so each call
 /// below goes through `GMeshMcpServer`'s tool handler over a real session.
 fn hint_server(dir: &std::path::Path, store: Arc<IndexStore>) -> super::GMeshMcpServer {
-    use crate::daemon::indexing_status::{IndexingStatus, Phase};
-    use crate::daemon::lifecycle::CoreActivity;
-    use crate::daemon::manifest::DiscoveredPlugins;
-    use crate::daemon::registry::PluginRegistry;
+    use crate::indexing_status::{IndexingStatus, Phase};
+    use crate::mcp::host_fake::FakeHost;
+    use crate::mcp::McpHost;
     let root = dir.join("project");
-    let state = dir.join("state");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
     let indexing = IndexingStatus::structural();
     indexing.set_phase(Phase::Ready);
-    let registry = Arc::new(PluginRegistry::new(
-        &root,
-        state,
-        DiscoveredPlugins::default(),
-        None,
-        None,
-        Arc::new(EmbeddingPipeline::disabled()),
-    ));
-    super::GMeshMcpServer::new(
-        store,
-        registry,
-        CoreActivity::new(),
-        indexing,
-        Arc::new(EmbeddingPipeline::disabled()),
-    )
+    let host: Arc<dyn McpHost> = Arc::new(FakeHost::new(&root));
+    super::GMeshMcpServer::new(store, host, indexing, Arc::new(EmbeddingPipeline::disabled()))
 }
 
 /// One MCP call on `client`'s session, as its JSON body.

@@ -50,10 +50,12 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 
-use crate::daemon::manifest::{plain_spelling, read_manifest, PluginManifest};
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
+use crate::mcp::context::QueryCtx;
 use crate::mcp::query_shapes::QueryShapes;
+use crate::mcp::session_hints::SessionHints;
+use crate::plugin_manifest::{plain_spelling, read_manifest, PluginManifest};
 use crate::protocol::ndjson::BulkItem;
 use crate::storage::index_store::IndexStore;
 pub use report::{CheckResult, Outcome, Report, Section};
@@ -124,7 +126,7 @@ pub fn check(
     // the directory every manifest-relative `command`/`args` entry is joined
     // onto: under that prefix Windows resolves nothing, so the plugin's own
     // entry point arrives at it spelled `...\typescript\dist/src/index.js`.
-    // `manifest::plain_win32_path` carries the evidence for what that costs.
+    // `plugin_manifest::plain_win32_path` carries the evidence for what that costs.
     // The report prints both paths too, and the extended-length spelling of a
     // path is nobody's idea of where their plugin is.
     let plugin_dir = plain_spelling(
@@ -458,12 +460,18 @@ fn expectations_section(
     let capabilities = HashMap::from([(manifest.language.clone(), manifest.capabilities)]);
     let shapes = QueryShapes::from_manifests([manifest]);
     let ctx = expectations::EvalContext {
-        conn,
-        embedding: &embedding,
-        project_root: &project_root,
-        entry_points: &entry_points,
-        capabilities: &capabilities,
-        shapes: &shapes,
+        query: QueryCtx {
+            store: Arc::clone(conn),
+            embedding: Arc::new(embedding),
+            shapes: Arc::new(shapes),
+            hints: SessionHints::default(),
+            project_root,
+            capabilities,
+            entry_points,
+            uncovered: Vec::new(),
+            coverage: None,
+            watcher_quiet: None,
+        },
     };
 
     let mut results =

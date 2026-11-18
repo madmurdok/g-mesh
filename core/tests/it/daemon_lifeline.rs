@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, LIFELINE_PID_ENV, PLUGIN_IDLE_ENV};
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 
 use crate::common;
@@ -118,19 +119,22 @@ impl Project {
     }
 
     fn core_pid_file(&self) -> PathBuf {
-        daemon::pid_path_in(&self.state_dir)
+        StateDir::at(&self.state_dir).pid_file()
     }
 
     fn plugin_pid_file(&self) -> PathBuf {
-        daemon::plugin_pid_path_in(&self.state_dir)
+        StateDir::at(&self.state_dir).plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)
     }
 
     /// Everything that describes a running daemon; all of it must be gone
     /// once the daemon has stopped itself.
     fn state_files(&self) -> Vec<PathBuf> {
         #[allow(unused_mut)]
-        let mut files =
-            vec![self.core_pid_file(), self.plugin_pid_file(), daemon::build_stamp_path_in(&self.state_dir)];
+        let mut files = vec![
+            self.core_pid_file(),
+            self.plugin_pid_file(),
+            StateDir::at(&self.state_dir).build_stamp_file(),
+        ];
         #[cfg(unix)]
         files.push(self.state_dir.join("daemon.sock"));
         files
@@ -140,7 +144,7 @@ impl Project {
 impl Drop for Project {
     fn drop(&mut self) {
         // A failed test must not leave its daemon or plugin running.
-        for (_, path) in daemon::registry::discovered_pid_files(&self.state_dir) {
+        for (_, path) in StateDir::at(&self.state_dir).plugin_pid_files() {
             common::kill_pid_file(&path);
         }
         common::kill_pid_file(&self.core_pid_file());
@@ -259,7 +263,9 @@ fn a_daemon_whose_lifeline_is_running_or_unreadable_is_left_alone() {
     ] {
         assert!(daemon_process.is_running(), "a daemon with {name} must not stop itself");
         assert!(
-            daemon::is_listening(&project.root).expect("the endpoint must be resolvable"),
+            StateDir::of(&project.root)
+                .and_then(|sd| g_mesh::control::lock::is_listening(&sd))
+                .expect("the endpoint must be resolvable"),
             "a daemon with {name} must still be serving its endpoint"
         );
         assert_eq!(recorded_pid(&project.core_pid_file()), daemon_process.child.id(), "{name}: same process");

@@ -2,7 +2,7 @@
 //! SDK's generic [`LspBridge`].
 //!
 //! Everything about *driving* a language server is the SDK's
-//! (`plugins/sdk/src/lsp/`). What is left here is which binary to run. The
+//! (`plugins/sdk-lsp/src/`). What is left here is which binary to run. The
 //! design, with the traces behind every choice, is
 //! `docs/architecture/gm-325-typescript-lsp-semantics.md`.
 //!
@@ -44,11 +44,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use g_mesh_plugin_sdk::lsp::{
-    self, npm_candidates_on_path, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig,
-    HOST_SCRIPT_EXTENSIONS, PROBE_BUDGET,
-};
 use g_mesh_plugin_sdk::SemanticEngine;
+use g_mesh_plugin_sdk_lsp::{
+    self as lsp, npm_candidates_on_path, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig,
+    ServerProfile, HOST_SCRIPT_EXTENSIONS, PROBE_BUDGET,
+};
 
 /// The language id this plugin speaks, for `didOpen` and for log lines.
 const LANGUAGE: &str = "typescript";
@@ -79,6 +79,10 @@ const LANGUAGE_IDS: [(&str, &str); 5] = [
 /// once per server, and only in full by a server that never answers.
 const WARM_UP: Duration = Duration::from_secs(120);
 
+/// How the bridge talks to vtsls.
+pub const PROFILE: ServerProfile =
+    ServerProfile { language_ids: &LANGUAGE_IDS, warm_up: Some(WARM_UP), ..ServerProfile::DEFAULT };
+
 /// The npm package's language-server bin, the manifest's `command`.
 const SERVER_BIN: &str = "vtsls";
 
@@ -99,7 +103,13 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
             )
         })?;
     prepare(&mut config)?;
-    Ok(Box::new(LspBridge::new(LANGUAGE, root, config).language_ids(&LANGUAGE_IDS).warm_up(WARM_UP)))
+    Ok(Box::new(bridge(root, config)))
+}
+
+/// The bridge [`engine`] returns: vtsls under `config`, with [`PROFILE`].
+/// Constructing it starts nothing.
+fn bridge(root: &Path, config: SemanticConfig) -> LspBridge {
+    LspBridge::new(LANGUAGE, root, config).with_profile(PROFILE)
 }
 
 /// Turns the manifest's `config` into the one the server runs with: the
@@ -150,7 +160,7 @@ fn same_binary(command: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use g_mesh_plugin_sdk::lsp::{OverloadDisambiguation, ServerReadiness, WINDOWS_SCRIPT_EXTENSIONS};
+    use g_mesh_plugin_sdk_lsp::{OverloadDisambiguation, ServerReadiness, WINDOWS_SCRIPT_EXTENSIONS};
 
     const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml");
 
@@ -261,15 +271,16 @@ mod tests {
         );
     }
 
-    /// vtsls's first question gets a two-minute warm-up, and `engine` hands
-    /// it to the bridge. The bridge keeps its budgets private, so the wiring
-    /// is read from this file's own `engine` body.
+    /// vtsls's first question gets a two-minute warm-up, and the bridge
+    /// `engine` returns carries it, with the extension-to-`languageId` table.
+    ///
+    /// Control: drop `.with_profile(PROFILE)` from `bridge`.
     #[test]
     fn the_engine_gives_vtsls_a_two_minute_warm_up() {
         assert_eq!(WARM_UP, Duration::from_secs(120));
-        let source = include_str!("semantic.rs");
-        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
-        let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
-        assert!(body.contains(".warm_up(WARM_UP)"), "`engine` must pass WARM_UP to the bridge:\n{body}");
+        let bridge = bridge(&std::env::temp_dir(), SemanticConfig::new("vtsls"));
+        let profile = bridge.profile();
+        assert_eq!(profile.warm_up, Some(WARM_UP), "{profile:?}");
+        assert_eq!(profile.language_ids, &LANGUAGE_IDS, "{profile:?}");
     }
 }

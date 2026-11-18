@@ -23,15 +23,21 @@ use anyhow::{bail, Context, Result};
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::daemon::indexing_status::{IndexingStatus, Phase};
-use crate::storage::{connection, schema, vectors};
+use crate::indexing_status::{IndexingStatus, Phase};
+use crate::paths::state_dir::{StateDir, INDEX_DB_FILE};
+use crate::storage::{schema, vectors};
 
-/// The temp file a seed is copied into before its rename to `index.db`.
-const SEED_TMP: &str = "index.db.seed-tmp";
+/// `path` with `suffix` appended to its file name: SQLite's side files
+/// (`-wal`, `-shm`, `-journal`) are named this way.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
 
 /// Environment switch: `0` disables seeding (also the opt-out for a user),
 /// `1` enables it even when [`SEEDING_DEFAULT`] is off.
-pub const SEED_ENV: &str = "G_MESH_SEED";
+pub const SEED_ENV: &str = crate::knobs::SEED.name;
 
 /// Whether a daemon seeds without [`SEED_ENV`] set.
 const SEEDING_DEFAULT: bool = true;
@@ -46,7 +52,7 @@ pub struct SeedOrigin {
 /// Whether seeding is switched on, from `G_MESH_SEED` and
 /// [`SEEDING_DEFAULT`].
 fn seed_enabled() -> bool {
-    seed_enabled_from(std::env::var(SEED_ENV).ok().as_deref())
+    seed_enabled_from(crate::knobs::string_raw(&crate::knobs::SEED).as_deref())
 }
 
 /// [`seed_enabled`] with the variable's value passed in, so a test need not
@@ -65,10 +71,10 @@ fn seed_enabled_from(value: Option<&str>) -> bool {
 /// so a test that forgets the file fails instead of wedging the daemon. A
 /// no-op unless set.
 pub(crate) fn hold_the_seeded_reconcile_for_tests() {
-    let Some(path) = std::env::var_os(HOLD_RECONCILE_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let Some(path) = crate::knobs::os_non_empty(&crate::knobs::SEED_HOLD_RECONCILE_FILE) else { return };
     let path = PathBuf::from(path);
-    crate::log_line!(
-        "g-mesh daemon: holding the seeded reconcile until {} is removed ({HOLD_RECONCILE_FILE_ENV})",
+    crate::log_role!(
+        "holding the seeded reconcile until {} is removed ({HOLD_RECONCILE_FILE_ENV})",
         path.display()
     );
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -79,7 +85,7 @@ pub(crate) fn hold_the_seeded_reconcile_for_tests() {
 
 /// Path whose deletion releases a seeded reconcile held by
 /// [`hold_the_seeded_reconcile_for_tests`].
-pub const HOLD_RECONCILE_FILE_ENV: &str = "G_MESH_SEED_HOLD_RECONCILE_FILE";
+pub const HOLD_RECONCILE_FILE_ENV: &str = crate::knobs::SEED_HOLD_RECONCILE_FILE.name;
 
 /// Held by whoever runs a seeded index's first-start reconcile; while it is
 /// held the phase stays `Walking`, so tool calls wait on `Need::Structural`.
@@ -194,13 +200,10 @@ fn is_bare(common: &Path) -> bool {
 /// `state_dir`. Called at start, next to `remove_stale_staging`.
 pub(crate) fn remove_stale_seed_tmp(state_dir: &Path) {
     for suffix in ["", "-journal", "-wal", "-shm"] {
-        let path = state_dir.join(format!("{SEED_TMP}{suffix}"));
+        let path = with_suffix(&StateDir::at(state_dir).seed_tmp_file(), suffix);
         if let Err(err) = fs::remove_file(&path) {
             if err.kind() != std::io::ErrorKind::NotFound {
-                crate::log_line!(
-                    "g-mesh daemon: could not remove the stale seed file {} ({err})",
-                    path.display()
-                );
+                crate::log_role!("could not remove the stale seed file {} ({err})", path.display());
             }
         }
     }
@@ -216,7 +219,7 @@ pub(crate) fn seed_if_eligible(root: &Path, state_dir: &Path, indexer_version: &
     let home = match crate::paths::g_mesh_home() {
         Ok(home) => home,
         Err(err) => {
-            crate::log_line!("g-mesh daemon: not seeding - no g-mesh home ({err:#})");
+            crate::log_role!("not seeding - no g-mesh home ({err:#})");
             return None;
         }
     };
@@ -231,22 +234,19 @@ fn seed_if_eligible_under(
     state_dir: &Path,
     indexer_version: &str,
 ) -> Option<SeedOrigin> {
-    if fs::symlink_metadata(state_dir.join("index.db")).is_ok() {
+    if fs::symlink_metadata(StateDir::at(state_dir).index_db()).is_ok() {
         return None;
     }
     let source_root = main_checkout(root)?;
-    let source_db = match connection::project_dir_under(home, &source_root) {
-        Ok(dir) => dir.join("index.db"),
+    let source_db = match StateDir::of_under(home, &source_root) {
+        Ok(dir) => dir.index_db(),
         Err(err) => {
-            crate::log_line!(
-                "g-mesh daemon: not seeding - no state dir for {} ({err:#})",
-                source_root.display()
-            );
+            crate::log_role!("not seeding - no state dir for {} ({err:#})", source_root.display());
             return None;
         }
     };
     if fs::symlink_metadata(&source_db).is_err() {
-        crate::log_line!("g-mesh daemon: not seeding - {} has no index", source_root.display());
+        crate::log_role!("not seeding - {} has no index", source_root.display());
         return None;
     }
     match seed_from(&source_db, state_dir, &source_root, indexer_version) {
@@ -254,7 +254,7 @@ fn seed_if_eligible_under(
         Ok(None) => None,
         Err(err) => {
             remove_stale_seed_tmp(state_dir);
-            crate::log_line!("g-mesh daemon: not seeding from {} ({err:#})", source_root.display());
+            crate::log_role!("not seeding from {} ({err:#})", source_root.display());
             None
         }
     }
@@ -293,11 +293,11 @@ fn seed_from(
     source.busy_timeout(Duration::from_secs(5)).context("failed to set a busy timeout")?;
     // Checked before copying, so a mismatch never costs a copy.
     if let Err(reason) = check_source(&source, indexer_version) {
-        crate::log_line!("g-mesh daemon: not seeding from {} - {reason:#}", source_root.display());
+        crate::log_role!("not seeding from {} - {reason:#}", source_root.display());
         return Ok(None);
     }
 
-    let tmp = state_dir.join(SEED_TMP);
+    let tmp = StateDir::at(state_dir).seed_tmp_file();
     remove_stale_seed_tmp(state_dir);
     {
         let mut dest =
@@ -320,7 +320,7 @@ fn seed_from(
         if let Err(reason) = check_source(&dest, indexer_version) {
             drop(dest);
             remove_stale_seed_tmp(state_dir);
-            crate::log_line!("g-mesh daemon: not seeding from {} - {reason:#}", source_root.display());
+            crate::log_role!("not seeding from {} - {reason:#}", source_root.display());
             return Ok(None);
         }
         schema::record_seed_origin(&dest, &source_root.to_string_lossy())?;
@@ -335,15 +335,17 @@ fn seed_from(
         .with_context(|| format!("failed to sync {}", tmp.display()))?;
     // A crashed daemon's side files with no `index.db` would be applied to
     // the renamed copy.
-    for side in ["index.db-wal", "index.db-shm", "index.db-journal"] {
-        match fs::remove_file(state_dir.join(side)) {
+    let db = StateDir::at(state_dir).index_db();
+    for side in ["-wal", "-shm", "-journal"] {
+        match fs::remove_file(with_suffix(&db, side)) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err).with_context(|| format!("failed to remove a stale {side}")),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to remove a stale {INDEX_DB_FILE}{side}"))
+            }
         }
     }
     remove_seed_side_files(state_dir);
-    let db = state_dir.join("index.db");
     fs::rename(&tmp, &db).with_context(|| format!("failed to rename {} into place", tmp.display()))?;
     if let Ok(dir) = fs::File::open(state_dir) {
         let _ = dir.sync_all();
@@ -355,7 +357,7 @@ fn seed_from(
 /// and checkpointed, so nothing named after the temp file outlives it.
 fn remove_seed_side_files(state_dir: &Path) {
     for suffix in ["-wal", "-shm", "-journal"] {
-        let _ = fs::remove_file(state_dir.join(format!("{SEED_TMP}{suffix}")));
+        let _ = fs::remove_file(with_suffix(&StateDir::at(state_dir).seed_tmp_file(), suffix));
     }
 }
 

@@ -1,12 +1,11 @@
-pub mod apply;
 pub mod batch;
 pub mod burst;
 pub mod debounce;
 pub mod ignore_layers;
 pub mod rescan;
-pub mod staleness;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::RwLock;
 use std::time::Duration;
@@ -24,14 +23,7 @@ use ignore_layers::{IgnoreLayers, GITIGNORE_FILE_NAME};
 /// couldn't get a real watch, not the whole project.
 const POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Directory names excluded whatever `.gitignore` says, in every language:
-/// git's object store and Claude Code's session directory (`.claude/worktrees/`
-/// holds whole copies of the project), neither of which is ever source. The
-/// same pair as `BASELINE_EXCLUDED_DIRS` in plugins/sdk/src/walk.rs, which the
-/// SDK-built plugins' bulk walks apply; everything language-specific
-/// (`node_modules`, `target`, `vendor`) is the plugin's own `[plugin.workspace]
-/// exclude_dirs`. Shared with `cli::status`'s coverage walk.
-pub const BASELINE_EXCLUDED_DIRS: [&str; 2] = [".git", ".claude"];
+pub use g_mesh_walk::BASELINE_EXCLUDED_DIRS;
 
 /// Watches a project root for filesystem changes, filtering out anything
 /// a `.gitignore` at any level ignores (plus `.git` and `.claude`, which
@@ -49,8 +41,9 @@ pub struct ProjectWatcher {
     // it stops the poll loop.
     _poll_fallback: Option<PollWatcher>,
     events: Receiver<WatchSignal>,
-    // A sender into `events`, so a test can inject a Rescan without an
-    // FSEvents storm ([`Self::inject_rescan`]).
+    // A sender into `events`, so a test can inject a Rescan or a path
+    // without the OS event service ([`Self::inject_rescan`],
+    // [`Self::inject_path`]).
     #[cfg(test)]
     test_events: Sender<WatchSignal>,
     root: PathBuf,
@@ -58,6 +51,9 @@ pub struct ProjectWatcher {
     // `reload_ignores` when a `.gitignore` or a link may have changed; read
     // for every event.
     ignores: RwLock<IgnoreLayers>,
+    // Set by `next_change` on every signal it receives, ignored paths
+    // included, before any filtering; cleared by [`Self::take_signal_seen`].
+    signal_seen: AtomicBool,
 }
 
 impl ProjectWatcher {
@@ -153,6 +149,7 @@ impl ProjectWatcher {
             test_events: tx,
             root: root.to_path_buf(),
             ignores,
+            signal_seen: AtomicBool::new(false),
         })
     }
 
@@ -240,6 +237,9 @@ impl ProjectWatcher {
     /// the ignore layers do not judge directories that way. A rescan the
     /// remap would drop, or one outside the root, is widened to the root, so
     /// a dropped event is never lost with it.
+    ///
+    /// Every signal received, a dropped or ignored one included, is recorded
+    /// for [`Self::take_signal_seen`].
     pub fn next_change(&self, timeout: Duration) -> Option<Change> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -247,7 +247,11 @@ impl ProjectWatcher {
             if remaining.is_zero() {
                 return None;
             }
-            match self.events.recv_timeout(remaining) {
+            let signal = self.events.recv_timeout(remaining);
+            if signal.is_ok() {
+                self.signal_seen.store(true, Ordering::Relaxed);
+            }
+            match signal {
                 Ok(WatchSignal::Path(path)) => {
                     let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let path = match layers.to_indexed(&path) {
@@ -275,6 +279,13 @@ impl ProjectWatcher {
         }
     }
 
+    /// Whether [`Self::next_change`] received any signal since the last call,
+    /// including ones it dropped as ignored (a build writing `target/`); clears
+    /// the record.
+    pub fn take_signal_seen(&self) -> bool {
+        self.signal_seen.swap(false, Ordering::Relaxed)
+    }
+
     /// Test-only seam: queues a Rescan of `path` exactly as the OS callback
     /// would ([`forward_event`]), so a test can reproduce a dropped-event
     /// signal without an FSEvents storm. It then reaches
@@ -282,6 +293,15 @@ impl ProjectWatcher {
     #[cfg(test)]
     pub(crate) fn inject_rescan(&self, path: impl Into<PathBuf>) {
         let _ = self.test_events.send(WatchSignal::Rescan(path.into()));
+    }
+
+    /// Test-only seam: queues `path` exactly as the OS callback queues an
+    /// ordinary event's path ([`forward_event`]), so a test can feed
+    /// [`Self::next_change`] the spelling the OS reports without a live OS
+    /// event stream.
+    #[cfg(test)]
+    pub(crate) fn inject_path(&self, path: impl Into<PathBuf>) {
+        let _ = self.test_events.send(WatchSignal::Path(path.into()));
     }
 }
 
@@ -345,34 +365,66 @@ mod tests {
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
     const NO_EVENT_TIMEOUT: Duration = Duration::from_millis(500);
-    const DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
+    /// A hang guard, not a timing claim: the sync sentinel waits behind
+    /// whatever the OS event service has queued.
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(20);
+    /// A hang guard only: an injected signal is already queued when
+    /// `next_change` starts waiting.
+    const INJECTED_TIMEOUT: Duration = Duration::from_millis(200);
     // The polling fallback only rescans every POLL_FALLBACK_INTERVAL (2s), so
     // give it a few cycles' worth of headroom to avoid a flaky race against
     // the poll loop's own timer.
     const POLL_EVENT_TIMEOUT: Duration = Duration::from_secs(7);
 
     /// macOS FSEvents can replay a creation event for the watched root
-    /// itself (and other setup noise) shortly after `watch()` starts, even
-    /// though it isn't gitignored and predates the watcher. Drain that
-    /// startup noise before asserting on the write under test, or it reads
-    /// as a false "change detected".
+    /// itself (and other setup noise) at any time after `watch()` starts.
+    /// Writes a sentinel at the root and consumes changes until it surfaces:
+    /// the OS delivers events in order, so every setup event is then behind
+    /// the test. A late duplicate of the sentinel can still surface, so
+    /// assertions filter by the paths they mean.
     fn drain_startup_noise(watcher: &ProjectWatcher) {
-        while watcher.next_change(DRAIN_TIMEOUT).is_some() {}
+        static SENTINELS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SENTINELS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sentinel = watcher.root.join(format!(".watcher-sync-{n}"));
+        assert!(!watcher.is_ignored(&sentinel), "the sync sentinel must not be ignored");
+        fs::write(&sentinel, b"").unwrap();
+        changes_until(watcher, &sentinel, SYNC_TIMEOUT).expect("the sync sentinel never surfaced");
     }
 
+    /// A watcher whose OS watch is stopped and its queue drained, so
+    /// `next_change` sees only the signals a test injects. The filter and
+    /// remap tests run on exactly the paths they name, whatever the OS event
+    /// service is doing.
+    fn injected_only(root: &Path) -> ProjectWatcher {
+        let mut watcher = ProjectWatcher::new(root).unwrap();
+        let root = watcher.root.clone();
+        watcher._watcher.unwatch(&root).unwrap();
+        while watcher.events.try_recv().is_ok() {}
+        watcher
+    }
+
+    /// What `next_change` makes of `path` as the OS reports it: the
+    /// surfaced spelling, or `None` when it is dropped or ignored.
+    fn delivered(watcher: &ProjectWatcher, path: &Path) -> Option<PathBuf> {
+        watcher.inject_path(path);
+        watcher.next_change(INJECTED_TIMEOUT).map(Change::into_path)
+    }
+
+    /// Live: a write surfaces through the OS event service.
     #[test]
     fn write_to_tracked_file_produces_an_event() {
         let tmp = tempfile::tempdir().unwrap();
         let watcher = ProjectWatcher::new(tmp.path()).unwrap();
         drain_startup_noise(&watcher);
 
-        let tracked = tmp.path().join("tracked.txt");
+        let tracked = tmp.path().canonicalize().unwrap().join("tracked.txt");
         fs::write(&tracked, b"hello").unwrap();
 
-        let changed = watcher.next_change(EVENT_TIMEOUT).map(Change::into_path);
-        assert_eq!(changed, Some(tracked.canonicalize().unwrap()));
+        assert!(changes_until(&watcher, &tracked, EVENT_TIMEOUT).is_some());
     }
 
+    /// Live: a write under a `.gitignore`d directory never surfaces before a
+    /// later tracked write does (the OS delivers in order).
     #[test]
     fn write_to_gitignored_path_produces_no_event() {
         let tmp = tempfile::tempdir().unwrap();
@@ -382,52 +434,54 @@ mod tests {
         let watcher = ProjectWatcher::new(tmp.path()).unwrap();
         drain_startup_noise(&watcher);
 
-        fs::write(tmp.path().join("node_modules/ignored.txt"), b"noise").unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join("node_modules/ignored.txt"), b"noise").unwrap();
+        // A silent watcher isn't proof of filtering: the tracked write must
+        // surface.
+        let tracked = root.join("tracked.txt");
+        fs::write(&tracked, b"hello").unwrap();
+        let seen = changes_until(&watcher, &tracked, EVENT_TIMEOUT).expect("the tracked write must surface");
+        let ignored = root.join("node_modules");
         assert!(
-            watcher.next_change(NO_EVENT_TIMEOUT).is_none(),
-            "a write under a .gitignore'd directory must not surface as a change"
+            seen.iter().all(|path| !path.starts_with(&ignored)),
+            "a write under a .gitignore'd directory must not surface as a change: {seen:?}"
         );
-
-        // Confirm the watcher is still alive and correctly reports real
-        // changes afterward - a silent watcher isn't proof of filtering.
-        fs::write(tmp.path().join("tracked.txt"), b"hello").unwrap();
-        assert!(watcher.next_change(EVENT_TIMEOUT).is_some());
     }
 
     #[test]
     fn write_under_dot_git_produces_no_event() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir(tmp.path().join(".git")).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        let watcher = injected_only(&root);
 
-        let watcher = ProjectWatcher::new(tmp.path()).unwrap();
-        drain_startup_noise(&watcher);
-
-        fs::write(tmp.path().join(".git/HEAD"), b"ref: refs/heads/main").unwrap();
-        assert!(
-            watcher.next_change(NO_EVENT_TIMEOUT).is_none(),
+        let head = write(&root, ".git/HEAD", "ref: refs/heads/main");
+        assert_eq!(
+            delivered(&watcher, &head),
+            None,
             ".git is always excluded even when not explicitly listed in .gitignore"
         );
 
-        fs::write(tmp.path().join("tracked.txt"), b"hello").unwrap();
-        assert!(watcher.next_change(EVENT_TIMEOUT).is_some());
+        let tracked = write(&root, "tracked.txt", "hello");
+        assert_eq!(delivered(&watcher, &tracked), Some(tracked));
     }
 
     #[test]
     fn write_under_dot_claude_produces_no_event() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join(".claude/worktrees/agent-abc123")).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".claude/worktrees/agent-abc123")).unwrap();
+        let watcher = injected_only(&root);
 
-        let watcher = ProjectWatcher::new(tmp.path()).unwrap();
-        drain_startup_noise(&watcher);
-
-        fs::write(tmp.path().join(".claude/worktrees/agent-abc123/index.ts"), b"stale copy").unwrap();
-        assert!(
-            watcher.next_change(NO_EVENT_TIMEOUT).is_none(),
+        let stale = write(&root, ".claude/worktrees/agent-abc123/index.ts", "stale copy");
+        assert_eq!(
+            delivered(&watcher, &stale),
+            None,
             ".claude is always excluded even when not explicitly listed in .gitignore"
         );
 
-        fs::write(tmp.path().join("tracked.txt"), b"hello").unwrap();
-        assert!(watcher.next_change(EVENT_TIMEOUT).is_some());
+        let tracked = write(&root, "tracked.txt", "hello");
+        assert_eq!(delivered(&watcher, &tracked), Some(tracked));
     }
 
     /// Simulates the exact error notify's inotify backend raises when
@@ -529,22 +583,19 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         write(&root, "src/.gitignore", "gen/\n");
         fs::create_dir_all(root.join("src/gen")).unwrap();
+        let watcher = injected_only(&root);
 
-        let watcher = ProjectWatcher::new(&root).unwrap();
-        drain_startup_noise(&watcher);
-
-        let ignored_dir = root.join("src/gen");
-        write(&root, "src/gen/a.ts", "export const a = 1;\n");
+        let ignored = write(&root, "src/gen/a.ts", "export const a = 1;\n");
         let tracked = write(&root, "src/b.ts", "export const b = 1;\n");
-
-        let mut seen = changes_until(&watcher, &tracked, EVENT_TIMEOUT)
-            .expect("a save outside the nested-ignored directory must still surface");
-        // No order is guaranteed between the two writes' events: keep
-        // listening after the tracked one.
-        seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
-        assert!(
-            seen.iter().all(|path| !path.starts_with(&ignored_dir)),
-            "nothing under src/gen (ignored by src/.gitignore) may surface: {seen:?}"
+        assert_eq!(
+            delivered(&watcher, &ignored),
+            None,
+            "nothing under src/gen (ignored by src/.gitignore) may surface"
+        );
+        assert_eq!(
+            delivered(&watcher, &tracked),
+            Some(tracked),
+            "a save outside the nested-ignored directory must still surface"
         );
     }
 
@@ -588,7 +639,7 @@ mod tests {
         let generated = write(&root, "generated/x.ts", "");
         let nested = write(&root, "src/gen/y.ts", "");
 
-        let watcher = ProjectWatcher::new(&root).unwrap();
+        let watcher = injected_only(&root);
         assert!(watcher.is_ignored(&generated));
         assert!(!watcher.is_ignored(&nested));
 
@@ -602,10 +653,10 @@ mod tests {
         assert!(watcher.is_ignored(&nested), "the new src/.gitignore ignores src/gen/");
 
         // And the events follow: a save in the un-ignored directory surfaces.
-        drain_startup_noise(&watcher);
         write(&root, "generated/x.ts", "export const x = 1;\n");
-        assert!(
-            changes_until(&watcher, &generated, EVENT_TIMEOUT).is_some(),
+        assert_eq!(
+            delivered(&watcher, &generated),
+            Some(generated.clone()),
             "a save under generated/ must surface once the reloaded layers allow it"
         );
     }
@@ -624,14 +675,14 @@ mod tests {
         let own = write(&root, ".gitignore", ".gitignore\nvendor/\n");
         let in_ignored_dir = write(&root, "vendor/.gitignore", "*.tmp\n");
 
-        let watcher = ProjectWatcher::new(&root).unwrap();
+        let watcher = injected_only(&root);
         assert!(!watcher.is_ignored(&own), "a .gitignore listing itself is not ignored");
         assert!(watcher.is_ignored(&in_ignored_dir), "a .gitignore inside an ignored directory is");
 
-        drain_startup_noise(&watcher);
         write(&root, ".gitignore", ".gitignore\nvendor/\n*.log\n");
-        assert!(
-            changes_until(&watcher, &own, EVENT_TIMEOUT).is_some(),
+        assert_eq!(
+            delivered(&watcher, &own),
+            Some(own.clone()),
             "the self-ignoring .gitignore's edit must surface"
         );
     }
@@ -700,9 +751,9 @@ mod tests {
 
     /// GM-514 (docs/architecture/gm-514-core-symlink-table.md, section 5):
     /// events under followed, duplicate, refused and file links surface
-    /// spelled as the walk lists the file. The live tests assert on the
-    /// spelling that surfaces, which is the same whichever spelling the OS
-    /// reported (M2: FSEvents reports the real path; inotify either one).
+    /// spelled as the walk lists the file. FSEvents reports the real path
+    /// (M2; inotify either one): the live alias-only test pins that, and the
+    /// others inject the real path into a watcher with no OS watch.
     #[cfg(unix)]
     mod links {
         use super::*;
@@ -771,23 +822,28 @@ mod tests {
         /// surfaces under the winning link only - inotify may report the
         /// duplicate's spelling, FSEvents the real one; both become the
         /// winner's.
+        ///
+        /// Control: drop the `Duplicate` rule in `LinkTable::new` - the
+        /// duplicate's spelling surfaces as `src/dup/a.ts`.
         #[test]
         fn an_edit_under_a_duplicated_target_surfaces_under_the_winning_link_only() {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().canonicalize().unwrap();
             alias_only(&root);
             link(&root, "src/dup", "../gen");
-            let watcher = ProjectWatcher::new(&root).unwrap();
-            drain_startup_noise(&watcher);
+            let watcher = injected_only(&root);
 
+            let winner = root.join("src/api/a.ts");
             write(&root, "gen/a.ts", "export const a = 2;\n");
-            let mut seen = surfaces(&watcher, &root.join("src/api/a.ts"), "an edit");
-            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
-            assert!(
-                seen.iter().all(
-                    |path| !path.starts_with(root.join("src/dup")) && !path.starts_with(root.join("gen"))
-                ),
-                "only the winner's spelling surfaces: {seen:?}"
+            assert_eq!(
+                delivered(&watcher, &root.join("gen/a.ts")),
+                Some(winner.clone()),
+                "the real spelling"
+            );
+            assert_eq!(
+                delivered(&watcher, &root.join("src/dup/a.ts")),
+                Some(winner),
+                "the duplicate's spelling"
             );
         }
 
@@ -828,21 +884,20 @@ mod tests {
         /// under the link's spelling (its real spelling is ignored), reloads
         /// the layers, and its rules then apply along the link.
         ///
-        /// Control: in `next_change`, skip the remap - on macOS the event is
+        /// Control: in `next_change`, skip the remap - the real spelling is
         /// dropped as ignored and `src/api/.gitignore` never surfaces.
         #[test]
         fn a_nested_gitignore_in_an_alias_only_target_surfaces_under_the_link_and_applies() {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().canonicalize().unwrap();
             alias_only(&root);
-            let watcher = ProjectWatcher::new(&root).unwrap();
-            drain_startup_noise(&watcher);
+            let watcher = injected_only(&root);
             let skipped = root.join("src/api/x.skip.ts");
             assert!(!watcher.is_ignored(&skipped));
 
-            write(&root, "gen/.gitignore", "*.skip.ts\n");
+            let real = write(&root, "gen/.gitignore", "*.skip.ts\n");
             let alias = root.join("src/api/.gitignore");
-            surfaces(&watcher, &alias, "the nested .gitignore");
+            assert_eq!(delivered(&watcher, &real), Some(alias.clone()), "the nested .gitignore");
 
             assert!(watcher.reload_ignores_if_changed(std::slice::from_ref(&alias)).is_some());
             assert!(watcher.is_ignored(&skipped), "the target's rules apply along the link");
@@ -895,8 +950,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().canonicalize().unwrap();
             alias_only(&root);
-            let watcher = ProjectWatcher::new(&root).unwrap();
-            drain_startup_noise(&watcher);
+            let watcher = injected_only(&root);
 
             let gitignore = write(&root, ".gitignore", "");
             assert_eq!(
@@ -904,14 +958,12 @@ mod tests {
                 Some(vec!["src/api".to_string()]),
                 "the link is judged differently (Followed -> Aliases)"
             );
-            changes_within(&watcher, NO_EVENT_TIMEOUT);
 
-            write(&root, "gen/a.ts", "export const a = 2;\n");
-            let mut seen = surfaces(&watcher, &root.join("gen/a.ts"), "an edit");
-            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
-            assert!(
-                seen.iter().all(|path| !path.starts_with(root.join("src/api"))),
-                "the old alias spelling no longer surfaces: {seen:?}"
+            let edited = write(&root, "gen/a.ts", "export const a = 2;\n");
+            assert_eq!(
+                delivered(&watcher, &edited),
+                Some(edited.clone()),
+                "an edit surfaces under gen/, not the old alias spelling"
             );
         }
 
@@ -923,7 +975,8 @@ mod tests {
         /// reaches the now dangling link and reloads again.
         ///
         /// Control: drop the `Followed` real-target rule in
-        /// `LinkTable::new` - on macOS nothing surfaces for the edit.
+        /// `LinkTable::new` - the real spelling is ignored and nothing
+        /// surfaces for the edit.
         #[test]
         fn edits_deletes_and_creates_of_a_file_links_target_surface_as_the_link() {
             let tmp = tempfile::tempdir().unwrap();
@@ -931,20 +984,18 @@ mod tests {
             write(&root, ".gitignore", "cfg/\n");
             write(&root, "cfg/config.ts", "export const c = 1;\n");
             let alias = link(&root, "src/config.ts", "../cfg/config.ts");
-            let watcher = ProjectWatcher::new(&root).unwrap();
-            drain_startup_noise(&watcher);
+            let watcher = injected_only(&root);
 
-            write(&root, "cfg/config.ts", "export const c = 2;\n");
-            let mut seen = surfaces(&watcher, &alias, "an edit of the target");
+            let real = write(&root, "cfg/config.ts", "export const c = 2;\n");
+            assert_eq!(delivered(&watcher, &real), Some(alias.clone()), "an edit of the target");
             assert_eq!(
                 watcher.reload_ignores_if_changed(std::slice::from_ref(&alias)),
                 None,
                 "an edit is not a link change"
             );
-            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
 
-            fs::remove_file(root.join("cfg/config.ts")).unwrap();
-            seen.extend(surfaces(&watcher, &alias, "a delete of the target"));
+            fs::remove_file(&real).unwrap();
+            assert_eq!(delivered(&watcher, &real), Some(alias.clone()), "a delete of the target");
             assert_eq!(
                 watcher.reload_ignores_if_changed(std::slice::from_ref(&alias)),
                 Some(vec!["src/config.ts".to_string()]),
@@ -953,19 +1004,13 @@ mod tests {
             let mut batch = vec![alias.clone()];
             watcher.retain_unignored(&mut batch);
             assert_eq!(batch, vec![alias.clone()], "the dangling link's path is routed (as absent)");
-            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
 
             write(&root, "cfg/config.ts", "export const c = 3;\n");
-            seen.extend(surfaces(&watcher, &alias, "a re-create of the target"));
+            assert_eq!(delivered(&watcher, &real), Some(alias.clone()), "a re-create of the target");
             assert_eq!(
                 watcher.reload_ignores_if_changed(std::slice::from_ref(&alias)),
                 Some(vec!["src/config.ts".to_string()]),
                 "the link is followed again"
-            );
-            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
-            assert!(
-                seen.iter().all(|path| !path.starts_with(root.join("cfg"))),
-                "nothing surfaces under the real spelling: {seen:?}"
             );
         }
 
@@ -989,19 +1034,17 @@ mod tests {
             let winner = link(&root, "src/a.ts", "../cfg/shared.ts");
             let duplicate = link(&root, "src/b.ts", "../cfg/shared.ts");
             let refused = link(&root, "src/out.ts", outside_dir.join("out.ts"));
-            let watcher = ProjectWatcher::new(&root).unwrap();
-            drain_startup_noise(&watcher);
+            let watcher = injected_only(&root);
 
             let mut batch = vec![duplicate.clone(), refused, winner.clone(), main.clone()];
             watcher.retain_unignored(&mut batch);
             assert_eq!(batch, vec![winner.clone(), main]);
 
-            write(&root, "cfg/shared.ts", "export const s = 1;\n");
-            let mut seen = surfaces(&watcher, &winner, "an edit of the shared target");
-            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
-            assert!(
-                seen.iter().all(|path| *path != duplicate && !path.starts_with(root.join("cfg"))),
-                "only the winner's spelling surfaces: {seen:?}"
+            let shared = write(&root, "cfg/shared.ts", "export const s = 1;\n");
+            assert_eq!(
+                delivered(&watcher, &shared),
+                Some(winner),
+                "an edit of the shared target surfaces under the winner only"
             );
         }
     }
@@ -1089,5 +1132,45 @@ mod tests {
             watcher.inject_rescan(&injected);
             assert_eq!(next_rescan(&watcher), Some(expected), "a rescan of {}", injected.display());
         }
+    }
+
+    /// A path `next_change` drops as ignored is still recorded as a signal
+    /// received, once: the next `take_signal_seen` clears it, and a
+    /// `next_change` that receives nothing records nothing.
+    ///
+    /// Control: in `next_change`, set `signal_seen` only where it returns a
+    /// `Change` (after the ignore check) - the ignored path is not recorded
+    /// and the first assertion fails.
+    #[test]
+    fn an_ignored_path_is_recorded_as_a_signal_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, ".gitignore", "target/\n");
+        let watcher = injected_only(&root);
+        let built = root.join("target/debug/build.o");
+        assert!(watcher.is_ignored(&built), "the fixture path must be ignored");
+
+        assert_eq!(delivered(&watcher, &built), None, "an ignored path is not routed");
+        assert!(watcher.take_signal_seen(), "an ignored path is still a signal received");
+        assert!(!watcher.take_signal_seen(), "taking the record clears it");
+
+        assert_eq!(watcher.next_change(INJECTED_TIMEOUT), None);
+        assert!(!watcher.take_signal_seen(), "no signal received, none recorded");
+    }
+
+    /// A Rescan and a routed path are signals received too.
+    #[test]
+    fn a_rescan_and_a_routed_path_are_recorded_as_signals_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let watcher = injected_only(&root);
+
+        watcher.inject_rescan(&root);
+        assert_eq!(watcher.next_change(INJECTED_TIMEOUT), Some(Change::Rescan(root.clone())));
+        assert!(watcher.take_signal_seen(), "a Rescan is a signal received");
+
+        let source = root.join("src/lib.rs");
+        assert_eq!(delivered(&watcher, &source), Some(source.clone()));
+        assert!(watcher.take_signal_seen(), "a routed path is a signal received");
     }
 }

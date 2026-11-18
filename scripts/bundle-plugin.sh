@@ -20,8 +20,8 @@
 # grammars' native addons in `node_modules/` beside it, and the embedded
 # runtime's LICENSE-nodejs. All of that is gone. The plugin is now a Rust
 # binary crate in the *same cargo workspace* as core (see the root
-# Cargo.toml), so it is built exactly the way scripts/bundle-rust-plugin.sh
-# (GM-288) and scripts/bundle-python-plugin.sh (GM-298) build theirs: `rustup
+# Cargo.toml), so it is built exactly the way scripts/bundle-cargo-plugin.sh
+# builds the Rust and Python plugins: `rustup
 # target add`, then `cargo build --target <target>` from the crate's own
 # directory, on whichever runner that target's row in
 # .github/workflows/release.yml runs on. Building it needs no Node.js, no npm
@@ -30,7 +30,7 @@
 # Like those two, this does not refuse a non-host target (there is no
 # runtime to embed any more), but it does not promise a non-host target will
 # link either: the tree-sitter grammars compile C for the target, the same
-# question core's own cross-build answers (see bundle-rust-plugin.sh's
+# question core's own cross-build answers (see bundle-cargo-plugin.sh's
 # header).
 #
 # The semantic tier is not bundled. It talks to vtsls, an external language
@@ -66,7 +66,7 @@
 #                                      SDK, wire and tree-sitter grammar crates
 #
 # `typescript` as the directory name is required, not cosmetic:
-# `core/src/daemon/manifest.rs` enforces that a manifest's `language` equals
+# `core/src/plugin_manifest.rs` enforces that a manifest's `language` equals
 # its containing directory's name.
 
 set -euo pipefail

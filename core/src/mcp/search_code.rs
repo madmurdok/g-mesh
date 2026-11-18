@@ -11,28 +11,27 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use base64::prelude::{Engine, BASE64_STANDARD};
-use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::indexing_status::Phase;
 use crate::embedding::ce_text::{ce_text, source_lines, CeNode};
 use crate::embedding::rerank::{self, RerankOutcome, Scorer};
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
-use crate::storage::index_store::IndexStore;
-use crate::storage::vectors::pack;
+use crate::graph::search::{self, NodeTextColumns};
+use crate::indexing_status::Phase;
+use crate::storage::vectors;
 
-use super::query_shapes::QueryShapes;
+use super::context::QueryCtx;
+use super::query::{ToolAnswer, WirePage};
 use super::session_hints::{self, HintKey, SessionHints};
 use super::similarity;
-use super::tool_result::{error, internal_error, success};
+use super::tool_result::internal_error;
 use super::{human_duration, SearchCodeParams};
 
 /// One matched symbol, ranked by relevance to the query.
@@ -65,6 +64,21 @@ pub(super) struct SearchResult {
     pub(super) language: String,
 }
 
+impl From<search::VectorHit> for SearchResult {
+    fn from(hit: search::VectorHit) -> Self {
+        SearchResult {
+            symbol_id: hit.id,
+            qualified_name: hit.qualified_name,
+            kind: hit.kind,
+            file_path: hit.file_path,
+            start_line: hit.start_line,
+            start_col: hit.start_col,
+            score: hit.score,
+            language: hit.language,
+        }
+    }
+}
+
 #[cfg(test)]
 impl SearchResult {
     /// The two fields `super::similarity`'s tests vary, with the rest filled
@@ -94,7 +108,7 @@ impl SearchResult {
 /// position for the same reason).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SearchPage {
+pub(crate) struct SearchPage {
     results: Vec<SearchResult>,
     has_more: bool,
     next_cursor: Option<String>,
@@ -123,6 +137,25 @@ struct SearchPage {
     partial: Option<PartialCounts>,
 }
 
+/// What `search_code` answers: the page, led by a prose note while
+/// embeddings are owed. Serialized as the page alone.
+pub(crate) struct SearchAnswer {
+    note: Option<String>,
+    page: SearchPage,
+}
+
+impl Serialize for SearchAnswer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.page.serialize(serializer)
+    }
+}
+
+impl WirePage for SearchAnswer {
+    fn lead_note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+}
+
 /// `IndexingStatus::embed_progress` at the moment the page was ranked.
 #[derive(Serialize)]
 struct PartialCounts {
@@ -143,7 +176,7 @@ enum PassState {
 
 /// Why a `search_code` page is partial: the embedding pass had not finished
 /// when the call's bounded wait ran out.
-pub(super) struct Coverage {
+pub(crate) struct Coverage {
     state: PassState,
     embedded: u64,
     total: u64,
@@ -219,15 +252,6 @@ fn split_partial_cursor(cursor: &str) -> Option<(u64, &str)> {
     Some((stored.parse().ok()?, inner))
 }
 
-/// How many vectors [`search`] ranks from.
-fn stored_vectors(conn: &Connection) -> anyhow::Result<u64> {
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM vectors v JOIN nodes n ON n.id = v.nodeId", [], |row| {
-            row.get(0)
-        })?;
-    Ok(u64::try_from(count).unwrap_or(0))
-}
-
 /// Ranks every embedded node against `query` and paginates the result.
 /// Split out from `handle` so tests can drive it with a small `page_size`
 /// without needing a page-size field on the public tool parameters - and,
@@ -240,42 +264,19 @@ pub(super) fn search(
     page_size: usize,
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<SearchResult>> {
-    // `v.nodeId AS id` and the distance-to-similarity flip are the only
-    // things this base query owes `paginate_by_score`'s contract (a `score`
-    // and an `id` column); every other column just rides along for the
-    // caller. The inner join is what keeps unembedded nodes (no doc comment
-    // or signature, or filtered as noise - see `embedding::text::node_text`) out of the
-    // results without a separate filter.
-    let base_sql = "SELECT v.nodeId AS id, n.qualifiedName, n.kind, n.filePath, n.startLine, n.startCol, \
-                     n.language, \
-                     (1.0 - vec_distance_cosine(v.embedding, ?1)) AS score \
-                     FROM vectors v JOIN nodes n ON n.id = v.nodeId";
-    let packed = pack(query);
-    let params: Vec<&dyn rusqlite::ToSql> = vec![&packed];
-
-    pagination::paginate_by_score(conn, base_sql, &params, page_size, cursor, |row| {
-        let score: f64 = row.get("score")?;
-        let id: String = row.get("id")?;
-        Ok((
-            SearchResult {
-                symbol_id: id.clone(),
-                qualified_name: row.get("qualifiedName")?,
-                kind: row.get("kind")?,
-                file_path: row.get("filePath")?,
-                start_line: row.get("startLine")?,
-                start_col: row.get("startCol")?,
-                score,
-                language: row.get("language")?,
-            },
-            score,
-            id,
-        ))
+    let page = search::by_vector(conn, &vectors::pack(query), page_size, cursor)?;
+    Ok(pagination::Page {
+        results: page.results.into_iter().map(SearchResult::from).collect(),
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        all_unresolved: page.all_unresolved,
     })
 }
 
 /// The first `k` rows [`search`] returns for `query`, as (node id, score):
 /// exactly what `search_code` would rank. The embedding eval's harness-parity
 /// check (`cli::embed_eval`) compares its own ranking against this.
+#[cfg(feature = "embed-eval")]
 pub(crate) fn top_k_for_eval(
     conn: &Connection,
     query: &[f32],
@@ -291,19 +292,13 @@ pub(crate) fn top_k_for_eval(
 /// serving. Dropping the returned future (a cancelled call) does not stop
 /// the blocking work: it runs to completion and its answer is discarded.
 pub(super) async fn handle_off_worker(
-    store: Arc<IndexStore>,
-    embedding: Arc<EmbeddingPipeline>,
-    shapes: Arc<QueryShapes>,
-    hints: SessionHints,
+    ctx: QueryCtx,
     params: SearchCodeParams,
     coverage: Option<Coverage>,
-    project_root: Option<PathBuf>,
-) -> Result<CallToolResult, ErrorData> {
-    tokio::task::spawn_blocking(move || {
-        handle(&store, &embedding, &shapes, &hints, params, coverage.as_ref(), project_root.as_deref())
-    })
-    .await
-    .map_err(|e| internal_error("search_code task failed", e.into()))?
+) -> Result<ToolAnswer<SearchAnswer>, ErrorData> {
+    tokio::task::spawn_blocking(move || handle(&ctx, params, coverage.as_ref()))
+        .await
+        .map_err(|e| internal_error("search_code task failed", e.into()))?
 }
 
 /// Answers one `search_code` call. `coverage` is `Some` when the embedding
@@ -315,38 +310,37 @@ pub(super) async fn handle_off_worker(
 /// Only a first, complete page is reranked (`embedding::rerank`), and its
 /// verdict is judged on the embedding order's page, so the verdict never
 /// depends on the rerank. The reranker's texts read their body lines from
-/// the files under `project_root`; with `None` they have no body.
+/// the files under `ctx.project_root`; an empty root has no body.
 pub(super) fn handle(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    hints: &SessionHints,
+    ctx: &QueryCtx,
     params: SearchCodeParams,
     coverage: Option<&Coverage>,
-    project_root: Option<&Path>,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<SearchAnswer>, ErrorData> {
+    let QueryCtx { store, embedding, shapes, hints, .. } = ctx;
+    let project_root = Some(ctx.project_root.as_path()).filter(|root| !root.as_os_str().is_empty());
     let Some(query_vector) = embedding.embed_query(&params.query) else {
-        return error(
+        return Ok(ToolAnswer::refused(
             "g-mesh: semantic search is not available for this project - no embedding model \
              is loaded. Run `g-mesh model fetch` and restart the daemon, or use the \
              structural tools (find_references, find_definition, ...) instead.",
-        );
+        ));
     };
 
     let conn = store.read();
     let partial_cursor_in = params.cursor.as_deref().and_then(split_partial_cursor);
     let stored = if coverage.is_some() || partial_cursor_in.is_some() {
-        stored_vectors(&conn).map_err(|e| internal_error("failed to count stored vectors", e))?
+        vectors::count_embedded_nodes(&conn)
+            .map_err(|e| internal_error("failed to count stored vectors", e))?
     } else {
         0
     };
     let cursor = match partial_cursor_in {
         Some((issued, _)) if issued != stored => {
-            return error(format!(
+            return Ok(ToolAnswer::refused(format!(
                 "g-mesh: this cursor came from a page ranked while the embedding pass was still running \
                  ({issued} symbols embedded then, {stored} now), so its continuation would rank a different \
                  set. Call search_code again without `cursor`."
-            ));
+            )));
         }
         Some((_, inner)) => Some(inner),
         None => params.cursor.as_deref(),
@@ -404,13 +398,8 @@ pub(super) fn handle(
         hint,
         partial: coverage.map(|c| PartialCounts { embedded: c.embedded, total: c.total }),
     };
-    match coverage {
-        None => success(&body),
-        Some(coverage) => Ok(CallToolResult::success(vec![
-            ContentBlock::text(coverage.note(stored)),
-            ContentBlock::json(&body)?,
-        ])),
-    }
+    let note = coverage.map(|coverage| coverage.note(stored));
+    Ok(ToolAnswer::Page(SearchAnswer { note, page: body }))
 }
 
 /// A page ready to answer with, and the rows its verdict is judged on when
@@ -539,15 +528,13 @@ fn window_texts(
     project_root: Option<&Path>,
     tok: &dyn Fn(&str) -> usize,
 ) -> anyhow::Result<Vec<String>> {
-    let mut statement = conn.prepare_cached(
-        "SELECT docComment, signature, kind, nativeKind, name, qualifiedName, filePath, startLine, endLine, \
-         language FROM nodes WHERE id = ?1",
-    )?;
+    let columns = search::node_text_columns(conn, rows.iter().map(|row| row.symbol_id.as_str()))?;
     let mut files: HashMap<String, Option<Vec<String>>> = HashMap::new();
-    rows.iter()
-        .map(|row| {
-            let Some(columns) = statement.query_row([&row.symbol_id], NodeColumns::read).optional()? else {
-                return Ok(String::new());
+    Ok(columns
+        .into_iter()
+        .map(|columns| {
+            let Some(columns) = columns else {
+                return String::new();
             };
             let lines = match (project_root, columns.file_path.as_deref()) {
                 (Some(root), Some(file_path)) => files
@@ -556,54 +543,24 @@ fn window_texts(
                     .as_deref(),
                 _ => None,
             };
-            Ok(ce_text(&columns.node(), lines, tok))
+            ce_text(&ce_node(&columns), lines, tok)
         })
-        .collect()
+        .collect())
 }
 
-/// The `nodes` columns [`ce_text`] reads.
-struct NodeColumns {
-    doc_comment: Option<String>,
-    signature: Option<String>,
-    kind: Option<String>,
-    native_kind: Option<String>,
-    name: Option<String>,
-    qualified_name: Option<String>,
-    file_path: Option<String>,
-    start_line: i64,
-    end_line: i64,
-    language: Option<String>,
-}
-
-impl NodeColumns {
-    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            doc_comment: r.get(0)?,
-            signature: r.get(1)?,
-            kind: r.get(2)?,
-            native_kind: r.get(3)?,
-            name: r.get(4)?,
-            qualified_name: r.get(5)?,
-            file_path: r.get(6)?,
-            start_line: r.get(7)?,
-            end_line: r.get(8)?,
-            language: r.get(9)?,
-        })
-    }
-
-    fn node(&self) -> CeNode<'_> {
-        CeNode {
-            kind: self.kind.as_deref(),
-            native_kind: self.native_kind.as_deref(),
-            name: self.name.as_deref(),
-            qualified_name: self.qualified_name.as_deref(),
-            file_path: self.file_path.as_deref(),
-            start_line: usize::try_from(self.start_line).unwrap_or(0),
-            end_line: usize::try_from(self.end_line).unwrap_or(0),
-            language: self.language.as_deref(),
-            signature: self.signature.as_deref(),
-            doc_comment: self.doc_comment.as_deref(),
-        }
+/// [`ce_text`]'s view of a node's columns.
+fn ce_node(columns: &NodeTextColumns) -> CeNode<'_> {
+    CeNode {
+        kind: columns.kind.as_deref(),
+        native_kind: columns.native_kind.as_deref(),
+        name: columns.name.as_deref(),
+        qualified_name: columns.qualified_name.as_deref(),
+        file_path: columns.file_path.as_deref(),
+        start_line: usize::try_from(columns.start_line).unwrap_or(0),
+        end_line: usize::try_from(columns.end_line).unwrap_or(0),
+        language: columns.language.as_deref(),
+        signature: columns.signature.as_deref(),
+        doc_comment: columns.doc_comment.as_deref(),
     }
 }
 
@@ -646,36 +603,8 @@ fn continue_rerank(
 /// The rows for `ids` that still have a vector, in `ids`' order, scored as
 /// [`search`] scores them.
 fn rows_by_id(conn: &Connection, query_vector: &[f32], ids: &[String]) -> anyhow::Result<Vec<SearchResult>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let sql =
-        "SELECT v.nodeId AS id, n.qualifiedName, n.kind, n.filePath, n.startLine, n.startCol, n.language, \
-               (1.0 - vec_distance_cosine(v.embedding, ?1)) AS score \
-               FROM vectors v JOIN nodes n ON n.id = v.nodeId \
-               WHERE v.nodeId IN (SELECT value FROM json_each(?2))";
-    let packed = pack(query_vector);
-    let ids_json = serde_json::to_string(ids)?;
-    let mut statement = conn.prepare(sql)?;
-    let mut found: std::collections::HashMap<String, SearchResult> = statement
-        .query_map(rusqlite::params![packed, ids_json], |row| {
-            let id: String = row.get("id")?;
-            Ok((
-                id.clone(),
-                SearchResult {
-                    symbol_id: id,
-                    qualified_name: row.get("qualifiedName")?,
-                    kind: row.get("kind")?,
-                    file_path: row.get("filePath")?,
-                    start_line: row.get("startLine")?,
-                    start_col: row.get("startCol")?,
-                    score: row.get("score")?,
-                    language: row.get("language")?,
-                },
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
+    let hits = search::hits_by_id(conn, &vectors::pack(query_vector), ids)?;
+    Ok(hits.into_iter().map(SearchResult::from).collect())
 }
 
 /// `judged` is true when the page carries `noMatch` or `lowSimilarity`: the
@@ -704,7 +633,12 @@ fn rerank_model_hint(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::mcp::query::test_support::Rendered;
+    use crate::mcp::query_shapes::QueryShapes;
+    use crate::storage::index_store::IndexStore;
     use crate::storage::schema;
     use crate::storage::vectors::{insert, register_extension};
 
@@ -724,7 +658,8 @@ mod tests {
         .unwrap();
     }
 
-    fn json_body(result: &CallToolResult) -> serde_json::Value {
+    fn json_body(result: &impl Rendered) -> serde_json::Value {
+        let result = &result.rendered();
         assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -732,7 +667,8 @@ mod tests {
         }
     }
 
-    fn error_text(result: &CallToolResult) -> String {
+    fn error_text(result: &impl Rendered) -> String {
+        let result = &result.rendered();
         assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),
@@ -827,7 +763,7 @@ mod tests {
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
         let result =
-            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None)
+            handle(&QueryCtx { embedding: Arc::new(embedding), ..QueryCtx::for_test(&conn) }, params, None)
                 .unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
@@ -841,14 +777,14 @@ mod tests {
     #[test]
     fn handle_reports_a_tool_error_when_the_configured_model_is_unavailable() {
         let conn = Arc::new(IndexStore::new(setup()));
-        let embedding = EmbeddingPipeline::load_at(
-            &crate::config::EmbeddingConfig::default(),
-            Path::new("/nonexistent-g-mesh-test-model-dir"),
-        );
+        let mut settings =
+            crate::config::embedding::embedding_settings(&crate::config::EmbeddingConfig::default());
+        settings.model.dir_override = Some(Path::new("/nonexistent-g-mesh-test-model-dir").to_path_buf());
+        let embedding = EmbeddingPipeline::load(settings);
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
         let result =
-            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None)
+            handle(&QueryCtx { embedding: Arc::new(embedding), ..QueryCtx::for_test(&conn) }, params, None)
                 .unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
@@ -1044,7 +980,7 @@ mod tests {
     #[test]
     #[ignore = "needs the real model weights; run `g-mesh model fetch` first"]
     fn a_query_related_to_a_docstring_ranks_that_symbol_above_an_unrelated_one() {
-        let dir = crate::embedding::default_model_dir(&crate::config::EmbeddingConfig::default().model)
+        let dir = crate::config::embedding::model_dir(crate::embedding::DEFAULT_MODEL_NAME)
             .expect("failed to resolve the default model directory");
         assert!(
             dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists(),
@@ -1089,13 +1025,15 @@ mod tests {
         .unwrap();
 
         let conn = Arc::new(IndexStore::new(conn));
-        let embedding = EmbeddingPipeline::load(&crate::config::EmbeddingConfig::default());
+        let embedding = EmbeddingPipeline::load(crate::config::embedding::embedding_settings(
+            &crate::config::EmbeddingConfig::default(),
+        ));
         let params = SearchCodeParams {
             query: "load the contents of a file from the filesystem".to_string(),
             ..Default::default()
         };
         let body = json_body(
-            &handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None)
+            &handle(&QueryCtx { embedding: Arc::new(embedding), ..QueryCtx::for_test(&conn) }, params, None)
                 .unwrap(),
         );
 

@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "4.29.0"
+version = "4.33.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -13,10 +13,15 @@ name = "g-mesh"
 path = "src/main.rs"
 
 [features]
+# Compiles the embedding search-quality eval (`g-mesh debug-embed-eval`, hidden
+# subcommand). Off by default: the shipped binary carries no eval code. Tests
+# and clippy in CI build with it so the eval stays checked.
+embed-eval = []
 # Links ONNX Runtime's CoreML execution provider (and CoreML.framework) so
-# `debug-embed-eval run --ep coreml` can time it. Off by default: release and
-# CI builds stay CPU-only and the daemon never reads the switch.
-ep-coreml = ["ort/coreml", "dep:tracing-subscriber"]
+# `debug-embed-eval run --ep coreml` can time it, hence it implies `embed-eval`.
+# Off by default: release and CI builds stay CPU-only and the daemon never
+# reads the switch.
+ep-coreml = ["embed-eval", "ort/coreml", "dep:tracing-subscriber"]
 
 [dependencies]
 anyhow = "1"
@@ -26,7 +31,7 @@ dirs = "5"
 flate2 = "1"
 # Already resolved into this tree as a transitive dependency of `ignore`
 # (which uses it internally for `.gitignore`-style overrides), so promoting
-# it to a direct dependency for `daemon::manifest`'s `[plugin.workspace]
+# it to a direct dependency for `plugin_manifest`'s `[plugin.workspace]
 # watch_files` glob validation (`*.csproj`, per the multi-language-plugins
 # architecture doc's paper stress test) adds no new subtree to compile -
 # `cargo tree` already has one copy. Chosen over hand-rolling glob matching
@@ -46,6 +51,8 @@ g-mesh-wire = { path = "../wire", features = ["json-schema"] }
 # (status, the absent-language count, the watcher's layers and link table,
 # the `.gitignore` gate) list the same files under the same spellings.
 g-mesh-walk = { path = "../walk" }
+# The `plugin.toml` schema, shared with the SDK and its LSP bridge.
+g-mesh-manifest = { path = "../manifest" }
 ignore = "0.4"
 notify = "6"
 # `[plugin] memoryLimitMb` (task GM-274, `daemon::memory`) needs each
@@ -201,4 +208,5 @@ tempfile = "3"
 # The `ep-coreml` ONNX Runtime log test asks the installed subscriber which
 # targets and levels it lets through.
 tracing = "0.1"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+# `test-util`: the heartbeat tests run on tokio's paused clock.
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "test-util"] }

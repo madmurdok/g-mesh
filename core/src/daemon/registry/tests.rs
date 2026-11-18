@@ -1,9 +1,9 @@
 use super::*;
 use rusqlite::Connection;
 
-use crate::daemon::manifest::discover;
-use crate::daemon::test_plugin;
+use crate::plugin_manifest::discover;
 use crate::storage::schema;
+use crate::test_plugin;
 
 /// A registry over `languages`, each installed as a fake plugin claiming
 /// one extension named after it (`python` -> `.python-src`), deliberately
@@ -45,7 +45,7 @@ fn registry_over_inner(
         .collect();
 
     let discovered = discover(&[plugins.path().to_path_buf()]).expect("the fixtures must discover cleanly");
-    let state_dir = crate::storage::connection::project_dir(project.path())
+    let state_dir = crate::paths::state_dir::project_dir(project.path())
         .expect("failed to resolve the fixture project's state directory");
     std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
     let registry = PluginRegistry::new(
@@ -298,7 +298,7 @@ fn routing_resolves_an_extension_to_its_language_and_ignores_case() {
 
 /// [`PluginRegistry::entry_points`]'s own test: built directly from
 /// `PluginManifest` literals rather than [`registry_over`]'s fixture
-/// plugins - `daemon::test_plugin`'s stub manifests never set
+/// plugins - `test_plugin`'s stub manifests never set
 /// `[plugin.workspace] entry_points`, and this method's whole job is to
 /// surface exactly that field. Proves the union-of-discovered-manifests
 /// plumbing GM-273 wires `mcp::get_dependencies` through (see
@@ -306,7 +306,7 @@ fn routing_resolves_an_extension_to_its_language_and_ignores_case() {
 /// end of it), at the layer that actually owns discovery's results.
 #[test]
 fn entry_points_unions_every_discovered_manifests_own_list_deduplicated() {
-    use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
+    use crate::plugin_manifest::{Capabilities, PluginManifest, WorkspaceConfig};
 
     let manifest = |language: &str, entry_points: &[&str]| PluginManifest {
         language: language.to_string(),
@@ -335,7 +335,7 @@ fn entry_points_unions_every_discovered_manifests_own_list_deduplicated() {
     discovered.manifests.insert("rust".to_string(), manifest("rust", &["mod.rs", "main.rs", "lib.rs"]));
 
     let project = tempfile::tempdir().expect("failed to create a project root");
-    let state_dir = crate::storage::connection::project_dir(project.path())
+    let state_dir = crate::paths::state_dir::project_dir(project.path())
         .expect("failed to resolve the fixture project's state directory");
     fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
     let registry = PluginRegistry::new(
@@ -825,7 +825,7 @@ fn registry_over_workspace(
     );
 
     let discovered = discover(&[plugins.path().to_path_buf()]).expect("the fixture must discover cleanly");
-    let state_dir = crate::storage::connection::project_dir(project.path())
+    let state_dir = crate::paths::state_dir::project_dir(project.path())
         .expect("failed to resolve the fixture project's state directory");
     std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
     let registry = PluginRegistry::new(
@@ -1000,7 +1000,7 @@ fn watch_languages_returns_every_language_that_declared_the_path() {
         test_plugin::install_with_workspace(plugins.path(), language, &[extension.as_str()], &[], &[]);
     }
     let discovered = discover(&[plugins.path().to_path_buf()]).unwrap();
-    let state_dir = crate::storage::connection::project_dir(project.path()).unwrap();
+    let state_dir = crate::paths::state_dir::project_dir(project.path()).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
     let registry = PluginRegistry::new(
         project.path(),
@@ -1220,7 +1220,7 @@ fn registry_claiming(
         test_plugin::install_with_workspace(root.path(), language, extensions, &[], exclude_dirs);
     }
     let discovered = discover(&[root.path().to_path_buf()]).expect("the fixtures must discover cleanly");
-    let state_dir = crate::storage::connection::project_dir(project.path())
+    let state_dir = crate::paths::state_dir::project_dir(project.path())
         .expect("failed to resolve the fixture project's state directory");
     let registry = PluginRegistry::new(
         project.path(),
@@ -1533,7 +1533,7 @@ fn canonical_alpha_registry(
         test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &[], exclude_dirs);
     let discovered = discover(&[plugins.path().to_path_buf()]).expect("the fixtures must discover cleanly");
     let root = project.path().canonicalize().unwrap();
-    let state_dir = crate::storage::connection::project_dir(&root).unwrap();
+    let state_dir = crate::paths::state_dir::project_dir(&root).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
     let registry = PluginRegistry::new(
         &root,

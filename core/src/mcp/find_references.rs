@@ -3,28 +3,25 @@
 //! `graph::pagination::paginate_edges`; this module is just the "anchor
 //! lookup -> incoming usage edges -> usage-site JSON" wiring around it.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use anyhow::Context;
-use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::manifest::{Capabilities, MemberOverrides};
-use crate::daemon::registry::PathCoverage;
-use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, Direction};
+use crate::graph::pagination;
 use crate::graph::queries;
-use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
+use crate::graph::Direction;
+use crate::mcp::response_bound;
+use crate::model::NodeRecord;
+use crate::plugin_manifest::MemberOverrides;
 
+use super::answer::EdgeAnswer;
+use super::context::QueryCtx;
 use super::not_indexed::{self, NotIndexed};
 use super::overrides::{self, OverriddenMember, Overrides};
-use super::query_shapes::QueryShapes;
+use super::query::ToolAnswer;
 use super::session_hints::{self, HintKey, SessionHints};
-use super::tool_result::{internal_error, success};
+use super::tool_result::internal_error;
 use super::unlinked::{self, UnlinkedUsages};
 use super::untyped::{self, UntypedReceiverCalls};
 use super::{anchor, answer, find_definition, provenance, SymbolQueryParams};
@@ -83,23 +80,23 @@ struct ReferenceSite {
 /// them agree on an item type.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ReferencePage<'a> {
+pub(crate) struct ReferencePage {
     /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
     /// so a caller asking about usages "elsewhere" doesn't need a separate
     /// `find_definition` call just to learn the anchor's own file/line.
-    anchor: &'a anchor::AnchorInfo,
-    results: &'a [ReferenceSite],
+    anchor: anchor::AnchorInfo,
+    results: Vec<ReferenceSite>,
     /// Every file holding a reference to the anchor, with a per-file count,
     /// computed over the whole edge set rather than this page - see
     /// `pagination::tally_edge_files`. Present only when it says something
-    /// `results` doesn't already say (`pagination::tally_is_worth_sending`):
+    /// `results` doesn't already say (`response_bound::tally_is_worth_sending`):
     /// the page is incomplete, or its rows repeat files. Omitted entirely -
     /// not sent as an empty array - otherwise, so an exact narrow lookup's
     /// response is byte-for-byte what it was before this field existed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    files: Option<&'a [pagination::FileTally]>,
+    files: Option<Vec<pagination::FileTally>>,
     /// Present only when `files` leaves files out, cut by its entry or byte
-    /// cap (`pagination::tally_edge_files_bounded`); absent, not `false`,
+    /// cap (`response_bound::tally_edge_files_bounded`); absent, not `false`,
     /// otherwise.
     #[serde(skip_serializing_if = "answer::is_false")]
     files_truncated: bool,
@@ -108,7 +105,7 @@ struct ReferencePage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<usize>,
     has_more: bool,
-    next_cursor: Option<&'a str>,
+    next_cursor: Option<String>,
     /// See `Page::all_unresolved` - true when every reference in `results`
     /// came from an edge the linker couldn't confirm.
     all_unresolved: bool,
@@ -119,17 +116,17 @@ struct ReferencePage<'a> {
     /// See [`UnlinkedUsages`] - usages that may target the anchor but that
     /// the linker left on a placeholder. Absent when there is no candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
-    unlinked_usages: Option<&'a UnlinkedUsages>,
+    unlinked_usages: Option<UnlinkedUsages>,
     /// See [`UntypedReceiverCalls`] - functions calling a method of the
     /// anchor's name through a receiver whose type was not inferred, with no
     /// edge to the anchor yet. Absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
+    untyped_receiver_calls: Option<UntypedReceiverCalls>,
     /// See [`Overrides`] - the base members the anchor overrides or
     /// implements, whose pages hold the uses made through a base-typed
     /// receiver. Absent (not `[]`) when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    overrides: Option<&'a [OverriddenMember]>,
+    overrides: Option<Vec<OverriddenMember>>,
     /// Present only when `overrides` was cut to its row cap.
     #[serde(skip_serializing_if = "answer::is_false")]
     overrides_truncated: bool,
@@ -143,33 +140,36 @@ struct ReferencePage<'a> {
     /// See `super::not_indexed::group` - the `file_paths` entries in a
     /// language with no indexed files (plugin absent or failed), one entry
     /// per language. Absent when the filter is omitted or fully covered.
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    not_indexed: &'a [NotIndexed],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    not_indexed: Vec<NotIndexed>,
 }
 
 /// The response-level disclosures of [`ReferencePage`], carried unchanged by
 /// the non-row answers (`answer::Summary`).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ReferenceDisclosures<'a> {
+pub(crate) struct ReferenceDisclosures {
     #[serde(skip_serializing_if = "Option::is_none")]
-    unlinked_usages: Option<&'a UnlinkedUsages>,
+    unlinked_usages: Option<UnlinkedUsages>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
+    untyped_receiver_calls: Option<UntypedReceiverCalls>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    overrides: Option<&'a [OverriddenMember]>,
+    overrides: Option<Vec<OverriddenMember>>,
     #[serde(skip_serializing_if = "answer::is_false")]
     overrides_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    not_indexed: &'a [NotIndexed],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    not_indexed: Vec<NotIndexed>,
 }
+
+/// What `find_references` answers: rows, or a `files`/`count` summary.
+pub(crate) type ReferencesAnswer = EdgeAnswer<ReferencePage, ReferenceDisclosures>;
 
 /// Paginates the incoming `USAGE_EDGE_KINDS` edges for `anchor_id` and
 /// resolves each one to its referencing node, cut so that the response
 /// `response_len` measures for a candidate page fits
-/// `pagination::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
+/// `response_bound::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
 /// drive it with a small `page_size` without needing a page-size field on
 /// the public tool parameters.
 fn list_references(
@@ -217,20 +217,7 @@ fn list_references(
         });
     }
 
-    Ok(pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
-}
-
-pub(crate) fn handle(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
-    find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_in(store, semantic, capabilities, hints, params.clone())
-    })
+    Ok(response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
 }
 
 /// Everything a reference page carries besides its rows, fetched once so that
@@ -253,13 +240,13 @@ struct ReferenceParts<'a> {
 impl ReferenceParts<'_> {
     /// The response for `page`. `send` spends once-per-session hints; without
     /// it they are only peeked, for measuring.
-    fn response<'p>(
-        &'p self,
-        page: &'p pagination::Page<ReferenceSite>,
+    fn response(
+        &self,
+        page: &pagination::Page<ReferenceSite>,
         total: Option<usize>,
         send: bool,
-    ) -> ReferencePage<'p> {
-        let files = pagination::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
+    ) -> ReferencePage {
+        let files = response_bound::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
             .then_some(self.tally.as_slice());
 
         // Every file this response names: rows, the tally, the unlinked and
@@ -295,52 +282,40 @@ impl ReferenceParts<'_> {
         ]);
 
         ReferencePage {
-            anchor: &self.anchor_info,
-            results: &page.results,
-            files,
+            anchor: self.anchor_info.clone(),
+            results: page.results.clone(),
+            files: files.map(<[_]>::to_vec),
             files_truncated: files.is_some() && self.tally_truncated,
             total,
             has_more: page.has_more,
-            next_cursor: page.next_cursor.as_deref(),
+            next_cursor: page.next_cursor.clone(),
             all_unresolved: page.all_unresolved,
             hint,
-            unlinked_usages: self.unlinked.as_ref(),
-            untyped_receiver_calls: self.untyped.as_ref(),
-            overrides: self.overrides.as_ref().map(|found| found.members.as_slice()),
+            unlinked_usages: self.unlinked.clone(),
+            untyped_receiver_calls: self.untyped.clone(),
+            overrides: self.overrides.as_ref().map(|found| found.members.clone()),
             overrides_truncated: self.overrides.as_ref().is_some_and(|found| found.truncated),
             provenance,
-            not_indexed: self.not_indexed,
+            not_indexed: self.not_indexed.to_vec(),
         }
     }
 }
 
-/// One pass of [`handle`] - see [`find_definition::SemanticRung`].
-pub(crate) fn handle_in(
-    store: &Arc<IndexStore>,
+/// One pass of `find_references` - see [`find_definition::SemanticRung`];
+/// [`QueryCtx::resolve_lazily`] runs both. `ctx.uncovered` (the `file_paths`
+/// entries whose language is not indexed) is named in `notIndexed`
+/// (`not_indexed::group`).
+pub(crate) fn handle(
+    ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
     params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
-    handle_in_covered(store, semantic, capabilities, hints, &[], params)
-}
-
-/// [`handle_in`], with `uncovered` the `file_paths` entries whose language
-/// is not indexed (`GMeshMcpServer::filter_coverage`): the answer names them
-/// in `notIndexed` (`not_indexed::group`).
-pub(crate) fn handle_in_covered(
-    store: &Arc<IndexStore>,
-    semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    uncovered: &[(String, PathCoverage)],
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<ReferencesAnswer>, ErrorData> {
+    let QueryCtx { store, capabilities, hints, uncovered, .. } = ctx;
     let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, semantic, &params)? {
         Ok(resolved) => resolved,
-        Err(finished) => return Ok(finished),
+        Err(finished) => return Ok(finished.widen()),
     };
     // Destructured here so everything below still reads the node directly,
     // while `resolved.by` stays available for the response's `resolvedBy`.
@@ -371,7 +346,7 @@ pub(crate) fn handle_in_covered(
     )
     .map_err(|e| internal_error("failed to count references", e))?;
     if let Some(counted) = counted {
-        return answer::respond(&anchor_info, &counted, |files, send| {
+        return Ok(ToolAnswer::Page(answer::respond(&anchor_info, &counted, |files, send| {
             let touched = files
                 .into_iter()
                 .flatten()
@@ -386,18 +361,18 @@ pub(crate) fn handle_in_covered(
                 hints.offer(send, overrides.is_some(), HintKey::Overrides, session_hints::OVERRIDES),
             ]);
             let disclosures = ReferenceDisclosures {
-                unlinked_usages: unlinked.as_ref(),
-                untyped_receiver_calls: untyped.as_ref(),
-                overrides: overrides.as_ref().map(|found| found.members.as_slice()),
+                unlinked_usages: unlinked.clone(),
+                untyped_receiver_calls: untyped.clone(),
+                overrides: overrides.as_ref().map(|found| found.members.clone()),
                 overrides_truncated: overrides.as_ref().is_some_and(|found| found.truncated),
                 provenance,
-                not_indexed: &not_indexed,
+                not_indexed: not_indexed.clone(),
             };
             (hint, disclosures)
-        });
+        })));
     }
 
-    let (tally, tally_truncated) = pagination::tally_edge_files_bounded(
+    let (tally, tally_truncated) = response_bound::tally_edge_files_bounded(
         &conn,
         &anchor.id,
         Direction::Incoming,
@@ -428,9 +403,9 @@ pub(crate) fn handle_in_covered(
         page_size,
         params.cursor.as_deref(),
         |candidate| {
-            pagination::wire_len(&parts.response(
+            response_bound::wire_len(&parts.response(
                 candidate,
-                pagination::widest_total(candidate.has_more),
+                response_bound::widest_total(candidate.has_more),
                 false,
             ))
         },
@@ -444,15 +419,21 @@ pub(crate) fn handle_in_covered(
         .transpose()
         .map_err(|e| internal_error("failed to count references", e))?;
 
-    success(&parts.response(&page, total, true))
+    Ok(ToolAnswer::Page(EdgeAnswer::Rows(parts.response(&page, total, true))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::queries::{upsert_edge, upsert_node};
+    use crate::mcp::query::test_support::Rendered;
+    use crate::mcp::PathCoverage;
+    use crate::model::{EdgeRecord, NodeRecord};
+    use crate::plugin_manifest::Capabilities;
+    use crate::storage::index_store::IndexStore;
     use crate::storage::schema;
-    use crate::storage::write::{EdgeRecord, NodeRecord};
+    use crate::storage::write::{upsert_edge, upsert_node};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// The capability map every test in this module passes: empty, so
     /// `provenance::resolve` reads "no plugin here declares a semantic
@@ -471,7 +452,8 @@ mod tests {
         conn
     }
 
-    fn json_body(result: &CallToolResult) -> serde_json::Value {
+    fn json_body(result: &impl Rendered) -> serde_json::Value {
+        let result = &result.rendered();
         assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -479,7 +461,8 @@ mod tests {
         }
     }
 
-    fn error_text(result: &CallToolResult) -> String {
+    fn error_text(result: &impl Rendered) -> String {
+        let result = &result.rendered();
         assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
         match &result.content[0] {
             rmcp::model::ContentBlock::Text(text) => text.text.clone(),
@@ -507,14 +490,11 @@ mod tests {
         .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 2, "{body}");
@@ -626,15 +606,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let callers = json_body(
-            &super::super::find_callers_callees::handle_callers(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    super::super::find_callers_callees::handle_callers,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let mut caller_ids: Vec<&str> = callers["results"]
             .as_array()
@@ -650,15 +627,12 @@ mod tests {
         );
 
         let references = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let mut reference_ids: Vec<&str> = references["results"]
             .as_array()
@@ -698,19 +672,16 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams {
-                    symbol_id: Some("target".to_string()),
-                    limit: Some(1),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams {
+                        symbol_id: Some("target".to_string()),
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 1, "precondition: limit 1 shows a single row");
         assert_eq!(body["hasMore"], true, "precondition: four more references are behind the cursor");
@@ -749,15 +720,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert_eq!(body["hasMore"], false, "precondition: the page is complete");
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
@@ -790,15 +758,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         assert_eq!(body["hasMore"], false);
         let files =
@@ -831,19 +796,16 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams {
-                    symbol_id: Some("target".to_string()),
-                    file_paths: Some(vec!["a.ts".to_string()]),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams {
+                        symbol_id: Some("target".to_string()),
+                        file_paths: Some(vec!["a.ts".to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
         );
         let files =
             body["files"].as_array().expect("two in-scope rows in one file still leave deduplication to do");
@@ -910,15 +872,12 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
@@ -1065,15 +1024,9 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 25, "all 25 must come back in one page");
         assert_eq!(body["hasMore"], false);
@@ -1144,15 +1097,9 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
         let mut file_paths: Vec<&str> =
             body["results"].as_array().unwrap().iter().map(|r| r["filePath"].as_str().unwrap()).collect();
@@ -1194,15 +1141,9 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 1, "the out-of-scope file's reference must not come back");
@@ -1234,30 +1175,24 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let omitted = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let explicit_empty = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams {
-                    symbol_id: Some("target".to_string()),
-                    file_paths: Some(Vec::new()),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams {
+                        symbol_id: Some("target".to_string()),
+                        file_paths: Some(Vec::new()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
         );
         assert_eq!(
             omitted, explicit_empty,
@@ -1273,14 +1208,11 @@ mod tests {
             .unwrap();
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         let body = json_body(&result);
         assert_eq!(body["results"].as_array().unwrap().len(), 0);
@@ -1315,14 +1247,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle, params)
             .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 2);
@@ -1361,14 +1290,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle, params)
             .unwrap(),
         );
         assert_eq!(body["results"].as_array().unwrap().len(), 3);
@@ -1397,14 +1323,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle, params)
             .unwrap(),
         );
         assert_eq!(body["anchor"]["id"], "target");
@@ -1432,26 +1355,20 @@ mod tests {
         let conn = Arc::new(IndexStore::new(conn));
 
         let by_id = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         let by_name = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(
+                    handle,
+                    SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
+                )
+                .unwrap(),
         );
         // Everything but `resolvedBy` must match: the walk, the results and the
         // anchor are properties of the node, however the caller addressed it.
@@ -1476,14 +1393,11 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_name: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -1493,14 +1407,11 @@ mod tests {
         let conn = setup();
         let params =
             SymbolQueryParams { symbol_id: Some("does_not_exist".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         assert!(error_text(&result).contains("does_not_exist"));
     }
@@ -1532,15 +1443,9 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("file".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
 
         let hint = body["hint"].as_str().expect("a File-anchored call must carry a hint");
@@ -1565,14 +1470,11 @@ mod tests {
 
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                &Arc::new(IndexStore::new(conn)),
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+            }
+            .resolve_lazily(handle, params)
             .unwrap(),
         );
         assert!(
@@ -1617,15 +1519,9 @@ mod tests {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let result = handle(
-                &conn,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                &SessionHints::default(),
-                params,
-            )
-            .unwrap();
+            let result = QueryCtx { capabilities: no_capabilities(), ..QueryCtx::for_test(&conn) }
+                .resolve_lazily(handle, params)
+                .unwrap();
             let body = json_body(&result);
             let results = body["results"].as_array().unwrap().clone();
             seen.extend(results.iter().map(|r| r["referencingSymbolId"].as_str().unwrap().to_string()));
@@ -1662,15 +1558,9 @@ mod tests {
     fn hint_for(store: &Arc<IndexStore>, hints: &SessionHints) -> String {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(
-                store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                &no_capabilities(),
-                hints,
-                params,
-            )
-            .unwrap(),
+            &QueryCtx { capabilities: no_capabilities(), hints: hints.clone(), ..QueryCtx::for_test(store) }
+                .resolve_lazily(handle, params)
+                .unwrap(),
         );
         body["hint"].as_str().unwrap_or_default().to_string()
     }
@@ -1733,19 +1623,20 @@ mod tests {
         uncovered: &[(String, PathCoverage)],
         symbol_id: &str,
         answer: Option<Answer>,
-    ) -> CallToolResult {
+    ) -> ToolAnswer<ReferencesAnswer> {
         let params = SymbolQueryParams {
             symbol_id: Some(symbol_id.to_string()),
             file_paths: Some(vec!["a.rs".to_string(), "x.py".to_string()]),
             answer,
             ..Default::default()
         };
-        handle_in_covered(
-            store,
+        handle(
+            &QueryCtx {
+                capabilities: no_capabilities(),
+                uncovered: uncovered.to_vec(),
+                ..QueryCtx::for_test(store)
+            },
             &find_definition::SemanticRung::off(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            uncovered,
             params,
         )
         .unwrap()
@@ -1806,8 +1697,8 @@ mod tests {
     // `overrides` (GM-536): the same field and session hint as find_callers'
     // -----------------------------------------------------------------
 
-    use crate::daemon::manifest::MemberOverrides;
     use crate::mcp::find_callers_callees::handle_callers;
+    use crate::plugin_manifest::MemberOverrides;
     use crate::protocol::types::{PathSegment, QualifiedPath};
 
     /// A `kind` declaration at `segments` (joined by `sep`) in `file` and
@@ -1849,14 +1740,12 @@ mod tests {
         answer: Option<Answer>,
     ) -> serde_json::Value {
         json_body(
-            &handle(
-                store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                capabilities,
-                hints,
-                params_for(id, answer),
-            )
+            &QueryCtx {
+                capabilities: capabilities.clone(),
+                hints: hints.clone(),
+                ..QueryCtx::for_test(store)
+            }
+            .resolve_lazily(handle, params_for(id, answer))
             .unwrap(),
         )
     }
@@ -1868,14 +1757,12 @@ mod tests {
         id: &str,
     ) -> serde_json::Value {
         json_body(
-            &handle_callers(
-                store,
-                &EmbeddingPipeline::disabled(),
-                QueryShapes::shipped(),
-                capabilities,
-                hints,
-                params_for(id, None),
-            )
+            &QueryCtx {
+                capabilities: capabilities.clone(),
+                hints: hints.clone(),
+                ..QueryCtx::for_test(store)
+            }
+            .resolve_lazily(handle_callers, params_for(id, None))
             .unwrap(),
         )
     }
@@ -1944,7 +1831,7 @@ mod tests {
     /// The mode comes from the anchor language's capabilities: no entry for
     /// the language (or another language's `by_name`) is `none`, so the same
     /// override carries no field and no sentence. Control: pass
-    /// `MemberOverrides::ByName` to `overrides::probe` in `handle_in_covered`
+    /// `MemberOverrides::ByName` to `overrides::probe` in `handle`
     /// whatever the map says.
     #[test]
     fn the_anchor_languages_capability_gates_overrides_on_references() {
@@ -2066,14 +1953,11 @@ mod tests {
         upsert_edge(&mut conn, EdgeRecord::new("e", "user", "stub", "CALLS", "tree-sitter", true)).unwrap();
 
         let params = SymbolQueryParams { symbol_name: Some("GetName".to_string()), ..Default::default() };
-        let result = handle(
-            &Arc::new(IndexStore::new(conn)),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            &no_capabilities(),
-            &SessionHints::default(),
-            params,
-        )
+        let result = QueryCtx {
+            capabilities: no_capabilities(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap();
         let body = json_body(&result);
         let rows = body["results"].as_array().unwrap_or_else(|| panic!("{body}"));

@@ -125,8 +125,8 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::daemon::candidates::{self, relative_to_root, segments};
-use crate::mcp::front::{PROJECT_ARG, SELECT_PROJECT, SWITCH_PROJECT_META};
+use crate::project_detect::{self as candidates, relative_to_root, segments};
+use crate::protocol::front::{PROJECT_ARG, SELECT_PROJECT, SWITCH_PROJECT_META};
 use crate::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 
 /// One connection to a daemon, split into what the router needs of it.

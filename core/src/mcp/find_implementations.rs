@@ -18,28 +18,26 @@
 //! [`dispatch`] and [`from_root`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use anyhow::Context;
-use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::manifest::Capabilities;
-use crate::daemon::registry::PathCoverage;
-use crate::embedding::EmbeddingPipeline;
-use crate::graph::pagination::{self, Direction};
+use crate::graph::pagination;
 use crate::graph::queries;
 use crate::graph::resume_token::{self, ResumeState, VisitedNode};
 use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResult, TruncatedBy};
-use crate::storage::index_store::IndexStore;
-use crate::storage::write::NodeRecord;
+use crate::graph::Direction;
+use crate::mcp::response_bound;
+use crate::model::NodeRecord;
+use crate::plugin_manifest::Capabilities;
 
+use super::context::QueryCtx;
 use super::not_indexed::{self, NotIndexed};
-use super::query_shapes::QueryShapes;
+use super::query::{ToolAnswer, WirePage};
 use super::session_hints::{self, HintKey, SessionHints};
-use super::tool_result::{error, internal_error, success};
+use super::tool_result::internal_error;
 use super::{anchor, find_definition, provenance, FindImplementationsParams, SymbolQueryParams};
 
 /// The one edge kind both the single-hop and transitive walks follow -
@@ -78,14 +76,14 @@ struct ImplementationSite {
 /// them agree on an item type.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ImplementationPage<'a> {
+pub(crate) struct ImplementationPage {
     /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
     /// so a caller asking about usages "elsewhere" doesn't need a separate
     /// `find_definition` call just to learn the anchor's own file/line.
-    anchor: &'a anchor::AnchorInfo,
-    results: &'a [ImplementationSite],
+    anchor: anchor::AnchorInfo,
+    results: Vec<ImplementationSite>,
     has_more: bool,
-    next_cursor: Option<&'a str>,
+    next_cursor: Option<String>,
     /// See `Page::all_unresolved` - true when every implementor in `results`
     /// came from an edge the linker couldn't confirm.
     all_unresolved: bool,
@@ -104,14 +102,27 @@ struct ImplementationPage<'a> {
     /// See `super::not_indexed::group` - the `file_paths` entries in a
     /// language with no indexed files (plugin absent or failed), one entry
     /// per language. Absent when the filter is omitted or fully covered.
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    not_indexed: &'a [NotIndexed],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    not_indexed: Vec<NotIndexed>,
 }
+
+/// What `find_implementations` answers: the direct page, or the transitive
+/// walk. Serialized as the inner value alone.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum ImplementationAnswer {
+    Direct(ImplementationPage),
+    Transitive(TransitiveImplementationWalk),
+}
+
+impl WirePage for ImplementationAnswer {}
+
+impl WirePage for TransitiveImplementationWalk {}
 
 /// Paginates the incoming `SUPERTYPE_OF` edges for `anchor_id` and resolves
 /// each one to the implementing/extending node, cut so that the response
 /// `response_len` measures for a candidate page fits
-/// `pagination::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
+/// `response_bound::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
 /// drive it with a small `page_size` without needing a page-size field on
 /// the public tool parameters.
 fn list_implementations(
@@ -159,39 +170,23 @@ fn list_implementations(
         });
     }
 
-    Ok(pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
-}
-
-#[cfg(test)]
-pub(super) fn handle(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    capabilities: &HashMap<String, Capabilities>,
-    params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
-    let hints = SessionHints::default();
-    find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_in(store, semantic, capabilities, &hints, &[], params.clone())
-    })
+    Ok(response_bound::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
 }
 
 /// The single-hop walk, one pass - see [`find_definition::SemanticRung`].
-/// `uncovered`: the `file_paths` entries whose language is not indexed,
+/// `ctx.uncovered`: the `file_paths` entries whose language is not indexed,
 /// named in the answer's `notIndexed` (`not_indexed::group`).
-fn handle_in(
-    store: &Arc<IndexStore>,
+fn handle(
+    ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    uncovered: &[(String, PathCoverage)],
     params: SymbolQueryParams,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<ImplementationAnswer>, ErrorData> {
+    let QueryCtx { store, capabilities, hints, uncovered, .. } = ctx;
     let conn = store.read();
 
     let resolved = match anchor::resolve(&conn, semantic, &params)? {
         Ok(resolved) => resolved,
-        Err(finished) => return Ok(finished),
+        Err(finished) => return Ok(finished.widen()),
     };
     // Destructured here so everything below still reads the node directly,
     // while `resolved.by` stays available for the response's `resolvedBy`.
@@ -232,31 +227,31 @@ fn handle_in(
         params.cursor.as_deref(),
         |candidate| {
             let (hint, provenance) = disclosures(candidate, false);
-            pagination::wire_len(&ImplementationPage {
-                anchor: &anchor_info,
-                results: &candidate.results,
+            response_bound::wire_len(&ImplementationPage {
+                anchor: anchor_info.clone(),
+                results: candidate.results.clone(),
                 has_more: candidate.has_more,
-                next_cursor: candidate.next_cursor.as_deref(),
+                next_cursor: candidate.next_cursor.clone(),
                 all_unresolved: candidate.all_unresolved,
                 hint,
                 provenance,
-                not_indexed: &not_indexed,
+                not_indexed: not_indexed.clone(),
             })
         },
     )
     .map_err(|e| internal_error("failed to find implementations", e))?;
     let (hint, provenance) = disclosures(&page, true);
 
-    success(&ImplementationPage {
-        anchor: &anchor_info,
-        results: &page.results,
+    Ok(ToolAnswer::Page(ImplementationAnswer::Direct(ImplementationPage {
+        anchor: anchor_info,
+        results: page.results,
         has_more: page.has_more,
-        next_cursor: page.next_cursor.as_deref(),
+        next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
         hint,
         provenance,
-        not_indexed: &not_indexed,
-    })
+        not_indexed,
+    })))
 }
 
 /// One implementing/extending type reached by the transitive walk, at the
@@ -314,7 +309,7 @@ impl From<ReachedNode> for TransitiveImplementationSite {
 /// the anchor resolved to a `File` node (see `anchor::file_anchor_hint`).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TransitiveImplementationWalk {
+pub(crate) struct TransitiveImplementationWalk {
     /// See `anchor::AnchorInfo`. Present only on a fresh walk (`from_root`),
     /// absent (not `null`) on a resumed one - same "only when this call
     /// actually resolved an anchor" convention `hint` below already follows:
@@ -403,7 +398,8 @@ fn bound_walk(
         }
     }
 
-    let Some(cut) = pagination::longest_prefix_fitting(&dtos, pagination::MAX_RESPONSE_BYTES - reserve)
+    let Some(cut) =
+        response_bound::longest_prefix_fitting(&dtos, response_bound::MAX_RESPONSE_BYTES - reserve)
     else {
         let truncated_by = result.truncated_by.map(wire_name);
         return TransitiveImplementationWalk {
@@ -476,7 +472,7 @@ fn from_root(
     max_depth: Option<u32>,
     capabilities: &HashMap<String, Capabilities>,
     hints: &SessionHints,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<TransitiveImplementationWalk, ErrorData> {
     // Carries the rung for the same reason the single-hop path does: a caller
     // must be able to tell an exact resolution from one the ladder suggested,
     // and `transitive: true` is the same query with a deeper walk, not a
@@ -502,7 +498,7 @@ fn from_root(
         walk.hint,
         hints.once(walk.provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
     );
-    success(&walk)
+    Ok(walk)
 }
 
 /// Continues a transitive walk the exploration budget or a prior
@@ -525,7 +521,7 @@ fn continued(
     token: &str,
     capabilities: &HashMap<String, Capabilities>,
     hints: &SessionHints,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<TransitiveImplementationWalk, ErrorData> {
     let state =
         resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
     let ResumeState { max_depth, max_fanout, visited: prior_visited, walked: prior_walked, .. } = state;
@@ -556,53 +552,23 @@ fn continued(
         walk.hint,
         hints.once(walk.provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
     );
-    success(&walk)
+    Ok(walk)
 }
 
-/// The tool's entry point, both passes of it ([`dispatch_in`] is one).
+/// The tool's entry point, one pass of it - see
+/// [`find_definition::SemanticRung`]; [`QueryCtx::resolve_lazily`] runs both.
 /// Dispatches on `transitive`/`resume_token` and otherwise defers entirely to
-/// the unmodified single-hop [`handle_in`]: the non-transitive path here is
-/// not a reimplementation of that logic, it
-/// *is* that logic, called with a plain [`SymbolQueryParams`] built from this
-/// struct's shared fields - which is what makes the single-hop response
-/// byte-identical to what it was before this file gained a `transitive`
-/// concept, by construction rather than by parallel maintenance.
+/// the single-hop [`handle`], called with a plain [`SymbolQueryParams`] built
+/// from this struct's shared fields, so the single-hop response is the same
+/// with or without `transitive: false`. Only the direct walk names
+/// `ctx.uncovered` (`notIndexed`): the transitive walk and a resumed one
+/// ignore `file_paths`, so they ignore `uncovered` too.
 pub(crate) fn dispatch(
-    store: &Arc<IndexStore>,
-    embedding: &EmbeddingPipeline,
-    shapes: &QueryShapes,
-    capabilities: &HashMap<String, Capabilities>,
-    params: FindImplementationsParams,
-) -> Result<CallToolResult, ErrorData> {
-    let hints = SessionHints::default();
-    find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        dispatch_in(store, semantic, capabilities, &hints, params.clone())
-    })
-}
-
-/// One pass of [`dispatch`] - see [`find_definition::SemanticRung`].
-pub(crate) fn dispatch_in(
-    store: &Arc<IndexStore>,
+    ctx: &QueryCtx,
     semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
     params: FindImplementationsParams,
-) -> Result<CallToolResult, ErrorData> {
-    dispatch_in_covered(store, semantic, capabilities, hints, &[], params)
-}
-
-/// [`dispatch_in`], with `uncovered` the `file_paths` entries whose language
-/// is not indexed (`GMeshMcpServer::filter_coverage`). Only the direct walk
-/// names them (`notIndexed`): the transitive walk and a resumed one ignore
-/// `file_paths`, so they ignore `uncovered` too.
-pub(crate) fn dispatch_in_covered(
-    store: &Arc<IndexStore>,
-    semantic: &find_definition::SemanticRung<'_>,
-    capabilities: &HashMap<String, Capabilities>,
-    hints: &SessionHints,
-    uncovered: &[(String, PathCoverage)],
-    params: FindImplementationsParams,
-) -> Result<CallToolResult, ErrorData> {
+) -> Result<ToolAnswer<ImplementationAnswer>, ErrorData> {
+    let QueryCtx { store, capabilities, hints, .. } = ctx;
     let FindImplementationsParams {
         symbol_id,
         symbol_name,
@@ -620,29 +586,33 @@ pub(crate) fn dispatch_in_covered(
         // it continues - same rule `get_dependencies.rs` applies to
         // `resume_token` alongside `file_path`/`module_id`.
         if symbol_id.is_some() || symbol_name.is_some() || transitive.is_some() {
-            return error(
+            return Ok(ToolAnswer::refused(
                 "g-mesh: `resume_token` already carries the walk it continues - call it without `symbol_id`/`symbol_name`/`transitive`",
-            );
+            ));
         }
         let conn = store.read();
-        return continued(&conn, &token, capabilities, hints);
+        return continued(&conn, &token, capabilities, hints).map(transitive_page);
     }
 
     let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: None };
 
     if !transitive.unwrap_or(false) {
-        return handle_in(store, semantic, capabilities, hints, uncovered, symbol_params);
+        return handle(ctx, semantic, symbol_params);
     }
 
     let conn = store.read();
     let resolved = match anchor::resolve(&conn, semantic, &symbol_params)? {
         Ok(resolved) => resolved,
-        Err(finished) => return Ok(finished),
+        Err(finished) => return Ok(finished.widen()),
     };
     let resolved_by = resolved.by;
     let queried_as = resolved.queried_as;
     let anchor = resolved.node;
-    from_root(&conn, &anchor, resolved_by, queried_as, max_depth, capabilities, hints)
+    from_root(&conn, &anchor, resolved_by, queried_as, max_depth, capabilities, hints).map(transitive_page)
+}
+
+fn transitive_page(walk: TransitiveImplementationWalk) -> ToolAnswer<ImplementationAnswer> {
+    ToolAnswer::Page(ImplementationAnswer::Transitive(walk))
 }
 
 #[cfg(test)]

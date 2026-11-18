@@ -14,13 +14,13 @@
 //!   now gets the absent refusal for a file it had an outline for.
 //!
 //! The control for the whole file: in `GMeshMcpServer::get_file_outline`,
-//! pass `None` instead of `coverage` to `get_file_outline::handle_covered` -
+//! build the call's `QueryCtx` with `coverage: None` -
 //! every outline refusal is the plain `no file '...' found` text and the
 //! JSON parse fails. Each test names its own narrower control too.
 
 use std::path::{Path, PathBuf};
 
-use g_mesh::daemon;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
@@ -51,13 +51,19 @@ fn write_files(root: &Path, files: &[(&str, &str)]) {
 /// Kills whatever daemon and plugins serve `dir` and removes its state.
 fn clean_up(dir: &Path) {
     let Ok(state) = project_dir(dir) else { return };
-    for path in [daemon::pid_path(dir), daemon::plugin_pid_path(dir)].into_iter().flatten() {
+    for path in [
+        StateDir::of(dir).map(|sd| sd.pid_file()),
+        StateDir::of(dir).map(|sd| sd.plugin_pid_file(g_mesh::daemon::plugin::BUNDLED_LANGUAGE)),
+    ]
+    .into_iter()
+    .flatten()
+    {
         common::kill_pid_file(&path);
     }
-    for (_, plugin_pid) in daemon::registry::discovered_pid_files(&state) {
+    for (_, plugin_pid) in StateDir::at(&state).plugin_pid_files() {
         common::kill_pid_file(&plugin_pid);
     }
-    if let Ok(endpoint) = daemon::endpoint(dir) {
+    if let Ok(endpoint) = StateDir::of(dir).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
         endpoint.clear_stale();
     }
     let _ = std::fs::remove_dir_all(state);
@@ -312,7 +318,7 @@ async fn select(client: &RunningService<RoleClient, ()>, project: &str) {
 /// No order between processes is asserted beyond the test's own sequential
 /// calls and the stop it waits for.
 ///
-/// Control: pass `None` to `get_file_outline::handle_covered` in
+/// Control: build the `QueryCtx` with `coverage: None` in
 /// `GMeshMcpServer::get_file_outline` - the last outline is the plain
 /// no-file text and the JSON parse fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -345,7 +351,7 @@ async fn the_field_appears_after_a_plugin_is_removed_mid_session() {
         String::from_utf8_lossy(&output.stderr)
     );
     common::wait_for("a's daemon to stop", common::startup_timeout(), || {
-        !daemon::is_listening(&a).unwrap_or(true)
+        !StateDir::of(&a).and_then(|sd| g_mesh::control::lock::is_listening(&sd)).unwrap_or(true)
     });
 
     // Two distinct selections contest the connection (D3 of GM-571), so the

@@ -21,22 +21,23 @@
 //! store read here is the failed language's recorded error, and only on the
 //! refusal path.
 
-use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::registry::PathCoverage;
-use crate::languages::{CatalogueEntry, LanguageOutcome};
+use crate::languages::CatalogueEntry;
+use crate::mcp::PathCoverage;
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{self, MAX_LANGUAGE_RETRIES};
 
 use super::instructions::error_cause;
+use super::query;
 use super::tool_result::internal_error;
 
 /// Why nothing of a language is in the index.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(super) enum NotIndexedReason {
+pub(crate) enum NotIndexedReason {
     /// No plugin for the language is installed.
     PluginAbsent,
     /// Its plugin is installed but failed the last walk (ADR 0021).
@@ -47,7 +48,7 @@ pub(super) enum NotIndexedReason {
 /// optional fields are omitted when empty.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct NotIndexed {
+pub(crate) struct NotIndexed {
     pub language: String,
     pub reason: NotIndexedReason,
     /// The command that fixes it: `g-mesh plugins install <lang>` when
@@ -79,7 +80,7 @@ impl NotIndexed {
         }
     }
 
-    /// `error` is the stored error chain (`languages::failed_error`), or
+    /// `error` is the stored error chain (`storage::language_outcome::failed_error`), or
     /// `None` when no outcome was recorded for the language.
     pub(super) fn failed(language: &str, error: Option<&str>) -> Self {
         Self {
@@ -183,19 +184,18 @@ pub(super) fn group(
 /// The JSON body of a refusal: `{"error": <message + sentence>, "notIndexed": {...}}`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Refusal<'a> {
-    error: String,
-    not_indexed: &'a NotIndexed,
+pub(crate) struct Refusal<'a> {
+    pub(crate) error: &'a str,
+    pub(crate) not_indexed: &'a NotIndexed,
 }
 
 /// A tool error (`isError: true`) for a path-anchored miss on a path in an
 /// uncovered language. `message` is the tool's own miss message (`g-mesh: no
-/// file 'x.py' found in the index`); the one content block is the JSON text
-/// of [`Refusal`], so a reader of the text sees the reason and a client can
-/// parse the `notIndexed` value.
-pub(super) fn refusal(message: &str, not_indexed: &NotIndexed) -> Result<CallToolResult, ErrorData> {
-    let body = Refusal { error: format!("{message}{}", not_indexed.sentence()), not_indexed };
-    Ok(CallToolResult::error(vec![ContentBlock::json(&body)?]))
+/// file 'x.py' found in the index`); rendered, the one content block is the
+/// JSON text of [`Refusal`], so a reader of the text sees the reason and a
+/// client can parse the `notIndexed` value.
+pub(super) fn refusal(message: &str, not_indexed: NotIndexed) -> query::Refusal {
+    query::Refusal::NotIndexed { error: format!("{message}{}", not_indexed.sentence()), not_indexed }
 }
 
 /// [`refusal`] for `coverage`, or the plain text error when the path's
@@ -205,11 +205,11 @@ pub(super) fn miss(
     conn: &Connection,
     coverage: Option<&PathCoverage>,
     message: String,
-) -> Result<CallToolResult, ErrorData> {
-    match coverage {
-        Some(coverage) => refusal(&message, &NotIndexed::from_coverage(conn, coverage)?),
-        None => super::tool_result::error(message),
-    }
+) -> Result<query::Refusal, ErrorData> {
+    Ok(match coverage {
+        Some(coverage) => refusal(&message, NotIndexed::from_coverage(conn, coverage)?),
+        None => query::Refusal::Text(message),
+    })
 }
 
 /// Fixtures the handler tests share: a coverage for each state, a recorded
@@ -218,17 +218,19 @@ pub(super) fn miss(
 pub(super) mod test_support {
     use std::collections::BTreeMap;
 
-    use rmcp::model::{CallToolResult, ContentBlock};
+    use rmcp::model::ContentBlock;
     use rusqlite::Connection;
 
-    use crate::daemon::registry::PathCoverage;
-    use crate::languages::{self, LanguageOutcome};
+    use crate::languages;
+    use crate::mcp::query::test_support::Rendered;
+    use crate::mcp::PathCoverage;
+    use crate::storage::language_outcome::LanguageOutcome;
     use crate::storage::schema;
 
     /// The innermost cause of [`FAILED_CHAIN`], as the field carries it.
     pub(in crate::mcp) const INNERMOST: &str = "No such file or directory (os error 2)";
 
-    /// A stored failed-outcome chain (`languages::failed_error`'s shape):
+    /// A stored failed-outcome chain (`storage::language_outcome::failed_error`'s shape):
     /// outermost first, one cause per line.
     pub(in crate::mcp) const FAILED_CHAIN: &str =
         "python plugin failed its bulk walk\nfailed to spawn g-mesh-plugin-python\nNo such file or directory (os error 2)";
@@ -251,7 +253,8 @@ pub(super) mod test_support {
     }
 
     /// The JSON body of a tool error that must be a refusal.
-    pub(in crate::mcp) fn refusal_body(result: &CallToolResult) -> serde_json::Value {
+    pub(in crate::mcp) fn refusal_body(result: &impl Rendered) -> serde_json::Value {
+        let result = &result.rendered();
         assert_eq!(result.is_error, Some(true), "expected a tool error: {:?}", result.content);
         assert_eq!(result.content.len(), 1, "a refusal is one content block: {:?}", result.content);
         match &result.content[0] {
@@ -262,7 +265,8 @@ pub(super) mod test_support {
     }
 
     /// The text of a tool error that must stay the plain message (no JSON).
-    pub(in crate::mcp) fn plain_error(result: &CallToolResult) -> String {
+    pub(in crate::mcp) fn plain_error(result: &impl Rendered) -> String {
+        let result = &result.rendered();
         assert_eq!(result.is_error, Some(true), "expected a tool error: {:?}", result.content);
         let text = match &result.content[0] {
             ContentBlock::Text(text) => text.text.clone(),

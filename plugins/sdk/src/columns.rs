@@ -7,8 +7,9 @@
 //! [`CharColumns`] is that conversion, computed against the file's own text,
 //! for any extractor that holds a `(row, byte column)` pair.
 //!
-//! It takes plain numbers rather than a parser's point type so that the SDK
-//! does not depend on a parser.
+//! The core takes plain numbers, so the SDK does not depend on a parser by
+//! default; the `tree-sitter` feature adds the adapters for tree-sitter's
+//! `Point` and `Node`.
 
 use g_mesh_wire::{Position, Range};
 
@@ -52,6 +53,18 @@ impl<'s> CharColumns<'s> {
     /// A range from two `(line, byte column)` pairs.
     pub fn range(&self, start: (usize, usize), end: (usize, usize)) -> Range {
         Range { start: self.at(start.0, start.1), end: self.at(end.0, end.1) }
+    }
+
+    /// One tree-sitter point, in the wire's units.
+    #[cfg(feature = "tree-sitter")]
+    pub fn point(&self, point: tree_sitter::Point) -> Position {
+        self.at(point.row, point.column)
+    }
+
+    /// A tree-sitter node's whole range.
+    #[cfg(feature = "tree-sitter")]
+    pub fn node_range(&self, node: tree_sitter::Node) -> Range {
+        Range { start: self.point(node.start_position()), end: self.point(node.end_position()) }
     }
 
     /// The whole file's range, ending where its content ends: trailing

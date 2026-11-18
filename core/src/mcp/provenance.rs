@@ -180,8 +180,8 @@ use std::collections::HashMap;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::manifest::Capabilities;
-use crate::graph::pagination;
+use crate::mcp::response_bound;
+use crate::plugin_manifest::Capabilities;
 use crate::storage::schema;
 
 use super::session_hints;
@@ -207,7 +207,7 @@ pub(super) const PENDING_FILES_MAX_BYTES: usize = 1_500;
 #[serde(rename_all = "camelCase")]
 pub(super) struct Provenance {
     /// The manifest's own `language` id (`"rust"`, `"python"`, ...), spelled
-    /// exactly as `nodes.language` and `daemon::manifest` spell it - the
+    /// exactly as `nodes.language` and `plugin_manifest` spell it - the
     /// same rule `mcp::instructions` follows and for the same reason: an
     /// agent cross-referencing the two must never meet two spellings of one
     /// language.
@@ -381,7 +381,7 @@ impl Resolved {
         }
         let found = pending.len();
         pending.truncate(MAX_PENDING_FILES);
-        pagination::truncate_to_bytes(&mut pending, PENDING_FILES_MAX_BYTES);
+        response_bound::truncate_to_bytes(&mut pending, PENDING_FILES_MAX_BYTES);
         let omitted = (found > pending.len()).then_some(found - pending.len());
         let mut provenance = Provenance::absent(language);
         match since {
@@ -403,7 +403,7 @@ impl Resolved {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::manifest::ReceiverCallResolution;
+    use crate::plugin_manifest::ReceiverCallResolution;
 
     /// A capability map naming one language with a declared semantic tier.
     fn with_semantic_tier(language: &str) -> HashMap<String, Capabilities> {
@@ -417,7 +417,7 @@ mod tests {
                 resolution_delta: false,
                 receiver_calls: ReceiverCallResolution::Resolved,
                 receiver_calls_structural: ReceiverCallResolution::Unresolved,
-                member_overrides: crate::daemon::manifest::MemberOverrides::None,
+                member_overrides: crate::plugin_manifest::MemberOverrides::None,
             },
         )])
     }

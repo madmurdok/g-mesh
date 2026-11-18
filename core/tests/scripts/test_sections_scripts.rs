@@ -6,7 +6,7 @@
 //! The checker runs for real on fixture `cargo nextest list` JSON, so no cargo
 //! work is paid for. The section script's argument handling runs with a
 //! stand-in `cargo` on `PATH` that records any call. One test runs `check` on
-//! the real tree; it lists the whole suite twelve times, so it is ignored here
+//! the real tree; it lists the whole suite thirteen times, so it is ignored here
 //! and CI runs the same `check` as its own step. Bash and python3 only, so Unix
 //! only, like `release_packaging_scripts.rs`.
 
@@ -17,7 +17,7 @@ use std::process::{Command, Output};
 
 use serde_json::{json, Map, Value};
 
-const SECTIONS: [&str; 12] = [
+const SECTIONS: [&str; 13] = [
     "core-it",
     "core-scripts",
     "core-mcp",
@@ -26,6 +26,7 @@ const SECTIONS: [&str; 12] = [
     "core-graph",
     "core-rest",
     "sdk",
+    "sdk-lsp",
     "plugin-typescript",
     "plugin-rust",
     "plugin-python",
@@ -237,7 +238,7 @@ fn sections_script(path_env: &str, args: &[&str]) -> Output {
 }
 
 #[test]
-fn list_prints_the_twelve_sections_in_run_order() {
+fn list_prints_the_thirteen_sections_in_run_order() {
     let dir = tempfile::tempdir().unwrap();
     let output = sections_script(&recording_cargo(dir.path()), &["list"]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
@@ -260,6 +261,20 @@ fn filter_prints_a_filterset_for_every_listed_section_and_refuses_an_unknown_one
     let stderr = String::from_utf8_lossy(&output.stderr);
     for name in SECTIONS {
         assert!(stderr.contains(name), "the refusal should name {name}\n{}", describe(&output));
+    }
+}
+
+/// `sdk` and `sdk-lsp` each hold exactly one package.
+#[test]
+fn the_sdk_and_sdk_lsp_sections_each_select_only_their_own_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+    for (name, expected) in
+        [("sdk", "package(g-mesh-plugin-sdk)"), ("sdk-lsp", "package(g-mesh-plugin-sdk-lsp)")]
+    {
+        let output = sections_script(&path_env, &["filter", name]);
+        assert_eq!(output.status.code(), Some(0), "{name}: {}", describe(&output));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected, "{name}");
     }
 }
 
@@ -430,50 +445,125 @@ fn core_scripts_is_the_scripts_binary_and_core_it_is_every_other_core_test_binar
     assert_eq!(filter_of("core-it"), "package(g-mesh) & kind(test) & !binary_id(g-mesh::scripts)");
 }
 
-/// A section nobody runs in CI drops its tests silently: each listed section
-/// has exactly one `tests: <section>` step, whose `if:` selects it by name.
-#[test]
-fn every_listed_section_has_exactly_one_ci_step_that_runs_it_when_selected() {
+/// `check-ci` on the workflow at `ci` (written as `ci.yml` in a scratch dir
+/// and passed by that relative path from it, when given), else on the
+/// repo's own.
+fn check_ci(ci: Option<&str>) -> Output {
     let dir = tempfile::tempdir().unwrap();
-    let listed = stdout_lines(&sections_script(&recording_cargo(dir.path()), &["list"]));
-    assert_eq!(listed.len(), SECTIONS.len(), "{listed:?}");
-    let ci = fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
-    let mut steps: Vec<Vec<&str>> = Vec::new();
-    for line in ci.lines() {
-        if line.trim_start().starts_with("- name:") {
-            steps.push(Vec::new());
-        }
-        if let Some(step) = steps.last_mut() {
-            step.push(line);
-        }
+    let mut command = Command::new("bash");
+    command.arg(repo_root().join("scripts/test-sections.sh")).arg("check-ci");
+    if let Some(ci) = ci {
+        fs::write(dir.path().join("ci.yml"), ci).unwrap();
+        command.arg("ci.yml");
     }
-    for name in &listed {
-        let run_line = format!("run: scripts/test-sections.sh run --profile ci {name}");
-        let running: Vec<&Vec<&str>> =
-            steps.iter().filter(|s| s.iter().any(|l| l.trim() == run_line)).collect();
-        assert_eq!(
-            running.len(),
-            1,
-            "section {name}: {} ci.yml steps run it, want exactly one",
-            running.len()
-        );
-        let step = running[0];
-        assert!(step[0].contains(&format!("\"tests: {name}\"")), "section {name}: step is `{}`", step[0]);
-        let condition = step.iter().find(|l| l.trim_start().starts_with("if:")).copied().unwrap_or("");
-        assert!(
-            condition.contains(&format!("' {name} '")),
-            "section {name}: its step's `if:` is `{condition}`"
-        );
+    command
+        .current_dir(dir.path())
+        .env("PATH", recording_cargo(dir.path()))
+        .output()
+        .expect("failed to run bash")
+}
+
+/// The repo's ci.yml with the one occurrence of `from` replaced by `to`.
+fn ci_yml_with(from: &str, to: &str) -> String {
+    let ci = fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    assert_eq!(ci.matches(from).count(), 1, "ci.yml should hold {from:?} once");
+    ci.replacen(from, to, 1)
+}
+
+/// Asserts `check-ci` refused `ci` (exit 1) naming `problem`.
+fn assert_check_ci_refuses(ci: &str, problem: &str) {
+    let output = check_ci(Some(ci));
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(problem),
+        "want {problem:?}\n{}",
+        describe(&output)
+    );
+}
+
+/// A section nobody runs in CI drops its tests silently: each listed section
+/// has exactly one `tests: <section>` step, whose `if:` selects it by name,
+/// and `check-ci` proves it of the real ci.yml (and of a copy, read through a
+/// path relative to the caller).
+#[test]
+fn check_ci_passes_on_the_real_ci_yml() {
+    let copy = fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    for ci in [None, Some(copy)] {
+        let output = check_ci(ci.as_deref());
+        assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("OK:"), "{}", describe(&output));
     }
 }
 
-/// A scratch checkout: the real `scripts/test-sections.sh` and `map`, when
-/// given, as `scripts/test-plugin-spawns.txt`.
+/// Control: compare `runs[list[i]] > 1` instead of `!= 1` in check-ci's `END`
+/// - a section without a step passes and this fails.
+#[test]
+fn check_ci_refuses_a_section_without_a_ci_step() {
+    let ci = ci_yml_with("        run: scripts/test-sections.sh run --profile ci core-mcp\n", "");
+    assert_check_ci_refuses(&ci, "section core-mcp: 0 ci.yml steps run it, want exactly one");
+}
+
+/// Control: drop the `for (s in runs) if (!(s in listed))` line - this fails.
+#[test]
+fn check_ci_refuses_a_step_running_a_section_it_does_not_list() {
+    let ci = ci_yml_with(
+        "        run: scripts/test-sections.sh run --profile ci wire\n",
+        "        run: scripts/test-sections.sh run --profile ci wire\n\n      - name: \"tests: wire2\"\n        if: ${{ contains(format(' {0} ', needs.select.outputs.sections), ' wire2 ') }}\n        run: scripts/test-sections.sh run --profile ci wire2\n",
+    );
+    assert_check_ci_refuses(&ci, "a ci.yml step runs wire2, which is not in SECTIONS");
+}
+
+/// Control: drop the step-name comparison in `flush()` - this fails.
+#[test]
+fn check_ci_refuses_a_step_named_for_another_section() {
+    let ci = ci_yml_with("- name: \"tests: core-cli\"\n", "- name: \"tests: core-kli\"\n");
+    assert_check_ci_refuses(
+        &ci,
+        "section core-cli: its step is named \"tests: core-kli\", want \"tests: core-cli\"",
+    );
+}
+
+/// Control: drop the `index(cond, ...)` comparison in `flush()` (check-ci
+/// ignores `if:`) - this fails.
+#[test]
+fn check_ci_refuses_a_step_whose_if_does_not_select_its_section() {
+    let ci = ci_yml_with("' core-graph ')", "' core-grph ')");
+    assert_check_ci_refuses(&ci, "section core-graph: the if: of its step does not select it by name");
+}
+
+/// `check` runs `check-ci` on the checkout's ci.yml first: a disagreement
+/// fails it before any cargo call.
+///
+/// Control: drop the `cmd_check_ci` line from `cmd_check` - check goes on to
+/// cargo and this fails.
+#[test]
+fn check_fails_before_listing_the_suite_when_ci_yml_disagrees() {
+    let root = sections_root(None);
+    let workflows = root.path().join(".github/workflows");
+    fs::create_dir_all(&workflows).unwrap();
+    fs::write(
+        workflows.join("ci.yml"),
+        ci_yml_with("- name: \"tests: wire\"\n", "- name: \"tests: wires\"\n"),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let output = sections_in(root.path(), &recording_cargo(dir.path()), &["check"]);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("section wire: its step is named"),
+        "{}",
+        describe(&output)
+    );
+    assert!(!dir.path().join("cargo-called").exists(), "cargo ran after a failed check-ci");
+}
+
+/// A scratch checkout: the real `scripts/test-sections.sh`, the
+/// `build-targets.sh` it reads the plugin list from, and `map`, when given, as
+/// `scripts/test-plugin-spawns.txt`.
 fn sections_root(map: Option<&str>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("scripts/test-sections.sh");
-    fs::create_dir_all(script.parent().unwrap()).unwrap();
-    for name in ["test-sections.sh", "prune-stale-objects.sh"] {
+    fs::create_dir_all(dir.path().join("scripts/lib")).unwrap();
+    for name in ["test-sections.sh", "prune-stale-objects.sh", "build-targets.sh", "lib/runnable.sh"] {
         fs::copy(repo_root().join("scripts").join(name), dir.path().join("scripts").join(name)).unwrap();
     }
     if let Some(map) = map {
@@ -572,13 +662,68 @@ fn core_spawns_selectors_are_runnable_but_not_listed_sections() {
     );
 }
 
+/// The plugin list of build-targets.sh as it stands in `PLUGINS=( ... )`.
+const PLUGIN_LIST: &str = "PLUGINS=(\n\ttypescript:cargo\n\tgo:go\n\trust:cargo\n\tpython:cargo\n)\n";
+
+/// `sections_root(Some(map))` whose build-targets.sh lists `plugin_list`.
+fn sections_root_with_plugins(map: &str, plugin_list: &str) -> tempfile::TempDir {
+    let root = sections_root(Some(map));
+    let build_targets = root.path().join("scripts/build-targets.sh");
+    let text = fs::read_to_string(&build_targets).unwrap();
+    assert_eq!(text.matches(PLUGIN_LIST).count(), 1, "build-targets.sh no longer holds {PLUGIN_LIST:?}");
+    fs::write(&build_targets, text.replace(PLUGIN_LIST, plugin_list)).unwrap();
+    root
+}
+
+/// `core-spawns-<plugin>` takes exactly the languages of
+/// `build-targets.sh --plugins`: each of them, a plugin added to that list,
+/// and no other name.
+///
+/// Control: restore the literal `core-spawns-typescript | core-spawns-rust |
+/// core-spawns-python | core-spawns-go)` case - `core-spawns-foo` is refused
+/// and this fails.
+#[test]
+fn core_spawns_selectors_take_the_plugins_of_build_targets_and_no_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+    let plugins = String::from_utf8(
+        Command::new("bash")
+            .arg(repo_root().join("scripts/build-targets.sh"))
+            .arg("--plugins")
+            .output()
+            .expect("failed to run bash")
+            .stdout,
+    )
+    .unwrap();
+    assert!(!plugins.trim().is_empty(), "build-targets.sh --plugins printed nothing");
+    let root = sections_root(Some(SPAWN_MAP));
+    for plugin in plugins.lines() {
+        let output = sections_in(root.path(), &path_env, &["filter", &format!("core-spawns-{plugin}")]);
+        assert_eq!(output.status.code(), Some(0), "{plugin}\n{}", describe(&output));
+    }
+    for name in ["core-spawns-nope", "core-spawns-", "core-spawns-typescript:cargo"] {
+        let output = sections_in(root.path(), &path_env, &["filter", name]);
+        assert_eq!(output.status.code(), Some(2), "{name}\n{}", describe(&output));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}: a filter was printed");
+    }
+
+    let root = sections_root_with_plugins(
+        &format!("{SPAWN_MAP}it:delta foo\n"),
+        "PLUGINS=(\n\ttypescript:cargo\n\tgo:go\n\trust:cargo\n\tpython:cargo\n\tfoo:cargo\n)\n",
+    );
+    assert_eq!(
+        spawns_filter(root.path(), "foo"),
+        "package(g-mesh) & ((binary_id(g-mesh::it) & test(/^(delta)::/)))"
+    );
+}
+
 /// The real tree: lists the whole workspace suite once plus once per section,
-/// on the current build. Ignored because that is twelve full listings; CI
+/// on the current build. Ignored because that is thirteen full listings; CI
 /// runs the same `scripts/test-sections.sh check` as its own step on the
 /// linux row, and cut-release runs it before waiting for CI. Run it with
 /// `cargo nextest run -p g-mesh --test scripts -E 'test(/^test_sections_scripts::/)' --run-ignored only`.
 #[test]
-#[ignore = "lists the whole suite 12 times; CI's coverage-check step runs the same check"]
+#[ignore = "lists the whole suite 13 times; CI's coverage-check step runs the same check"]
 fn the_real_sections_partition_the_real_suite() {
     let mut cmd = Command::new("bash");
     cmd.arg(repo_root().join("scripts/test-sections.sh")).arg("check");
@@ -676,8 +821,8 @@ fn the_local_profile_skips_exactly_its_heavy_list() {
     let skipped: std::collections::BTreeSet<_> = default.difference(&local).cloned().collect();
     assert_eq!(skipped, unique, "default minus local is not the heavy list");
     for name in [
-        "graph::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence",
-        "graph::containers::tests::bulk_batch_boundaries_do_not_change_the_result",
+        "storage::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence",
+        "storage::containers::tests::bulk_batch_boundaries_do_not_change_the_result",
     ] {
         let key = ("g-mesh".to_owned(), name.to_owned());
         assert!(default.contains(&key), "{name} is not in the suite");

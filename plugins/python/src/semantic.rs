@@ -10,7 +10,7 @@
 //! ([ADR 0032](../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
 //!
 //! Everything about *driving* a language server is the SDK's
-//! (`plugins/sdk/src/lsp/`, whose module doc carries the decision table).
+//! (`plugins/sdk-lsp/src/`, whose module doc carries the decision table).
 //! What is left for a language's own plugin is which binary to run and what
 //! to configure it with - and for pyright both of those turned out to differ
 //! from the rust-analyzer precedent `plugins/rust/src/semantic.rs` set, in
@@ -112,8 +112,8 @@
 //! extension list is a parameter, not a fact [`lsp::script_spellings`] reads
 //! for itself - [`lsp::HOST_SCRIPT_EXTENSIONS`] is the one place that picks
 //! [`lsp::WINDOWS_SCRIPT_EXTENSIONS`] under `#[cfg(windows)]`, the same shape
-//! `daemon::manifest::resolve_exe_suffix` uses around
-//! `daemon::manifest::exe_suffixed` and its `EXE_SUFFIX` - so the Windows arm
+//! `plugin_manifest::resolve_exe_suffix` uses around
+//! `plugin_manifest::exe_suffixed` and its `EXE_SUFFIX` - so the Windows arm
 //! is exercised by this module's own tests from this macOS host, rather than
 //! sitting behind a `#[cfg(windows)]` nobody here can run. GM-335 is what a
 //! test that never runs costs.
@@ -133,7 +133,7 @@
 //! The task that scheduled this work says "initialization options (basic type
 //! checking; the project's own venv if one is configured)", and that is the
 //! wrong channel. Measured, same fixture, one variable changed
-//! (`plugins/sdk/src/lsp/config.rs`'s module doc has the numbers):
+//! (`plugins/sdk-lsp/src/config.rs`'s module doc has the numbers):
 //! `initializationOptions` carrying `python.analysis.typeCheckingMode` changes
 //! **nothing**, and the identical object returned from a
 //! `workspace/configuration` request changes the diagnostics and writes
@@ -208,11 +208,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use g_mesh_plugin_sdk::lsp::{
-    self, npm_candidates_on_path, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig,
+use g_mesh_plugin_sdk::{walk_scope, SemanticEngine, WalkScope};
+use g_mesh_plugin_sdk_lsp::{
+    self as lsp, npm_candidates_on_path, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig,
     HOST_SCRIPT_EXTENSIONS, PROBE_BUDGET,
 };
-use g_mesh_plugin_sdk::{walk_scope, SemanticEngine, WalkScope};
 
 /// The language id this plugin speaks, for `didOpen` and for log lines.
 const LANGUAGE: &str = "python";
@@ -451,7 +451,7 @@ fn as_object(value: &mut serde_json::Value) -> &mut serde_json::Map<String, serd
 #[cfg(test)]
 mod tests {
     use super::*;
-    use g_mesh_plugin_sdk::lsp::{ServerReadiness, WINDOWS_SCRIPT_EXTENSIONS};
+    use g_mesh_plugin_sdk_lsp::{ServerReadiness, WINDOWS_SCRIPT_EXTENSIONS};
 
     /// A bare name is `PATH` only: never a `node_modules/.bin`, never `npx`.
     #[test]
@@ -699,7 +699,7 @@ mod tests {
         use std::sync::mpsc::{channel, Receiver};
         use std::time::{Duration, Instant};
 
-        use g_mesh_plugin_sdk::lsp::SemanticConfig;
+        use g_mesh_plugin_sdk_lsp::SemanticConfig;
         use serde_json::{json, Value};
 
         /// How long one request may take, pyright's first analysis included.

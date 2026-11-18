@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use g_mesh_plugin_sdk::lsp::SemanticConfig;
+use g_mesh_plugin_sdk_lsp::SemanticConfig;
 
 use crate::semantic::Toolchain;
 
@@ -373,7 +373,7 @@ pub use landlock_ns::{landlock_abi, trampoline};
 pub(crate) mod seatbelt {
     use std::path::{Path, PathBuf};
 
-    use g_mesh_plugin_sdk::lsp::{self, SemanticConfig, PROBE_BUDGET};
+    use g_mesh_plugin_sdk_lsp::{self as lsp, SemanticConfig, PROBE_BUDGET};
 
     use super::{SandboxOutcome, SandboxPolicy};
 
@@ -563,7 +563,7 @@ pub(crate) mod landlock_ns;
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use g_mesh_plugin_sdk::lsp::SemanticConfig;
+    use g_mesh_plugin_sdk_lsp::SemanticConfig;
 
     use super::seatbelt::{self, Rule};
     use super::{confine, SandboxOutcome, SandboxPolicy};

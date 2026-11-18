@@ -14,7 +14,7 @@
 //!
 //! - **The name has to carry the project hash itself.** [`Endpoint::named`]
 //!   builds `\\.\pipe\g-mesh-<hash>` from the same
-//!   `daemon::identity::project_hash` the state directory is named after, so
+//!   `crate::paths::state_dir::project_hash` the state directory is named after, so
 //!   the shim and the daemon still derive one identity from the project root
 //!   and nothing else. The pid, lock and build-stamp files stay exactly where
 //!   they are: they are ordinary files and need no porting.
@@ -90,7 +90,7 @@ const PIPE_BUFFER: u32 = 64 * 1024;
 /// not yet created the next one - a window of microseconds in
 /// [`AsyncListener::accept`], which creates the replacement instance
 /// immediately after handing one off. Bounded rather than infinite because
-/// this is also the code path `daemon::is_listening` runs, and that must
+/// this is also the code path `control::lock::is_listening` runs, and that must
 /// answer promptly.
 const CONNECT_BUSY_BUDGET: Duration = Duration::from_secs(1);
 const CONNECT_BUSY_WAIT_MS: u32 = 100;
@@ -103,7 +103,7 @@ pub struct Endpoint(OsString);
 
 impl Endpoint {
     /// `\\.\pipe\g-mesh-<id>`, where `id` is the project hash the state
-    /// directory is named after (`daemon::endpoint` passes it in).
+    /// directory is named after (`control::lock::endpoint` passes it in).
     pub fn named(id: &str) -> Self {
         Self(OsString::from(format!(r"\\.\pipe\g-mesh-{id}")))
     }

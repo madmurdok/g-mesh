@@ -136,6 +136,7 @@ fn container(key: &str) -> TargetScope {
     TargetScope::Container(key.to_string())
 }
 
+mod block_imports;
 mod fn_local_impls;
 mod glob_paths;
 mod module_paths;
@@ -2755,7 +2756,7 @@ fn a_suffixed_positional_token_names_no_field_and_its_value_is_visited() {
 /// trimmed, then `(newlines, chars of the last line)` - never on the empty
 /// line after a final newline.
 ///
-/// Control: restore the old body of `Positions::file_range` (emit.rs:
+/// Control: restore the old body of `CharColumns::file_range` (sdk columns.rs:
 /// `(split('\n').count() - 1, chars after the last '\n')`); every row ending
 /// in whitespace fails.
 #[test]

@@ -13,9 +13,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use g_mesh::daemon;
 use g_mesh::gc::last_used::{self, LastUsed};
 use g_mesh::ipc;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
@@ -58,11 +58,13 @@ impl Project {
     }
 
     fn endpoint(&self) -> ipc::Endpoint {
-        daemon::endpoint(self.root()).expect("failed to resolve the daemon endpoint")
+        StateDir::of(self.root())
+            .and_then(|sd| g_mesh::control::lock::endpoint(&sd))
+            .expect("failed to resolve the daemon endpoint")
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        StateDir::of(self.root()).map(|sd| sd.pid_file()).expect("failed to resolve the pid file path")
     }
 
     /// The whole point of the ticket: read the project's `lastUsed` from its

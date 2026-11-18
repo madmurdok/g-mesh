@@ -116,3 +116,17 @@ fn columns_file_range_is_unmoved_by_a_space_before_the_last_newline() {
         );
     }
 }
+
+/// `é` is two bytes and one character: a tree-sitter byte column after it is
+/// one more than the character column, and a line without it agrees.
+///
+/// Control: `CharColumns::point` returning `point.column` unconverted fails
+/// this.
+#[cfg(feature = "tree-sitter")]
+#[test]
+fn a_tree_sitter_point_is_converted_from_bytes_to_characters() {
+    let columns = CharColumns::new("// é é\nfn a() {}\n");
+    assert_eq!(columns.point(tree_sitter::Point { row: 0, column: 8 }), pos(0, 6));
+    assert_eq!(columns.point(tree_sitter::Point { row: 0, column: 5 }), pos(0, 4));
+    assert_eq!(columns.point(tree_sitter::Point { row: 1, column: 3 }), pos(1, 3));
+}

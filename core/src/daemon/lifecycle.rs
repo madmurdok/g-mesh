@@ -34,13 +34,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::config::ProjectConfig;
-use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
+use crate::ingest::apply::{FileChangeOutcome, SemanticPassOutcome};
+use crate::ingest::staleness::{self, StalenessOutcome};
+use crate::paths::state_dir::StateDir;
+use crate::plugin_manifest::PluginManifest;
 use crate::protocol::jsonrpc::is_timeout;
 use crate::storage::index_store::{self, IndexStore};
-use crate::watcher::apply::{FileChangeOutcome, SemanticPassOutcome};
-use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s default.
 pub const DEFAULT_PLUGIN_IDLE: Duration = Duration::from_secs(60 * 60);
@@ -50,10 +51,10 @@ pub const DEFAULT_CORE_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Overrides the plugin's idle timeout, in milliseconds, for the test suite;
 /// real installs never set it. `0` disables the timer (the plugin never sleeps).
-pub const PLUGIN_IDLE_ENV: &str = "G_MESH_PLUGIN_IDLE_MS";
+pub const PLUGIN_IDLE_ENV: &str = crate::knobs::PLUGIN_IDLE_MS.name;
 
 /// The core's equivalent of [`PLUGIN_IDLE_ENV`]; `0` means never exit on idleness.
-pub const CORE_IDLE_ENV: &str = "G_MESH_CORE_IDLE_MS";
+pub const CORE_IDLE_ENV: &str = crate::knobs::CORE_IDLE_MS.name;
 
 /// Test-only: the pid of a process this daemon must not outlive. The
 /// integration tests set it to their own pid on every `g-mesh` they start
@@ -62,7 +63,7 @@ pub const CORE_IDLE_ENV: &str = "G_MESH_CORE_IDLE_MS";
 /// its daemon running: [`supervise`] shuts down within one tick once that pid
 /// is gone. Unset in production, where it changes nothing; a value that does
 /// not parse as a pid is ignored.
-pub const LIFELINE_PID_ENV: &str = "G_MESH_LIFELINE_PID";
+pub const LIFELINE_PID_ENV: &str = crate::knobs::LIFELINE_PID.name;
 
 /// Lower bound on the tick, so a very short timeout never becomes a spin loop.
 const MIN_TICK: Duration = Duration::from_millis(50);
@@ -92,8 +93,8 @@ impl IdleTimeouts {
     pub fn from_config(config: &ProjectConfig) -> Self {
         Self::from_config_and_overrides(
             config,
-            std::env::var(PLUGIN_IDLE_ENV).ok().as_deref(),
-            std::env::var(CORE_IDLE_ENV).ok().as_deref(),
+            crate::knobs::string_raw(&crate::knobs::PLUGIN_IDLE_MS).as_deref(),
+            crate::knobs::string_raw(&crate::knobs::CORE_IDLE_MS).as_deref(),
         )
     }
 
@@ -109,8 +110,13 @@ impl IdleTimeouts {
         let plugin_default = Duration::from_secs(config.plugin.idle_timeout_minutes.saturating_mul(60));
         let core_default = Duration::from_secs(config.daemon.core_idle_timeout_hours.saturating_mul(60 * 60));
         Self {
-            plugin: parse_timeout(plugin_env, plugin_default, PLUGIN_IDLE_ENV),
-            core: parse_timeout(core_env, core_default, CORE_IDLE_ENV),
+            plugin: crate::knobs::millis_from(
+                plugin_env,
+                PLUGIN_IDLE_ENV,
+                crate::knobs::ZeroIs::Off,
+                plugin_default,
+            ),
+            core: crate::knobs::millis_from(core_env, CORE_IDLE_ENV, crate::knobs::ZeroIs::Off, core_default),
         }
     }
 
@@ -121,23 +127,6 @@ impl IdleTimeouts {
             Some(shortest) => (shortest / 4).clamp(MIN_TICK, MAX_TICK),
             // Nothing to time, but the loop still has to notice a stopped accept loop.
             None => MAX_TICK,
-        }
-    }
-}
-
-/// `None` for a configured zero (timer off); the default for anything unparseable,
-/// so a typo neither silently turns a timer off nor stops the daemon starting.
-pub(crate) fn parse_timeout(raw: Option<&str>, default: Duration, name: &str) -> Option<Duration> {
-    let Some(raw) = raw else { return Some(default) };
-    match raw.trim().parse::<u64>() {
-        Ok(0) => None,
-        Ok(millis) => Some(Duration::from_millis(millis)),
-        Err(_) => {
-            crate::log_line!(
-                "g-mesh daemon: ignoring {name}={raw:?} - not a whole number of milliseconds; \
-                 using the default {default:?}"
-            );
-            Some(default)
         }
     }
 }
@@ -259,7 +248,7 @@ impl PluginSupervisor {
     ) -> Result<Arc<Self>> {
         let process = PluginProcess::spawn(project_root, &manifest, pid_file.clone())
             .with_context(|| format!("failed to start the {} plugin", manifest.language))?;
-        super::write_pid_file(&pid_file, process.pid());
+        crate::paths::state_dir::write_pid_file(&pid_file, process.pid());
 
         Ok(Arc::new(Self {
             project_root: project_root.to_path_buf(),
@@ -340,15 +329,15 @@ impl PluginSupervisor {
                 // mid-write, and it has already been killed and relaunched). Queue it
                 // like a change seen while asleep, so the next `replay_pending` sends it
                 // to the fresh process instead of dropping it.
-                crate::log_line!(
-                    "g-mesh daemon: {} plugin timed out applying a file change ({err:#}) - \
+                crate::log_role!(
+                    "{} plugin timed out applying a file change ({err:#}) - \
                      the plugin was relaunched and {retry_path} is queued for replay",
                     self.manifest.language
                 );
                 inner.dirty.push(retry_path);
                 self.pending.store(true, Ordering::SeqCst);
             } else {
-                crate::log_line!("g-mesh daemon: failed to apply file change: {err:#}");
+                crate::log_role!("failed to apply file change: {err:#}");
             }
         }
     }
@@ -368,15 +357,15 @@ impl PluginSupervisor {
         if inner.process.is_none() {
             let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
                 .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
-            super::write_pid_file(&self.pid_file, process.pid());
+            crate::paths::state_dir::write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
 
         let queued = inner.dirty.drain();
         self.pending.store(false, Ordering::SeqCst);
         // Lists the paths, so the log tells a queue replay from a project rescan.
-        crate::log_line!(
-            "g-mesh daemon: waking the {} plugin to replay {} queued file change(s): {}",
+        crate::log_role!(
+            "waking the {} plugin to replay {} queued file change(s): {}",
             self.manifest.language,
             queued.len(),
             queued.join(", ")
@@ -394,7 +383,7 @@ impl PluginSupervisor {
                 }
                 // One unreadable file does not cost the rest of the queue its replay.
                 Err(err) => {
-                    crate::log_line!("g-mesh daemon: failed to replay queued change to {file_path}: {err:#}")
+                    crate::log_role!("failed to replay queued change to {file_path}: {err:#}")
                 }
             }
         }
@@ -472,7 +461,7 @@ impl PluginSupervisor {
         if inner.process.is_none() {
             let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
                 .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
-            super::write_pid_file(&self.pid_file, process.pid());
+            crate::paths::state_dir::write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
         self.touch();
@@ -513,7 +502,7 @@ impl PluginSupervisor {
                         self.manifest.language
                     )
                 })?;
-            super::write_pid_file(&self.pid_file, process.pid());
+            crate::paths::state_dir::write_pid_file(&self.pid_file, process.pid());
             inner.process = Some(process);
         }
         self.touch();
@@ -627,8 +616,8 @@ impl PluginSupervisor {
             return;
         };
         if confirmed_mb <= limit_mb {
-            crate::log_line!(
-                "g-mesh daemon: the {} plugin's process tree read {measured_mb}MB against a \
+            crate::log_role!(
+                "the {} plugin's process tree read {measured_mb}MB against a \
                  memoryLimitMb of {limit_mb}MB, but a confirming sample read {confirmed_mb}MB - \
                  treating that as a transient member of the tree rather than a sustained overage, \
                  and leaving the plugin running",
@@ -650,8 +639,8 @@ impl PluginSupervisor {
     /// The "no evidence either way" log, emitted once per supervisor.
     fn log_sampling_unavailable_once(&self, pid: u32) {
         if !self.sampling_unavailable_logged.swap(true, Ordering::SeqCst) {
-            crate::log_line!(
-                "g-mesh daemon: could not sample the {} plugin's process-tree memory \
+            crate::log_role!(
+                "could not sample the {} plugin's process-tree memory \
                  (pid {pid}) - memoryLimitMb has nothing to enforce against until a later \
                  sample succeeds; logged once",
                 self.manifest.language
@@ -662,30 +651,24 @@ impl PluginSupervisor {
     /// This language's suspension marker: next to the pid file and named the same
     /// way, so `cli::status`/`cli::stop` find it by listing the state directory.
     fn suspended_marker_path(&self) -> PathBuf {
-        self.pid_file
-            .parent()
-            .expect("a pid file is always inside the project's state directory")
-            .join(super::registry::plugin_suspended_marker_file_name(&self.manifest.language))
+        StateDir::at(
+            self.pid_file.parent().expect("a pid file is always inside the project's state directory"),
+        )
+        .plugin_suspended_marker(&self.manifest.language)
     }
 
     /// Best-effort write of the suspension marker, temp-then-rename like
-    /// [`super::write_pid_file`] so a reader never sees a half-written one;
+    /// [`crate::paths::state_dir::write_pid_file`] so a reader never sees a half-written one;
     /// `reason` is the only record of why a language was suspended.
     fn write_suspended_marker(&self, reason: &str) {
         let path = self.suspended_marker_path();
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         if let Err(err) = fs::write(&temporary, format!("{reason}\n")) {
-            crate::log_line!(
-                "g-mesh daemon: failed to write suspension marker {}: {err}",
-                temporary.display()
-            );
+            crate::log_role!("failed to write suspension marker {}: {err}", temporary.display());
             return;
         }
         if let Err(err) = fs::rename(&temporary, &path) {
-            crate::log_line!(
-                "g-mesh daemon: failed to put suspension marker {} in place: {err}",
-                path.display()
-            );
+            crate::log_role!("failed to put suspension marker {} in place: {err}", path.display());
             let _ = fs::remove_file(&temporary);
         }
     }
@@ -695,13 +678,13 @@ impl PluginSupervisor {
     fn put_to_sleep(&self, process: PluginProcess, reason: &str) {
         let pid = process.pid();
         if let Err(err) = process.shutdown(PLUGIN_EXIT_GRACE) {
-            crate::log_line!("g-mesh daemon: the plugin (pid {pid}) did not shut down cleanly: {err:#}");
+            crate::log_role!("the plugin (pid {pid}) did not shut down cleanly: {err:#}");
         }
         // Removed: a pid file naming a deliberately exited process reads as a
         // crashed daemon to `cli::stop` and `cli::status`.
         let _ = fs::remove_file(&self.pid_file);
-        crate::log_line!(
-            "g-mesh daemon: {} plugin (pid {pid}) put to sleep - {reason}; file changes will be \
+        crate::log_role!(
+            "{} plugin (pid {pid}) put to sleep - {reason}; file changes will be \
              queued until a request needs it again",
             self.manifest.language
         );
@@ -827,12 +810,12 @@ pub fn orphan_check(
 /// [`LIFELINE_PID_ENV`] as a pid: `None` when unset (production) or when the
 /// value does not parse, so a malformed variable never ends the process.
 fn lifeline_pid() -> Option<u32> {
-    lifeline_pid_from(std::env::var(LIFELINE_PID_ENV).ok().as_deref())
+    lifeline_pid_from(crate::knobs::string_raw(&crate::knobs::LIFELINE_PID).as_deref())
 }
 
 /// [`lifeline_pid`] over the variable's raw value, given rather than read.
 fn lifeline_pid_from(raw: Option<&str>) -> Option<u32> {
-    raw?.trim().parse().ok()
+    crate::knobs::parsed_from(raw)
 }
 
 /// `true` only for a path the filesystem positively reports as absent
@@ -875,13 +858,13 @@ impl Drop for ConnectionGuard {
 /// daemon has none.
 ///
 /// [`sleep_now`]: PluginSupervisor::sleep_now
-/// [`IndexingStatus::detach_state_files`]: crate::daemon::indexing_status::IndexingStatus::detach_state_files
+/// [`IndexingStatus::detach_state_files`]: crate::indexing_status::IndexingStatus::detach_state_files
 pub fn supervise(
     project_root: &Path,
     state_dir: &Path,
     registry: &crate::daemon::registry::PluginRegistry,
     core: &CoreActivity,
-    indexing: Option<&crate::daemon::indexing_status::IndexingStatus>,
+    indexing: Option<&crate::indexing_status::IndexingStatus>,
     timeouts: IdleTimeouts,
     accept_loop: Receiver<Result<()>>,
 ) -> Result<Exit> {
@@ -905,8 +888,8 @@ pub fn supervise(
         // First in the tick: an orphan has nothing left to time and no reason to
         // pay for a `sysinfo` scan on its way out.
         if let Some(orphan) = orphan_check(project_root, std::env::current_exe(), lifeline) {
-            crate::log_line!(
-                "g-mesh daemon: {orphan} - shutting down; nothing can ask this daemon for \
+            crate::log_role!(
+                "{orphan} - shutting down; nothing can ask this daemon for \
                  anything again, and a fresh one will be started if the project comes back"
             );
             // The same teardown as the idle exit below.
@@ -924,8 +907,8 @@ pub fn supervise(
         registry.check_memory_limits_all();
 
         if let Some(idle) = core.idle_beyond(timeouts.core) {
-            crate::log_line!(
-                "g-mesh daemon: no MCP requests for {idle:?} - shutting down; the next request \
+            crate::log_role!(
+                "no MCP requests for {idle:?} - shutting down; the next request \
                  will start a fresh daemon for this project"
             );
             registry.sleep_all_now("the core is shutting down");
@@ -968,8 +951,8 @@ const GROUP_EXIT_GRACE: Duration = Duration::from_secs(1);
 fn end_process_group() {
     match crate::process::kill_own_group(GROUP_EXIT_GRACE) {
         crate::process::GroupSweep::Swept { terminated, killed } if terminated > 0 => {
-            crate::log_line!(
-                "g-mesh daemon: ended {terminated} process(es) left in its process group \
+            crate::log_role!(
+                "ended {terminated} process(es) left in its process group \
                  ({killed} needed SIGKILL)"
             );
         }
@@ -988,7 +971,7 @@ const PURGE_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// directory (GM-524 D1): the index and every lock and log file of a project
 /// that no longer exists. Called by `daemon::run` and `front::run` after the
 /// singleton lock is dropped, so the directory is judged by exactly the rules
-/// `clean orphaned --force` uses (`cli::clean::purge_orphaned_state_dir`): the
+/// `clean orphaned --force` uses (`control::purge::purge_orphaned_state_dir`): the
 /// root must read as deleted by `root_state` (`NotFound`, parent present on
 /// the recorded device), nothing may be running for it, and the
 /// root is re-checked under the bootstrap lock in case it came back.
@@ -1012,20 +995,18 @@ pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
     if cfg!(windows) {
         return;
     }
-    let wait = crate::cli::clean::LockWait::UpTo(PURGE_LOCK_WAIT);
-    match crate::cli::clean::purge_orphaned_state_dir(state_dir, wait) {
-        Ok(crate::cli::clean::Purge::Deleted) => crate::log_line!(
-            "g-mesh daemon: deleted the state of {} ({}) - its project root no longer exists",
+    let wait = crate::control::purge::LockWait::UpTo(PURGE_LOCK_WAIT);
+    match crate::control::purge::purge_orphaned_state_dir(state_dir, wait) {
+        Ok(crate::control::purge::Purge::Deleted) => crate::log_role!(
+            "deleted the state of {} ({}) - its project root no longer exists",
             root.display(),
             state_dir.display()
         ),
-        Ok(crate::cli::clean::Purge::Kept(reason)) => crate::log_line!(
-            "g-mesh daemon: kept the state of {} ({}): {reason}",
-            root.display(),
-            state_dir.display()
-        ),
-        Err(err) => crate::log_line!(
-            "g-mesh daemon: could not delete the state of {} ({}): {err:#} - `g-mesh clean orphaned` \
+        Ok(crate::control::purge::Purge::Kept(reason)) => {
+            crate::log_role!("kept the state of {} ({}): {reason}", root.display(), state_dir.display())
+        }
+        Err(err) => crate::log_role!(
+            "could not delete the state of {} ({}): {err:#} - `g-mesh clean orphaned` \
              or the next shim's sweep will",
             root.display(),
             state_dir.display()
@@ -1044,20 +1025,22 @@ pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
 /// that the daemon is gone, so nothing it describes may outlive it (GM-446).
 /// The endpoint stays last, as before.
 fn release_state_files(state_dir: &Path) {
-    for (_, pid_file) in super::registry::discovered_pid_files(state_dir) {
+    let sd = StateDir::at(state_dir);
+    for (_, pid_file) in sd.plugin_pid_files() {
         let _ = fs::remove_file(pid_file);
     }
-    let _ = fs::remove_file(super::build_stamp_path_in(state_dir));
+    let _ = fs::remove_file(sd.build_stamp_file());
     // The phase file exists only while a daemon publishes it, so no outside
     // reader mistakes a stale phase for a live one's (D13 in
     // `docs/architecture/lazy-indexing.md`).
-    let _ = fs::remove_file(super::phase_path_in(state_dir));
-    let _ = fs::remove_file(super::progress_path_in(state_dir));
-    let _ = fs::remove_file(super::rerank_outcome_path_in(state_dir));
-    let _ = fs::remove_file(super::pid_path_in(state_dir));
-    // Derived through the parent module so what a daemon binds and what it
-    // releases are the same endpoint by construction. No-op on Windows.
-    if let Some(endpoint) = super::endpoint_in(state_dir) {
+    let _ = fs::remove_file(sd.phase_file());
+    let _ = fs::remove_file(sd.progress_file());
+    let _ = fs::remove_file(sd.rerank_outcome_file());
+    let _ = fs::remove_file(sd.pid_file());
+    // Derived through `ipc::endpoint_for`, as `daemon::run` binds it, so what a
+    // daemon binds and what it releases are the same endpoint by construction.
+    // No-op on Windows.
+    if let Some(endpoint) = crate::ipc::endpoint_for(&sd) {
         endpoint.clear_stale();
     }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::daemon::manifest::{Capabilities, WorkspaceConfig};
+use crate::plugin_manifest::{Capabilities, WorkspaceConfig};
 use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
 use crate::storage::index_store::IndexStore;
 use rusqlite::Connection;
@@ -99,7 +99,7 @@ fn missing_workspace_binary_hint_ignores_a_missing_path_outside_target() {
     assert_eq!(missing_workspace_binary_hint(&binary), None);
 }
 
-/// GM-335: on Windows, `manifest::resolve_exe_suffix` only ever switches
+/// GM-335: on Windows, `plugin_manifest::resolve_exe_suffix` only ever switches
 /// `command` to the `.exe` spelling once that file is confirmed to
 /// exist - so a genuinely-missing binary reaches this function still
 /// spelled without a suffix, exactly as `plugins/python/plugin.toml`
@@ -117,7 +117,7 @@ fn missing_workspace_binary_hint_ignores_a_missing_path_outside_target() {
 fn missing_workspace_binary_hint_names_the_exe_suffixed_spelling_on_windows() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
-    // Exactly what `manifest::resolve_path_entry` leaves `command` as
+    // Exactly what `plugin_manifest::resolve_path_entry` leaves `command` as
     // when neither spelling exists: unsuffixed, per the manifest itself.
     let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-python");
 
@@ -173,7 +173,7 @@ fn missing_workspace_binary_hint_leads_with_the_build_command_in_both_variants()
 }
 
 /// Once the `.exe` file actually exists, `command` itself would already
-/// have been switched to it by `manifest::resolve_exe_suffix` before ever
+/// have been switched to it by `plugin_manifest::resolve_exe_suffix` before ever
 /// reaching this function - so from this function's own point of view
 /// (which only sees whatever `command` it was handed), an existing
 /// suffixed binary reads as `command.is_file()` and produces no hint at
@@ -393,7 +393,7 @@ fn the_discovered_plugins_are_fingerprintable_from_the_test_binary() {
 /// binary's `target/<profile>/`.
 fn typescript_manifest() -> PluginManifest {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript");
-    let manifest = crate::daemon::manifest::read_manifest(&dir)
+    let manifest = crate::plugin_manifest::read_manifest(&dir)
         .unwrap_or_else(|err| panic!("plugins/typescript/plugin.toml: {err:#}"));
     PluginManifest { capabilities: Capabilities::default(), ..manifest }
 }
@@ -532,7 +532,7 @@ fn a_refused_query_time_reindex_relaunches_the_plugin_so_the_retry_applies_the_e
             .unwrap()
     };
     let on_disk = |path: &Path| -> (i64, String) {
-        let mtime = staleness::mtime_millis(&fs::metadata(path).unwrap()).unwrap();
+        let mtime = crate::fsutil::mtime_millis(&fs::metadata(path).unwrap()).unwrap();
         let hash = Sha256::digest(fs::read(path).unwrap()).iter().map(|b| format!("{b:02x}")).collect();
         (mtime, hash)
     };

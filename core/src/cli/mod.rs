@@ -34,6 +34,7 @@ pub mod clean;
 pub mod config_wizard;
 pub mod debug_candidates;
 pub mod deps;
+#[cfg(feature = "embed-eval")]
 pub mod embed_eval;
 pub mod init;
 pub mod model;
@@ -50,7 +51,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::languages::LanguageOutcome;
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::{daemon, shim};
 
 /// The exit code of a command that did its work and printed its result, but
@@ -102,7 +103,7 @@ pub fn language_outcome_lines(outcomes: &BTreeMap<String, LanguageOutcome>) -> V
             LanguageOutcome::Indexed { .. } => None,
             LanguageOutcome::Failed { error } => Some(format!(
                 "g-mesh: {language} failed to index and is not in the index: {}",
-                crate::languages::error_on_one_line(error)
+                crate::storage::language_outcome::error_on_one_line(error)
             )),
             LanguageOutcome::PluginAbsent { files } => {
                 let what = match files {
@@ -236,6 +237,7 @@ pub enum Command {
     /// parity. An instrument for choosing the model - not a user-facing
     /// command.
     #[command(hide = true)]
+    #[cfg(feature = "embed-eval")]
     DebugEmbedEval {
         #[command(subcommand)]
         command: embed_eval::EmbedEvalCommand,
@@ -379,8 +381,12 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Clean(args) => clean::run(&args),
         Command::Stop => stop::run(),
         Command::McpShim => shim::run(),
-        Command::Daemon { project_root } => daemon::run(&project_root),
+        Command::Daemon { project_root } => {
+            crate::log::set_role(crate::log::Role::Daemon);
+            daemon::run(&project_root)
+        }
         Command::DebugCandidates { dir, json } => debug_candidates::run(dir, json),
+        #[cfg(feature = "embed-eval")]
         Command::DebugEmbedEval { command } => embed_eval::run(command),
     }
 }
@@ -735,7 +741,7 @@ mod tests {
         );
     }
 
-    /// A `Failed` language's stored chain (`languages::failed_error`, one
+    /// A `Failed` language's stored chain (`storage::language_outcome::failed_error`, one
     /// cause per line) is printed on ONE stderr line, every cause joined by
     /// ": ", outermost first (GM-330, ADR 0021 section 2).
     ///
@@ -751,7 +757,7 @@ mod tests {
             "invalid type: map, expected a string\nat line 3",
         ));
         let err = inner.context("reading the manifest").context("loading the rust plugin").unwrap_err();
-        let stored = crate::languages::failed_error(&err);
+        let stored = crate::storage::language_outcome::failed_error(&err);
         assert_eq!(stored.lines().count(), 3, "the fixture must be a multi-line chain: {stored}");
 
         let lines = language_outcome_lines(&outcomes(&[("rust", LanguageOutcome::Failed { error: stored })]));
@@ -800,5 +806,35 @@ mod tests {
         assert_eq!(exit_code(&anyhow::anyhow!("every discovered language failed to index")), 1);
         let status: anyhow::Error = ExitStatus { code: 2, message: "partial".to_string() }.into();
         assert_eq!(exit_code(&status.context("while running init")), 2);
+    }
+
+    /// `debug-embed-eval` exists only in a build with the `embed-eval`
+    /// feature: the default build rejects it as an unknown subcommand.
+    #[test]
+    fn debug_embed_eval_exists_only_with_the_embed_eval_feature() {
+        let err = parse(&["debug-embed-eval", "--help"]).expect_err("`--help` or an unknown subcommand");
+        if cfg!(feature = "embed-eval") {
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp, "{err}");
+        } else {
+            assert_eq!(err.kind(), ErrorKind::InvalidSubcommand, "{err}");
+        }
+    }
+
+    /// The feature is off by default, and `ep-coreml` (which times the eval
+    /// on CoreML) turns it on.
+    #[test]
+    fn embed_eval_is_off_by_default_and_ep_coreml_implies_it() {
+        let manifest: toml::Value = toml::from_str(include_str!("../../Cargo.toml")).unwrap();
+        let features = manifest["features"].as_table().expect("a [features] table");
+        let enables = |feature: &str| -> Vec<&str> {
+            features
+                .get(feature)
+                .and_then(toml::Value::as_array)
+                .map(|list| list.iter().filter_map(toml::Value::as_str).collect())
+                .unwrap_or_default()
+        };
+        assert!(features.contains_key("embed-eval"), "{features:?}");
+        assert!(!enables("default").contains(&"embed-eval"), "{features:?}");
+        assert!(enables("ep-coreml").contains(&"embed-eval"), "{features:?}");
     }
 }

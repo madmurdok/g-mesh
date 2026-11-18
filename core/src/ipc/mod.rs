@@ -52,6 +52,20 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{AsyncListener, AsyncStream, Endpoint, Listener, Stream};
 
+/// Where the daemon of the project whose state directory this is listens: the
+/// socket file inside it on Unix, a pipe named after its final component (the
+/// project hash) on Windows. `None` only for a path with no final component.
+pub fn endpoint_for(state_dir: &crate::paths::state_dir::StateDir) -> Option<Endpoint> {
+    #[cfg(unix)]
+    {
+        Some(Endpoint::at_path(state_dir.socket_file()))
+    }
+    #[cfg(windows)]
+    {
+        Some(Endpoint::named(state_dir.id()?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,7 +158,7 @@ mod tests {
 
     /// Nothing is listening, so connecting fails rather than hanging - the
     /// judgement `shim::incumbent` turns into `Incumbent::Absent` and
-    /// `daemon::is_listening` into `false`.
+    /// `control::lock::is_listening` into `false`.
     #[test]
     fn connecting_to_an_unbound_endpoint_fails_promptly() {
         let (_dir, endpoint) = unique_endpoint();

@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use super::*;
-use crate::daemon::manifest::discover;
-use crate::daemon::test_plugin;
+use crate::plugin_manifest::discover;
 use crate::storage::connection;
+use crate::test_plugin;
 
 const GENERATION: &str = "test-generation";
 const ALPHA_FILE: &str = "src/a.alpha-src";
@@ -414,7 +414,7 @@ fn a_seeded_activation_waits_for_the_seeded_reconcile_before_embedding() {
     let fixture = Fixture::new();
     fixture.full_walk();
     let Start { mut ctx, .. } = fixture.prepare(false);
-    let indexing = IndexingStatus::walking_because(crate::daemon::indexing_status::ColdCause::Seeded);
+    let indexing = IndexingStatus::walking_because(crate::indexing_status::ColdCause::Seeded);
     ctx.indexing = indexing.clone();
     let (reconciled, wait) = std::sync::mpsc::channel();
     ctx.seed_reconciled = Some(wait);

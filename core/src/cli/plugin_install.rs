@@ -2,9 +2,9 @@
 //! language plugin beside the running g-mesh binary.
 //!
 //! Plugins land in `<dir of the g-mesh executable>/plugins/<language>/`, the
-//! installed bundled root [`crate::daemon::manifest::discover`] scans, so a
+//! installed bundled root [`crate::plugin_manifest::discover`] scans, so a
 //! plugin is version-locked to the core that installed it and replaced by the
-//! next `install.sh`. With [`manifest::PLUGIN_ROOTS_OVERRIDE_ENV`] set, that
+//! next `install.sh`. With [`plugin_manifest::PLUGIN_ROOTS_OVERRIDE_ENV`] set, that
 //! one directory is the target instead, the same directory discovery would
 //! then read.
 //!
@@ -46,7 +46,7 @@ use clap::{ArgGroup, Args};
 use sha2::{Digest, Sha256};
 
 use crate::cli::model;
-use crate::daemon::manifest;
+use crate::plugin_manifest;
 
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("source").required(true).args(["language", "from"])))]
@@ -63,12 +63,6 @@ pub struct InstallArgs {
 /// `<root>/<language>/plugin.toml`, the file discovery looks for.
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
 
-/// Base for `<version-tag>/<asset>` URLs, the same variable and meaning as in
-/// `scripts/install.sh`.
-const DOWNLOAD_BASE_ENV: &str = "G_MESH_DOWNLOAD_BASE";
-
-/// `owner/repo` the default download base points at, as in `scripts/install.sh`.
-const REPO_ENV: &str = "G_MESH_REPO";
 const DEFAULT_REPO: &str = "madmurdok/g-mesh";
 
 /// Printed after every successful install and remove: discovery runs once, at
@@ -101,23 +95,23 @@ pub fn remove(language: &str) -> Result<()> {
 
 /// The root plugins are installed into and removed from.
 fn install_root() -> Result<PathBuf> {
-    install_root_from(std::env::var_os(manifest::PLUGIN_ROOTS_OVERRIDE_ENV).map(PathBuf::from))
+    install_root_from(crate::knobs::os_raw(&crate::knobs::PLUGIN_ROOTS_OVERRIDE).map(PathBuf::from))
 }
 
 /// The override replaces the root exactly as it replaces discovery's roots
-/// (`manifest::default_roots`), so an install lands where discovery reads.
+/// (`plugin_manifest::default_roots`), so an install lands where discovery reads.
 fn install_root_from(override_root: Option<PathBuf>) -> Result<PathBuf> {
     match override_root {
         Some(root) => Ok(root),
-        None => manifest::installed_bundled_root()
+        None => plugin_manifest::installed_bundled_root()
             .context("could not locate the g-mesh executable, so there is no plugins directory beside it"),
     }
 }
 
 fn download_base() -> String {
-    let non_empty = |name| std::env::var(name).ok().filter(|value: &String| !value.is_empty());
-    non_empty(DOWNLOAD_BASE_ENV).unwrap_or_else(|| {
-        let repo = non_empty(REPO_ENV).unwrap_or_else(|| DEFAULT_REPO.to_string());
+    crate::knobs::string_non_empty(&crate::knobs::DOWNLOAD_BASE).unwrap_or_else(|| {
+        let repo =
+            crate::knobs::string_non_empty(&crate::knobs::REPO).unwrap_or_else(|| DEFAULT_REPO.to_string());
         format!("https://github.com/{repo}/releases/download")
     })
 }
@@ -248,7 +242,7 @@ fn remove_from(language: &str, root: &Path, out: &mut impl Write) -> Result<()> 
         }
         Ok(_) => {}
     }
-    // Discovery is filesystem-based (`manifest::discover` scans the roots for
+    // Discovery is filesystem-based (`plugin_manifest::discover` scans the roots for
     // `<language>/plugin.toml`), so deleting the directory is the whole
     // removal: there is no config entry to edit.
     fs::remove_dir_all(&dir).with_context(|| format!("failed to remove {}", dir.display()))?;
@@ -294,7 +288,7 @@ fn sha256_of_file(path: &Path) -> Result<String> {
 }
 
 /// The language an unpacked plugin directory provides: its own name, which
-/// `manifest::read_manifest` requires to match the manifest's language.
+/// `plugin_manifest::read_manifest` requires to match the manifest's language.
 fn directory_language(dir: &Path) -> Result<String> {
     if !dir.join(MANIFEST_FILE_NAME).is_file() {
         bail!(
@@ -419,7 +413,7 @@ fn validate_plugin_dir(dir: &Path, language: &str, source: &str) -> Result<()> {
     if !dir.join(MANIFEST_FILE_NAME).is_file() {
         bail!("{source} has no {language}/{MANIFEST_FILE_NAME} - nothing was installed");
     }
-    let manifest = manifest::read_manifest(dir).with_context(|| {
+    let manifest = plugin_manifest::read_manifest(dir).with_context(|| {
         format!("{source} does not carry a valid {language} plugin - nothing was installed")
     })?;
     if manifest.command.starts_with(dir) && !manifest.command.is_file() {
@@ -436,11 +430,11 @@ fn validate_plugin_dir(dir: &Path, language: &str, source: &str) -> Result<()> {
 fn place(staged: &Path, root: &Path, staging: &Staging, out: &mut impl Write) -> Result<()> {
     let language = staged.file_name().context("staged plugin has no directory name")?;
     let dest = root.join(language);
-    let new_version = manifest::read_manifest(staged)?.plugin_version;
+    let new_version = plugin_manifest::read_manifest(staged)?.plugin_version;
 
     let previous = match fs::symlink_metadata(&dest) {
         Ok(_) => {
-            let old_version = manifest::read_manifest(&dest).ok().map(|m| m.plugin_version);
+            let old_version = plugin_manifest::read_manifest(&dest).ok().map(|m| m.plugin_version);
             let aside = staging.path().join("previous");
             fs::rename(&dest, &aside)
                 .with_context(|| format!("failed to move the installed {} aside", dest.display()))?;
@@ -479,7 +473,7 @@ fn place(staged: &Path, root: &Path, staging: &Staging, out: &mut impl Write) ->
 /// Discovery takes a language from the first root that has it, so a copy in
 /// an earlier root (`~/.g-mesh/plugins/`) wins over the one just installed.
 fn warn_if_shadowed(language: &str, root: &Path, out: &mut impl Write) -> Result<()> {
-    for earlier in manifest::default_roots().into_iter().take_while(|candidate| candidate != root) {
+    for earlier in plugin_manifest::default_roots().into_iter().take_while(|candidate| candidate != root) {
         let other = earlier.join(language);
         if other.join(MANIFEST_FILE_NAME).is_file() {
             writeln!(

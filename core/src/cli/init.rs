@@ -103,9 +103,10 @@ use crate::cli::agent_instructions::{self, AgentsMdWrite};
 use crate::cli::{reindex, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::indexing_status::IndexingStatus;
-use crate::daemon::{manifest, registry, semantic};
+use crate::daemon::{registry, semantic};
 use crate::embedding::{backfill, EmbeddingPipeline};
+use crate::indexing_status::IndexingStatus;
+use crate::plugin_manifest;
 use crate::storage::index_store::IndexStore;
 use crate::storage::{connection, schema};
 
@@ -160,8 +161,8 @@ pub fn run(agents: &[AgentTarget]) -> Result<()> {
 pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
     let (stop_outcome, _hold) = reindex::stop_for_rebuild(project_root, "init")?;
 
-    let state_dir =
-        connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
+    let state_dir = crate::paths::state_dir::project_dir(project_root)
+        .context("failed to resolve the project's state directory")?;
     let project_id =
         state_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
@@ -180,8 +181,8 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
     // start throws away the index this command just paid to build. Same
     // discovery `daemon::run`'s own cold start uses; the walk below takes this
     // same value rather than repeating the scan.
-    let discovered =
-        manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
+    let discovered = plugin_manifest::discover(&plugin_manifest::default_roots())
+        .context("failed to discover language plugins")?;
 
     let conn = connection::open(project_root).context("failed to open the project's SQLite index")?;
     schema::ensure_current(&conn, &registry::indexer_version(&discovered))
@@ -209,11 +210,13 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
                 .canonicalize()
                 .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
             let conn = Arc::new(
-                IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())),
+                IndexStore::new(conn)
+                    .with_link_rules(plugin_manifest::link_rules(discovered.manifests.values())),
             );
             let project_config = config::read_project_config(project_root)
                 .context("failed to read the project's config.toml")?;
-            let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
+            let embedding_pipeline =
+                EmbeddingPipeline::load(config::embedding::embedding_settings(&project_config.embedding));
             // Per language now: `run_once` asks every currently-owed
             // language and records `language_state.semanticPassAt` (and the
             // roll-up) itself - see that function's own doc comment.
@@ -236,7 +239,7 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             .canonicalize()
             .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
         let conn = Arc::new(
-            IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())),
+            IndexStore::new(conn).with_link_rules(plugin_manifest::link_rules(discovered.manifests.values())),
         );
         // Read back rather than assumed from `ProjectConfig::default()`: a
         // pre-existing config.toml (the `!config_written` case) may name a
@@ -244,7 +247,8 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         // configured, exactly like `daemon::run`'s own cold start.
         let project_config =
             config::read_project_config(project_root).context("failed to read the project's config.toml")?;
-        let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
+        let embedding_pipeline =
+            EmbeddingPipeline::load(config::embedding::embedding_settings(&project_config.embedding));
         // Discovery's result, resolved above, handed straight in - see
         // `daemon::bulk_index::run`'s doc comment for why it takes that
         // directly rather than a `PluginRegistry`. The walk is

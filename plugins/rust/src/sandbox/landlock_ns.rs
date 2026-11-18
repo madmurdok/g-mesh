@@ -34,7 +34,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
-use g_mesh_plugin_sdk::lsp::{self, SemanticConfig, PROBE_BUDGET};
+use g_mesh_plugin_sdk_lsp::{self as lsp, SemanticConfig, PROBE_BUDGET};
 
 use super::{SandboxOutcome, SandboxPolicy};
 

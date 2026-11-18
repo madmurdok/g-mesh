@@ -767,7 +767,7 @@ jobs:
         id: build
         timeout-minutes: ${{ matrix.build_timeout || 25 }}
         shell: bash
-        run: cargo nextest run --workspace --profile ci --no-run
+        run: cargo nextest run --workspace --features g-mesh/embed-eval --profile ci --no-run
 
       # The partition does not depend on the platform, so one row checks it.
       - name: Test sections cover the whole suite
@@ -823,6 +823,12 @@ jobs:
         timeout-minutes: 10
         shell: bash
         run: scripts/test-sections.sh run --profile ci sdk
+
+      - name: "tests: sdk-lsp"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' sdk-lsp ')) }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci sdk-lsp
 
       - name: "tests: plugin-typescript"
         if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' plugin-typescript ')) }}

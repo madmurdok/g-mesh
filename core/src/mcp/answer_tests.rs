@@ -1,20 +1,18 @@
 //! `answer: rows|files|count` and `total` on `find_references`,
 //! `find_callers` and `find_callees`, through their real handlers.
 
-use std::collections::{HashMap, HashSet};
+use crate::mcp::context::QueryCtx;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
-use super::query_shapes::QueryShapes;
-use super::session_hints::SessionHints;
 use super::{find_callers_callees, find_references, Answer, SymbolQueryParams};
-use crate::embedding::EmbeddingPipeline;
-use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::mcp::query::test_support::Rendered;
+use crate::model::{EdgeRecord, NodeRecord};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::{EdgeRecord, NodeRecord};
+use crate::storage::write::{upsert_edge, upsert_node};
 
 #[derive(Clone, Copy)]
 enum Tool {
@@ -23,7 +21,8 @@ enum Tool {
     Callees,
 }
 
-fn body(result: &CallToolResult) -> serde_json::Value {
+fn body(result: &impl Rendered) -> serde_json::Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -32,17 +31,16 @@ fn body(result: &CallToolResult) -> serde_json::Value {
 }
 
 fn call(tool: Tool, store: &Arc<IndexStore>, params: SymbolQueryParams) -> serde_json::Value {
-    let embedding = EmbeddingPipeline::disabled();
-    let shapes = QueryShapes::shipped();
-    let capabilities = HashMap::new();
-    let hints = SessionHints::default();
+    let ctx = QueryCtx::for_test(store);
     let result = match tool {
-        Tool::References => find_references::handle(store, &embedding, shapes, &capabilities, &hints, params),
+        Tool::References => {
+            ctx.resolve_lazily(find_references::handle, params).map(|answer| answer.rendered())
+        }
         Tool::Callers => {
-            find_callers_callees::handle_callers(store, &embedding, shapes, &capabilities, &hints, params)
+            ctx.resolve_lazily(find_callers_callees::handle_callers, params).map(|answer| answer.rendered())
         }
         Tool::Callees => {
-            find_callers_callees::handle_callees(store, &embedding, shapes, &capabilities, params)
+            ctx.resolve_lazily(find_callers_callees::handle_callees, params).map(|answer| answer.rendered())
         }
     };
     body(&result.unwrap())

@@ -5,7 +5,7 @@
 //! discovered manifest's `command`/`args` name).
 //!
 //! [`PluginProcess`]/[`PluginState`] here are generic over any one plugin;
-//! discovery and per-language routing live in `daemon::manifest`
+//! discovery and per-language routing live in `plugin_manifest`
 //! (`~/.g-mesh/plugins/<language>/plugin.toml` + the bundled root) and
 //! `daemon::registry::PluginRegistry`, which spawns one `PluginProcess` per
 //! discovered language, lazily, the first time anything needs it. Every
@@ -37,8 +37,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::daemon::manifest::PluginManifest;
 use crate::embedding::EmbeddingPipeline;
+use crate::ingest::apply::{
+    apply_file_change as apply_file_change_diff, apply_residual_semantic_pass, apply_scoped_semantic_pass,
+    apply_semantic_pass, reextract_file, FileChangeOutcome, SemanticPassOutcome,
+};
+use crate::ingest::staleness::{self, StalenessOutcome};
+use crate::plugin_manifest::PluginManifest;
 use crate::protocol::handshake;
 use crate::protocol::jsonrpc::{is_timeout, read_message_with_timeout, write_message};
 use crate::protocol::types::{
@@ -46,11 +51,6 @@ use crate::protocol::types::{
     JSONRPC_VERSION,
 };
 use crate::storage::index_store::{self, IndexStore};
-use crate::watcher::apply::{
-    apply_file_change as apply_file_change_diff, apply_residual_semantic_pass, apply_scoped_semantic_pass,
-    apply_semantic_pass, reextract_file, FileChangeOutcome, SemanticPassOutcome,
-};
-use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// How often [`PluginProcess::shutdown`] checks whether the plugin has taken
 /// the hint and exited.
@@ -65,7 +65,7 @@ const RELAUNCH_GRACE: Duration = Duration::from_secs(2);
 
 /// Per-method budgets for one control-plane round trip - see
 /// `docs/architecture/multi-language-plugins.md`'s "Semantic engine hangs or
-/// is slow" failure mode, and `watcher::apply::round_trip`/
+/// is slow" failure mode, and `ingest::apply::round_trip`/
 /// `protocol::jsonrpc::read_message_with_timeout` for the mechanism that
 /// enforces them. Three separate fields, not one shared timeout, because each
 /// covers a different amount of plugin work - and, as of this task's review
@@ -84,7 +84,7 @@ const RELAUNCH_GRACE: Duration = Duration::from_secs(2);
 ///   and a loaded CI box before calling the plugin wedged rather than merely
 ///   slow. Treat this as a guess with a wide margin, not a validated budget.
 /// - **`semantic_pass_file`**: the per-file semantic upgrade that rides on
-///   the very same reparse (`watcher::apply::apply_file_change`'s own doc
+///   the very same reparse (`ingest::apply::apply_file_change`'s own doc
 ///   comment). **Not measured either** - same gap: the bench indexes this
 ///   task's `semantic_pass_project` numbers came from only record the
 ///   *whole-project* pass's timestamps (`meta.bulkIndexedAt` /
@@ -190,14 +190,14 @@ pub const SEMANTIC_PASS_PER_FILE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Test-only override for [`RoundTripTimeouts::file_changed`] - real installs
 /// never set it. See [`RoundTripTimeouts`]'s doc comment.
-pub const FILE_CHANGED_TIMEOUT_ENV: &str = "G_MESH_FILE_CHANGED_TIMEOUT_MS";
+pub const FILE_CHANGED_TIMEOUT_ENV: &str = crate::knobs::FILE_CHANGED_TIMEOUT_MS.name;
 /// Test-only override for [`RoundTripTimeouts::semantic_pass_file`].
-pub const SEMANTIC_PASS_FILE_TIMEOUT_ENV: &str = "G_MESH_SEMANTIC_PASS_FILE_TIMEOUT_MS";
+pub const SEMANTIC_PASS_FILE_TIMEOUT_ENV: &str = crate::knobs::SEMANTIC_PASS_FILE_TIMEOUT_MS.name;
 /// Test-only override for [`RoundTripTimeouts::semantic_pass_project`] - the
 /// floor, not the scaled timeout (there is no override for the per-file
 /// budget; tests that need a short whole-project timeout pass a small
 /// `file_count` too, since the floor is what dominates at small counts).
-pub const SEMANTIC_PASS_PROJECT_TIMEOUT_ENV: &str = "G_MESH_SEMANTIC_PASS_PROJECT_TIMEOUT_MS";
+pub const SEMANTIC_PASS_PROJECT_TIMEOUT_ENV: &str = crate::knobs::SEMANTIC_PASS_PROJECT_TIMEOUT_MS.name;
 
 impl Default for RoundTripTimeouts {
     fn default() -> Self {
@@ -215,21 +215,24 @@ impl RoundTripTimeouts {
     pub fn from_env() -> Self {
         let default = Self::default();
         Self {
-            file_changed: parse_round_trip_timeout(
-                std::env::var(FILE_CHANGED_TIMEOUT_ENV).ok().as_deref(),
+            file_changed: crate::knobs::millis(
+                &crate::knobs::FILE_CHANGED_TIMEOUT_MS,
+                crate::knobs::ZeroIs::Default,
                 default.file_changed,
-                FILE_CHANGED_TIMEOUT_ENV,
-            ),
-            semantic_pass_file: parse_round_trip_timeout(
-                std::env::var(SEMANTIC_PASS_FILE_TIMEOUT_ENV).ok().as_deref(),
+            )
+            .unwrap_or(default.file_changed),
+            semantic_pass_file: crate::knobs::millis(
+                &crate::knobs::SEMANTIC_PASS_FILE_TIMEOUT_MS,
+                crate::knobs::ZeroIs::Default,
                 default.semantic_pass_file,
-                SEMANTIC_PASS_FILE_TIMEOUT_ENV,
-            ),
-            semantic_pass_project: parse_round_trip_timeout(
-                std::env::var(SEMANTIC_PASS_PROJECT_TIMEOUT_ENV).ok().as_deref(),
+            )
+            .unwrap_or(default.semantic_pass_file),
+            semantic_pass_project: crate::knobs::millis(
+                &crate::knobs::SEMANTIC_PASS_PROJECT_TIMEOUT_MS,
+                crate::knobs::ZeroIs::Default,
                 default.semantic_pass_project,
-                SEMANTIC_PASS_PROJECT_TIMEOUT_ENV,
-            ),
+            )
+            .unwrap_or(default.semantic_pass_project),
         }
     }
 
@@ -248,26 +251,6 @@ impl RoundTripTimeouts {
         let file_count = u32::try_from(file_count).unwrap_or(u32::MAX);
         let scaled = SEMANTIC_PASS_PER_FILE_BUDGET.saturating_mul(file_count);
         self.semantic_pass_project.max(scaled)
-    }
-}
-
-/// `default` for an absent or unparseable override, and - unlike
-/// `daemon::lifecycle::parse_timeout`'s idle timers - also for an explicit
-/// `0`: an idle timer can mean "never" at zero, but a round-trip timeout of
-/// zero would fail every request, which is not a meaningful "off" state for
-/// this type to offer.
-fn parse_round_trip_timeout(raw: Option<&str>, default: Duration, name: &str) -> Duration {
-    let Some(raw) = raw else { return default };
-    match raw.trim().parse::<u64>() {
-        Ok(0) => default,
-        Ok(millis) => Duration::from_millis(millis),
-        Err(_) => {
-            crate::log_line!(
-                "g-mesh daemon: ignoring {name}={raw:?} - not a whole number of milliseconds; \
-                 using the default {default:?}"
-            );
-            default
-        }
     }
 }
 
@@ -290,7 +273,7 @@ pub const FINGERPRINT_UNAVAILABLE: &str = "unavailable";
 const BASELINE_FINGERPRINT_IGNORE: &[&str] =
     &[".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"];
 
-/// The language whose pid file `daemon::plugin_pid_path` resolves: the
+/// The language whose pid file `StateDir::plugin_pid_file` is asked for: the
 /// bundled TypeScript plugin's manifest `language`, which is also its
 /// directory name under a plugin root.
 ///
@@ -354,8 +337,8 @@ pub fn fingerprint(manifest: &PluginManifest) -> String {
     })
 }
 
-/// One digest over every plugin `daemon::manifest::discover` finds from
-/// `daemon::manifest::default_roots` - the same value `daemon::registry::indexer_version`
+/// One digest over every plugin `plugin_manifest::discover` finds from
+/// `plugin_manifest::default_roots` - the same value `daemon::registry::indexer_version`
 /// appends to the core pipeline's generation - memoized for the process's
 /// lifetime. It is what `build_stamp::of_running_process` records, so a shim
 /// can tell that a running daemon's plugins were rebuilt under an unchanged
@@ -370,7 +353,7 @@ pub fn fingerprint(manifest: &PluginManifest) -> String {
 pub fn discovered_fingerprint() -> &'static str {
     static FINGERPRINT: OnceLock<String> = OnceLock::new();
     FINGERPRINT.get_or_init(|| {
-        match crate::daemon::manifest::discover(&crate::daemon::manifest::default_roots()) {
+        match crate::plugin_manifest::discover(&crate::plugin_manifest::default_roots()) {
             Ok(discovered) => crate::daemon::registry::plugins_digest(&discovered),
             Err(err) => {
                 crate::log_line!(
@@ -505,7 +488,7 @@ struct PluginState {
 ///
 /// Triggered by the path shape the bundled cargo-workspace plugins declare
 /// (`${G_MESH_BIN_DIR}/g-mesh-plugin-<language>`, resolved by
-/// `daemon::manifest::resolve_command` against the running g-mesh
+/// `plugin_manifest::resolve_command` against the running g-mesh
 /// executable's own `target/<profile>/` directory) rather than by name, so a
 /// plugin that joins the cargo workspace the same way is covered without this
 /// function learning its name.
@@ -533,7 +516,7 @@ struct PluginState {
 /// # Which spelling the message names
 ///
 /// `command` reaching this function already went through
-/// `manifest::resolve_exe_suffix` once, at manifest-read time - so on a
+/// `plugin_manifest::resolve_exe_suffix` once, at manifest-read time - so on a
 /// platform with a non-empty [`std::env::consts::EXE_SUFFIX`] (Windows),
 /// `command` is extensionless *here* only when neither the unsuffixed nor
 /// the suffixed spelling exists (if the suffixed one did, resolution would
@@ -541,7 +524,7 @@ struct PluginState {
 /// would name a spelling cargo never produces on that platform at all -
 /// wrong in a different way than the bare `No such file or directory` this
 /// function exists to replace, not an improvement over it. So this
-/// re-derives the suffixed spelling via [`manifest::exe_suffixed`] (the same
+/// re-derives the suffixed spelling via [`plugin_manifest::exe_suffixed`] (the same
 /// pure decision `resolve_exe_suffix` itself uses) purely for the message,
 /// independent of whether that file exists - it's the name a real
 /// `cargo build --workspace` on this platform would actually produce, and
@@ -570,7 +553,7 @@ pub(crate) fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: 
     let workspace_root = target_dir.parent().filter(|root| root.join("Cargo.toml").is_file());
 
     let named =
-        crate::daemon::manifest::exe_suffixed(command, suffix).unwrap_or_else(|| command.to_path_buf());
+        crate::plugin_manifest::exe_suffixed(command, suffix).unwrap_or_else(|| command.to_path_buf());
     let build =
         if profile == "release" { "cargo build --workspace --release" } else { "cargo build --workspace" };
 
@@ -613,12 +596,12 @@ impl PluginState {
             .args(&manifest.args)
             .arg(project_root)
             // The manifest core read, so the plugin reads the same one - see
-            // `manifest::MANIFEST_PATH_ENV`. Without it an SDK plugin looks
+            // `plugin_manifest::MANIFEST_PATH_ENV`. Without it an SDK plugin looks
             // beside its own binary, which is right in an installed layout and
             // wrong in a checkout, where core would send a `semanticPass` to a
             // plugin that never found the `[plugin.semantic]` section
             // declaring the server to answer it with.
-            .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
+            .env(crate::plugin_manifest::MANIFEST_PATH_ENV, manifest.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Plugin logs are diagnostic-only today - nothing consumes them
@@ -963,8 +946,8 @@ impl PluginProcess {
                         "its change to {file_path} could not be applied ({err:#}), so its cached copy of \
                      that file is ahead of the index - a fresh process re-extracts it in full"
                     )) {
-                        crate::log_line!(
-                            "g-mesh daemon: could not relaunch the {} plugin after a failed apply \
+                        crate::log_role!(
+                            "could not relaunch the {} plugin after a failed apply \
                          ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
                             self.manifest.language
                         );
@@ -1006,8 +989,8 @@ impl PluginProcess {
             return;
         }
         if let Err(err) = self.relaunch("it exited while re-extracting the files an edit moved") {
-            crate::log_line!(
-                "g-mesh daemon: failed to relaunch the {} plugin after a failed re-extract: {err:#}",
+            crate::log_role!(
+                "failed to relaunch the {} plugin after a failed re-extract: {err:#}",
                 self.manifest.language
             );
         }
@@ -1065,14 +1048,14 @@ impl PluginProcess {
     }
 
     /// Synchronous per-file staleness check plus reindex-if-needed, per
-    /// `watcher::staleness::ensure_fresh` - see
+    /// `ingest::staleness::ensure_fresh` - see
     /// `daemon::lifecycle::PluginSupervisor::ensure_fresh`'s doc for why this
     /// exists and what gap it closes.
     ///
-    /// The mtime/hash comparison (`watcher::staleness::is_stale`) runs
+    /// The mtime/hash comparison (`ingest::staleness::is_stale`) runs
     /// without this process's `state` lock at all - the overwhelmingly common
     /// case (nothing changed) must not queue behind a live reparse it has
-    /// nothing to do with, matching the whole point of `watcher::staleness`'s
+    /// nothing to do with, matching the whole point of `ingest::staleness`'s
     /// two-tier design. Only a real mismatch takes the lock, for exactly the
     /// one round trip a live watcher event would also pay for.
     ///
@@ -1099,7 +1082,7 @@ impl PluginProcess {
     /// query's retry would get an empty diff back, succeed, and record the
     /// new content hash as this file's baseline over a graph that never took
     /// the edit: stale data marked fresh, surviving a restart. The baseline
-    /// is not written for the failed attempt (`watcher::staleness::
+    /// is not written for the failed attempt (`ingest::staleness::
     /// ensure_fresh` records it only after a successful reindex); the
     /// relaunch is what makes the retry a full extraction instead of that
     /// empty diff. The error is still returned, for the MCP layer to log.
@@ -1163,8 +1146,8 @@ impl PluginProcess {
                 "its query-time reindex of {file_path} could not be applied ({err:#}), so its cached \
                  copy of that file is ahead of the index - a fresh process re-extracts it in full"
             )) {
-                crate::log_line!(
-                    "g-mesh daemon: could not relaunch the {} plugin after a failed query-time \
+                crate::log_role!(
+                    "could not relaunch the {} plugin after a failed query-time \
                      reindex ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
                     self.manifest.language
                 );
@@ -1175,7 +1158,7 @@ impl PluginProcess {
 
     /// Asks the plugin's semantic layer to upgrade what the structural pass
     /// could only guess at, and commits its answer - see
-    /// `watcher::apply::apply_semantic_pass`.
+    /// `ingest::apply::apply_semantic_pass`.
     ///
     /// This is the *whole-project* entry point, used once the cold-start
     /// bulk walk is done (`daemon::run`); the per-file pass that follows an
@@ -1207,7 +1190,7 @@ impl PluginProcess {
     /// `file_paths` empty asks the whole project. Non-empty, it is a residual
     /// language's owed files (GM-521, `storage::schema::
     /// semantic_residual_files`) and the pass is
-    /// `watcher::apply::apply_residual_semantic_pass`; `file_count` is then
+    /// `ingest::apply::apply_residual_semantic_pass`; `file_count` is then
     /// their number. The returned [`SemanticPassOutcome`] says what the
     /// caller records.
     pub fn semantic_pass(
@@ -1370,8 +1353,8 @@ impl PluginProcess {
             return;
         }
         if let Err(relaunch_err) = self.relaunch(&format!("the process exited unexpectedly ({err:#})")) {
-            crate::log_line!(
-                "g-mesh daemon: failed to relaunch the {} plugin after a control-plane timeout: {relaunch_err:#}",
+            crate::log_role!(
+                "failed to relaunch the {} plugin after a control-plane timeout: {relaunch_err:#}",
                 self.manifest.language
             );
         }
@@ -1552,8 +1535,8 @@ impl PluginProcess {
     /// `Mutex`.
     fn kill_on_timeout<'a>(&'a self, child: &'a mut Child) -> impl FnMut() + 'a {
         move || {
-            crate::log_line!(
-                "g-mesh daemon: the {} plugin did not answer a control-plane request in time - \
+            crate::log_role!(
+                "the {} plugin did not answer a control-plane request in time - \
                  killing it so a fresh process can take over",
                 self.manifest.language
             );
@@ -1609,16 +1592,16 @@ impl PluginProcess {
     /// was killed, and what keeps a relaunched *live* plugin from leaving its
     /// tsserver running or its pid a zombie.
     fn relaunch(&self, why: &str) -> Result<()> {
-        crate::log_line!("g-mesh daemon: relaunching the {} plugin: {why}", self.manifest.language);
+        crate::log_role!("relaunching the {} plugin: {why}", self.manifest.language);
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
         let replaced = std::mem::replace(&mut *self.state(), fresh);
-        super::write_pid_file(&self.pid_file, pid);
+        crate::paths::state_dir::write_pid_file(&self.pid_file, pid);
         // Outside the state lock: the fresh process is already serving, and
         // waiting out the old one's grace period must not hold up a request.
         if let Err(err) = replaced.end(RELAUNCH_GRACE) {
-            crate::log_line!(
-                "g-mesh daemon: the replaced {} plugin process did not shut down cleanly: {err:#}",
+            crate::log_role!(
+                "the replaced {} plugin process did not shut down cleanly: {err:#}",
                 self.manifest.language
             );
         }

@@ -863,7 +863,7 @@ fn the_go_plugin_satisfies_its_own_expectations_file() {
 /// `tier = "semantic"` entries cleanly `Skip`. That could only happen
 /// because the Go plugin's whole-project `semanticPass` answered an empty
 /// diff with no `incomplete` field - wire/src/lib.rs's
-/// `FileChangeResponse::incomplete`, which core's `watcher::apply::
+/// `FileChangeResponse::incomplete`, which core's `ingest::apply::
 /// apply_semantic_pass` reads to decide whether a whole-project pass gets to
 /// leave `language_state.semanticPassAt` set. Absent means "this pass
 /// finished," so a Go index built with no toolchain on `PATH` looked exactly

@@ -43,9 +43,9 @@ fn refused_by_all_needs_every_language_and_at_least_one() {
 fn a_plugin_without_the_table_keeps_refused_by_all_false() {
     let declared = PluginManifest {
         non_symbol_queries: shapes(&["@"], &[]),
-        ..crate::daemon::manifest::bare_manifest("typescript")
+        ..crate::plugin_manifest::bare_manifest("typescript")
     };
-    let silent = crate::daemon::manifest::bare_manifest("cobol");
+    let silent = crate::plugin_manifest::bare_manifest("cobol");
 
     let map = QueryShapes::from_manifests([&declared, &silent]);
 
@@ -117,12 +117,12 @@ fn rewrites_strip_a_declared_prefix_and_keep_only_a_remainder_the_language_accep
 fn a_plugin_without_the_table_is_never_rewritten_for() {
     let declared = PluginManifest {
         non_symbol_queries: shapes(&["@"], &[]),
-        symbol_query_prefixes: crate::daemon::manifest::SymbolQueryPrefixes { strip: vec!["@".to_string()] },
-        ..crate::daemon::manifest::bare_manifest("typescript")
+        symbol_query_prefixes: crate::plugin_manifest::SymbolQueryPrefixes { strip: vec!["@".to_string()] },
+        ..crate::plugin_manifest::bare_manifest("typescript")
     };
     let silent = PluginManifest {
         non_symbol_queries: shapes(&["@"], &[]),
-        ..crate::daemon::manifest::bare_manifest("cobol")
+        ..crate::plugin_manifest::bare_manifest("cobol")
     };
 
     let map = QueryShapes::from_manifests([&declared, &silent]);

@@ -1,0 +1,111 @@
+{
+  "edges": [
+    {
+      "fromId": "n1",
+      "id": "e993bb1f768d7f2f97b6b5a84a5a7a7c",
+      "kind": "DEFINES",
+      "toDeclaration": null,
+      "toId": "n2"
+    },
+    {
+      "fromId": "n1",
+      "id": "2acdc048c3ce5523a37ad31d4bc83084",
+      "kind": "CALLS",
+      "toDeclaration": 0,
+      "toId": "n2"
+    },
+    {
+      "fromId": "n1",
+      "id": "c25c95159195db66a611a5b42f125c09",
+      "kind": "CALLS",
+      "toDeclaration": 2,
+      "toId": "n2"
+    },
+    {
+      "fromId": "from id",
+      "id": "2364f0c42e3776812733862b3f087f45",
+      "kind": "SUPERTYPE_OF",
+      "toDeclaration": null,
+      "toId": "to id"
+    },
+    {
+      "fromId": "",
+      "id": "7e6170702d74364b9ff0f284413c85ee",
+      "kind": "REFERENCES",
+      "toDeclaration": null,
+      "toId": ""
+    },
+    {
+      "fromId": "f",
+      "id": "faf88137e1ce6dd4a17bc42498a6665e",
+      "kind": "CALLS",
+      "toDeclaration": null,
+      "toId": "t 1"
+    },
+    {
+      "fromId": "f",
+      "id": "1ec6fd2324dd43512efd4d820dc62d01",
+      "kind": "CALLS",
+      "toDeclaration": 1,
+      "toId": "t"
+    }
+  ],
+  "nodes": [
+    {
+      "filePath": "main.go",
+      "id": "1c06532b9ba18d30da653a043b3ed0e1",
+      "kind": "File",
+      "nativeKind": "",
+      "qualifiedName": "main.go"
+    },
+    {
+      "filePath": "pkg/a.go",
+      "id": "4028cae7bf513d1ffeea1442cbf6625c",
+      "kind": "Function",
+      "nativeKind": "method",
+      "qualifiedName": "pkg.Do"
+    },
+    {
+      "filePath": "pkg/a.go",
+      "id": "a6864a82663f5dc450c4133b5cad12e7",
+      "kind": "Type",
+      "nativeKind": "",
+      "qualifiedName": "pkg.T"
+    },
+    {
+      "filePath": "",
+      "id": "d61c3c4fe145ae4017786a96a2eadc2d",
+      "kind": "Variable",
+      "nativeKind": "",
+      "qualifiedName": ""
+    },
+    {
+      "filePath": "dir with space/file name.go",
+      "id": "8300a99d5d24d0e49feb2abbed23f54f",
+      "kind": "Module",
+      "nativeKind": "",
+      "qualifiedName": "mod path"
+    },
+    {
+      "filePath": "pkg/naïve.go",
+      "id": "40f724c27178141d1219010d016c7508",
+      "kind": "Type",
+      "nativeKind": "struct",
+      "qualifiedName": "Naïve"
+    },
+    {
+      "filePath": "p",
+      "id": "8a3578c0cb7fee43a6f87cffc803c20f",
+      "kind": "Function",
+      "nativeKind": "z",
+      "qualifiedName": "x y"
+    },
+    {
+      "filePath": "p",
+      "id": "d4ece4745507040ffc58513493a029cc",
+      "kind": "Function",
+      "nativeKind": "y z",
+      "qualifiedName": "x"
+    }
+  ]
+}

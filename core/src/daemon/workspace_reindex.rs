@@ -6,7 +6,7 @@
 //!
 //! A workspace file decides where module and crate boundaries are, which
 //! every other file's container key (`graph::containers`) and every
-//! placeholder's scope (`graph::symbol_links`, `graph::imports`) were
+//! placeholder's scope (`link::symbol_links`, `link::imports`) were
 //! computed against, so a single-file diff cannot correct it: the language
 //! is walked again from nothing, with the same one-shot `--bulk-index`
 //! machinery the cold start uses, restricted to one manifest.
@@ -84,26 +84,25 @@ use anyhow::{Context, Result};
 
 use crate::daemon::bulk_index::{self, WalkContext};
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::manifest::{self, PluginManifest};
 use crate::daemon::plugin;
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::embedding::pipeline::ComputedBatch;
 use crate::embedding::EmbedStats;
+use crate::ingest::apply::SemanticPassOutcome;
+use crate::ingest::staleness;
+use crate::paths::state_dir::StateDir;
+use crate::plugin_manifest::{self, PluginManifest};
 use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
 use crate::storage::schema;
-use crate::watcher::apply::SemanticPassOutcome;
-use crate::watcher::staleness;
-
-const STAGING_PREFIX: &str = "staging-";
-const STAGING_SUFFIX: &str = ".db";
+use crate::storage::vectors::VectorWrite;
 
 /// Where `language`'s staging index lives in the project's state directory.
 fn staging_path(state_dir: &Path, language: &str) -> PathBuf {
-    state_dir.join(format!("{STAGING_PREFIX}{language}{STAGING_SUFFIX}"))
+    StateDir::at(state_dir).staging_db(language)
 }
 
 /// Removes a staging file and the journal SQLite may have left beside it.
@@ -113,10 +112,7 @@ fn remove_staging(path: &Path) {
     for file in [path, journal.as_path()] {
         if let Err(err) = std::fs::remove_file(file) {
             if err.kind() != std::io::ErrorKind::NotFound {
-                crate::log_line!(
-                    "g-mesh daemon: could not remove the staging index {} ({err})",
-                    file.display()
-                );
+                crate::log_role!("could not remove the staging index {} ({err})", file.display());
             }
         }
     }
@@ -130,7 +126,7 @@ pub(crate) fn remove_stale_staging(state_dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(STAGING_PREFIX) && name.ends_with(STAGING_SUFFIX) {
+        if StateDir::is_staging_db(name) {
             remove_staging(&entry.path());
         }
     }
@@ -145,15 +141,14 @@ pub(crate) fn remove_stale_semantic_pending(
     conn: &rusqlite::Connection,
     manifests: &std::collections::HashMap<String, PluginManifest>,
 ) {
-    let capable: HashSet<String> = manifest::semantic_pass_capable_languages(manifests).into_iter().collect();
+    let capable: HashSet<String> =
+        plugin_manifest::semantic_pass_capable_languages(manifests).into_iter().collect();
     match schema::clear_stale_semantic_pending(conn, &capable) {
         Ok(0) => {}
         Ok(cleared) => {
-            crate::log_line!(
-                "g-mesh daemon: cleared the stale semantic-pending rows of {cleared} language(s)"
-            )
+            crate::log_role!("cleared the stale semantic-pending rows of {cleared} language(s)")
         }
-        Err(err) => crate::log_line!("g-mesh daemon: could not clear stale semantic-pending rows ({err:#})"),
+        Err(err) => crate::log_role!("could not clear stale semantic-pending rows ({err:#})"),
     }
 }
 
@@ -164,14 +159,12 @@ pub(crate) fn resume_pending(registry: &PluginRegistry, store: &IndexStore) {
     let pending = match store.with(schema::pending_reindexes) {
         Ok(pending) => pending,
         Err(err) => {
-            crate::log_line!("g-mesh daemon: could not read the interrupted workspace reindexes ({err:#})");
+            crate::log_role!("could not read the interrupted workspace reindexes ({err:#})");
             return;
         }
     };
     for (language, trigger) in pending {
-        crate::log_line!(
-            "g-mesh daemon: the {language} workspace reindex after {trigger} was interrupted - rerunning it"
-        );
+        crate::log_role!("the {language} workspace reindex after {trigger} was interrupted - rerunning it");
         registry.workspace_file_changed(store, &language, &trigger);
     }
 }
@@ -218,8 +211,8 @@ pub(crate) fn run_with(
     let embed_stats = supervisor.with_exclusive_access(|process| -> Result<EmbedStats> {
         if let Some(process) = process {
             if let Err(err) = process.notify_workspace_changed(changed_file) {
-                crate::log_line!(
-                    "g-mesh daemon: failed to notify the {language} plugin that {changed_file} changed \
+                crate::log_role!(
+                    "failed to notify the {language} plugin that {changed_file} changed \
                      ({err:#}) - it keeps whatever module/crate map it had cached, but the reindex below \
                      walks the language from scratch regardless"
                 );
@@ -256,8 +249,8 @@ fn prepare_semantic_pass(supervisor: &PluginSupervisor, process: Option<&PluginP
         return;
     }
     if let Err(err) = process.notify_prepare_semantic_pass() {
-        crate::log_line!(
-            "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) \
+        crate::log_role!(
+            "could not tell the {language} plugin its semantic pass is owed ({err:#}) \
              - it starts its engine when the pass is asked instead"
         );
     }
@@ -287,9 +280,7 @@ fn semantic_pass_after_swap(
                     _ => schema::record_language_semantic_pass(conn, language),
                 });
                 if let Err(err) = recorded {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to record {language}'s semantic pass after {after} ({err:#})"
-                    );
+                    crate::log_role!("failed to record {language}'s semantic pass after {after} ({err:#})");
                     semantic::record_failure(store, language, &err);
                 }
             }
@@ -297,16 +288,16 @@ fn semantic_pass_after_swap(
             // `PluginSupervisor::semantic_pass`). The language stays owed for
             // whoever next asks; status shows why.
             // Incomplete, with the unfinished files named: already recorded
-            // residual by the pass (`watcher::apply`); the next daemon start
+            // residual by the pass (`ingest::apply`); the next daemon start
             // asks only those files.
-            Ok(Some(SemanticPassOutcome::Residual { left })) => crate::log_line!(
-                "g-mesh daemon: the {language} semantic pass after {after} left {left} file(s) \
+            Ok(Some(SemanticPassOutcome::Residual { left })) => crate::log_role!(
+                "the {language} semantic pass after {after} left {left} file(s) \
                  unfinished - the next start asks only those"
             ),
             Ok(None) => semantic::record_not_run(store, language),
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: the {language} semantic pass after {after} failed ({err:#}) - \
+                crate::log_role!(
+                    "the {language} semantic pass after {after} failed ({err:#}) - \
                      its edges keep whatever the structural pass resolved"
                 );
                 semantic::record_failure(store, language, &err);
@@ -315,9 +306,7 @@ fn semantic_pass_after_swap(
 
         let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
         if let Err(err) = store.with(|conn| schema::reconcile_semantic_pass_rollup(conn, &capable)) {
-            crate::log_line!(
-                "g-mesh daemon: failed to update the project-wide semantic-pass roll-up ({err:#})"
-            );
+            crate::log_role!("failed to update the project-wide semantic-pass roll-up ({err:#})");
         }
     }
 }
@@ -360,15 +349,15 @@ pub(crate) fn retry_failed(
         walked_files.iter().map(String::as_str),
         walk_started,
     ) {
-        Ok(baselines) if baselines.skipped > 0 => crate::log_line!(
-            "g-mesh daemon: {} of {} retried {language} files got no staleness baseline - each reindexes on \
+        Ok(baselines) if baselines.skipped > 0 => crate::log_role!(
+            "{} of {} retried {language} files got no staleness baseline - each reindexes on \
              its first query",
             baselines.skipped,
             walked_files.len()
         ),
         Ok(_) => {}
-        Err(err) => crate::log_line!(
-            "g-mesh daemon: could not record the retried {language} files' staleness baselines - each \
+        Err(err) => crate::log_role!(
+            "could not record the retried {language} files' staleness baselines - each \
              reindexes on its first query: {err:#}"
         ),
     }
@@ -440,7 +429,7 @@ fn rebuild(
         &mut staged,
         live_path,
         language,
-        embedding.embedding_version(),
+        &embedding.text_rule(),
         keep_semantic_placeholders,
     )?;
     drop(staged);
@@ -453,8 +442,9 @@ fn rebuild(
 
     let semantic_pass_languages: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
     let fingerprint = plugin::fingerprint(manifest);
+    let write = embedding.vector_write(&computed);
     let vectors = match kind {
-        Rebuild::Reindex => Some((embedding.as_ref(), &computed)),
+        Rebuild::Reindex => Some(&write as &dyn VectorWrite),
         Rebuild::Retry => None,
     };
     store.swap_language(
@@ -468,8 +458,8 @@ fn rebuild(
         },
     )?;
     let counts = plan.counts;
-    crate::log_line!(
-        "g-mesh daemon: {language} reindex swapped in - nodes -{} +{}, edges -{} +{}, containers -{} +{}, \
+    crate::log_role!(
+        "{language} reindex swapped in - nodes -{} +{}, edges -{} +{}, containers -{} +{}, \
          {} texts owed a vector, {} file(s) structural until the semantic pass, {} placeholder(s) kept \
          for it",
         counts.delete_nodes,
@@ -494,10 +484,11 @@ mod tests {
     use rusqlite::OptionalExtension;
 
     use super::*;
-    use crate::daemon::manifest::discover;
-    use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
-    use crate::storage::write::{apply_diff, Diff, NodeRecord};
+    use crate::model::{Diff, NodeRecord};
+    use crate::plugin_manifest::discover;
+    use crate::storage::write::apply_diff;
+    use crate::test_plugin;
 
     /// A file-backed index in `project`'s state directory, where the daemon
     /// keeps it: the swap attaches the live index by its path. Foreign keys
@@ -545,7 +536,7 @@ mod tests {
 
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifests must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -728,7 +719,7 @@ mod tests {
         );
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -776,7 +767,7 @@ mod tests {
         );
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -826,7 +817,7 @@ mod tests {
         adjust(&alpha_dir);
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -922,7 +913,7 @@ mod tests {
         test_plugin::answer_first_semantic_pass_incomplete(&alpha_dir, "alpha", Some(REASON));
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -974,7 +965,7 @@ mod tests {
         );
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -1059,7 +1050,7 @@ mod tests {
         test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &["go.mod"], &[]);
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
@@ -1146,11 +1137,11 @@ mod tests {
     // the test writes (`test_plugin::set_bulk_stream`).
     // -----------------------------------------------------------------
 
+    use crate::model::EdgeRecord;
     use crate::protocol::types::{
         EdgeKind, NodeKind, PlaceholderTarget, Position, QualifiedPath, Range, SourceTier, TargetKey,
         TargetScope, Visibility, WireDeclaration, WireEdge, WireNode,
     };
-    use crate::storage::write::EdgeRecord;
 
     fn wire_node(id: &str, file_path: &str) -> WireNode {
         WireNode {
@@ -1246,7 +1237,7 @@ mod tests {
         }
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
@@ -2059,7 +2050,7 @@ mod tests {
     /// this pass did not re-send: what the pass sent and the syntactic edge
     /// stay. The plugin never retracts across processes
     /// (`a_new_bridge_does_not_retract_what_an_earlier_process_emitted` in
-    /// `plugins/sdk/tests/lsp_bridge.rs`), so core's sweep is what removes it.
+    /// `plugins/sdk-lsp/tests/lsp_bridge.rs`), so core's sweep is what removes it.
     ///
     /// Control: `semantic_sweep = false` in `plugins/typescript/plugin.toml`
     /// -> `alpha-old` survives.
@@ -2082,7 +2073,7 @@ mod tests {
     /// and `alpha-old` may be what it never got to.
     ///
     /// Control: sweep before the `outcome.incomplete && whole_project` check
-    /// in `watcher::apply::apply_semantic_pass_in` -> `alpha-old` is gone.
+    /// in `ingest::apply::apply_semantic_pass_in` -> `alpha-old` is gone.
     #[test]
     fn an_incomplete_typescript_pass_sweeps_nothing() {
         let kept = vec![
@@ -2213,7 +2204,7 @@ mod tests {
     /// sends it: kept at the swap, deleted with its edge after the pass.
     ///
     /// Control: remove the `store.sweep_unclaimed_nodes(language)` call from
-    /// `watcher::apply::apply_semantic_pass_in` -> `alpha-sp` is still there
+    /// `ingest::apply::apply_semantic_pass_in` -> `alpha-sp` is still there
     /// after the pass (its edge goes with the edge sweep either way).
     #[test]
     fn a_kept_placeholder_the_next_complete_pass_does_not_send_is_deleted() {
@@ -2429,14 +2420,16 @@ mod tests {
     fn alpha_failed_and_counted(registry: &PluginRegistry, conn: &IndexStore) {
         let outcomes = std::collections::BTreeMap::from([(
             "alpha".to_string(),
-            crate::languages::LanguageOutcome::Failed { error: "the walk failed".to_string() },
+            crate::storage::language_outcome::LanguageOutcome::Failed {
+                error: "the walk failed".to_string(),
+            },
         )]);
         conn.with(|conn| schema::record_language_outcomes(conn, &outcomes)).unwrap();
         conn.with(|conn| schema::begin_language_retry(conn, "alpha")).unwrap();
         registry.set_failed_languages(["alpha".to_string()]);
     }
 
-    fn alpha_outcome(conn: &IndexStore) -> crate::languages::LanguageOutcome {
+    fn alpha_outcome(conn: &IndexStore) -> crate::storage::language_outcome::LanguageOutcome {
         conn.with(schema::language_outcomes).unwrap().into_iter().find(|(l, _)| l == "alpha").unwrap().1
     }
 
@@ -2469,7 +2462,10 @@ mod tests {
         let failed = retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now());
 
         assert!(failed.is_err(), "a walk that exits non-zero fails the retry");
-        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Failed { .. }));
+        assert!(matches!(
+            alpha_outcome(&conn),
+            crate::storage::language_outcome::LanguageOutcome::Failed { .. }
+        ));
         assert_eq!(conn.with(schema::language_retries).unwrap().get("alpha"), Some(&1));
         assert!(registry.is_failed_language("alpha"), "a failed retry leaves the language unrouted");
         assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 0);
@@ -2479,7 +2475,10 @@ mod tests {
         retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now())
             .expect("the retry succeeds");
 
-        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Indexed { files: _ }));
+        assert!(matches!(
+            alpha_outcome(&conn),
+            crate::storage::language_outcome::LanguageOutcome::Indexed { files: _ }
+        ));
         assert!(conn.with(schema::language_retries).unwrap().is_empty(), "the swap drops the count");
         assert!(!registry.is_failed_language("alpha"), "the swapped-in language is routed");
         assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 2);

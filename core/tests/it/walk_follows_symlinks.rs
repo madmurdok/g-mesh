@@ -21,8 +21,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use g_mesh::daemon;
 use g_mesh::daemon::bulk_index::ABSENT_COUNT_OFF_ENV;
+use g_mesh::paths::state_dir::StateDir;
 use g_mesh::storage::connection::project_dir;
 use rusqlite::Connection;
 
@@ -106,10 +106,10 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        if let Ok(path) = daemon::pid_path(self.root()) {
+        if let Ok(path) = StateDir::of(self.root()).map(|sd| sd.pid_file()) {
             common::kill_pid_file(&path);
         }
-        if let Ok(endpoint) = daemon::endpoint(self.root()) {
+        if let Ok(endpoint) = StateDir::of(self.root()).and_then(|sd| g_mesh::control::lock::endpoint(&sd)) {
             endpoint.clear_stale();
         }
         if let Ok(state) = project_dir(self.root()) {

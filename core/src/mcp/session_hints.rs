@@ -126,6 +126,16 @@ pub(crate) const WALK_COMPLETE_IMPORT_TYPE: &str =
     "`truncated: false`: this walk is complete for the depth asked (at `max_depth: 1`, every direct \
      importer or import, `import type` included), so don't re-derive it with a `from '...'` grep.";
 
+/// `WALK_COMPLETE` for Rust: the module paths its plugin does not turn into
+/// import edges. An inline path rooted at another crate (`std::mem::drop`)
+/// draws none, which only an `Outgoing` walk can miss.
+pub(crate) const WALK_COMPLETE_RUST: &str =
+    "`truncated: false`: complete, except a module reached via a glob `use`, in a `macro_rules!` body or \
+     fn-local `mod`, or an external crate named only inline; don't grep for the rest.";
+
+/// The language whose `WALK_COMPLETE` is [`WALK_COMPLETE_RUST`].
+pub(crate) const RUST_LANGUAGE: &str = "rust";
+
 /// The language whose import edges are file-to-file and include type-only
 /// imports - JavaScript files are indexed under it too.
 pub(crate) const IMPORT_TYPE_LANGUAGE: &str = "typescript";
@@ -190,29 +200,18 @@ mod tests {
     /// clone it per request: clones must share one set, new servers must not.
     #[test]
     fn each_server_starts_its_own_session_and_its_clones_share_it() {
-        use crate::daemon::indexing_status::IndexingStatus;
-        use crate::daemon::lifecycle::CoreActivity;
-        use crate::daemon::manifest::DiscoveredPlugins;
-        use crate::daemon::registry::PluginRegistry;
         use crate::embedding::EmbeddingPipeline;
+        use crate::indexing_status::IndexingStatus;
+        use crate::mcp::host_fake::FakeHost;
         use crate::storage::index_store::IndexStore;
 
         let dir = tempfile::tempdir().unwrap();
         let server = || {
             let embedding = Arc::new(EmbeddingPipeline::disabled());
-            let registry = PluginRegistry::new(
-                dir.path(),
-                dir.path().to_path_buf(),
-                DiscoveredPlugins::default(),
-                None,
-                None,
-                Arc::clone(&embedding),
-            );
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             super::super::GMeshMcpServer::new(
                 Arc::new(IndexStore::new(conn)),
-                Arc::new(registry),
-                CoreActivity::new(),
+                Arc::new(FakeHost::new(dir.path())),
                 IndexingStatus::unindexed(),
                 embedding,
             )
@@ -254,6 +253,7 @@ mod tests {
             FILES_TALLY,
             WALK_COMPLETE,
             WALK_COMPLETE_IMPORT_TYPE,
+            WALK_COMPLETE_RUST,
             SEARCH_HITS,
             RERANK_MODEL_MISSING,
             RERANK_MODEL_FAILED,

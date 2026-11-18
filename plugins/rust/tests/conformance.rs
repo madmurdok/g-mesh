@@ -217,67 +217,33 @@ fn count_expectations() -> (usize, usize) {
     (total, semantic)
 }
 
-/// The `[plugin.semantic]` section of the manifest this plugin ships, as
-/// TOML.
-///
-/// Read from `plugin.toml` and re-serialized rather than written out again
-/// here, so these tests check the configuration a user gets - the server
-/// command, the `implementation_kinds` the sweep depends on, the
-/// `initializationOptions` that keep rust-analyzer from writing a `target/`
-/// into the fixture. A copy would drift, and the first sign of the drift
-/// would be a conformance run passing against a configuration nobody ships.
-///
-/// `command` is overridden when `server` is given, which is the whole of how
-/// the semantic and missing-toolchain arms differ.
-fn semantic_section(server: Option<&Path>) -> String {
-    let manifest = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
-    let text = std::fs::read_to_string(manifest).expect("plugins/rust/plugin.toml is readable");
-    let parsed: toml::Value = toml::from_str(&text).expect("plugins/rust/plugin.toml parses");
-    let mut section = parsed["plugin"]["semantic"].clone();
-    if let Some(server) = server {
-        section["command"] = toml::Value::String(server.to_string_lossy().into_owned());
-    }
-    let mut plugin = toml::map::Map::new();
-    plugin.insert("semantic".to_string(), section);
-    let mut root = toml::map::Map::new();
-    root.insert("plugin".to_string(), toml::Value::Table(plugin));
-    toml::to_string(&toml::Value::Table(root)).expect("the section re-serializes")
-}
-
+/// The manifest this plugin ships, read rather than restated, so these tests
+/// check the configuration a user gets - the server command, the
+/// `implementation_kinds` the sweep depends on, the `initializationOptions`
+/// that keep rust-analyzer from writing a `target/` into the fixture.
 fn base() -> PluginCheck {
-    PluginCheck::new(
-        "rust",
+    PluginCheck::from_manifest(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"),
         env!("CARGO_BIN_EXE_g-mesh-plugin-rust"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/project"),
     )
-    .extensions(&[".rs"])
-    .exclude_dirs(&g_mesh_plugin_rust::project::EXCLUDE_DIRS)
-    .watch_files(&["Cargo.toml"])
-    .entry_points(&["lib.rs", "main.rs", "mod.rs"])
 }
 
 /// The shipped configuration, with a real rust-analyzer.
 fn semantic() -> PluginCheck {
-    let server = rust_analyzer();
-    base()
-        .semantic_pass(true)
-        .receiver_calls("resolved", "unresolved")
-        .manifest_extra(semantic_section(Some(&server)))
+    base().semantic_command(rust_analyzer())
 }
 
 /// The manifest as 3.2.0 declared it: no semantic tier, so core never asks
 /// for one and the structural tier answers alone.
 fn structural_3_2_0() -> PluginCheck {
-    base().semantic_pass(false).receiver_calls("unresolved", "unresolved")
+    base().semantic_pass(false).receiver_calls("unresolved", "unresolved").without_semantic_section()
 }
 
 /// The shipped configuration on a machine with no rust-analyzer.
 fn missing_toolchain() -> PluginCheck {
     let nowhere = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/there-is-no-rust-analyzer-here");
-    base()
-        .semantic_pass(true)
-        .receiver_calls("resolved", "unresolved")
-        .manifest_extra(semantic_section(Some(&nowhere)))
+    base().semantic_command(nowhere)
 }
 
 /// The rust-analyzer these tests need, resolved the way the plugin itself

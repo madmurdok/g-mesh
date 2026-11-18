@@ -849,7 +849,7 @@ fn rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_
 #[cfg(unix)]
 mod project_extra_env {
     use super::*;
-    use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
+    use g_mesh_plugin_sdk_lsp::{LspBridge, SemanticConfig, ServerProfile};
 
     /// Where the project's `rust-analyzer.toml` sits.
     #[derive(Clone, Copy)]
@@ -1003,7 +1003,10 @@ mod project_extra_env {
                 }
                 let options = config.initialization_options.get_or_insert_with(|| serde_json::json!({}));
                 options["cargo"]["extraEnv"] = env.clone();
-                Box::new(LspBridge::new("rust", &fixture.root, config).quiescent_signal())
+                Box::new(
+                    LspBridge::new("rust", &fixture.root, config)
+                        .with_profile(ServerProfile { quiescent_status: true, ..ServerProfile::DEFAULT }),
+                )
             }
         };
         let answer = engine.answer(&[], &index).expect("the engine answers");
@@ -1259,8 +1262,8 @@ mod cargo_env_loader_var {
     #[test]
     #[ignore = "run by its parent test in the fixture's environment"]
     fn a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env() {
-        use g_mesh_plugin_sdk::lsp::LspBridge;
         use g_mesh_plugin_sdk::SemanticEngine;
+        use g_mesh_plugin_sdk_lsp::{LspBridge, ServerProfile};
 
         let test =
             "cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env";
@@ -1274,7 +1277,8 @@ mod cargo_env_loader_var {
             "the server does not start under Seatbelt: {config:?}"
         );
         let index = index_of(&root);
-        let mut bridge = LspBridge::new("rust", &root, config).quiescent_signal();
+        let mut bridge = LspBridge::new("rust", &root, config)
+            .with_profile(ServerProfile { quiescent_status: true, ..ServerProfile::DEFAULT });
         let answer = bridge.answer(&[], &index).expect("the confined server answers");
         drop(bridge);
 
@@ -1320,8 +1324,8 @@ mod cargo_env_loader_var {
     #[test]
     #[ignore = "run by its parent test in the fixture's environment"]
     fn a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env() {
-        use g_mesh_plugin_sdk::lsp::LspBridge;
         use g_mesh_plugin_sdk::SemanticEngine;
+        use g_mesh_plugin_sdk_lsp::{LspBridge, ServerProfile};
 
         let test =
             "cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env";
@@ -1333,7 +1337,8 @@ mod cargo_env_loader_var {
         let launched = format!("{config:?}");
         let (command, args) = (config.command.clone(), config.args.clone());
         let index = index_of(&root);
-        let mut bridge = LspBridge::new("rust", &root, config).quiescent_signal();
+        let mut bridge = LspBridge::new("rust", &root, config)
+            .with_profile(ServerProfile { quiescent_status: true, ..ServerProfile::DEFAULT });
         let answer = bridge.answer(&[], &index).expect("the confined server answers");
         drop(bridge);
 
@@ -1823,8 +1828,8 @@ mod sandbox_writes_and_network {
     use super::*;
     use std::collections::BTreeSet;
 
-    use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
     use g_mesh_plugin_sdk::{SemanticAnswer, SemanticEngine};
+    use g_mesh_plugin_sdk_lsp::{LspBridge, SemanticConfig, ServerProfile};
 
     const LAUNCHER: &str = env!("CARGO_BIN_EXE_g-mesh-plugin-rust");
 
@@ -1873,7 +1878,8 @@ mod sandbox_writes_and_network {
     /// The index of `root` and the server's answer about it under `config`.
     fn answer(root: &Path, config: SemanticConfig) -> (SdkIndex, SemanticAnswer) {
         let index = index_of(root);
-        let mut bridge = LspBridge::new("rust", root, config).quiescent_signal();
+        let mut bridge = LspBridge::new("rust", root, config)
+            .with_profile(ServerProfile { quiescent_status: true, ..ServerProfile::DEFAULT });
         let answer = bridge.answer(&[], &index).expect("the confined server answers");
         drop(bridge);
         (index, answer)
@@ -2220,7 +2226,7 @@ mod linux_sandbox {
     use std::process::Output;
 
     use g_mesh_plugin_rust::sandbox::{self, SandboxOutcome, SandboxPolicy};
-    use g_mesh_plugin_sdk::lsp::SemanticConfig;
+    use g_mesh_plugin_sdk_lsp::SemanticConfig;
 
     pub(super) const LAUNCHER: &str = env!("CARGO_BIN_EXE_g-mesh-plugin-rust");
 

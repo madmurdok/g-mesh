@@ -21,8 +21,9 @@
 #
 # Invariants:
 # - A path no rule names selects `full`: an unknown path is never skipped.
-# - A change to anything every crate builds on (wire, the SDK, cargo and
-#   nextest config, CI and this selection machinery) selects `full`.
+# - A change to anything every crate builds on (wire, the manifest schema,
+#   the SDK, cargo and nextest config, CI and this selection machinery)
+#   selects `full`.
 # - A change under `core/` selects every core section; one under
 #   `core/tests/log_line/` (which the SDK's tests include) adds `sdk`. With
 #   `--narrow` only: `core/src/cli/` or `core/src/mcp/` selects that module's
@@ -32,7 +33,7 @@
 #   `core/src/` path outside SCRIPTS_CLOSURE selects every core section but
 #   `core-scripts`.
 # - SCRIPTS_CLOSURE holds every core source file the `g-mesh::scripts` tests
-#   reach (they use only `daemon::manifest::read_manifest` and
+#   reach (they use only `plugin_manifest::read_manifest` and
 #   `languages::CATALOGUE`); a new core use in core/tests/scripts extends it.
 # - A change under `scripts/` selects `core-scripts`, in both modes: those
 #   tests read scripts/.
@@ -41,6 +42,11 @@
 #   plugins/<p>/ other than its plugin.toml or Cargo.toml (which core tests
 #   read) selects `plugin-<p>` and `core-spawns-<p>` instead of every core
 #   section: the core tests scripts/test-plugin-spawns.txt says start <p>.
+#   A plugin here is one with a `plugin-<p>` section in SECTIONS; a path
+#   under any other plugins/<p>/ (go and sdk-lsp aside) selects `full`.
+# - A change under plugins/sdk-lsp/ selects `sdk-lsp`, every `plugin-<p>`
+#   section and every core section. With `--narrow`, other than its
+#   Cargo.toml, `sdk-lsp`, every `plugin-<p>` and its `core-spawns-<p>`.
 # - A `core-spawns-<p>` selector is printed only while some core section that
 #   holds a test binary of scripts/test-plugin-spawns.txt is missing from the
 #   selection; it is a subset of the core sections.
@@ -139,9 +145,11 @@ SECTIONS=($(scripts/test-sections.sh list))
 [ ${#SECTIONS[@]} -gt 0 ] || die "scripts/test-sections.sh list printed nothing"
 CORE=()
 CORE_LIB=()
+PLUGIN_SECTIONS=()
 for s in "${SECTIONS[@]}"; do
 	case "$s" in core-*) CORE+=("$s") ;; esac
 	case "$s" in core-it | core-scripts) ;; core-*) CORE_LIB+=("$s") ;; esac
+	case "$s" in plugin-*) PLUGIN_SECTIONS+=("$s") ;; esac
 done
 
 full=0
@@ -157,7 +165,7 @@ add() {
 # One path, first matching row wins. Sets `full` or adds sections.
 classify() {
 	case "$1" in
-	wire/* | plugins/sdk/*) full=1 ;;
+	wire/* | manifest/* | plugins/sdk/*) full=1 ;;
 	Cargo.toml | Cargo.lock | .cargo/* | .config/nextest.toml | rust-toolchain*) full=1 ;;
 	.github/workflows/* | scripts/test-sections.sh | scripts/test-sections-check.py | scripts/test-select.sh) full=1 ;;
 	scripts/test-plugin-spawns.txt) full=1 ;;
@@ -170,20 +178,23 @@ classify() {
 	core/src/mcp/*) if [ -n "$narrow" ]; then add core-mcp core-it; else add "${CORE[@]}"; fi ;;
 	# SCRIPTS_CLOSURE
 	core/src/lib.rs | core/src/log.rs | core/src/languages.rs | core/src/languages/* | \
-		core/src/daemon/manifest.rs | core/src/daemon/manifest/* | \
-		core/src/graph/symbol_links.rs | core/src/graph/symbol_links/* | core/src/protocol/*)
+		core/src/plugin_manifest.rs | core/src/plugin_manifest/* | core/src/project_walk.rs | \
+		core/src/storage/language_outcome.rs | \
+		core/src/link/symbol_links.rs | core/src/link/symbol_links/* | core/src/protocol/*)
 		add "${CORE[@]}"
 		;;
 	core/src/*) if [ -n "$narrow" ]; then add core-it "${CORE_LIB[@]}"; else add "${CORE[@]}"; fi ;;
 	core/tests/it/*) if [ -n "$narrow" ]; then add core-it; else add "${CORE[@]}"; fi ;;
 	core/tests/scripts/*) if [ -n "$narrow" ]; then add core-it core-scripts; else add "${CORE[@]}"; fi ;;
 	core/*) add "${CORE[@]}" ;;
-	plugins/python/* | plugins/rust/* | plugins/typescript/*)
-		local plugin="${1#plugins/}"
-		plugin="${plugin%%/*}"
+	plugins/sdk-lsp/*)
 		case "$narrow:$1" in
-		1:plugins/*/plugin.toml | 1:plugins/*/Cargo.toml | :*) add "plugin-$plugin" "${CORE[@]}" ;;
-		*) add "plugin-$plugin" "core-spawns-$plugin" ;;
+		1:plugins/sdk-lsp/Cargo.toml | :*) add sdk-lsp "${PLUGIN_SECTIONS[@]}" "${CORE[@]}" ;;
+		*)
+			local s
+			add sdk-lsp "${PLUGIN_SECTIONS[@]}"
+			for s in "${PLUGIN_SECTIONS[@]}"; do add "core-spawns-${s#plugin-}"; done
+			;;
 		esac
 		;;
 	plugins/go/*)
@@ -191,6 +202,19 @@ classify() {
 		case "$narrow:$1" in
 		1:plugins/go/plugin.toml | :*) add "${CORE[@]}" ;;
 		*) add core-spawns-go ;;
+		esac
+		;;
+	plugins/*/*)
+		local plugin="${1#plugins/}"
+		plugin="${plugin%%/*}"
+		case " ${PLUGIN_SECTIONS[*]} " in
+		*" plugin-$plugin "*)
+			case "$narrow:$1" in
+			1:plugins/*/plugin.toml | 1:plugins/*/Cargo.toml | :*) add "plugin-$plugin" "${CORE[@]}" ;;
+			*) add "plugin-$plugin" "core-spawns-$plugin" ;;
+			esac
+			;;
+		*) full=1 ;;
 		esac
 		;;
 	README.md) add core-cli ;;
@@ -233,7 +257,11 @@ else
 		case "$selected" in *" $s "*) ;; *) spawns_covered=0 ;; esac
 	done
 	if [ "$spawns_covered" -eq 0 ]; then
-		for s in core-spawns-typescript core-spawns-rust core-spawns-python core-spawns-go; do
+		# Cargo plugins, then go ones: the order the selectors are printed in.
+		spawn_plugins="$(bash scripts/build-targets.sh --plugins cargo && bash scripts/build-targets.sh --plugins go)" ||
+			die "could not read build-targets.sh --plugins"
+		for p in $spawn_plugins; do
+			s="core-spawns-$p"
 			case "$selected" in *" $s "*) out+=("$s") ;; esac
 		done
 	fi

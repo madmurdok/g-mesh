@@ -6,8 +6,8 @@
 //! The protocol-level work goes through the daemon's own functions, unchanged:
 //! the handshake is verified by `protocol::handshake::verify`, each bulk
 //! stream is committed by `daemon::bulk_index::ingest` (the real batching)
-//! and linked by `graph::imports::link_all` + `graph::symbol_links::link_all`,
-//! and every control-plane round trip is `watcher::apply::apply_file_change`
+//! and linked by `link::imports::link_all` + `link::symbol_links::link_all`,
+//! and every control-plane round trip is `ingest::apply::apply_file_change`
 //! / `apply_semantic_pass` - including the `semantic_pass` capability gate
 //! `apply_file_change` applies itself - so the diffs land through the real
 //! `storage::write::apply_diff`, container maintenance, and `link_diff`.
@@ -71,10 +71,13 @@ use rusqlite::Connection;
 use super::checks::is_placeholder;
 use super::expectations::FilesCreatedPair;
 use crate::daemon::bulk_index::{self, WalkContext, BULK_INDEX_FLAG};
-use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
+use crate::graph::queries;
+pub(crate) use crate::graph::queries::{ImportRow, StoredRange};
+use crate::ingest::apply::{apply_file_change, apply_semantic_pass, SemanticPassOutcome};
 use crate::paths;
+use crate::plugin_manifest::PluginManifest;
 use crate::protocol::handshake;
 use crate::protocol::jsonrpc::{read_frame, read_message_with_timeout, write_message};
 use crate::protocol::ndjson::BulkItem;
@@ -84,7 +87,6 @@ use crate::protocol::types::{
 };
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::watcher::apply::{apply_file_change, apply_semantic_pass, SemanticPassOutcome};
 
 /// The directory the kit hands every plugin process it spawns, via this
 /// environment variable, for the plugin-side markers the kit defines.
@@ -97,7 +99,7 @@ use crate::watcher::apply::{apply_file_change, apply_semantic_pass, SemanticPass
 /// never does so is not failed for it; `checks` reports it "not instrumented"
 /// instead, because the absence of a marker is no evidence the engine was
 /// lazy.
-pub const MARKER_DIR_ENV: &str = "G_MESH_PLUGIN_CHECK_MARKER_DIR";
+pub const MARKER_DIR_ENV: &str = crate::knobs::PLUGIN_CHECK_MARKER_DIR.name;
 
 /// See [`MARKER_DIR_ENV`].
 pub const SEMANTIC_ENGINE_MARKER: &str = "semantic-engine-started";
@@ -377,9 +379,9 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
         .arg(scratch.workspace())
         // The manifest being checked, so an SDK plugin reads the same file the
         // kit is judging it against rather than one beside its own binary -
-        // see `daemon::manifest::MANIFEST_PATH_ENV`. Checking a plugin against
+        // see `plugin_manifest::MANIFEST_PATH_ENV`. Checking a plugin against
         // a manifest it cannot see is checking something else.
-        .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
+        .env(crate::plugin_manifest::MANIFEST_PATH_ENV, manifest.path())
         // The daemon's lifeline, exactly as `walk_one_language` sets it up:
         // a stdin pipe kept inside `child` and never written, plus
         // the variable that arms the plugin's watcher on it. Checking a
@@ -547,7 +549,7 @@ pub(crate) fn open_index(manifest: &PluginManifest) -> Result<Arc<IndexStore>> {
     let conn = Connection::open_in_memory().context("failed to open an in-memory index")?;
     conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
     schema::apply(&conn)?;
-    let rules = crate::daemon::manifest::link_rules([manifest]);
+    let rules = crate::plugin_manifest::link_rules([manifest]);
     Ok(Arc::new(IndexStore::new(conn).with_link_rules(rules)))
 }
 
@@ -565,18 +567,12 @@ pub(crate) fn ingest_and_link(conn: &IndexStore, bytes: &[u8]) -> Result<()> {
 ///
 /// Read from the index rather than from the plugin's own output on both
 /// sides, because linking legitimately removes nodes a plugin emitted:
-/// `graph::imports` drops a `resolved_module` placeholder once it has
+/// `link::imports` drops a `resolved_module` placeholder once it has
 /// repointed its edge onto the real file. Comparing raw bulk output against
 /// the index would report every linked import as a missing id.
 pub(crate) fn file_node_ids(store: &IndexStore, file: &str) -> Result<BTreeSet<String>> {
-    let conn = store.read();
-    let mut statement = conn.prepare("SELECT id FROM nodes WHERE filePath = ?1")?;
-    let ids = statement.query_map([file], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?;
-    Ok(ids)
+    queries::node_ids_in_file(&store.read(), file)
 }
-
-/// A node's `(startLine, startCol, endLine, endCol)` as the index stores it.
-pub(crate) type StoredRange = (i64, i64, i64, i64);
 
 /// `file`'s nodes and where the linked index says each one is - read after
 /// the session's declaration edit was applied, and from a fresh index that
@@ -584,15 +580,7 @@ pub(crate) type StoredRange = (i64, i64, i64, i64);
 /// `id-stability.declaration-edit-applies`. Index against index for the same
 /// reason [`file_node_ids`] is.
 pub(crate) fn file_node_ranges(store: &IndexStore, file: &str) -> Result<BTreeMap<String, StoredRange>> {
-    let conn = store.read();
-    let mut statement =
-        conn.prepare("SELECT id, startLine, startCol, endLine, endCol FROM nodes WHERE filePath = ?1")?;
-    let rows = statement
-        .query_map([file], |row| {
-            Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+    queries::node_ranges_in_file(&store.read(), file)
 }
 
 // --- the edited file ----------------------------------------------------------
@@ -776,52 +764,12 @@ pub(crate) fn choose_edit_target(
 
 // --- filesCreated -------------------------------------------------------------
 
-/// One `IMPORTS` edge leaving a node of the importer, and where it lands in
-/// the linked index - `capabilities.files-created-resolves`' evidence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ImportRow {
-    pub to_file: String,
-    pub to_kind: String,
-    pub to_name: String,
-    pub to_native_kind: Option<String>,
-    pub resolved: bool,
-    /// When the edge lands on a core-owned container (a Python module, a Go
-    /// package), the files of that container's members - empty otherwise.
-    pub container_member_files: Vec<String>,
-}
-
 /// Every `IMPORTS` edge whose `fromId` is a node of `importer`, with its
 /// landing node, as the linked index holds them - and, for a landing node
 /// that is a core-owned container, the files its members live in (the
 /// container's `DEFINES` edges, which core alone writes).
 pub(crate) fn import_rows(store: &IndexStore, importer: &str) -> Result<Vec<ImportRow>> {
-    let conn = store.read();
-    let mut statement = conn.prepare(
-        "SELECT t.filePath, t.kind, t.name, t.nativeKind, e.resolved, \
-                (SELECT group_concat(DISTINCT m.filePath) FROM containers c \
-                   JOIN edges d ON d.fromId = c.nodeId AND d.kind = 'DEFINES' \
-                   JOIN nodes m ON m.id = d.toId \
-                 WHERE c.nodeId = t.id) \
-         FROM edges e JOIN nodes f ON f.id = e.fromId JOIN nodes t ON t.id = e.toId \
-         WHERE e.kind = 'IMPORTS' AND f.filePath = ?1 \
-         ORDER BY t.filePath, t.name",
-    )?;
-    let rows = statement
-        .query_map([importer], |row| {
-            let members: Option<String> = row.get(5)?;
-            Ok(ImportRow {
-                to_file: row.get(0)?,
-                to_kind: row.get(1)?,
-                to_name: row.get(2)?,
-                to_native_kind: row.get(3)?,
-                resolved: row.get::<_, i64>(4)? != 0,
-                container_member_files: members
-                    .map(|members| members.split(',').map(str::to_string).collect())
-                    .unwrap_or_default(),
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+    queries::import_rows_of(&store.read(), importer)
 }
 
 /// Why `pair` cannot be run against `workspace`, one finding per violation -
@@ -1394,7 +1342,7 @@ pub(crate) struct Session {
 }
 
 /// Copies every byte read through it, so the session can recover the raw
-/// response frames `watcher::apply` consumed.
+/// response frames `ingest::apply` consumed.
 struct TeeReader<R> {
     inner: R,
     log: Vec<u8>,
@@ -1634,8 +1582,8 @@ impl<'a> Driver<'a> {
         command
             .args(&manifest.args)
             .arg(scratch.workspace())
-            // As in `run_bulk` above - see `daemon::manifest::MANIFEST_PATH_ENV`.
-            .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
+            // As in `run_bulk` above - see `plugin_manifest::MANIFEST_PATH_ENV`.
+            .env(crate::plugin_manifest::MANIFEST_PATH_ENV, manifest.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // As in `run_bulk` above - see [`StderrCapture`].
@@ -1712,7 +1660,7 @@ impl<'a> Driver<'a> {
         Ok(())
     }
 
-    /// Runs one operation through `watcher::apply` and records what crossed
+    /// Runs one operation through `ingest::apply` and records what crossed
     /// the wire. Returns whether the session can continue.
     fn step(&mut self, label: &str, file: &str, operation: &Operation) -> bool {
         let id = RequestId::Number(self.next_id);

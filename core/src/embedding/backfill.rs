@@ -97,13 +97,14 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{Connection, Result as SqlResult};
+use rusqlite::Connection;
 
-use crate::daemon::indexing_status::IndexingStatus;
 use crate::embedding::text::{embed_tier, is_noise, EmbedInput, EmbedTier, NOISE_RULE_VERSION};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
+use crate::indexing_status::IndexingStatus;
+use crate::model::{Diff, NodeRecord};
+use crate::storage::embed_row::{self, count_candidates, fetch_candidate_page, EmbedCandidate as Candidate};
 use crate::storage::index_store::{IndexStore, Unit};
-use crate::storage::write::{Diff, NodeRecord};
 use crate::storage::{schema, vectors};
 
 /// Keyset page size. Small enough that one page's inference plus its commit
@@ -119,12 +120,12 @@ pub(crate) const PAGE_SIZE: i64 = 256;
 /// test needs no real ONNX weights on disk. A no-op unless set, which is
 /// every real run - same poll-until-deleted shape as
 /// `daemon::bulk_index::WALK_HOLD_FILE_ENV`.
-pub const HOLD_FILE_ENV: &str = "G_MESH_EMBED_PASS_HOLD_FILE";
+pub const HOLD_FILE_ENV: &str = crate::knobs::EMBED_PASS_HOLD_FILE.name;
 
 /// While this env var is set to a non-empty value, [`run`] panics before its
 /// first batch - test-only, for GM-395 slice 2b's guard that a panic in this
 /// pass must not turn the whole activation into
-/// [`Phase::Failed`](crate::daemon::indexing_status::Phase::Failed):
+/// [`Phase::Failed`](crate::indexing_status::Phase::Failed):
 /// `daemon::activation::ActivationCtx::activate` wraps this call in
 /// `catch_unwind` precisely so that structural tools keep answering even if
 /// this pass blows up, and this knob is what lets a test make it blow up
@@ -132,7 +133,7 @@ pub const HOLD_FILE_ENV: &str = "G_MESH_EMBED_PASS_HOLD_FILE";
 /// hold above, before the availability check, for the same reason the hold
 /// itself runs early: a test needs this to fire whether or not the machine
 /// running it has ever fetched real weights.
-pub const PANIC_ENV: &str = "G_MESH_EMBED_PASS_PANIC";
+pub const PANIC_ENV: &str = crate::knobs::EMBED_PASS_PANIC.name;
 
 /// What one call to [`run`] actually did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -171,7 +172,7 @@ impl BackfillSummary {
 /// no model to run at all.
 /// The hold has to come before that check, not after: a phase-gating test
 /// needs to observe the daemon sitting in
-/// [`Phase::Embedding`](crate::daemon::indexing_status::Phase::Embedding)
+/// [`Phase::Embedding`](crate::indexing_status::Phase::Embedding)
 /// regardless of whether the machine running it has ever fetched real
 /// weights, and an early return for "no model" would make the hold
 /// unreachable on exactly the machines (CI, a fresh checkout) that need it
@@ -190,8 +191,8 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
         let candidates = match store.step(|conn| count_candidates(conn, version)) {
             Ok(count) => count,
             Err(err) => {
-                crate::log_line!(
-                    "g-mesh daemon: failed to count nodes owed an embedding, skipping the backfill pass ({err:#})"
+                crate::log_role!(
+                    "failed to count nodes owed an embedding, skipping the backfill pass ({err:#})"
                 );
                 return BackfillSummary::default();
             }
@@ -211,17 +212,18 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
             let mut tier_len = 0usize;
             let mut after_id: Option<String> = None;
             loop {
-                let page =
-                    match store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)) {
-                        Ok(page) => page,
-                        Err(err) => {
-                            crate::log_line!(
-                                "g-mesh daemon: failed to read a page of nodes owed an embedding, stopping the \
+                let page = match store
+                    .step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE))
+                {
+                    Ok(page) => page,
+                    Err(err) => {
+                        crate::log_role!(
+                            "failed to read a page of nodes owed an embedding, stopping the \
                                  backfill pass early ({err:#})"
-                            );
-                            break 'tiers;
-                        }
-                    };
+                        );
+                        break 'tiers;
+                    }
+                };
                 if page.is_empty() {
                     break;
                 }
@@ -232,7 +234,9 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
                 // once per pass, so `embed_done` never exceeds `embed_total`.
                 let nodes: Vec<NodeRecord> = page
                     .into_iter()
-                    .filter(|candidate| candidate_tier(candidate) == tier && handed.insert(candidate.id.clone()))
+                    .filter(|candidate| {
+                        candidate_tier(candidate) == tier && handed.insert(candidate.id.clone())
+                    })
                     .map(to_node_record)
                     .collect();
                 if nodes.is_empty() {
@@ -245,11 +249,11 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
                 // Inference runs between the unit's steps.
                 let computed = embedding.compute(&diff, &mut stats);
                 filtered += computed.dropped_len();
-                store.store_vectors(embedding, &computed);
+                store.store_vectors(&embedding.vector_write(&computed));
                 progress.add_embed_done(nodes_len as u64);
             }
-            crate::log_line!(
-                "g-mesh daemon: embedding backfill finished the {} tier: {tier_len} candidates in {:.1}s",
+            crate::log_role!(
+                "embedding backfill finished the {} tier: {tier_len} candidates in {:.1}s",
                 tier.as_str(),
                 tier_started.elapsed().as_secs_f64()
             );
@@ -275,7 +279,7 @@ pub(crate) fn purge_noise_vectors(store: &IndexStore) -> usize {
             Ok(Some(rule)) if rule == NOISE_RULE_VERSION => return 0,
             Ok(_) => {}
             Err(err) => {
-                crate::log_line!("g-mesh daemon: failed to read the embedding noise purge marker ({err:#})");
+                crate::log_role!("failed to read the embedding noise purge marker ({err:#})");
                 return 0;
             }
         }
@@ -289,18 +293,18 @@ pub(crate) fn purge_noise_vectors(store: &IndexStore) -> usize {
                     after_id = last_id;
                 }
                 Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to purge the vectors of filtered nodes, retrying next start ({err:#})"
+                    crate::log_role!(
+                        "failed to purge the vectors of filtered nodes, retrying next start ({err:#})"
                     );
                     return purged;
                 }
             }
         }
         if let Err(err) = store.step(|conn| schema::record_noise_purge(conn, NOISE_RULE_VERSION)) {
-            crate::log_line!("g-mesh daemon: {err:#} - the purge runs again next start");
+            crate::log_role!("{err:#} - the purge runs again next start");
         }
         if purged > 0 {
-            crate::log_line!("g-mesh daemon: deleted {purged} vectors of name-only module and test nodes");
+            crate::log_role!("deleted {purged} vectors of name-only module and test nodes");
         }
         purged
     })
@@ -315,53 +319,17 @@ fn purge_noise_page(
     after_id: &str,
     limit: i64,
 ) -> anyhow::Result<(usize, Option<String>)> {
-    type Row = (String, String, String, String, String, Option<String>, Option<String>);
-    let rows: Vec<Row> = {
-        let mut stmt = conn.prepare(
-            "SELECT n.id, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
-             FROM vectors v JOIN nodes n ON n.id = v.nodeId \
-             WHERE v.nodeId > ?1 ORDER BY v.nodeId LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![after_id, limit], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
-        })?;
-        rows.collect::<SqlResult<_>>()?
-    };
+    let rows = embed_row::embedded_rows_after(conn, after_id, limit)?;
     let Some(last_id) = rows.last().map(|row| row.0.clone()) else { return Ok((0, None)) };
     let mut deleted = 0;
-    for (id, kind, name, qualified_name, file_path, doc, signature) in &rows {
-        let input = EmbedInput {
-            kind,
-            name,
-            qualified_name,
-            file_path,
-            doc: doc.as_deref(),
-            signature: signature.as_deref(),
-            // A generated node never gets a vector (`EmbeddingPipeline::compute`
-            // drops it, schema 15 rebuilt every older index), so this purge
-            // has none to find; it stays the noise rule's alone.
-            generated: false,
-        };
+    for (id, row) in &rows {
+        let input = EmbedInput::from_row(row);
         if is_noise(&input) {
             vectors::delete(conn, id)?;
             deleted += 1;
         }
     }
     Ok((deleted, Some(last_id)))
-}
-
-/// One candidate row: a node's id plus the columns
-/// [`EmbeddingPipeline::compute`] actually reads, and the `visibility`
-/// [`candidate_tier`] reads.
-struct Candidate {
-    id: String,
-    visibility: String,
-    kind: String,
-    name: String,
-    qualified_name: String,
-    file_path: String,
-    doc_comment: Option<String>,
-    signature: Option<String>,
 }
 
 /// Builds a [`NodeRecord`] carrying only what
@@ -373,76 +341,12 @@ struct Candidate {
 /// row before writing anything, so a filler language here can never leak
 /// into a stored answer.
 fn to_node_record(candidate: Candidate) -> NodeRecord {
-    let Candidate { id, visibility: _, kind, name, qualified_name, file_path, doc_comment, signature } =
-        candidate;
-    let mut node = NodeRecord::new(id, kind, name, qualified_name, file_path, "");
-    node.doc_comment = doc_comment;
-    node.signature = signature;
-    node
+    candidate.row.into_node_record(candidate.id)
 }
 
 /// The embedding tier `candidate` belongs to.
 fn candidate_tier(candidate: &Candidate) -> EmbedTier {
-    let input = EmbedInput {
-        kind: &candidate.kind,
-        name: &candidate.name,
-        qualified_name: &candidate.qualified_name,
-        file_path: &candidate.file_path,
-        doc: candidate.doc_comment.as_deref(),
-        signature: candidate.signature.as_deref(),
-        generated: false,
-    };
-    embed_tier(&input, &candidate.visibility)
-}
-
-/// Total rows this pass owes the project right now: every node with
-/// embeddable text (a doc comment or a signature) and no `vectors` row yet,
-/// or one made under an `embeddingVersion` other than `version`.
-/// Mirrors [`fetch_candidate_page`]'s own `WHERE` clause exactly - this is
-/// the unpaged count of the same set that query pages through.
-fn count_candidates(conn: &Connection, version: &str) -> SqlResult<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
-         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?1) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0",
-        [version],
-        |row| row.get(0),
-    )
-}
-
-/// One keyset page of candidates strictly after `after_id` (or from the
-/// start, if `None`), ordered by `id` so paging never revisits or skips a
-/// row regardless of how many pages have already run - see this module's own
-/// "Termination" doc section.
-fn fetch_candidate_page(
-    conn: &Connection,
-    version: &str,
-    after_id: Option<&str>,
-    limit: i64,
-) -> SqlResult<Vec<Candidate>> {
-    let mut stmt = conn.prepare(
-        "SELECT n.id, n.visibility, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
-         FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
-         WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0 \
-         AND n.id > ?1 ORDER BY n.id LIMIT ?2",
-    )?;
-    // Every real node id is a non-empty string, so `id > ''` is true for all
-    // of them - the same query serves both "from the very start" (`after_id`
-    // is `None`) and "strictly after the last page's id" with one statement.
-    let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit, version], |row| {
-        Ok(Candidate {
-            id: row.get(0)?,
-            visibility: row.get(1)?,
-            kind: row.get(2)?,
-            name: row.get(3)?,
-            qualified_name: row.get(4)?,
-            file_path: row.get(5)?,
-            doc_comment: row.get(6)?,
-            signature: row.get(7)?,
-        })
-    })?;
-    rows.collect()
+    embed_tier(&EmbedInput::from_row(&candidate.row), &candidate.visibility)
 }
 
 /// Honors [`HOLD_FILE_ENV`]. A no-op unless it is set, which is every real
@@ -451,10 +355,10 @@ fn fetch_candidate_page(
 /// wait, bounded so a test that forgets to release it fails as a timeout
 /// rather than wedging the daemon forever).
 fn hold_before_first_batch_for_tests() {
-    let Some(path) = std::env::var_os(HOLD_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let Some(path) = crate::knobs::os_non_empty(&crate::knobs::EMBED_PASS_HOLD_FILE) else { return };
     let path = std::path::PathBuf::from(path);
-    crate::log_line!(
-        "g-mesh daemon: holding the embedding backfill pass until {} is removed ({HOLD_FILE_ENV})",
+    crate::log_role!(
+        "holding the embedding backfill pass until {} is removed ({HOLD_FILE_ENV})",
         path.display()
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -469,8 +373,11 @@ fn hold_before_first_batch_for_tests() {
 /// project's structural tools into a tool error needs this pass to actually
 /// panic, not merely pause.
 fn panic_before_first_batch_for_tests() {
-    if std::env::var_os(PANIC_ENV).filter(|p| !p.is_empty()).is_some() {
-        panic!("g-mesh daemon: G_MESH_EMBED_PASS_PANIC test knob fired - this panic is expected");
+    if crate::knobs::flag(&crate::knobs::EMBED_PASS_PANIC) {
+        panic!(
+            "{}G_MESH_EMBED_PASS_PANIC test knob fired - this panic is expected",
+            crate::log::role_prefix()
+        );
     }
 }
 
@@ -478,6 +385,8 @@ fn panic_before_first_batch_for_tests() {
 mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    use rusqlite::Result as SqlResult;
 
     use super::*;
     use crate::storage::schema;
@@ -560,11 +469,11 @@ mod tests {
             },
         )
         .unwrap();
-        let model = crate::config::EmbeddingConfig::default().model;
-        let current = crate::embedding::model::embedding_version(&model);
+        let model = crate::embedding::model::DEFAULT_MODEL_NAME;
+        let current = crate::embedding::model::embedding_version(model);
         assert_ne!(current, model, "the default model's version must not be the fp32 weights' bare name");
         let zeros = [0.0; crate::embedding::EMBEDDING_DIM];
-        crate::storage::vectors::insert(&conn, "embedded_by_fp32", &zeros, &model).unwrap();
+        crate::storage::vectors::insert(&conn, "embedded_by_fp32", &zeros, model).unwrap();
         crate::storage::vectors::insert(&conn, "embedded_by_int8", &zeros, &current).unwrap();
         crate::storage::vectors::insert(&conn, "embedded_from_full_text", &zeros, &format!("{model}+int8"))
             .unwrap();
@@ -1029,7 +938,8 @@ mod tests {
         let diff =
             Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
         let computed = reference_pipeline.compute(&diff, &mut EmbedStats::default());
-        id_order.unit(Unit::Backfill, |store| store.store_vectors(&reference_pipeline, &computed));
+        id_order
+            .unit(Unit::Backfill, |store| store.store_vectors(&reference_pipeline.vector_write(&computed)));
 
         let rows = vector_rows(&tiered_store);
         assert_eq!(rows.len(), 30, "{:?}", rows.iter().map(|r| &r.0).collect::<Vec<_>>());

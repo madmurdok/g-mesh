@@ -1,75 +1,11 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
-use crate::daemon::identity::{self, project_hash};
-use crate::paths;
 use crate::storage::vectors;
 
-/// `~/.g-mesh/projects/` (or `$G_MESH_HOME/projects/`), the one directory
-/// every project's state lives under. Public because `cli::clean` enumerates
-/// it rather than deriving a single project's path from a root the way
-/// everything else here does.
-pub fn projects_root() -> Result<PathBuf> {
-    Ok(projects_root_under(&paths::g_mesh_home()?))
-}
-
-/// [`projects_root`] under the g-mesh home `home`.
-pub(crate) fn projects_root_under(home: &Path) -> PathBuf {
-    home.join("projects")
-}
-
-/// `~/.g-mesh/projects/<hash>/` for the given (canonicalized) project root.
-/// Uses the same hash as the daemon's own socket/pid file location
-/// (`daemon::identity::project_hash`) so the two can never disagree.
-pub fn project_dir(root: &Path) -> Result<PathBuf> {
-    project_dir_under(&paths::g_mesh_home()?, root)
-}
-
-/// [`project_dir`] under the g-mesh home `home` rather than the one the
-/// environment names, so a test can point it at a temp dir without writing
-/// `G_MESH_HOME`, which every other thread in the process reads.
-pub(crate) fn project_dir_under(home: &Path, root: &Path) -> Result<PathBuf> {
-    Ok(projects_root_under(home).join(project_hash(root)?))
-}
-
-/// The project's state directory, created if absent and recording which
-/// project root it belongs to.
-///
-/// The one place a state directory comes into existence, so that no path can
-/// create one without also leaving `project.root` in it - which is what
-/// `cli::clean orphaned` reads to tell state whose project was deleted from
-/// state whose project is merely idle. `identity::record_project_root` is
-/// idempotent, so an existing directory acquires the file the next time
-/// anything opens it.
-///
-/// That claim was false until GM-255. `daemon::run` and
-/// `shim::acquire_bootstrap_lock` both created the directory with a bare
-/// `fs::create_dir_all` and no root file, and the shim is the *earliest* of
-/// the three - so a project whose first contact was a shim got a state
-/// directory with no identity. Nothing recovers it later: `project_hash` is
-/// one-way, so `clean orphaned` can only class such a directory `Legacy` and
-/// leave it alone. Measured on this machine's own test home, 707 of 775
-/// directories were unsweepable for that reason.
-///
-/// So if a fourth call site ever needs a project directory, it goes through
-/// here. A bare `create_dir_all` on this path is not a shortcut, it is a
-/// directory that can never be cleaned up.
-pub fn ensure_project_dir(root: &Path) -> Result<PathBuf> {
-    ensure_project_dir_under(&paths::g_mesh_home()?, root)
-}
-
-/// [`ensure_project_dir`] under the g-mesh home `home` (see
-/// [`project_dir_under`]).
-pub(crate) fn ensure_project_dir_under(home: &Path, root: &Path) -> Result<PathBuf> {
-    let dir = project_dir_under(home, root)?;
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create project directory {}", dir.display()))?;
-    identity::record_project_root(&dir, root)?;
-    Ok(dir)
-}
+pub use crate::paths::state_dir::{ensure_project_dir, project_dir, projects_root};
 
 /// Opens (creating if absent) the project's SQLite index in WAL mode, with
 /// the sqlite-vec extension available on the returned connection (see
@@ -84,7 +20,7 @@ pub(crate) fn ensure_project_dir_under(home: &Path, root: &Path) -> Result<PathB
 /// Cross-file edges are lazy by design: when a symbol another file points at
 /// is deleted or renamed, an edge into it that no placeholder carried is left
 /// dangling until its file is reindexed, and an import linked to a deleted
-/// file until core re-extracts the importer (see `graph::imports::link_diff`
+/// file until core re-extracts the importer (see `link::imports::link_diff`
 /// and `storage::write::apply_diff`). And the TS
 /// plugin reports any change to a symbol as a delete plus an upsert of the
 /// same id, without re-sending the unchanged edges into it - so under
@@ -103,7 +39,7 @@ pub(crate) fn ensure_project_dir_under(home: &Path, root: &Path) -> Result<PathB
 ///
 /// Because nothing cascades, a delete from `nodes` owes its dependents an
 /// explicit delete of their own - `storage::write::apply_diff`,
-/// `graph::containers`' empty-container delete, `graph::imports`' placeholder
+/// `graph::containers`' empty-container delete, `link::imports`' placeholder
 /// drop and `storage::language_swap::swap` all do this.
 /// `ON DELETE CASCADE` in the DDL is still honoured where a connection turns
 /// enforcement on (many unit tests do, to catch an edge pointed at a node that
@@ -111,10 +47,9 @@ pub(crate) fn ensure_project_dir_under(home: &Path, root: &Path) -> Result<PathB
 /// production relies on.
 ///
 /// Every connection that *writes* a project's index comes through here: the
-/// daemon (`daemon::run`), `g-mesh init` and `g-mesh reindex`. The two that
-/// open an existing file without `CREATE` - `cli::status::index_status` and
-/// `gc::last_used::read_from_project_dir` - deliberately leave the pragma
-/// alone: they only read, and foreign-key enforcement only ever affects
+/// daemon (`daemon::run`), `g-mesh init` and `g-mesh reindex`. The readers
+/// that open an existing file without `CREATE` ([`open_existing`]) leave the
+/// pragma alone: they only read, and foreign-key enforcement only ever affects
 /// writes. The one other index core builds, `g-mesh plugins check`'s
 /// in-memory one (`cli::plugin_check::session::open_index`), switches it off
 /// itself, because it exists to commit diffs exactly as the daemon would.
@@ -123,7 +58,7 @@ pub fn open(root: &Path) -> Result<Connection> {
 
     let dir = ensure_project_dir(root)?;
 
-    let db_path = dir.join("index.db");
+    let db_path = crate::paths::state_dir::StateDir::at(&dir).index_db();
     let conn = Connection::open(&db_path)
         .with_context(|| format!("failed to open SQLite database at {}", db_path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").context("failed to enable WAL mode")?;
@@ -132,6 +67,15 @@ pub fn open(root: &Path) -> Result<Connection> {
     // file temp storage each step's statement journal spills to a temp file.
     conn.pragma_update(None, "temp_store", "MEMORY").context("failed to keep temp storage in memory")?;
     Ok(conn)
+}
+
+/// Opens the existing index at `db_path` for reading: read-write without
+/// `CREATE`. Recovering a WAL an abandoned daemon left behind needs write
+/// access, and a missing database must never be conjured into existence by a
+/// reader. Its callers only read.
+pub fn open_existing(db_path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
+        .with_context(|| format!("failed to open the project index at {}", db_path.display()))
 }
 
 /// Opens (creating) a throwaway index at `path` with the graph schema - the
@@ -203,7 +147,7 @@ mod tests {
 
         let state_dir = project_dir(tmp.path()).unwrap();
 
-        let recorded = crate::daemon::identity::read_project_root(&state_dir);
+        let recorded = crate::paths::state_dir::read_project_root(&state_dir);
         assert_eq!(recorded, Some(tmp.path().canonicalize().unwrap()));
     }
 }

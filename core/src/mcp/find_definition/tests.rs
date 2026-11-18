@@ -1,11 +1,14 @@
 use super::*;
+use crate::mcp::context::QueryCtx;
+use crate::mcp::query::test_support::Rendered;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::graph::queries::{upsert_edge, upsert_node};
+use crate::model::EdgeRecord;
 use crate::protocol::types::QualifiedPath;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::storage::write::EdgeRecord;
+use crate::storage::write::{upsert_edge, upsert_node};
 
 /// A project root with nothing in it, for the tests that are about
 /// resolution rather than about source. Every snippet lookup under it
@@ -36,7 +39,8 @@ fn node_with_span(
     node
 }
 
-fn json_body(result: &CallToolResult) -> serde_json::Value {
+fn json_body(result: &impl Rendered) -> serde_json::Value {
+    let result = &result.rendered();
     assert_ne!(result.is_error, Some(true), "expected a success result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => serde_json::from_str(&text.text).unwrap(),
@@ -44,7 +48,8 @@ fn json_body(result: &CallToolResult) -> serde_json::Value {
     }
 }
 
-fn error_text(result: &CallToolResult) -> String {
+fn error_text(result: &impl Rendered) -> String {
+    let result = &result.rendered();
     assert_eq!(result.is_error, Some(true), "expected an error result: {:?}", result.content);
     match &result.content[0] {
         rmcp::model::ContentBlock::Text(text) => text.text.clone(),
@@ -57,14 +62,14 @@ fn error_text(result: &CallToolResult) -> String {
 /// sitting on the import line of the file that wrote it.
 fn import_placeholder(id: &str, name: &str, specifier: &str, file: &str) -> NodeRecord {
     let mut node = NodeRecord::new(id, "Module", name, specifier, file, "go");
-    node.native_kind = Some(crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND.to_string());
+    node.native_kind = Some(g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND.to_string());
     node.start_line = 8;
     node.end_line = 8;
     node.end_col = 20;
     node
 }
 
-fn resolved_by_name(conn: &Connection, name: &str) -> Result<CallToolResult, ErrorData> {
+fn resolved_by_name(conn: &Connection, name: &str) -> Result<ToolAnswer<DefinitionNode>, ErrorData> {
     by_name(conn, None, &SemanticRung::off(), name, None)
 }
 
@@ -199,13 +204,11 @@ fn ambiguous_bare_name_returns_both_as_ranked_candidates() {
         cursor: None,
         include_source: None,
     };
-    let result = handle(
-        &Arc::new(IndexStore::new(conn)),
-        &no_sources(),
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        params,
-    )
+    let result = QueryCtx {
+        project_root: no_sources().to_path_buf(),
+        ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+    }
+    .resolve_lazily(handle, params)
     .unwrap();
     let body = json_body(&result);
     let results = body["results"].as_array().unwrap();
@@ -241,13 +244,11 @@ fn placeholders_named_after_a_symbol_are_not_definition_candidates() {
         include_source: None,
     };
     let body = json_body(
-        &handle(
-            &Arc::new(IndexStore::new(conn)),
-            &no_sources(),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            params,
-        )
+        &QueryCtx {
+            project_root: no_sources().to_path_buf(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap(),
     );
     assert_eq!(body["ambiguous"], serde_json::Value::Null, "only one node is a real definition");
@@ -276,13 +277,11 @@ fn a_container_named_like_its_member_is_not_a_definition_candidate() {
         include_source: None,
     };
     let body = json_body(
-        &handle(
-            &Arc::new(IndexStore::new(conn)),
-            &no_sources(),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            params,
-        )
+        &QueryCtx {
+            project_root: no_sources().to_path_buf(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        }
+        .resolve_lazily(handle, params)
         .unwrap(),
     );
     assert_eq!(body["ambiguous"], serde_json::Value::Null);
@@ -304,13 +303,11 @@ fn file_and_position_query_returns_a_single_node_not_a_list() {
         cursor: None,
         include_source: None,
     };
-    let result = handle(
-        &Arc::new(IndexStore::new(conn)),
-        &no_sources(),
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        params,
-    )
+    let result = QueryCtx {
+        project_root: no_sources().to_path_buf(),
+        ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+    }
+    .resolve_lazily(handle, params)
     .unwrap();
     let body = json_body(&result);
     assert_eq!(body["id"], "n1");
@@ -335,13 +332,11 @@ fn qualified_name_requery_returns_the_exact_node() {
         cursor: None,
         include_source: None,
     };
-    let result = handle(
-        &Arc::new(IndexStore::new(conn)),
-        &no_sources(),
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        params,
-    )
+    let result = QueryCtx {
+        project_root: no_sources().to_path_buf(),
+        ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+    }
+    .resolve_lazily(handle, params)
     .unwrap();
     let body = json_body(&result);
     assert_eq!(body["id"], "n2");
@@ -359,13 +354,11 @@ fn no_match_is_a_tool_level_error() {
         cursor: None,
         include_source: None,
     };
-    let result = handle(
-        &Arc::new(IndexStore::new(conn)),
-        &no_sources(),
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        params,
-    )
+    let result = QueryCtx {
+        project_root: no_sources().to_path_buf(),
+        ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+    }
+    .resolve_lazily(handle, params)
     .unwrap();
     assert!(error_text(&result).contains("does_not_exist"));
 }
@@ -381,13 +374,11 @@ fn neither_name_nor_position_is_a_tool_level_error() {
         cursor: None,
         include_source: None,
     };
-    let result = handle(
-        &Arc::new(IndexStore::new(conn)),
-        &no_sources(),
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        params,
-    )
+    let result = QueryCtx {
+        project_root: no_sources().to_path_buf(),
+        ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+    }
+    .resolve_lazily(handle, params)
     .unwrap();
     assert!(error_text(&result).contains("symbol_name"));
 }
@@ -414,9 +405,9 @@ fn ambiguous_candidates_paginate_across_cursor_continuation() {
         cursor: None,
         include_source: None,
     };
-    let first =
-        handle(&conn, &no_sources(), &EmbeddingPipeline::disabled(), QueryShapes::shipped(), first_params)
-            .unwrap();
+    let first = QueryCtx { project_root: no_sources().to_path_buf(), ..QueryCtx::for_test(&conn) }
+        .resolve_lazily(handle, first_params)
+        .unwrap();
     let first_body = json_body(&first);
     let first_results = first_body["results"].as_array().unwrap();
     assert_eq!(first_results.len(), CANDIDATE_PAGE_SIZE);
@@ -431,9 +422,9 @@ fn ambiguous_candidates_paginate_across_cursor_continuation() {
         cursor: Some(cursor),
         include_source: None,
     };
-    let second =
-        handle(&conn, &no_sources(), &EmbeddingPipeline::disabled(), QueryShapes::shipped(), second_params)
-            .unwrap();
+    let second = QueryCtx { project_root: no_sources().to_path_buf(), ..QueryCtx::for_test(&conn) }
+        .resolve_lazily(handle, second_params)
+        .unwrap();
     let second_body = json_body(&second);
     let second_results = second_body["results"].as_array().unwrap();
     assert_eq!(second_results.len(), 1, "the one remaining candidate must land on the second page");
@@ -869,17 +860,13 @@ fn include_source_false_leaves_the_response_exactly_as_it_was() {
     };
 
     let opted_out = json_body(
-        &handle(
-            &conn,
-            project.path(),
-            &EmbeddingPipeline::disabled(),
-            QueryShapes::shipped(),
-            params(Some(false)),
-        )
-        .unwrap(),
+        &QueryCtx { project_root: project.path().to_path_buf(), ..QueryCtx::for_test(&conn) }
+            .resolve_lazily(handle, params(Some(false)))
+            .unwrap(),
     );
     let default_on = json_body(
-        &handle(&conn, project.path(), &EmbeddingPipeline::disabled(), QueryShapes::shipped(), params(None))
+        &QueryCtx { project_root: project.path().to_path_buf(), ..QueryCtx::for_test(&conn) }
+            .resolve_lazily(handle, params(None))
             .unwrap(),
     );
 
@@ -951,8 +938,8 @@ fn unloaded_pipeline() -> EmbeddingPipeline {
     )
 }
 
-fn shapes(starts_with: &[&str], contains: &[&str]) -> crate::daemon::manifest::NonSymbolShapes {
-    crate::daemon::manifest::NonSymbolShapes {
+fn shapes(starts_with: &[&str], contains: &[&str]) -> crate::plugin_manifest::NonSymbolShapes {
+    crate::plugin_manifest::NonSymbolShapes {
         starts_with: starts_with.iter().map(|s| s.to_string()).collect(),
         contains: contains.iter().map(|s| s.to_string()).collect(),
     }
@@ -982,11 +969,15 @@ fn with_the_shipped_shapes_a_specifier_is_refused_before_it_is_embedded() {
 
 /// The second pass of the ladder with a query vector identical to `near`'s,
 /// so the semantic rung scores 1.0 and answers whenever it is consulted.
-fn with_a_matching_vector(conn: &Connection, name: &str) -> CallToolResult {
+fn with_a_matching_vector(conn: &Connection, name: &str) -> ToolAnswer<DefinitionNode> {
     with_a_matching_vector_and(conn, QueryShapes::shipped(), name)
 }
 
-fn with_a_matching_vector_and(conn: &Connection, shapes: &QueryShapes, name: &str) -> CallToolResult {
+fn with_a_matching_vector_and(
+    conn: &Connection,
+    shapes: &QueryShapes,
+    name: &str,
+) -> ToolAnswer<DefinitionNode> {
     let query = [1.0_f32, 0.0];
     by_name(conn, None, &SemanticRung::Embedded { name, query: Some(&query), shapes }, name, None).unwrap()
 }
@@ -1276,7 +1267,7 @@ fn a_rust_field_suffix_matches_only_the_field() {
 /// alias `shapes::Square::area` is what `Square::area` matches.
 ///
 /// **Control.** Drop the `for alias in aliases` loop from
-/// `storage::qualified_path::suffixes`: `Square::area` is refused, while the
+/// `model::qualified_path::suffixes`: `Square::area` is refused, while the
 /// primary-path suffix `<Square as Shape>::area` still resolves.
 #[test]
 fn a_trait_impl_member_is_found_through_its_alias() {
@@ -1365,7 +1356,7 @@ fn ts_decl(conn: &mut Connection, id: &str, name: &str, qualified_name: &str, la
 
 /// The ladder with no model and `map`'s declarations in place of the
 /// shipped ones.
-fn resolved_with(conn: &Connection, map: &QueryShapes, name: &str) -> CallToolResult {
+fn resolved_with(conn: &Connection, map: &QueryShapes, name: &str) -> ToolAnswer<DefinitionNode> {
     let embedding = EmbeddingPipeline::disabled();
     by_name(conn, None, &SemanticRung::deferred(&embedding, map), name, None).unwrap()
 }
@@ -1515,7 +1506,7 @@ fn a_prefixed_path_is_still_refused() {
 fn a_scoped_package_keeps_its_import_note() {
     let mut conn = setup();
     let mut ph = NodeRecord::new("ph", "Module", "pkg", "@scope/pkg", "src/a.ts", "typescript");
-    ph.native_kind = Some(crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND.to_string());
+    ph.native_kind = Some(g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND.to_string());
     upsert_node(&mut conn, ph).unwrap();
     ts_decl(&mut conn, "deco", "Component", "Component", "typescript");
 
@@ -1697,7 +1688,8 @@ fn a_rewritten_page_continues_through_its_cursor() {
             include_source: None,
         };
         json_body(
-            &handle(&store, &no_sources(), &EmbeddingPipeline::disabled(), QueryShapes::shipped(), params)
+            &QueryCtx { project_root: no_sources().to_path_buf(), ..QueryCtx::for_test(&store) }
+                .resolve_lazily(handle, params)
                 .unwrap(),
         )
     };
@@ -1752,8 +1744,14 @@ fn definition_params() -> FindDefinitionParams {
     }
 }
 
-fn define(store: &Arc<IndexStore>, root: &std::path::Path, params: FindDefinitionParams) -> CallToolResult {
-    handle(store, root, &EmbeddingPipeline::disabled(), QueryShapes::shipped(), params).unwrap()
+fn define(
+    store: &Arc<IndexStore>,
+    root: &std::path::Path,
+    params: FindDefinitionParams,
+) -> ToolAnswer<DefinitionNode> {
+    QueryCtx { project_root: root.to_path_buf(), ..QueryCtx::for_test(store) }
+        .resolve_lazily(handle, params)
+        .unwrap()
 }
 
 fn named(name: &str) -> FindDefinitionParams {
@@ -2090,15 +2088,12 @@ fn a_candidates_source_is_cut_at_twenty_lines_and_says_so() {
 fn an_anchored_tools_ambiguous_page_carries_lines_and_no_source() {
     let store = runs(&[("a", "a.rs", 3, 7), ("b", "b.rs", 10, 12)]);
 
-    let result = crate::mcp::find_references::handle(
-        &store,
-        &EmbeddingPipeline::disabled(),
-        QueryShapes::shipped(),
-        &HashMap::new(),
-        &crate::mcp::session_hints::SessionHints::default(),
-        crate::mcp::SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
-    )
-    .unwrap();
+    let result = QueryCtx::for_test(&store)
+        .resolve_lazily(
+            crate::mcp::find_references::handle,
+            crate::mcp::SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
+        )
+        .unwrap();
     let body = json_body(&result);
 
     assert_eq!(body["ambiguous"], true, "precondition: {body}");
@@ -2129,15 +2124,23 @@ fn covered_call(
     conn: Connection,
     coverage: Option<&PathCoverage>,
     params: FindDefinitionParams,
-) -> CallToolResult {
-    handle_in(&Arc::new(IndexStore::new(conn)), &no_sources(), &SemanticRung::off(), coverage, params)
-        .unwrap()
+) -> ToolAnswer<DefinitionNode> {
+    handle(
+        &QueryCtx {
+            project_root: no_sources().to_path_buf(),
+            coverage: coverage.cloned(),
+            ..QueryCtx::for_test(&Arc::new(IndexStore::new(conn)))
+        },
+        &SemanticRung::off(),
+        params,
+    )
+    .unwrap()
 }
 
 /// File + position on an absent language's file is
 /// refused with the install command.
 ///
-/// Control: pass `None` instead of `coverage` from `handle_in` to
+/// Control: pass `None` instead of `coverage` from `handle` to
 /// `by_position` (or call `error(..)` in its `None` arm) - the body is not
 /// JSON.
 #[test]

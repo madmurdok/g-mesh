@@ -5,23 +5,34 @@
 //! from one `GROUP BY` or one `COUNT`, without the rows nobody asked for.
 
 use anyhow::Context;
-use rmcp::model::CallToolResult;
-use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::graph::pagination::{self, Direction, FileTally};
+use crate::graph::pagination::{self, FileTally};
+use crate::graph::Direction;
+use crate::mcp::response_bound;
 
-use super::tool_result::success;
+use super::query::WirePage;
 use super::{anchor, Answer};
+
+/// What an edge tool answers: its rows (`R`), or the non-row [`Summary`]
+/// carrying the same disclosures (`D`). Serialized as the inner value alone.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum EdgeAnswer<R, D> {
+    Rows(R),
+    Summary(Box<Summary<D>>),
+}
+
+impl<R: Serialize, D: Serialize> WirePage for EdgeAnswer<R, D> {}
 
 /// Wire shape of a non-row answer. `D` is the tool's own response-level
 /// disclosures (unlinked usages, excluded references, provenance, ...),
 /// flattened in so they keep the field names the row answer gives them.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Summary<'a, D: Serialize> {
-    anchor: &'a anchor::AnchorInfo,
+pub(crate) struct Summary<D> {
+    anchor: anchor::AnchorInfo,
     /// Exact number of matching rows over the whole set.
     total: usize,
     /// How many of `total` the linker could not confirm. `count` only.
@@ -30,7 +41,7 @@ struct Summary<'a, D: Serialize> {
     /// Every file holding a match, with its count. `files` only, and sent
     /// there even when empty: it is the answer.
     #[serde(skip_serializing_if = "Option::is_none")]
-    files: Option<&'a [FileTally]>,
+    files: Option<Vec<FileTally>>,
     /// Present only when the tally's entry cap or the response's byte
     /// ceiling left files out, which the caller could otherwise see only by
     /// summing `refs` against `total`.
@@ -43,44 +54,34 @@ struct Summary<'a, D: Serialize> {
 }
 
 /// The [`Summary`] for `counted`, with `files` cut to what fits
-/// `pagination::MAX_RESPONSE_BYTES` beside everything else the response
+/// `response_bound::MAX_RESPONSE_BYTES` beside everything else the response
 /// carries. `tail(files, send)` returns the hint and disclosures for a
 /// response naming `files`; `send` is false while candidates are measured and
 /// true for the one sent, so a once-per-session hint is spent only there.
-pub(super) fn respond<D: Serialize>(
+pub(super) fn respond<R, D: Serialize>(
     anchor: &anchor::AnchorInfo,
     counted: &Counted,
     mut tail: impl FnMut(Option<&[FileTally]>, bool) -> (Option<String>, D),
-) -> Result<CallToolResult, ErrorData> {
+) -> EdgeAnswer<R, D> {
     let mut build = |budget: usize, send: bool| {
         let mut files = counted.files.clone();
-        let cut = files.as_mut().is_some_and(|files| pagination::truncate_to_bytes(files, budget));
+        let cut = files.as_mut().is_some_and(|files| response_bound::truncate_to_bytes(files, budget));
         let (hint, disclosures) = tail(files.as_deref(), send);
-        let bytes = pagination::wire_len(&Summary {
-            anchor,
+        Summary {
+            anchor: anchor.clone(),
             total: counted.total,
             unresolved: counted.unresolved,
-            files: files.as_deref(),
+            files,
             files_truncated: counted.files_truncated || cut,
-            hint: hint.clone(),
-            disclosures: &disclosures,
-        });
-        (files, cut, hint, disclosures, bytes)
+            hint,
+            disclosures,
+        }
     };
-    let budget = pagination::fit_budget(|budget| {
-        let (files, _, _, _, bytes) = build(budget, false);
-        (files.as_deref().map_or(0, pagination::wire_len), bytes)
+    let budget = response_bound::fit_budget(|budget| {
+        let summary = build(budget, false);
+        (summary.files.as_deref().map_or(0, response_bound::wire_len), response_bound::wire_len(&summary))
     });
-    let (files, cut, hint, disclosures, _) = build(budget, true);
-    success(&Summary {
-        anchor,
-        total: counted.total,
-        unresolved: counted.unresolved,
-        files: files.as_deref(),
-        files_truncated: counted.files_truncated || cut,
-        hint,
-        disclosures,
-    })
+    EdgeAnswer::Summary(Box::new(build(budget, true)))
 }
 
 /// The counted part of a [`Summary`], before the tool attaches its anchor,

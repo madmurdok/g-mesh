@@ -1,6 +1,6 @@
 # Bundled Rust plugin manifest. See docs/architecture/multi-language-plugins.md
 # ("Interfaces > `plugin.toml` additions") for the schema this file follows,
-# and core/src/daemon/manifest.rs (`read_manifest`) for the parser/validation
+# and core/src/plugin_manifest.rs (`read_manifest`) for the parser/validation
 # rules it must satisfy. `language` must equal this directory's own name
 # ("rust"), the same rule plugins/typescript's manifest documents.
 #
@@ -15,7 +15,7 @@
 #
 # GM-288 (distribution) does not reuse this file for a release archive: it
 # generates a separate, installed manifest per target
-# (scripts/bundle-rust-plugin.sh) whose command names that target's actual
+# (scripts/bundle-cargo-plugin.sh) whose command names that target's actual
 # staged binary (`./g-mesh-plugin-rust` or `./g-mesh-plugin-rust.exe`), the
 # same way plugins/typescript/plugin.toml's checked-in dev manifest is never
 # the one an archive ships either (see scripts/bundle-plugin.sh).
@@ -29,7 +29,7 @@ protocol_version = 2
 # the plugin changed since the previous release tag, and
 # scripts/cut-release.sh enforces that. See
 # docs/architecture/plugin-modularity.md, "plugin_version: two rules, not one".
-plugin_version = "4.29.0"
+plugin_version = "4.33.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-rust"
@@ -79,7 +79,7 @@ resolution_delta = true
 
 # How to start rust-analyzer. Read by *this plugin*, never by core - core has
 # no use for the fields and validating them would make a typo here take the
-# structural tier down with it (see plugins/sdk/src/lsp/config.rs's module
+# structural tier down with it (see plugins/sdk-lsp/src/config.rs's module
 # doc for the argument in full).
 [plugin.semantic]
 # A bare name: the absolute `rustup which --toolchain <default>
