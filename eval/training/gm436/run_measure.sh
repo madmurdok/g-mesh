@@ -25,6 +25,7 @@
 # GM436_DATA, GM456_DATA, GM436_OUT (default $GM436_DATA/measure or .../dry),
 # MIN_FREE_GB (10), THREADS (2), PY (the GM-436 venv python).
 
+# shellcheck disable=SC2086,SC2206,SC2046 # repo lists, arm lists and per-config train args are space-separated strings; each word must be its own argument
 set -Eeuo pipefail
 
 if [ -z "${GM436_CAFFEINATED:-}" ]; then
