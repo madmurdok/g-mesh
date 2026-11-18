@@ -494,3 +494,42 @@ Only on AWS (measure slice S6, one background script, `verify-clean` after each)
   instant fleets honour the 8-vCPU quota as expected; that the
   EventBridge Scheduler universal target for `ec2:terminateInstances` is
   available in both regions.
+
+**Confirmed in the code slice (read-only calls, profile `default`, 2026-11-19):**
+
+- SSM path `/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id`
+  exists in both regions: us-east-1 `ami-0a654363d2b9a01db`, us-west-2
+  `ami-0b87420e2a817294d`, both "Deep Learning Base OSS Nvidia Driver GPU AMI
+  (Ubuntu 22.04) 20261113", x86_64, root `/dev/sda1` 75 GB gp3 (so the root
+  volume is 95 GB). Pinned in `eval/gpu/config.toml`.
+- Driver version: not exposed by SSM or `describe-images` (no tags; the
+  release-notes URL in the description returns 404). The AMI's supported list
+  includes G7/P6-B300 (Blackwell), which needs a newer driver than 525, so
+  >= 525 is implied, not read. The runner's smoke step reads it with
+  `nvidia-smi` and fails the attempt below 525; the first S6 launch records it.
+- Spot quota `L-3819A6DF` "All G and VT Spot Instance Requests" = 8 in both
+  regions. A dry-run spot `RunInstances` of g5.xlarge succeeds in both. Whether
+  an instant fleet over g5.xlarge + g5.2xlarge stays within it cannot be shown
+  without launching: the fleet asks for one instance (4 or 8 vCPU), a relaunch
+  waits until the previous instance is terminated, and a quota error is
+  reported as such. First S6 launch confirms.
+- EventBridge Scheduler answers `list-schedules` in both regions (no schedules
+  yet). The universal target `aws-sdk:ec2:terminateInstances` cannot be shown
+  without creating a schedule; S6's scheduler-only scenario confirms it.
+- g5 offerings: us-east-1 a/b/c/d/f (not 1e), us-west-2 a/b/c; the fleet's
+  overrides are the default subnets of the offering AZs only.
+- gp3 list price $0.08/GB-month (Pricing API) for EBS in `cost.json`;
+  `boto3==1.44.6`, uv 0.12.1 installer URL resolves.
+
+**Code-slice choices beyond the edit map:** checkpoints and outputs are per
+job step (`runs/<id>/ckpt/<step>/`, `out/<step>/`; the parity job runs the G
+and A arms as two steps of one launch); `CreateFleet` needs a launch template,
+created per attempt and deleted right after the call (`reap` and
+`verify-clean` cover leftovers); S3 lifecycle prefixes cannot match
+`runs/*/ckpt/`, so the rule expires all of `runs/` after 30 days (`pull`
+copies everything but checkpoints); the runner records `terminated` when the
+OS stops it (hard terminate or in-OS lifetime) and the launcher relaunches it
+as `no-status` unless the lifetime has passed; the adapter's data subset also
+needs `$GM456_DATA/work/runs/<variant>/*/{manifest.json,node_ids.txt}`
+(`cache.tables_for` reads them); `eval/gpu/smoke_job.py` is the smoke job's
+stand-in trainer.

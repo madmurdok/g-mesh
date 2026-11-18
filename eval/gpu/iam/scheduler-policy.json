@@ -1,0 +1,12 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "TerminateTaggedOnly",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "arn:aws:ec2:*:${account}:instance/*",
+      "Condition": {"StringEquals": {"aws:ResourceTag/gmesh-train": "1"}}
+    }
+  ]
+}

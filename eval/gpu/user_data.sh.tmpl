@@ -1,0 +1,53 @@
+#!/bin/bash
+# User data of one attempt of a GPU training run; rendered by gpu_train.py user_data().
+# The lifetime line stays first: it must be armed before anything can hang.
+@@lifetime@@
+set -euo pipefail
+
+BUCKET=@@bucket@@
+REGION=@@bucket_region@@
+RUN_ID=@@run_id@@
+ATTEMPT=@@attempt@@
+CODE_KEY=@@code_key@@
+WORK=/opt/gm457
+MARKER=/var/run/gm457-status-written
+BOOT_LOG=/var/log/gm457-boot.log
+
+exec > >(tee -a "$BOOT_LOG") 2>&1
+
+# Runs on every exit: success, failure, error or signal. Records a boot failure
+# when the runner never wrote status.json, uploads the boot log, powers off
+# (InstanceInitiatedShutdownBehavior=terminate turns that into a termination).
+finish() {
+  rc=$?
+  set +e
+  if [ ! -e "$MARKER" ]; then
+    printf '{"n": %s, "state": "failed", "reason": "boot-failed", "exit": %s, "end": "%s"}\n' \
+      "$ATTEMPT" "$rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/gm457-boot.json
+    aws --region "$REGION" s3 cp --only-show-errors /tmp/gm457-boot.json \
+      "s3://$BUCKET/runs/$RUN_ID/status/attempt-$ATTEMPT.boot.json"
+  fi
+  aws --region "$REGION" s3 cp --only-show-errors "$BOOT_LOG" \
+    "s3://$BUCKET/runs/$RUN_ID/logs/attempt-$ATTEMPT.boot.log"
+  @@shutdown@@
+}
+trap finish EXIT
+trap 'exit 143' TERM INT
+
+echo "gm457: run $RUN_ID attempt $ATTEMPT, boot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+mkdir -p "$WORK/src"
+
+if ! command -v aws >/dev/null; then
+  curl -fsSL -o /tmp/awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+  python3 -m zipfile -e /tmp/awscliv2.zip /tmp/awscli
+  chmod -R +x /tmp/awscli/aws/dist /tmp/awscli/aws/install
+  /tmp/awscli/aws/install
+fi
+
+curl -fsSL https://astral.sh/uv/@@uv_version@@/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+
+aws --region "$REGION" s3 cp --only-show-errors "s3://$BUCKET/$CODE_KEY" "$WORK/code.tar.gz"
+tar -xzf "$WORK/code.tar.gz" -C "$WORK/src"
+
+python3 "$WORK/src/eval/gpu/runner.py" --bucket "$BUCKET" --region "$REGION" \
+  --run-id "$RUN_ID" --attempt "$ATTEMPT" --work "$WORK" --src "$WORK/src" --grace @@grace@@
