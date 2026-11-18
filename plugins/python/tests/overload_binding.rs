@@ -2,7 +2,7 @@
 //! this plugin ships, binds each overloaded call to the `@overload` stub it
 //! calls - read straight off the bridge's diff, with no core in between.
 //!
-//! `plugins/sdk/tests/lsp_bridge.rs` pins every rule of the binding against a
+//! `plugins/sdk-lsp/tests/lsp_bridge.rs` pins every rule of the binding against a
 //! scripted server; this file is the one place that proves pyright still
 //! answers the way those scripts assume (`definition` names the whole set,
 //! `hover` at the call renders the bound stub, `hover` at a stub's own name

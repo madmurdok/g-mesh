@@ -270,14 +270,16 @@ impl LspClient {
         let server = config.engine.clone();
         std::thread::spawn(move || drain_stderr(&label, &server, stderr));
 
+        // The hook is registered before the server joins LIVE_SERVERS, so a
+        // lifeline exit can never see the server listed but no hook to kill it.
+        static REGISTERED: Once = Once::new();
+        REGISTERED.call_once(|| on_lifeline_exit(kill_live_servers));
         let child = Arc::new(Mutex::new(child));
         {
             let mut servers = LIVE_SERVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             servers.retain(|server| server.strong_count() > 0);
             servers.push(Arc::downgrade(&child));
         }
-        static REGISTERED: Once = Once::new();
-        REGISTERED.call_once(|| on_lifeline_exit(kill_live_servers));
 
         let mut client = Self {
             language: language.to_string(),

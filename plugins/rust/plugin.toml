@@ -79,7 +79,7 @@ resolution_delta = true
 
 # How to start rust-analyzer. Read by *this plugin*, never by core - core has
 # no use for the fields and validating them would make a typo here take the
-# structural tier down with it (see plugins/sdk/src/lsp/config.rs's module
+# structural tier down with it (see plugins/sdk-lsp/src/config.rs's module
 # doc for the argument in full).
 [plugin.semantic]
 # A bare name: the absolute `rustup which --toolchain <default>

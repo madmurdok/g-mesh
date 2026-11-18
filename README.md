@@ -418,7 +418,8 @@ Oniguruma, tree-sitter grammars) for that target.
    single CI run, which is how v3.10.0 was tagged with nothing to publish
    (GM-391).
 2. Merge the release branch (with `core/Cargo.toml`, `wire/Cargo.toml`,
-   `walk/Cargo.toml` and `plugins/sdk/Cargo.toml`, which must all agree,
+   `walk/Cargo.toml`, `plugins/sdk/Cargo.toml` and `plugins/sdk-lsp/Cargo.toml`,
+   which must all agree,
    already bumped to the new version) into `main` with `--no-ff` and the
    subject `merge: release-<version> into main`. `plugins/rust`,
    `plugins/python` and `plugins/typescript` carry their own version: bump a
