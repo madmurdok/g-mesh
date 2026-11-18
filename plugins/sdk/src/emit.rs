@@ -180,3 +180,167 @@ impl GraphEmitter {
         self.graph.finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{placeholder_id, render_target};
+    use g_mesh_wire::{Position, Visibility};
+
+    const FILE: &str = "pkg/mod.toy";
+
+    fn range() -> Range {
+        Range { start: Position { line: 0, col: 0 }, end: Position { line: 0, col: 1 } }
+    }
+
+    fn emitter() -> GraphEmitter {
+        let path = RelPath::new(FILE);
+        let file = NodeSpec::new(NodeKind::File, "mod.toy", FILE, range());
+        GraphEmitter::new(FileGraphBuilder::new("toy", "test", &path), &path, file)
+    }
+
+    fn function(name: &str) -> NodeSpec {
+        NodeSpec::new(NodeKind::Function, name, name, range())
+            .native_kind("function")
+            .visibility(Visibility::Public)
+    }
+
+    fn target(scope: TargetScope, key: TargetKey) -> PlaceholderTarget {
+        PlaceholderTarget { scope, key, from_container: None, key_path: None, also_scopes: Vec::new() }
+    }
+
+    #[test]
+    fn the_file_node_is_first_and_its_id_is_file_id() {
+        let emitter = emitter();
+        let file_id = emitter.file_id().to_string();
+        assert_eq!(file_id, node_id(FILE, NodeKind::File, FILE, None));
+        let graph = emitter.finish();
+        assert_eq!(graph.nodes.first().map(|node| node.id.as_str()), Some(file_id.as_str()));
+    }
+
+    /// The first declaration of an id wins; a second adds no node and no
+    /// `DEFINES`/`EXPORTS` edge, and answers with the first one's id.
+    #[test]
+    fn a_second_declaration_of_one_id_adds_nothing_and_reuses_the_first() {
+        let mut emitter = emitter();
+        let first = emitter.declare(function("f"), true);
+        let mut later = function("f");
+        later.range = Range { start: Position { line: 5, col: 0 }, end: Position { line: 5, col: 1 } };
+        let second = emitter.declare(later, true);
+        assert_eq!(first, second);
+        let graph = emitter.finish();
+        assert_eq!(graph.nodes.len(), 2, "the File node and one `f`: {:?}", graph.nodes);
+        assert_eq!(graph.nodes[1].range.start.line, 0, "the first occurrence is the one kept");
+        assert_eq!(graph.edges.len(), 2, "one DEFINES and one EXPORTS: {:?}", graph.edges);
+    }
+
+    /// Control C8: drop the `edges` dedup set (`resolved_edge` adds
+    /// unconditionally) and this fails.
+    #[test]
+    fn one_edge_written_twice_is_one_edge() {
+        let mut emitter = emitter();
+        let id = emitter.declare(function("f"), true);
+        let file = emitter.file_id().to_string();
+        let first = emitter.resolved_edge(EdgeKind::Calls, &file, &id);
+        let second = emitter.resolved_edge(EdgeKind::Calls, &file, &id);
+        assert_eq!(first, second);
+        let graph = emitter.finish();
+        let calls: Vec<_> = graph.edges.iter().filter(|edge| edge.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].resolved);
+    }
+
+    #[test]
+    fn placeholder_and_import_edges_are_deduped_and_the_first_specifier_is_kept() {
+        let mut emitter = emitter();
+        let f = emitter.declare(function("f"), false);
+        let file = emitter.file_id().to_string();
+        let p = emitter.placeholder(
+            PlaceholderKind::PendingSymbol,
+            "g",
+            target(TargetScope::File("other.toy".into()), TargetKey::Name("g".into())),
+            range(),
+        );
+        emitter.placeholder_edge(EdgeKind::Calls, &f, &p);
+        emitter.placeholder_edge(EdgeKind::Calls, &f, &p);
+        emitter.import_edge(&file, &p, "./other");
+        emitter.import_edge(&file, &p, "other");
+        let graph = emitter.finish();
+        let calls: Vec<_> = graph.edges.iter().filter(|edge| edge.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(!calls[0].resolved, "an edge onto a placeholder is never resolved");
+        let imports: Vec<_> = graph.edges.iter().filter(|edge| edge.kind == EdgeKind::Imports).collect();
+        assert_eq!(imports.len(), 1, "{imports:?}");
+        assert_eq!(imports[0].specifier.as_deref(), Some("./other"));
+    }
+
+    /// A placeholder's id is the one `placeholder_id` (and so `render_target`)
+    /// gives its target; two waiting on one target are one node, and every
+    /// part of the target - kind, scope shape, key kind - tells two apart.
+    ///
+    /// Control: drop the key's kind (`is_qualified`) from `placeholder_key`
+    /// and the name/qualified-name pair collapses into one node.
+    #[test]
+    fn placeholders_are_one_node_per_address_and_keyed_by_every_part_of_it() {
+        let mut emitter = emitter();
+        let path = RelPath::new(FILE);
+        let name_in_container = target(TargetScope::Container("a.b".into()), TargetKey::Name("C".into()));
+        let cases = [
+            (PlaceholderKind::PendingSymbol, name_in_container.clone()),
+            (
+                PlaceholderKind::PendingSymbol,
+                target(TargetScope::Container("a.b".into()), TargetKey::QualifiedName("C".into())),
+            ),
+            (
+                PlaceholderKind::PendingSymbol,
+                target(TargetScope::File("a.b".into()), TargetKey::Name("C".into())),
+            ),
+            (PlaceholderKind::Reexport, name_in_container.clone()),
+        ];
+        let ids: Vec<String> = cases
+            .iter()
+            .map(|(kind, target)| {
+                let id = emitter.placeholder(*kind, "C", target.clone(), range());
+                assert_eq!(id, placeholder_id(&path, *kind, target), "{kind:?} {target:?}");
+                id
+            })
+            .collect();
+        let distinct: HashSet<_> = ids.iter().collect();
+        assert_eq!(distinct.len(), cases.len(), "{ids:?}");
+
+        let again =
+            emitter.placeholder(PlaceholderKind::PendingSymbol, "other-site", name_in_container, range());
+        assert_eq!(again, ids[0]);
+        let graph = emitter.finish();
+        assert_eq!(graph.nodes.len(), 1 + cases.len(), "{:?}", graph.nodes);
+        assert_eq!(graph.nodes[1].qualified_name, render_target(&cases[0].1));
+    }
+
+    #[test]
+    fn an_external_module_is_one_node() {
+        let mut emitter = emitter();
+        let a = emitter.external_module("os", range());
+        let b = emitter.external_module("os", range());
+        assert_eq!(a, b);
+        assert_eq!(a, node_id(FILE, NodeKind::Module, "os", Some("external_module")));
+        assert_eq!(emitter.finish().nodes.len(), 2);
+    }
+
+    /// A node a caller adds itself is claimed once; a later `declare` of the
+    /// same id then adds nothing.
+    #[test]
+    fn claim_node_and_is_declared_share_the_set_declare_uses() {
+        let mut emitter = emitter();
+        let spec = function("f");
+        assert!(!emitter.is_declared(&spec));
+        let id = node_id(FILE, spec.kind, &spec.qualified_name, spec.native_kind.as_deref());
+        assert!(emitter.claim_node(&id));
+        assert!(!emitter.claim_node(&id), "a second claim is refused");
+        assert!(emitter.is_declared(&spec));
+        assert_eq!(emitter.add_node(spec.clone()), id);
+        assert_eq!(emitter.declare(spec, true), id);
+        let graph = emitter.finish();
+        assert_eq!(graph.nodes.len(), 2, "{:?}", graph.nodes);
+        assert!(graph.edges.is_empty(), "declare of a claimed id adds no DEFINES: {:?}", graph.edges);
+    }
+}

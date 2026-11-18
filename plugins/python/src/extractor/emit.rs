@@ -421,4 +421,24 @@ mod tests {
         assert_eq!(positions.point(tree_sitter::Point { row: 0, column: 7 }), Position { line: 0, col: 5 });
         assert_eq!(positions.point(tree_sitter::Point { row: 1, column: 3 }), Position { line: 1, col: 3 });
     }
+
+    /// `CharColumns::node_range` over a parsed node: both ends in characters.
+    /// `b` starts at byte 8 but character 7, after the two-byte `é`.
+    ///
+    /// Control: `node_range` building its ends from the node's byte points
+    /// unconverted fails this.
+    #[test]
+    fn a_node_range_is_converted_from_bytes_to_characters() {
+        let source = "é = 1; b = 2\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let b = tree.root_node().descendant_for_byte_range(8, 9).unwrap();
+        assert_eq!(b.utf8_text(source.as_bytes()).unwrap(), "b");
+        assert_eq!(b.start_position().column, 8, "tree-sitter counts bytes");
+        assert_eq!(
+            CharColumns::new(source).node_range(b),
+            Range { start: Position { line: 0, col: 7 }, end: Position { line: 0, col: 8 } }
+        );
+    }
 }

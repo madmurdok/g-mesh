@@ -294,6 +294,54 @@ mod tests {
         }
     }
 
+    /// A wrong-typed key the SDK never reads still makes the manifest unusable
+    /// as a whole: the spec stands, never merged field by field.
+    #[test]
+    fn a_manifest_with_a_wrong_typed_capability_leaves_the_spec_standing() {
+        let resolved = resolve_against(
+            "wrong-type",
+            Some(
+                "[plugin]\nlanguage = \"toy\"\nprotocol_version = 2\nplugin_version = \"1.2.3\"\n\n\
+                 [plugin.languages]\nextensions = [\".other\"]\n\n\
+                 [plugin.capabilities]\nsemantic_pass = \"yes\"\n",
+            ),
+        );
+        assert_eq!(resolved.version, "9.9.9-from-code");
+        assert_eq!(resolved.extensions, vec![".toy"]);
+        assert_eq!(resolved.manifest_path, None);
+    }
+
+    /// `from_manifest_str` takes `language`, `plugin_version`, `extensions` and
+    /// `exclude_dirs` from each plugin's own manifest, compared against the
+    /// file read as plain TOML.
+    #[test]
+    fn from_manifest_str_reads_each_shipped_manifests_values() {
+        let sdk = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in
+            ["../python/plugin.toml", "../rust/plugin.toml", "../typescript/plugin.toml", "toy/plugin.toml"]
+        {
+            let text = std::fs::read_to_string(sdk.join(relative)).unwrap();
+            let raw: toml::Value = toml::from_str(&text).unwrap();
+            let raw = &raw["plugin"];
+            let strings = |value: &toml::Value| -> Vec<String> {
+                value.as_array().unwrap().iter().map(|item| item.as_str().unwrap().to_string()).collect()
+            };
+            let resolved = ResolvedSpec::resolve_from(&PluginSpec::from_manifest_str(&text), None);
+            assert_eq!(resolved.language, raw["language"].as_str().unwrap(), "{relative}");
+            assert_eq!(resolved.version, raw["plugin_version"].as_str().unwrap(), "{relative}");
+            assert_eq!(resolved.extensions, strings(&raw["languages"]["extensions"]), "{relative}");
+            let exclude =
+                raw.get("workspace").and_then(|w| w.get("exclude_dirs")).map(strings).unwrap_or_default();
+            assert_eq!(resolved.exclude_dirs, exclude, "{relative}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not usable")]
+    fn from_manifest_str_panics_on_a_manifest_it_cannot_use() {
+        PluginSpec::from_manifest_str("[plugin]\nlanguage = \"toy\"\nplugin_version = \"1\"\n");
+    }
+
     /// The spec alone, with nothing to resolve against - a plugin binary run
     /// straight out of `target/debug` with no manifest anywhere.
     #[test]

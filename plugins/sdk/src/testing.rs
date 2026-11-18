@@ -681,6 +681,91 @@ not a check line
         assert!(format!("{err:#}").contains("CARGO_BIN_EXE"), "{err:#}");
     }
 
+    /// The plugin manifests a conformance run is built from: the three
+    /// shipped plugins and the toy.
+    fn shipped_manifests() -> Vec<PathBuf> {
+        let sdk = Path::new(env!("CARGO_MANIFEST_DIR"));
+        ["../python/plugin.toml", "../rust/plugin.toml", "../typescript/plugin.toml", "toy/plugin.toml"]
+            .iter()
+            .map(|relative| sdk.join(relative))
+            .collect()
+    }
+
+    fn toml_at(text: &str) -> toml::Value {
+        toml::from_str(text).expect("valid TOML")
+    }
+
+    /// The manifest a run writes carries every value `from_manifest` reads
+    /// from the plugin's own `plugin.toml`, compared key by key against the
+    /// file read as plain TOML; a key the file omits takes the run's default.
+    ///
+    /// Control: drop `check.semantic = plugin.semantic` (or any one field
+    /// assignment) from `from_manifest` and this fails.
+    #[test]
+    fn from_manifest_carries_the_shipped_manifests_values_into_the_run() {
+        for path in shipped_manifests() {
+            let shipped = toml_at(&fs::read_to_string(&path).unwrap());
+            let shipped = &shipped["plugin"];
+            let check = PluginCheck::from_manifest(&path, std::env::current_exe().unwrap(), ".");
+            let written = toml_at(&check.manifest(Path::new("/tmp/plugin-binary")));
+            let written = &written["plugin"];
+            let at = path.display();
+
+            for key in ["language", "plugin_version"] {
+                assert_eq!(written.get(key), shipped.get(key), "{at}: {key}");
+            }
+            assert_eq!(written["languages"]["extensions"], shipped["languages"]["extensions"], "{at}");
+            let empty = toml::Value::Array(Vec::new());
+            for key in ["exclude_dirs", "entry_points", "watch_files"] {
+                let expected = shipped.get("workspace").and_then(|w| w.get(key)).unwrap_or(&empty);
+                assert_eq!(&written["workspace"][key], expected, "{at}: workspace.{key}");
+            }
+            let defaults = [
+                ("semantic_pass", toml::Value::Boolean(false)),
+                ("files_created", toml::Value::Boolean(false)),
+                ("receiver_calls", toml::Value::String("unresolved".into())),
+                ("receiver_calls_structural", toml::Value::String("unresolved".into())),
+            ];
+            for (key, default) in &defaults {
+                let expected = shipped.get("capabilities").and_then(|c| c.get(*key)).unwrap_or(default);
+                assert_eq!(&written["capabilities"][*key], expected, "{at}: capabilities.{key}");
+            }
+            assert_eq!(written.get("semantic"), shipped.get("semantic"), "{at}: [plugin.semantic] whole");
+            assert_eq!(written["spawn"]["command"].as_str(), Some("/tmp/plugin-binary"), "{at}");
+        }
+    }
+
+    /// `semantic_command` replaces `command` and keeps the rest of the table
+    /// the manifest declared; `without_semantic_section` writes none.
+    #[test]
+    fn semantic_command_keeps_the_manifests_other_semantic_keys() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../python/plugin.toml");
+        let shipped = toml_at(&fs::read_to_string(&path).unwrap());
+        let shipped = shipped["plugin"]["semantic"].as_table().expect("python declares [plugin.semantic]");
+        let check = PluginCheck::from_manifest(&path, std::env::current_exe().unwrap(), ".");
+
+        let overridden = check.clone().semantic_command("/opt/server");
+        let written = toml_at(&overridden.manifest(Path::new("/tmp/plugin-binary")));
+        let semantic = written["plugin"]["semantic"].as_table().expect("written");
+        assert_eq!(semantic["command"].as_str(), Some("/opt/server"));
+        for (key, value) in shipped.iter().filter(|(key, _)| key.as_str() != "command") {
+            assert_eq!(semantic.get(key), Some(value), "{key}");
+        }
+
+        let none = check.without_semantic_section();
+        let written = toml_at(&none.manifest(Path::new("/tmp/plugin-binary")));
+        assert_eq!(written["plugin"].get("semantic"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "extensions")]
+    fn from_manifest_panics_on_a_manifest_without_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugin.toml");
+        fs::write(&path, "[plugin]\nlanguage = \"toy\"\nplugin_version = \"1\"\n").unwrap();
+        PluginCheck::from_manifest(&path, "/bin/toy", ".");
+    }
+
     #[test]
     fn a_scratch_directory_is_removed_when_it_is_dropped() {
         let path = {
