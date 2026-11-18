@@ -187,6 +187,16 @@ delivery after the flood, was not observed. Each arm ran once (C twice).
 4. Whether to repeat the reproduction with a real parallel cargo build and a
    longer flood (more than 5 min) before choosing, to rule out real event loss.
 
+## 6.1 Owner review (2026-11-18)
+
+- Decision 1: "F3 сейчас, F1 в бэклог (Recommended)". F3 lands in this task:
+  tool descriptions say a file-anchored query forces freshness and by-name
+  answers can lag during heavy builds, and a by-name miss or a
+  `semanticNeighbours` fallback says how long the watcher has delivered no
+  event (decision 3 is folded into F3). F1 (starvation watchdog with a stat
+  sweep) is backlog task GM-727; decision 2 (N, project size) moves there.
+- Decision 4: "Нет, хватает (Recommended)": no repeat with a real cargo build.
+
 ## 7. Artifacts
 
 Scratchpad
