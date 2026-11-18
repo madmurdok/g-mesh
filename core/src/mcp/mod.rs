@@ -84,6 +84,8 @@ mod tools_list_tests;
 mod unlinked;
 mod untyped;
 #[cfg(test)]
+mod watcher_quiet_tests;
+#[cfg(test)]
 mod wire_golden_tests;
 
 pub use self::host::{Activity, McpHost, PathCoverage};
@@ -357,6 +359,7 @@ impl GMeshMcpServer {
             entry_points: self.host.entry_points(),
             uncovered: self.filter_coverage(file_paths),
             coverage: file.and_then(|path| self.host.path_coverage(path)),
+            watcher_quiet: self.host.watcher_quiet(),
         }
     }
 
@@ -660,7 +663,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "find_definition",
-        description = "Find where a symbol is defined, and get the declaration's source back with it. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it. The response carries the declaration's own text, so a follow-up read of that file is usually unnecessary; pass include_source: false if you only want coordinates. Line and column numbers in the response are zero-based; source.firstLine beside them is one-based, as an editor shows it."
+        description = "Find where a symbol is defined, and get the declaration's source back with it. Give either a symbol name, or a file path with a cursor position to resolve the symbol under it. The response carries the declaration's own text, so a follow-up read of that file is usually unnecessary; pass include_source: false if you only want coordinates. Line and column numbers in the response are zero-based; source.firstLine beside them is one-based, as an editor shows it. By name, answers can lag behind edits during a heavy build; with file_path, the file is re-read first."
     )]
     async fn find_definition(
         &self,
@@ -749,7 +752,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "get_file_outline",
-        description = "List the symbols a file declares, members included, in source order; pages are capped at about 8k bytes. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep. `exported` means reachable from outside the file, not that the symbol's own line carries a visibility keyword - e.g. in Rust, a trait method or a trait-impl method is exported through the trait/impl even where the language forbids writing `pub` on that line itself."
+        description = "List the symbols a file declares, members included, in source order; pages are capped at about 8k bytes. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep. `exported` means reachable from outside the file, not that the symbol's own line carries a visibility keyword - e.g. in Rust, a trait method or a trait-impl method is exported through the trait/impl even where the language forbids writing `pub` on that line itself. Re-reads the file first."
     )]
     async fn get_file_outline(
         &self,

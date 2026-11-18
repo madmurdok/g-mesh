@@ -5,6 +5,7 @@ pub mod ignore_layers;
 pub mod rescan;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::RwLock;
 use std::time::Duration;
@@ -50,6 +51,9 @@ pub struct ProjectWatcher {
     // `reload_ignores` when a `.gitignore` or a link may have changed; read
     // for every event.
     ignores: RwLock<IgnoreLayers>,
+    // Set by `next_change` on every signal it receives, ignored paths
+    // included, before any filtering; cleared by [`Self::take_signal_seen`].
+    signal_seen: AtomicBool,
 }
 
 impl ProjectWatcher {
@@ -145,6 +149,7 @@ impl ProjectWatcher {
             test_events: tx,
             root: root.to_path_buf(),
             ignores,
+            signal_seen: AtomicBool::new(false),
         })
     }
 
@@ -232,6 +237,9 @@ impl ProjectWatcher {
     /// the ignore layers do not judge directories that way. A rescan the
     /// remap would drop, or one outside the root, is widened to the root, so
     /// a dropped event is never lost with it.
+    ///
+    /// Every signal received, a dropped or ignored one included, is recorded
+    /// for [`Self::take_signal_seen`].
     pub fn next_change(&self, timeout: Duration) -> Option<Change> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -239,7 +247,11 @@ impl ProjectWatcher {
             if remaining.is_zero() {
                 return None;
             }
-            match self.events.recv_timeout(remaining) {
+            let signal = self.events.recv_timeout(remaining);
+            if signal.is_ok() {
+                self.signal_seen.store(true, Ordering::Relaxed);
+            }
+            match signal {
                 Ok(WatchSignal::Path(path)) => {
                     let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let path = match layers.to_indexed(&path) {
@@ -265,6 +277,13 @@ impl ProjectWatcher {
                 Err(RecvTimeoutError::Disconnected) => return None,
             }
         }
+    }
+
+    /// Whether [`Self::next_change`] received any signal since the last call,
+    /// including ones it dropped as ignored (a build writing `target/`); clears
+    /// the record.
+    pub fn take_signal_seen(&self) -> bool {
+        self.signal_seen.swap(false, Ordering::Relaxed)
     }
 
     /// Test-only seam: queues a Rescan of `path` exactly as the OS callback
@@ -1113,5 +1132,45 @@ mod tests {
             watcher.inject_rescan(&injected);
             assert_eq!(next_rescan(&watcher), Some(expected), "a rescan of {}", injected.display());
         }
+    }
+
+    /// A path `next_change` drops as ignored is still recorded as a signal
+    /// received, once: the next `take_signal_seen` clears it, and a
+    /// `next_change` that receives nothing records nothing.
+    ///
+    /// Control: in `next_change`, set `signal_seen` only where it returns a
+    /// `Change` (after the ignore check) - the ignored path is not recorded
+    /// and the first assertion fails.
+    #[test]
+    fn an_ignored_path_is_recorded_as_a_signal_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, ".gitignore", "target/\n");
+        let watcher = injected_only(&root);
+        let built = root.join("target/debug/build.o");
+        assert!(watcher.is_ignored(&built), "the fixture path must be ignored");
+
+        assert_eq!(delivered(&watcher, &built), None, "an ignored path is not routed");
+        assert!(watcher.take_signal_seen(), "an ignored path is still a signal received");
+        assert!(!watcher.take_signal_seen(), "taking the record clears it");
+
+        assert_eq!(watcher.next_change(INJECTED_TIMEOUT), None);
+        assert!(!watcher.take_signal_seen(), "no signal received, none recorded");
+    }
+
+    /// A Rescan and a routed path are signals received too.
+    #[test]
+    fn a_rescan_and_a_routed_path_are_recorded_as_signals_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let watcher = injected_only(&root);
+
+        watcher.inject_rescan(&root);
+        assert_eq!(watcher.next_change(INJECTED_TIMEOUT), Some(Change::Rescan(root.clone())));
+        assert!(watcher.take_signal_seen(), "a Rescan is a signal received");
+
+        let source = root.join("src/lib.rs");
+        assert_eq!(delivered(&watcher, &source), Some(source.clone()));
+        assert!(watcher.take_signal_seen(), "a routed path is a signal received");
     }
 }

@@ -98,6 +98,7 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
+use crate::daemon::watch_loop::WatcherClock;
 use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
 use crate::ingest::staleness::{self, StalenessOutcome};
@@ -488,6 +489,8 @@ pub struct PluginRegistry {
     /// update would put part of a language into an index that holds it wholly
     /// or not at all (ADR 0021).
     failed_languages: Mutex<HashSet<String>>,
+    /// When the watcher's consumer last took an event; read by the MCP host.
+    watcher_clock: WatcherClock,
 }
 
 impl PluginRegistry {
@@ -541,7 +544,13 @@ impl PluginRegistry {
             supervisors: Mutex::new(HashMap::new()),
             unroutable: Mutex::new(HashSet::new()),
             failed_languages: Mutex::new(HashSet::new()),
+            watcher_clock: WatcherClock::new(),
         }
+    }
+
+    /// When the watcher's consumer last took an event off the watcher.
+    pub(crate) fn watcher_clock(&self) -> &WatcherClock {
+        &self.watcher_clock
     }
 
     /// Records the languages the bulk walk failed, replacing any earlier set.

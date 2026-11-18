@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::plugin_manifest::{Capabilities, PluginManifest};
 use crate::storage::index_store::IndexStore;
@@ -55,6 +56,10 @@ pub trait McpHost: Activity + 'static {
     /// `Ok(None)`: no plugin claims the file. `Ok(Some(label))`: the check's
     /// outcome, as the trace line prints it.
     fn ensure_fresh(&self, store: &IndexStore, file_path: &str) -> anyhow::Result<Option<String>>;
+    /// How long the file watcher has delivered no event, when that is long
+    /// enough for a by-name answer to say so; `None` while events are recent
+    /// or no watcher listens.
+    fn watcher_quiet(&self) -> Option<Duration>;
 }
 
 /// Why a path-anchored answer about one file can be empty while the file

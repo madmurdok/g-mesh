@@ -34,7 +34,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use super::watch_loop::{watch_and_route_once, Rescans, DEBOUNCE_WINDOW};
+use super::watch_loop::{
+    watch_and_route_once, Rescans, WatcherClock, DEBOUNCE_WINDOW, WATCHER_QUIET_HINT_AFTER,
+};
 use crate::paths::state_dir::{project_dir, DAEMON_LOCK_FILE, DAEMON_SERVING_FILE};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -1302,4 +1304,134 @@ fn a_gitignore_written_in_the_watermark_second_is_rechecked_by_a_rescan() {
 
     assert!(rechecked, "a .gitignore from the watermark's own second must reach gitignore_changed");
     assert!(!file_node("generated/x.python-src"), "the newly ignored file has left the index");
+}
+
+// --- GM-725: the watcher clock behind a by-name answer's quiet note ---
+
+/// A fresh clock reports no quiet, however late it is asked: no consumer
+/// listens yet.
+#[test]
+fn a_clock_no_consumer_started_reports_no_quiet() {
+    let clock = WatcherClock::new();
+    let late = std::time::Instant::now() + Duration::from_secs(3600);
+    assert_eq!(clock.quiet_for_at(late), None);
+    assert_eq!(clock.quiet_worth_saying_at(late), None);
+}
+
+/// After an event the quiet grows one for one with time, and is worth
+/// saying from exactly `WATCHER_QUIET_HINT_AFTER` on, not before.
+///
+/// Control: in `quiet_worth_saying_at`, compare with `>` instead of `>=` -
+/// the quiet at exactly the threshold is dropped and the boundary assertion
+/// fails.
+#[test]
+fn the_quiet_grows_with_time_and_is_worth_saying_from_the_threshold() {
+    let clock = WatcherClock::new();
+    let before = std::time::Instant::now();
+    clock.heard();
+
+    let at = |secs: u64| before + Duration::from_secs(secs);
+    let ten = clock.quiet_for_at(at(10)).expect("an event was heard");
+    let twenty = clock.quiet_for_at(at(20)).expect("an event was heard");
+    assert_eq!(twenty - ten, Duration::from_secs(10), "the quiet grows one for one with time");
+    assert!(ten >= Duration::from_secs(10) - Duration::from_millis(1), "{ten:?}");
+
+    let last = at(10) - ten;
+    assert_eq!(clock.quiet_worth_saying_at(last + WATCHER_QUIET_HINT_AFTER), Some(WATCHER_QUIET_HINT_AFTER));
+    assert_eq!(clock.quiet_worth_saying_at(last + WATCHER_QUIET_HINT_AFTER - Duration::from_millis(1)), None);
+    assert_eq!(clock.quiet_worth_saying_at(at(4)), None, "4 s after the event is recent");
+    assert_eq!(WATCHER_QUIET_HINT_AFTER, Duration::from_secs(5), "the threshold the spec names");
+}
+
+/// A later event resets the quiet.
+///
+/// Control: make `heard` store only when no event was recorded yet
+/// (`compare_exchange(0, ..)`) - the second event leaves the quiet as it was.
+#[test]
+fn a_later_event_resets_the_quiet() {
+    let clock = WatcherClock::new();
+    clock.heard();
+    let probe = std::time::Instant::now() + Duration::from_secs(60);
+    let first = clock.quiet_for_at(probe).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    clock.heard();
+    let second = clock.quiet_for_at(probe).unwrap();
+    assert!(first >= second + Duration::from_millis(40), "first {first:?}, second {second:?}");
+}
+
+/// A watcher over a fresh empty directory, its setup noise drained by
+/// receiving until nothing arrives for a second; the signal record cleared.
+/// `next_change` is called directly, so no registry's clock sees the noise.
+fn quiet_watcher(root: &Path) -> ProjectWatcher {
+    let watcher = ProjectWatcher::new(root).unwrap();
+    while watcher.next_change(Duration::from_secs(1)).is_some() {}
+    watcher.take_signal_seen();
+    watcher
+}
+
+/// The consumer stamps the clock for every signal the watcher receives,
+/// one it drops as ignored included, and never when none arrives.
+///
+/// Controls: in `watch_and_route_once`, stamp only on `Some(change)` - the
+/// ignored path leaves the clock silent and the second assertion fails; or
+/// stamp on every iteration - the first assertion fails.
+#[test]
+fn an_ignored_path_stamps_the_watcher_clock() {
+    let (project, _plugins, _dirs, registry) = registry_over(&["python"]);
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let watcher = quiet_watcher(&root);
+    let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+    let now = || std::time::Instant::now();
+
+    watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
+    assert_eq!(registry.watcher_clock().quiet_for_at(now()), None, "no signal, no stamp");
+
+    let ignored = root.join(".git/objects/ab/cdef");
+    assert!(watcher.is_ignored(&ignored), "the fixture path must be ignored");
+    watcher.inject_path(&ignored);
+    watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
+    let quiet = registry.watcher_clock().quiet_for_at(now()).expect("an ignored path stamps the clock");
+    assert!(quiet < Duration::from_secs(5), "stamped just now: {quiet:?}");
+}
+
+/// A Rescan stamps the clock too.
+#[test]
+fn a_rescan_stamps_the_watcher_clock() {
+    let (project, _plugins, _dirs, registry) = registry_over(&["python"]);
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let watcher = quiet_watcher(&root);
+    let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+
+    watcher.inject_rescan(&root);
+    watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
+    assert!(registry.watcher_clock().quiet_for_at(std::time::Instant::now()).is_some());
+}
+
+/// The quiet counts from the consumer's start: before it the clock reports
+/// none; once the consumer has started it reports one, with no event.
+///
+/// Control: drop the `heard()` before the loop in `spawn_watch_consumer` -
+/// the clock stays silent and the wait times out.
+#[test]
+fn the_quiet_counts_from_the_consumer_start() {
+    let (project, _plugins, _dirs, registry) = registry_over(&["python"]);
+    let registry = Arc::new(registry);
+    let root = project.path().canonicalize().unwrap();
+    let watcher = quiet_watcher(&root);
+    assert_eq!(registry.watcher_clock().quiet_for_at(std::time::Instant::now()), None);
+
+    super::watch_loop::spawn_watch_consumer(
+        watcher,
+        Arc::new(test_plugin::empty_index()),
+        Arc::clone(&registry),
+        root,
+        super::watch_loop::ConsumerStart::AfterWalk,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while registry.watcher_clock().quiet_for_at(std::time::Instant::now()).is_none() {
+        assert!(std::time::Instant::now() < deadline, "the consumer never started the clock");
+        thread::sleep(Duration::from_millis(10));
+    }
 }

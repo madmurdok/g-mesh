@@ -228,7 +228,7 @@ fn not_indexed<P>(answer: ToolAnswer<P>) -> (String, String, Refusal) {
 /// `answer`'s text refusal; panics on anything else.
 fn text_refusal<P>(answer: ToolAnswer<P>) -> String {
     match answer {
-        ToolAnswer::Refused(Refusal::Text(message)) => message,
+        ToolAnswer::Refused(Refusal::Text(message) | Refusal::NoSymbol(message)) => message,
         ToolAnswer::Refused(other) => panic!("expected a text refusal, got NotIndexed: {}", other.message()),
         _ => panic!("expected a refusal"),
     }
