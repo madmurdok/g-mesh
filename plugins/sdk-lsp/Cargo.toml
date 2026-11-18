@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-sdk-lsp"
-version = "4.33.0"
+version = "4.34.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The LSP bridge a g-mesh language plugin uses for its semantic pass: a SemanticEngine that asks a language server"
