@@ -341,7 +341,7 @@ fn the_marker_is_absent_when_every_candidate_already_calls_the_method() {
 }
 
 /// The `file:` URI of an absolute path, spelled independently of the SDK's
-/// own (see `plugins/sdk/tests/lsp_bridge.rs`' `file_uri` for why).
+/// own (see `plugins/sdk-lsp/tests/lsp_bridge.rs`' `file_uri` for why).
 fn file_uri(path: &std::path::Path) -> String {
     let text = path.to_string_lossy();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text).replace('\\', "/");

@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-plugin-sdk-lsp = { path = "../sdk-lsp" }
 g-mesh-wire = { path = "../../wire" }
 # `Cargo.toml` parsing for the project model (`project::cargo_manifest`) -
 # crate roots and workspace membership, read as data, never by invoking

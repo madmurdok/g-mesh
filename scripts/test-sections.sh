@@ -51,6 +51,7 @@ SECTIONS=(
 	core-graph
 	core-rest
 	sdk
+	sdk-lsp
 	plugin-typescript
 	plugin-rust
 	plugin-python
@@ -126,6 +127,7 @@ section_filter() {
 	core-graph) echo 'package(g-mesh) & kind(lib) & test(/^(graph|link)::/)' ;;
 	core-rest) echo 'package(g-mesh) & (kind(bin) | (kind(lib) & !test(/^(mcp|daemon|cli|graph|link)::/)))' ;;
 	sdk) echo 'package(g-mesh-plugin-sdk)' ;;
+	sdk-lsp) echo 'package(g-mesh-plugin-sdk-lsp)' ;;
 	plugin-typescript) echo 'package(g-mesh-plugin-typescript)' ;;
 	plugin-rust) echo 'package(g-mesh-plugin-rust)' ;;
 	plugin-python) echo 'package(g-mesh-plugin-python)' ;;

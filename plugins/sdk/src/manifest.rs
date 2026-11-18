@@ -156,12 +156,11 @@ impl ResolvedSpec {
 /// [`MANIFEST_PATH_ENV`], else `plugin.toml` beside the executable, else
 /// nothing.
 ///
-/// `pub(crate)` since GM-289: [`crate::lsp::SemanticConfig`] reads a different
-/// section of the same file and has to look in the same places, and one
-/// search order is the point - a plugin whose walk reads one manifest and
-/// whose language server is configured by another would be a bug nobody could
-/// see.
-pub(crate) fn manifest_path() -> Option<PathBuf> {
+/// Public (hidden) because `g_mesh_plugin_sdk_lsp::SemanticConfig` reads a
+/// different section of the same file and has to look in the same places:
+/// one search order, or a plugin's walk and its language server could read
+/// different manifests.
+pub fn manifest_path() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os(MANIFEST_PATH_ENV).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(explicit));
     }

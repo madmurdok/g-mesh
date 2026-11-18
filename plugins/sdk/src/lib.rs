@@ -18,8 +18,10 @@
 //! - starting the semantic engine lazily, on the first `semanticPass` (or
 //!   the `prepareSemanticPass` core sends when one is owed) and never
 //!   before, with the conformance kit's marker written when it does;
-//! - a language-agnostic LSP bridge ([`lsp::LspBridge`]) for the languages
-//!   whose semantic tier is a language server;
+//! - running the exit hooks a semantic engine registered
+//!   ([`on_lifeline_exit`]) when core's control stream closes; the LSP
+//!   bridge, `g_mesh_plugin_sdk_lsp::LspBridge`, is its own crate and registers
+//!   the kill of its language servers there;
 //! - `workspaceChanged` handling: the project model is rebuilt, and a running
 //!   semantic engine is told, so its next pass waits for the server to reload.
 //!
@@ -86,8 +88,8 @@ mod graph;
 mod hold;
 pub mod ids;
 mod index;
+mod lifeline;
 pub mod log;
-pub mod lsp;
 mod manifest;
 mod path;
 mod resolution;
@@ -103,7 +105,14 @@ pub use graph::{
     placeholder_id, render_target, EdgeSpec, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind,
     PlaceholderKind,
 };
+#[doc(hidden)]
+pub use index::contains as node_contains;
 pub use index::{FileEntry, SdkIndex};
+pub use lifeline::on_lifeline_exit;
+#[doc(hidden)]
+pub use lifeline::run_lifeline_exit_hooks;
+#[doc(hidden)]
+pub use manifest::manifest_path;
 pub use manifest::{PluginSpec, ResolvedSpec, MANIFEST_PATH_ENV};
 pub use path::RelPath;
 pub use resolution::{container_delta, ContainerFacts};

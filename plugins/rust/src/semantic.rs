@@ -2,7 +2,7 @@
 //! the SDK's generic [`LspBridge`].
 //!
 //! Everything about *driving* a language server is the SDK's
-//! (`plugins/sdk/src/lsp/`, whose module doc carries the decision table).
+//! (`plugins/sdk-lsp/src/`, whose module doc carries the decision table).
 //! What is left for a language's own plugin is the one question the bridge
 //! cannot answer generically - **which binary** - and that question turned
 //! out to have a sharper edge than the task that scheduled this work
@@ -77,13 +77,33 @@ use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use g_mesh_plugin_sdk::lsp::{self, is_bare, Candidate, LspBridge, SemanticConfig, PROBE_BUDGET};
 use g_mesh_plugin_sdk::{RelPath, SdkIndex, SemanticAnswer, SemanticEngine};
+use g_mesh_plugin_sdk_lsp::{
+    self as lsp, is_bare, Candidate, LspBridge, SemanticConfig, ServerProfile, PROBE_BUDGET,
+};
 
 use crate::sandbox::{self, SandboxOutcome, SandboxPolicy};
 
 /// The language id this plugin speaks, for `didOpen` and for log lines.
 const LANGUAGE: &str = "rust";
+
+/// How the bridge talks to rust-analyzer.
+pub const PROFILE: ServerProfile = ServerProfile {
+    // rust-analyzer's start-up phases can be separated by more than the
+    // bridge's 2s settle under load, so its readiness is its own `quiescent`
+    // status rather than a quiet period.
+    quiescent_status: true,
+    // rust-analyzer's own file watcher would rerun `cargo metadata` on a
+    // manifest change before `CheckedBridge` could re-check the configs, so
+    // the server is told the client watches files: it registers its globs
+    // here and reloads only when `CheckedBridge::workspace_changed` asks.
+    // The bridge forwards the `.rs` files a pass is sent, inside
+    // `CheckedBridge::answer`, so even a created or deleted one (which makes
+    // rust-analyzer refetch the workspace) reaches it only after a re-check.
+    // Safe only under `CheckedBridge`.
+    client_watches_files: true,
+    ..ServerProfile::DEFAULT
+};
 
 /// Builds the semantic engine for `root` - the
 /// [`SemanticEngineFactory`](g_mesh_plugin_sdk::SemanticEngineFactory) body,
@@ -125,18 +145,13 @@ pub fn engine_with(root: &Path, launcher: &Path) -> Result<Box<dyn SemanticEngin
         anyhow::bail!("{refusal}");
     }
     let config = server_config_with(root, launcher)?;
-    // rust-analyzer's start-up phases can be separated by more than the
-    // bridge's 2s settle under load, so its readiness is its own `quiescent`
-    // status rather than a quiet period.
-    // rust-analyzer's own file watcher would rerun `cargo metadata` on a
-    // manifest change before `CheckedBridge` could re-check the configs, so
-    // the server is told the client watches files: it registers its globs
-    // here and reloads only when `CheckedBridge::workspace_changed` asks.
-    // The bridge forwards the `.rs` files a pass is sent, inside
-    // `CheckedBridge::answer`, so even a created or deleted one (which makes
-    // rust-analyzer refetch the workspace) reaches it only after a re-check.
-    let bridge = LspBridge::new(LANGUAGE, root, config).quiescent_signal().client_watches_files();
-    Ok(Box::new(CheckedBridge::new(root, bridge)))
+    Ok(Box::new(CheckedBridge::new(root, bridge(root, config))))
+}
+
+/// The bridge [`engine_with`] wraps in `CheckedBridge`: rust-analyzer under
+/// `config`, with [`PROFILE`]. Constructing it starts nothing.
+fn bridge(root: &Path, config: SemanticConfig) -> LspBridge {
+    LspBridge::new(LANGUAGE, root, config).with_profile(PROFILE)
 }
 
 /// The config [`engine`] starts the server with for `root`, minus the cargo
@@ -1011,7 +1026,7 @@ fn on_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use g_mesh_plugin_sdk::lsp::ServerReadiness;
+    use g_mesh_plugin_sdk_lsp::ServerReadiness;
 
     /// `script_proxy` names the cargo proxy under `CARGO_HOME`'s `bin/` only
     /// when it is a script (`#!`), by its canonical path; a binary, a missing
@@ -1187,21 +1202,16 @@ mod tests {
         assert_ne!(resolved.version, "no version reported");
     }
 
-    /// rust-analyzer's readiness is its own `quiescent` status (GM-550), and
-    /// `engine` turns that on in the bridge. The bridge keeps the flag
-    /// private, so the wiring is read from this file's own `engine` body, as
-    /// the TypeScript plugin pins its warm-up.
+    /// rust-analyzer's readiness is its own `quiescent` status, and the
+    /// client watches its files: the bridge `engine_with` wraps carries both.
     ///
-    /// Control: drop `.quiescent_signal()` from `engine_with`.
+    /// Control: drop `.with_profile(PROFILE)` from `bridge`.
     #[test]
-    fn the_engine_reads_rust_analyzers_quiescent_status() {
-        let source = include_str!("semantic.rs");
-        let engine = &source[source.find("pub fn engine_with(").expect("this file defines `engine_with`")..];
-        let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
-        assert!(
-            body.contains("LspBridge::new(LANGUAGE, root, config).quiescent_signal()"),
-            "`engine` must turn on the bridge's quiescent signal:\n{body}"
-        );
+    fn the_bridge_reads_quiescent_status_and_watches_files() {
+        let bridge = bridge(&std::env::temp_dir(), SemanticConfig::new("ra"));
+        let profile = bridge.profile();
+        assert!(profile.quiescent_status, "{profile:?}");
+        assert!(profile.client_watches_files, "{profile:?}");
     }
 
     /// `pinned_env` carries the toolchain pin as `RUSTUP_TOOLCHAIN`, which

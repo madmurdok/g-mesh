@@ -45,8 +45,8 @@ cd "$(dirname "$0")/.."
 ISOLATED='test(=daemon::registry::tests::two_languages_spawn_at_the_same_time_rather_than_one_after_the_other)'
 
 # The sections whose tests are (partly) a lib: the g-mesh lib, and the
-# plugin, sdk and wire crates' libs.
-LIB_SECTIONS=" core-mcp core-daemon core-cli core-graph core-rest sdk plugin-typescript plugin-rust plugin-python wire "
+# plugin, sdk, sdk-lsp and wire crates' libs.
+LIB_SECTIONS=" core-mcp core-daemon core-cli core-graph core-rest sdk sdk-lsp plugin-typescript plugin-rust plugin-python wire "
 
 # Seconds the one-process lib run may take before it is killed: libtest has
 # no per-test timeout.

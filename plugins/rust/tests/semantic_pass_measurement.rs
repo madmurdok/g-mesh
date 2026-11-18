@@ -36,9 +36,9 @@ use std::time::Instant;
 
 use g_mesh_plugin_rust::extractor::RustExtractor;
 use g_mesh_plugin_rust::project::{ProjectContext, EXCLUDE_DIRS};
-use g_mesh_plugin_sdk::lsp::{Budgets, LspBridge, SemanticConfig};
 use g_mesh_plugin_sdk::wire::SourceTier;
 use g_mesh_plugin_sdk::{walk_project, Extractor, OpenSiteKind, RelPath, SdkIndex, SemanticEngine};
+use g_mesh_plugin_sdk_lsp::{Budgets, LspBridge, SemanticConfig};
 
 /// The manifest this plugin ships, found from the test binary's own crate
 /// directory so the run does not depend on where it was started from.
