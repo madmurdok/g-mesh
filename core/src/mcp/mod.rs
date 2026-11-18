@@ -84,6 +84,8 @@ mod tools_list_tests;
 mod unlinked;
 mod untyped;
 #[cfg(test)]
+mod watcher_quiet_tests;
+#[cfg(test)]
 mod wire_golden_tests;
 
 pub use self::host::{Activity, McpHost, PathCoverage};

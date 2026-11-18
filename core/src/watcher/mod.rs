@@ -1133,4 +1133,44 @@ mod tests {
             assert_eq!(next_rescan(&watcher), Some(expected), "a rescan of {}", injected.display());
         }
     }
+
+    /// A path `next_change` drops as ignored is still recorded as a signal
+    /// received, once: the next `take_signal_seen` clears it, and a
+    /// `next_change` that receives nothing records nothing.
+    ///
+    /// Control: in `next_change`, set `signal_seen` only where it returns a
+    /// `Change` (after the ignore check) - the ignored path is not recorded
+    /// and the first assertion fails.
+    #[test]
+    fn an_ignored_path_is_recorded_as_a_signal_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, ".gitignore", "target/\n");
+        let watcher = injected_only(&root);
+        let built = root.join("target/debug/build.o");
+        assert!(watcher.is_ignored(&built), "the fixture path must be ignored");
+
+        assert_eq!(delivered(&watcher, &built), None, "an ignored path is not routed");
+        assert!(watcher.take_signal_seen(), "an ignored path is still a signal received");
+        assert!(!watcher.take_signal_seen(), "taking the record clears it");
+
+        assert_eq!(watcher.next_change(INJECTED_TIMEOUT), None);
+        assert!(!watcher.take_signal_seen(), "no signal received, none recorded");
+    }
+
+    /// A Rescan and a routed path are signals received too.
+    #[test]
+    fn a_rescan_and_a_routed_path_are_recorded_as_signals_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let watcher = injected_only(&root);
+
+        watcher.inject_rescan(&root);
+        assert_eq!(watcher.next_change(INJECTED_TIMEOUT), Some(Change::Rescan(root.clone())));
+        assert!(watcher.take_signal_seen(), "a Rescan is a signal received");
+
+        let source = root.join("src/lib.rs");
+        assert_eq!(delivered(&watcher, &source), Some(source.clone()));
+        assert!(watcher.take_signal_seen(), "a routed path is a signal received");
+    }
 }

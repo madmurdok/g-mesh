@@ -48,7 +48,6 @@ impl FakeHost {
 
     /// Makes `watcher_quiet` answer `quiet`, as the daemon would after that
     /// long without a watcher event.
-    #[expect(dead_code, reason = "the seam the watcher-quiet tests drive")]
     pub(crate) fn set_watcher_quiet(&self, quiet: Option<Duration>) {
         *self.watcher_quiet.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = quiet;
     }
