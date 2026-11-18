@@ -82,6 +82,7 @@
 
 mod columns;
 mod diff;
+mod emit;
 pub mod framing;
 mod generated;
 mod graph;
@@ -100,6 +101,7 @@ mod walk;
 
 pub use columns::CharColumns;
 pub use diff::{diff_file, is_empty_diff};
+pub use emit::GraphEmitter;
 pub use generated::is_generated;
 pub use graph::{
     placeholder_id, render_target, EdgeSpec, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind,

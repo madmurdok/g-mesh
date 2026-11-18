@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-plugin-sdk = { path = "../sdk", features = ["tree-sitter"] }
 g-mesh-plugin-sdk-lsp = { path = "../sdk-lsp" }
 g-mesh-wire = { path = "../../wire" }
 # `pyproject.toml` parsing for the project model (`project::pyproject`) - read
@@ -57,8 +57,10 @@ serde_json = "1"
 # already in that graph, so it changes nothing about which builds are
 # affected either way; it is recorded here only so a reader of this file does
 # not have to find the other one to learn it.
-tree-sitter = "0.25"
+tree-sitter = { workspace = true }
 tree-sitter-python = "0.25"
 
 [dev-dependencies]
+# The `plugin.toml` schema, for the tests that pin this crate's manifest to its code.
+g-mesh-manifest = { path = "../../manifest" }
 tempfile = "3"

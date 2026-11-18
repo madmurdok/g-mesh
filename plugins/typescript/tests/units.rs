@@ -13,8 +13,10 @@ use g_mesh_plugin_typescript::extractor::keys::{
 use g_mesh_plugin_typescript::extractor::model::{FileModel, NodeParams};
 use g_mesh_plugin_typescript::project::{EXCLUDE_DIRS, WATCH_FILES};
 
-fn manifest() -> toml::Value {
-    toml::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))).unwrap()
+const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+
+fn manifest() -> g_mesh_manifest::PluginSection {
+    g_mesh_manifest::parse(MANIFEST).unwrap().plugin.expect("plugin.toml declares [plugin]")
 }
 
 fn string_list(value: &toml::Value) -> Vec<&str> {
@@ -58,8 +60,7 @@ fn grammar_for_other_extensions_is_none() {
 
 #[test]
 fn extensions_equal_plugin_toml_languages_extensions() {
-    let manifest = manifest();
-    let listed = string_list(&manifest["plugin"]["languages"]["extensions"]);
+    let listed = manifest().languages.and_then(|languages| languages.extensions).expect("extensions");
     assert_eq!(listed, EXTENSIONS, "plugin.toml's extensions must equal grammar::EXTENSIONS");
 }
 
@@ -77,7 +78,7 @@ fn every_extension_has_exactly_one_grammar() {
 
 #[test]
 fn plugin_toml_grammars_equal_grammars() {
-    let manifest = manifest();
+    let manifest: toml::Value = toml::from_str(MANIFEST).unwrap();
     let table = manifest["plugin"]["grammars"].as_table().expect("[plugin.grammars] is a table");
     let listed: BTreeSet<(&str, Vec<&str>)> =
         table.iter().map(|(name, extensions)| (name.as_str(), string_list(extensions))).collect();
@@ -90,15 +91,13 @@ fn plugin_toml_grammars_equal_grammars() {
 
 #[test]
 fn plugin_toml_exclude_dirs_equal_exclude_dirs() {
-    let manifest = manifest();
-    let listed = string_list(&manifest["plugin"]["workspace"]["exclude_dirs"]);
+    let listed = manifest().workspace.exclude_dirs;
     assert_eq!(listed, EXCLUDE_DIRS, "plugin.toml's exclude_dirs must equal project::EXCLUDE_DIRS");
 }
 
 #[test]
 fn plugin_toml_watch_files_equal_watch_files() {
-    let manifest = manifest();
-    let listed = string_list(&manifest["plugin"]["workspace"]["watch_files"]);
+    let listed = manifest().workspace.watch_files;
     assert_eq!(listed, WATCH_FILES, "plugin.toml's watch_files must equal project::WATCH_FILES");
 }
 
@@ -109,7 +108,7 @@ fn plugin_toml_watch_files_equal_watch_files() {
 #[test]
 fn the_manifest_version_matches_the_crates() {
     assert_eq!(
-        manifest()["plugin"]["plugin_version"].as_str(),
+        manifest().plugin_version.as_deref(),
         Some(env!("CARGO_PKG_VERSION")),
         "plugin.toml's plugin_version must track Cargo.toml's version - see that file's comment"
     );

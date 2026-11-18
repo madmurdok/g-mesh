@@ -41,8 +41,6 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
 /// An explicit path to this plugin's `plugin.toml` - see this module's doc
 /// for why it exists.
 pub const MANIFEST_PATH_ENV: &str = "G_MESH_PLUGIN_MANIFEST";
@@ -56,10 +54,10 @@ pub const MANIFEST_PATH_ENV: &str = "G_MESH_PLUGIN_MANIFEST";
 /// an installed layout.
 #[derive(Debug, Clone)]
 pub struct PluginSpec {
-    language: &'static str,
-    version: &'static str,
-    extensions: &'static [&'static str],
-    exclude_dirs: &'static [&'static str],
+    language: String,
+    version: String,
+    extensions: Vec<String>,
+    exclude_dirs: Vec<String>,
 }
 
 impl PluginSpec {
@@ -68,7 +66,37 @@ impl PluginSpec {
     /// which must equal the plugin directory's name. `extensions` are
     /// lowercase and dot-prefixed (`".rs"`).
     pub fn new(language: &'static str, version: &'static str, extensions: &'static [&'static str]) -> Self {
-        Self { language, version, extensions, exclude_dirs: &[] }
+        Self {
+            language: language.to_string(),
+            version: version.to_string(),
+            extensions: extensions.iter().map(|e| (*e).to_string()).collect(),
+            exclude_dirs: Vec::new(),
+        }
+    }
+
+    /// The spec a plugin's own `plugin.toml` declares, from its text
+    /// (`include_str!("../plugin.toml")`): `language`, `plugin_version` as
+    /// the version, `[plugin.languages] extensions` and
+    /// `[plugin.workspace] exclude_dirs`.
+    ///
+    /// # Panics
+    ///
+    /// If the text is not a manifest or lacks `language`, `plugin_version` or
+    /// `extensions`: the text is compiled into the binary, so that is a build
+    /// of a broken manifest.
+    pub fn from_manifest_str(text: &str) -> Self {
+        let usable = g_mesh_manifest::parse(text)
+            .map_err(|err| err.to_string())
+            .and_then(|manifest| usable_manifest(manifest).ok_or_else(|| MISSING_KEYS.to_string()));
+        match usable {
+            Ok(usable) => Self {
+                language: usable.language,
+                version: usable.version,
+                extensions: usable.extensions,
+                exclude_dirs: usable.exclude_dirs,
+            },
+            Err(err) => panic!("the plugin's own plugin.toml is not usable: {err}"),
+        }
     }
 
     /// Directory names the walk never descends into, on top of
@@ -77,7 +105,7 @@ impl PluginSpec {
     /// decide what never to route to this plugin, and a walk that disagrees
     /// with it indexes files no edit will ever update.
     pub fn exclude_dirs(mut self, exclude_dirs: &'static [&'static str]) -> Self {
-        self.exclude_dirs = exclude_dirs;
+        self.exclude_dirs = exclude_dirs.iter().map(|d| (*d).to_string()).collect();
         self
     }
 }
@@ -120,10 +148,10 @@ impl ResolvedSpec {
     /// from a flake that only appears under load.
     pub(crate) fn resolve_from(spec: &PluginSpec, path: Option<PathBuf>) -> Self {
         let mut resolved = Self {
-            language: spec.language.to_string(),
-            version: spec.version.to_string(),
+            language: spec.language.clone(),
+            version: spec.version.clone(),
             extensions: spec.extensions.iter().map(|e| e.to_lowercase()).collect(),
-            exclude_dirs: spec.exclude_dirs.iter().map(|d| (*d).to_string()).collect(),
+            exclude_dirs: spec.exclude_dirs.clone(),
             manifest_path: None,
         };
 
@@ -135,19 +163,23 @@ impl ResolvedSpec {
                 return resolved;
             }
         };
-        if manifest.plugin.language != spec.language {
+        let Some(manifest) = usable_manifest(manifest) else {
+            crate::log_line!("[{}] ignoring {}: {MISSING_KEYS}", spec.language, path.display());
+            return resolved;
+        };
+        if manifest.language != spec.language {
             crate::log_line!(
                 "[{}] ignoring {}: it declares language {:?}, not this plugin's",
                 spec.language,
                 path.display(),
-                manifest.plugin.language
+                manifest.language
             );
             return resolved;
         }
 
-        resolved.version = manifest.plugin.plugin_version;
-        resolved.extensions = manifest.plugin.languages.extensions.iter().map(|e| e.to_lowercase()).collect();
-        resolved.exclude_dirs = manifest.plugin.workspace.exclude_dirs;
+        resolved.version = manifest.version;
+        resolved.extensions = manifest.extensions.iter().map(|e| e.to_lowercase()).collect();
+        resolved.exclude_dirs = manifest.exclude_dirs;
         resolved.manifest_path = Some(path);
         resolved
     }
@@ -168,50 +200,40 @@ pub fn manifest_path() -> Option<PathBuf> {
     beside.is_file().then_some(beside)
 }
 
-fn read_manifest(path: &Path) -> anyhow::Result<RawManifest> {
+fn read_manifest(path: &Path) -> anyhow::Result<g_mesh_manifest::Manifest> {
     let contents = std::fs::read_to_string(path)?;
-    Ok(toml::from_str(&contents)?)
+    Ok(g_mesh_manifest::parse(&contents)?)
 }
 
-/// Only the three fields a plugin needs back out of its own manifest. Core's
-/// `daemon::manifest::read_manifest` is the validating reader; this one is
-/// deliberately permissive about everything it does not use, so a manifest
-/// gaining a field never stops a plugin from starting.
-#[derive(Debug, Deserialize)]
-struct RawManifest {
-    plugin: RawPlugin,
-}
+const MISSING_KEYS: &str = "it lacks `language`, `plugin_version` or `[plugin.languages] extensions`";
 
-#[derive(Debug, Deserialize)]
-struct RawPlugin {
+/// The four values a plugin takes from its manifest. A manifest without
+/// `language`, `plugin_version` and `extensions` is not used at all, never
+/// merged field by field with the spec.
+struct UsableManifest {
     language: String,
-    plugin_version: String,
-    languages: RawLanguages,
-    #[serde(default)]
-    workspace: RawWorkspace,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawLanguages {
+    version: String,
     extensions: Vec<String>,
+    exclude_dirs: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct RawWorkspace {
-    #[serde(default)]
-    exclude_dirs: Vec<String>,
+fn usable_manifest(manifest: g_mesh_manifest::Manifest) -> Option<UsableManifest> {
+    let plugin = manifest.plugin?;
+    Some(UsableManifest {
+        language: plugin.language?,
+        version: plugin.plugin_version?,
+        extensions: plugin.languages?.extensions?,
+        exclude_dirs: plugin.workspace.exclude_dirs,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SPEC: PluginSpec = PluginSpec {
-        language: "toy",
-        version: "9.9.9-from-code",
-        extensions: &[".toy"],
-        exclude_dirs: &["from-code"],
-    };
+    fn spec() -> PluginSpec {
+        PluginSpec::new("toy", "9.9.9-from-code", &[".toy"]).exclude_dirs(&["from-code"])
+    }
 
     /// Writes `contents` to a uniquely named file and resolves against it.
     /// `None` resolves against a path that does not exist.
@@ -222,7 +244,7 @@ mod tests {
         if let Some(contents) = contents {
             std::fs::write(&path, contents).unwrap();
         }
-        ResolvedSpec::resolve_from(&SPEC, Some(path))
+        ResolvedSpec::resolve_from(&spec(), Some(path))
     }
 
     #[test]
@@ -272,11 +294,59 @@ mod tests {
         }
     }
 
+    /// A wrong-typed key the SDK never reads still makes the manifest unusable
+    /// as a whole: the spec stands, never merged field by field.
+    #[test]
+    fn a_manifest_with_a_wrong_typed_capability_leaves_the_spec_standing() {
+        let resolved = resolve_against(
+            "wrong-type",
+            Some(
+                "[plugin]\nlanguage = \"toy\"\nprotocol_version = 2\nplugin_version = \"1.2.3\"\n\n\
+                 [plugin.languages]\nextensions = [\".other\"]\n\n\
+                 [plugin.capabilities]\nsemantic_pass = \"yes\"\n",
+            ),
+        );
+        assert_eq!(resolved.version, "9.9.9-from-code");
+        assert_eq!(resolved.extensions, vec![".toy"]);
+        assert_eq!(resolved.manifest_path, None);
+    }
+
+    /// `from_manifest_str` takes `language`, `plugin_version`, `extensions` and
+    /// `exclude_dirs` from each plugin's own manifest, compared against the
+    /// file read as plain TOML.
+    #[test]
+    fn from_manifest_str_reads_each_shipped_manifests_values() {
+        let sdk = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in
+            ["../python/plugin.toml", "../rust/plugin.toml", "../typescript/plugin.toml", "toy/plugin.toml"]
+        {
+            let text = std::fs::read_to_string(sdk.join(relative)).unwrap();
+            let raw: toml::Value = toml::from_str(&text).unwrap();
+            let raw = &raw["plugin"];
+            let strings = |value: &toml::Value| -> Vec<String> {
+                value.as_array().unwrap().iter().map(|item| item.as_str().unwrap().to_string()).collect()
+            };
+            let resolved = ResolvedSpec::resolve_from(&PluginSpec::from_manifest_str(&text), None);
+            assert_eq!(resolved.language, raw["language"].as_str().unwrap(), "{relative}");
+            assert_eq!(resolved.version, raw["plugin_version"].as_str().unwrap(), "{relative}");
+            assert_eq!(resolved.extensions, strings(&raw["languages"]["extensions"]), "{relative}");
+            let exclude =
+                raw.get("workspace").and_then(|w| w.get("exclude_dirs")).map(strings).unwrap_or_default();
+            assert_eq!(resolved.exclude_dirs, exclude, "{relative}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not usable")]
+    fn from_manifest_str_panics_on_a_manifest_it_cannot_use() {
+        PluginSpec::from_manifest_str("[plugin]\nlanguage = \"toy\"\nplugin_version = \"1\"\n");
+    }
+
     /// The spec alone, with nothing to resolve against - a plugin binary run
     /// straight out of `target/debug` with no manifest anywhere.
     #[test]
     fn with_no_manifest_at_all_the_spec_is_the_answer() {
-        let resolved = ResolvedSpec::resolve_from(&SPEC, None);
+        let resolved = ResolvedSpec::resolve_from(&spec(), None);
         assert_eq!(resolved.language, "toy");
         assert_eq!(resolved.version, "9.9.9-from-code");
         assert_eq!(resolved.extensions, vec![".toy"]);

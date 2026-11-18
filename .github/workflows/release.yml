@@ -50,7 +50,7 @@
 #    It, not the tag, is what the artifacts are named after; the tag is checked
 #    against it in the first step of every build job so a mismatch costs a
 #    minute instead of four 90-minute builds. `wire/Cargo.toml`,
-#    `walk/Cargo.toml`, `plugins/sdk/Cargo.toml` and
+#    `walk/Cargo.toml`, `manifest/Cargo.toml`, `plugins/sdk/Cargo.toml` and
 #    `plugins/sdk-lsp/Cargo.toml` must say the same version too. `plugins/rust`, `plugins/python` and `plugins/typescript` carry their
 #    own version (`Cargo.toml` and `plugin.toml`, which the shipped manifest
 #    carries unchanged), bumped only when the plugin changed since the

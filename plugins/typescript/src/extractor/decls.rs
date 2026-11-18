@@ -128,9 +128,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
     }
 
     pub(super) fn range(&self, node: Node<'t>) -> Range {
-        let start = node.start_position();
-        let end = node.end_position();
-        self.columns.range((start.row, start.column), (end.row, end.column))
+        self.columns.node_range(node)
     }
 
     /// The parameters of a declaration spanning `at`, qualified by `qualified`.

@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-plugin-sdk = { path = "../sdk", features = ["tree-sitter"] }
 g-mesh-plugin-sdk-lsp = { path = "../sdk-lsp" }
 g-mesh-wire = { path = "../../wire" }
 # `Cargo.toml` parsing for the project model (`project::cargo_manifest`) -
@@ -71,13 +71,15 @@ serde = { version = "1", features = ["derive"] }
 # would flip it, and that function is written to catch exactly that (verified
 # by injecting precisely that change temporarily and watching it fail - see
 # GM-302's completion notes).
-tree-sitter = "0.25"
+tree-sitter = { workspace = true }
 tree-sitter-rust = "0.24"
 # The resolution facts' opaque blob (`project::facts`, GM-544): a derive over
 # sorted maps, so `preserve_order` (above) cannot change its bytes.
 serde_json = "1"
 
 [dev-dependencies]
+# The `plugin.toml` schema, for the tests that pin this crate's manifest to its code.
+g-mesh-manifest = { path = "../../manifest" }
 # `tests/workspace_changed.rs` drives the plugin's control-plane wire
 # directly (hand-rolled `Content-Length` framing, no SDK-published client
 # harness - see that test's own module doc) and needs to build/read the JSON

@@ -281,7 +281,7 @@ impl Declarer<'_, '_> {
         self.emitter.definition(
             &id,
             Definition {
-                range: self.emitter.positions().range(outer),
+                range: self.emitter.positions().node_range(outer),
                 signature: signature(outer, self.source),
                 overload: has_decorator(outer, self.source, OVERLOAD),
             },
@@ -322,7 +322,7 @@ impl Declarer<'_, '_> {
         let qualified = self.scopes.child_path(&name);
         let own = visibility();
         let mut spec =
-            NodeSpec::new(kind, name.clone(), qualified.clone(), self.emitter.positions().range(outer))
+            NodeSpec::new(kind, name.clone(), qualified.clone(), self.emitter.positions().node_range(outer))
                 .native_kind(native_kind)
                 .visibility(own.clone())
                 .in_container(self.module.key.clone(), self.module.parent.clone());
@@ -340,7 +340,7 @@ impl Declarer<'_, '_> {
             }
             _ => {
                 let scope = self.scopes.path().to_string();
-                let start = self.emitter.positions().range(outer).start;
+                let start = self.emitter.positions().node_range(outer).start;
                 self.model.declare(&scope, &name, &qualified, decl, start);
             }
         }
@@ -384,7 +384,7 @@ impl Declarer<'_, '_> {
                 NodeKind::Variable,
                 name,
                 self.scopes.child_path(name),
-                self.emitter.positions().range(assignment),
+                self.emitter.positions().node_range(assignment),
             )
             .native_kind("variable")
             .visibility(own.clone())
@@ -396,7 +396,7 @@ impl Declarer<'_, '_> {
                 self.model.note_constant(&id, value.clone());
             }
             let scope = self.scopes.path().to_string();
-            let start = self.emitter.positions().range(assignment).start;
+            let start = self.emitter.positions().node_range(assignment).start;
             self.model.declare(&scope, name, name, DeclRef { id, kind: NodeKind::Variable }, start);
         }
     }
@@ -421,14 +421,14 @@ impl Declarer<'_, '_> {
             .filter_map(|entry| string_literal(entry, self.source))
             .map(str::to_string)
             .collect();
-        self.model.set_dunder_all(names, self.emitter.positions().range(assignment));
+        self.model.set_dunder_all(names, self.emitter.positions().node_range(assignment));
     }
 
     /// `import a.b`, `import a.b as c` - one leaf per name bound. The edges
     /// come from [`import_edges`], which `super::bodies` shares for a
     /// function-local import; what is left here is the bindings.
     fn import_statement(&mut self, item: Node) {
-        let range = self.emitter.positions().range(item);
+        let range = self.emitter.positions().node_range(item);
         for edge in import_edges(item, self.source, self.project, self.module) {
             self.import_edge(&edge.container, &edge.specifier, range, edge.relative);
         }
@@ -477,7 +477,7 @@ impl Declarer<'_, '_> {
     /// the container's, and a GM-358 submodule's - come from
     /// [`import_edges`]; what is left here is the bindings.
     fn import_from_statement(&mut self, item: Node) {
-        let range = self.emitter.positions().range(item);
+        let range = self.emitter.positions().node_range(item);
         // More dots than there are packages above this file is Python's own
         // `ImportError`: nothing is emitted, which is the honest answer to a
         // statement that cannot run.

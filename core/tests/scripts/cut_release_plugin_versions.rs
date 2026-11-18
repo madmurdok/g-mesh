@@ -4,7 +4,7 @@
 //! backwards, and must agree between `Cargo.toml` and `plugin.toml`.
 //!
 //! Each test builds a scratch git repository shaped like the workspace (core,
-//! `plugins/{rust,python,typescript,sdk,sdk-lsp}`, `wire`, `walk`, `plugin.toml`
+//! `plugins/{rust,python,typescript,sdk,sdk-lsp}`, `wire`, `walk`, `manifest`, `plugin.toml`
 //! files and a hand-written `Cargo.lock`), commits it, tags it `v1.0.0`,
 //! commits an edit, then sources the script (its `main` is guarded for that)
 //! with `REPO_ROOT` pointed at the scratch repo and calls the check for
@@ -185,7 +185,8 @@ impl Repo {
         );
         repo.write("wire/Cargo.toml", &manifest("g-mesh-wire", ""));
         repo.write("walk/Cargo.toml", &manifest("g-mesh-walk", ""));
-        for crate_dir in ["core", "plugins/sdk", "plugins/sdk-lsp", "wire", "walk"] {
+        repo.write("manifest/Cargo.toml", &manifest("g-mesh-manifest", ""));
+        for crate_dir in ["core", "plugins/sdk", "plugins/sdk-lsp", "wire", "walk", "manifest"] {
             repo.write(&format!("{crate_dir}/src/lib.rs"), "pub fn f() {}\n");
         }
         for plugin in PLUGINS {
@@ -355,6 +356,7 @@ fn the_release_bump_of_core_and_the_shared_crates_changes_no_plugin() {
         "plugins/sdk-lsp/Cargo.toml",
         "wire/Cargo.toml",
         "walk/Cargo.toml",
+        "manifest/Cargo.toml",
     ] {
         repo.set_crate_version(manifest, RELEASE);
     }

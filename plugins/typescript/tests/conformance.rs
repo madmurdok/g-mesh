@@ -27,8 +27,6 @@
 use std::path::{Path, PathBuf};
 
 use g_mesh_plugin_sdk::testing::{CheckOutcome, PluginCheck, Verdict};
-use g_mesh_plugin_typescript::extractor::grammar::EXTENSIONS;
-use g_mesh_plugin_typescript::project::{EXCLUDE_DIRS, WATCH_FILES};
 
 const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.toml");
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml");
@@ -84,20 +82,22 @@ fn always_pass() -> Vec<&'static str> {
 }
 
 /// `plugin.toml`'s query tables (`non_symbol_queries`,
-/// `symbol_query_prefixes`, `reexports`) and, when `server` is given, its
-/// `[plugin.semantic]` with `command` set to `server` - re-serialized from the
-/// shipped file rather than copied, so a run checks what users get.
-fn manifest_extra(server: Option<&Path>) -> String {
+/// `symbol_query_prefixes`, `reexports`), which [`PluginCheck::from_manifest`]
+/// does not write - re-serialized from the shipped file rather than copied, so
+/// a run checks what users get.
+fn query_tables() -> String {
     let text = std::fs::read_to_string(MANIFEST).expect("plugins/typescript/plugin.toml is readable");
-    let parsed: toml::Value = toml::from_str(&text).expect("plugins/typescript/plugin.toml parses");
+    let shipped = g_mesh_manifest::parse(&text)
+        .expect("plugins/typescript/plugin.toml parses")
+        .plugin
+        .expect("plugins/typescript/plugin.toml has [plugin]");
     let mut plugin = toml::map::Map::new();
-    for table in ["non_symbol_queries", "symbol_query_prefixes", "reexports"] {
-        plugin.insert(table.to_string(), parsed["plugin"][table].clone());
-    }
-    if let Some(server) = server {
-        let mut section = parsed["plugin"]["semantic"].clone();
-        section["command"] = toml::Value::String(server.to_string_lossy().into_owned());
-        plugin.insert("semantic".to_string(), section);
+    for (table, value) in [
+        ("non_symbol_queries", shipped.non_symbol_queries),
+        ("symbol_query_prefixes", shipped.symbol_query_prefixes),
+        ("reexports", shipped.reexports),
+    ] {
+        plugin.insert(table.to_string(), value.unwrap_or_else(|| panic!("plugin.toml has [plugin.{table}]")));
     }
     let mut root = toml::map::Map::new();
     root.insert("plugin".to_string(), toml::Value::Table(plugin));
@@ -105,43 +105,29 @@ fn manifest_extra(server: Option<&Path>) -> String {
 }
 
 fn base() -> PluginCheck {
-    PluginCheck::new(
-        "typescript",
+    PluginCheck::from_manifest(
+        MANIFEST,
         env!("CARGO_BIN_EXE_g-mesh-plugin-typescript"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/project"),
     )
-    .extensions(&EXTENSIONS)
-    .exclude_dirs(&EXCLUDE_DIRS)
-    .watch_files(&WATCH_FILES)
-    .entry_points(&["index"])
-    // The shipped manifest declares it (GM-516).
-    .files_created(true)
+    .manifest_extra(query_tables())
 }
 
 /// The shipped configuration, with a real vtsls.
 fn semantic() -> PluginCheck {
-    base()
-        .semantic_pass(true)
-        .receiver_calls("resolved", "unresolved")
-        .manifest_extra(manifest_extra(Some(&vtsls())))
+    base().semantic_command(vtsls())
 }
 
 /// No semantic tier: core never asks for one and the structural tier answers
 /// alone.
 fn structural() -> PluginCheck {
-    base()
-        .semantic_pass(false)
-        .receiver_calls("unresolved", "unresolved")
-        .manifest_extra(manifest_extra(None))
+    base().semantic_pass(false).receiver_calls("unresolved", "unresolved").without_semantic_section()
 }
 
 /// The shipped configuration on a machine with no vtsls.
 fn missing_toolchain() -> PluginCheck {
     let nowhere = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/there-is-no-vtsls-here");
-    base()
-        .semantic_pass(true)
-        .receiver_calls("resolved", "unresolved")
-        .manifest_extra(manifest_extra(Some(&nowhere)))
+    base().semantic_command(nowhere)
 }
 
 /// The vtsls these tests run: this crate's `node_modules/.bin` first, then
