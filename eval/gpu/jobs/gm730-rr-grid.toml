@@ -4,6 +4,7 @@ name = "gm730-rr-grid"
 requirements = "eval/training/gm730/requirements-linux-cu121.txt"
 smoke = true
 max_minutes = 120
+max_minutes_scope = "job"
 checkpoint_minutes = 10
 grace_seconds = 30
 max_attempts = 5
@@ -11,49 +12,49 @@ max_attempts = 5
 [[steps]]
 name = "lr2e-5-tt1-a0"
 entry = "eval/training/gm730/train_ce.py"
-args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "2e-5", "--tau-t", "1", "--alpha", "0"]
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "2e-5", "--tau-t", "1", "--alpha", "0", "--job-steps", "8", "--eta-limit-minutes", "96"]
 device = "cuda"
 
 [[steps]]
 name = "lr2e-5-tt1-a0.5"
 entry = "eval/training/gm730/train_ce.py"
-args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "2e-5", "--tau-t", "1", "--alpha", "0.5"]
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "2e-5", "--tau-t", "1", "--alpha", "0.5", "--job-steps", "7", "--eta-limit-minutes", "96"]
 device = "cuda"
 
 [[steps]]
 name = "lr2e-5-tt2-a0"
 entry = "eval/training/gm730/train_ce.py"
-args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "2e-5", "--tau-t", "2", "--alpha", "0"]
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "2e-5", "--tau-t", "2", "--alpha", "0", "--job-steps", "6", "--eta-limit-minutes", "96"]
 device = "cuda"
 
 [[steps]]
 name = "lr2e-5-tt2-a0.5"
 entry = "eval/training/gm730/train_ce.py"
-args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "2e-5", "--tau-t", "2", "--alpha", "0.5"]
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "2e-5", "--tau-t", "2", "--alpha", "0.5", "--job-steps", "5", "--eta-limit-minutes", "96"]
 device = "cuda"
 
 [[steps]]
 name = "lr5e-5-tt1-a0"
 entry = "eval/training/gm730/train_ce.py"
-args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "5e-5", "--tau-t", "1", "--alpha", "0"]
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "5e-5", "--tau-t", "1", "--alpha", "0", "--job-steps", "4", "--eta-limit-minutes", "96"]
 device = "cuda"
 
 [[steps]]
 name = "lr5e-5-tt1-a0.5"
 entry = "eval/training/gm730/train_ce.py"
-args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "5e-5", "--tau-t", "1", "--alpha", "0.5"]
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "5e-5", "--tau-t", "1", "--alpha", "0.5", "--job-steps", "3", "--eta-limit-minutes", "96"]
 device = "cuda"
 
 [[steps]]
 name = "lr5e-5-tt2-a0"
 entry = "eval/training/gm730/train_ce.py"
-args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "5e-5", "--tau-t", "2", "--alpha", "0"]
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "5e-5", "--tau-t", "2", "--alpha", "0", "--job-steps", "2", "--eta-limit-minutes", "96"]
 device = "cuda"
 
 [[steps]]
 name = "lr5e-5-tt2-a0.5"
 entry = "eval/training/gm730/train_ce.py"
-args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "5e-5", "--tau-t", "2", "--alpha", "0.5"]
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", "730", "--lr", "5e-5", "--tau-t", "2", "--alpha", "0.5", "--job-steps", "1", "--eta-limit-minutes", "96"]
 device = "cuda"
 
 [[data]]

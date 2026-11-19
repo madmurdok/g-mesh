@@ -327,7 +327,7 @@ def run(a, argv):
                   "bestParams": L.trainable_state(model) if a.stage == "final" else None, "losses": [],
                   "docsPerStep": [], "trainSeconds": 0.0, "done": False}
             L.progress(f"{out}: epoch 0 dev MRR {m0['mrr']:.4f} r@10 {m0['recall@10']:.4f}")
-        probe = L.Probe(f"{route} {name}", total_steps)
+        probe = L.Probe.of(f"{route} {name}", total_steps, a)
         t_run = time.monotonic()
 
         def state():

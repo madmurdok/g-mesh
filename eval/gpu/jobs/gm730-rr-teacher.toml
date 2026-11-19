@@ -4,6 +4,7 @@ name = "gm730-rr-teacher"
 requirements = "eval/training/gm730/requirements-linux-cu121.txt"
 smoke = true
 max_minutes = 60
+max_minutes_scope = "job"
 checkpoint_minutes = 10
 grace_seconds = 30
 max_attempts = 5
@@ -11,7 +12,7 @@ max_attempts = 5
 [[steps]]
 name = "teacher"
 entry = "eval/training/gm730/score_teacher.py"
-args = ["--seed", "730"]
+args = ["--seed", "730", "--job-steps", "1", "--eta-limit-minutes", "48"]
 device = "cuda"
 
 [[data]]

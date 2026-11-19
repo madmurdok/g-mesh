@@ -11,7 +11,8 @@ sha256. A model row has no sha256 field and `debug-embed-eval run` checks no
 pin, so:
   - `verify` re-hashes each arm's files against its pins (and the dir name)
     before `run`;
-  - `check-run` compares every run manifest's `modelFiles` with the pins after it.
+  - `check-run` compares every run manifest's `modelFiles` with the pins after it; a
+    words-shuffled arm (no `modelFiles` of its own) through its reference's pins and runs.
 Rows are appended, never edited; no row gets `role = "control"`.
 
 Cross-encoder arms (`ce`): the same copy, and an entry in
@@ -200,23 +201,50 @@ def verify(names=None, variants=VARIANTS):
     return bad
 
 
+def words_shuffled_of(variants=VARIANTS):
+    """{arm name: its reference} of every words-shuffled row whose reference is a pinned arm."""
+    arms = pinned(variants)
+    return {r["name"]: r["reference"] for r in rows(Path(variants).read_text())
+            if r.get("arm") == "words-shuffled" and r.get("reference") in arms}
+
+
 def check_run(runs_dir, names=None, variants=VARIANTS):
-    """Problems (empty = ok): every <runs>/<arm>/<corpus>/manifest.json `modelFiles` vs the pins."""
+    """Problems (empty = ok): every <runs>/<arm>/<corpus>/manifest.json `modelFiles` vs the pins.
+    A words-shuffled arm encodes with its reference's model_dir and records no modelFiles, so
+    it is checked through its reference: the reference's files match its pins now, every
+    corpus the arm ran has a reference run whose modelFiles are the pins, and any modelFiles
+    the arm itself records are the pins too."""
     bad = []
     arms = pinned(variants)
-    for n in names or sorted(arms):
-        if n not in arms:
+    ws = words_shuffled_of(variants)
+
+    def files_vs_pins(mp, pins, allow_empty=False):
+        got = {f[0]: f[1] for f in json.loads(mp.read_text()).get("modelFiles", [])}
+        if allow_empty and not got:
+            return
+        for f in EMBED_FILES:
+            if got.get(f) != pins.get(f):
+                bad.append(f"{mp}: modelFiles {f} {got.get(f)} != pin {pins.get(f)}")
+
+    for n in names or sorted(arms) + sorted(ws):
+        ref = ws.get(n)
+        if ref is None and n not in arms:
             bad.append(f"{n}: no gm730 pins in {variants}")
             continue
-        _, pins = arms[n]
+        pins = arms[ref or n][1]
         mans = sorted((Path(runs_dir) / n).glob("*/manifest.json"))
         if not mans:
             bad.append(f"{n}: no run manifests under {runs_dir}/{n}")
+        if ref is not None:
+            bad += verify([ref], variants)
         for mp in mans:
-            got = {f[0]: f[1] for f in json.loads(mp.read_text()).get("modelFiles", [])}
-            for f in EMBED_FILES:
-                if got.get(f) != pins.get(f):
-                    bad.append(f"{mp}: modelFiles {f} {got.get(f)} != pin {pins.get(f)}")
+            files_vs_pins(mp, pins, allow_empty=ref is not None)
+            if ref is not None:
+                rp = Path(runs_dir) / ref / mp.parent.name / "manifest.json"
+                if not rp.exists():
+                    bad.append(f"{mp}: no reference run {rp}")
+                else:
+                    files_vs_pins(rp, pins)
     return bad
 
 

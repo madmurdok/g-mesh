@@ -22,7 +22,8 @@ determinism, timing, parameter sha256s), checkpoint.pt (GM-457 contract,
 trainlib). --stage final also exports the best epoch: onnx-fp32/ (model.onnx
 + tokenizer.json + config.json), onnx-quint8/ (export.quantize "l6", the
 official file's closed form), export.json (C-P torch vs fp32 ONNX on 1,000 dev
-pairs, quint8 vs fp32 at chunk 1).
+pairs, quint8 vs fp32 at chunk 1, and C-P2: the quint8 dev MRR at chunk 1 on the
+first 300 dev windows vs the fp32 export's, against the base L6's own gap).
 
 usage: train_ce.py --stage grid|final --lr X --tau-t X --alpha X --out DIR [--control shuffled-teacher] [options]
 """
@@ -44,6 +45,8 @@ SNAPSHOT = "l6"
 EXPORT_KEY = "l6"
 PARITY_N = 1000
 QUANT_N = 200
+CP2_WINDOWS = 300  # dev windows of the quint8 C-P2 check (chunk 1)
+CP2_MARGIN = 0.01
 
 
 def load_model(device):
@@ -127,8 +130,46 @@ def train_step(model, opt, sched, tok, data, batch_ws, device, a, autocast):
     return total
 
 
+def ort_window_evals(onnx_path, tok, data, windows, batch):
+    """[(query id, target, rank)] of `windows` scored by an ONNX cross-encoder on the CPU,
+    `batch` pairs per ORT run (1 for a dynamic-int8 model)."""
+    X = L.export_module()
+    f = X.ort_forward(X.ort_session(onnx_path))
+    out = []
+    for w in windows:
+        z = np.concatenate([f(feed).reshape(-1) for feed in X.batches(tok, data.pairs(w), batch)])
+        out.append((w["id"], w["target"], L.window_ranks(z, w)))
+    return out
+
+
+def quint8_check(fp32_onnx, q_onnx, tok, data, out):
+    """C-P2 for the quint8 student on the first CP2_WINDOWS dev windows: its dev MRR (chunk 1)
+    >= the fp32 export's - (the base L6's fp32 -> quint8 gap through the same export and
+    recipe + CP2_MARGIN)."""
+    X = L.export_module()
+    snap = L.S.path_of(SNAPSHOT)
+    sub = data.dev[:CP2_WINDOWS]
+    tmp = out / "_base_tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    t = time.monotonic()
+    try:
+        X.export_dir(X.load_torch(EXPORT_KEY, snap), EXPORT_KEY, tmp / "fp32", snap)
+        X.quantize(EXPORT_KEY, tmp / "fp32" / "model.onnx", tmp / "quint8" / "model.onnx")
+        mrr = {k: L.summarize(ort_window_evals(p, tok, data, sub, b))["mrr"]
+               for k, p, b in (("fp32", fp32_onnx, 16), ("quint8", q_onnx, 1),
+                               ("baseFp32", tmp / "fp32" / "model.onnx", 16),
+                               ("baseQuint8", tmp / "quint8" / "model.onnx", 1))}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    gap = mrr["baseFp32"] - mrr["baseQuint8"]
+    floor = mrr["fp32"] - (gap + CP2_MARGIN)
+    return {"check": "C-P2", "windows": len(sub), "quint8DevMrr": mrr["quint8"], "fp32DevMrr": mrr["fp32"],
+            "baseFp32DevMrr": mrr["baseFp32"], "baseQuint8DevMrr": mrr["baseQuint8"], "baseGap": gap,
+            "margin": CP2_MARGIN, "floor": floor, "pass": mrr["quint8"] >= floor, "cpuSeconds": time.monotonic() - t}
+
+
 def export_final(model, tok_dev, data, a, out):
-    """onnx-fp32 + onnx-quint8 of the loaded (best) model, C-P and the quint8 check."""
+    """onnx-fp32 + onnx-quint8 of the loaded (best) model, C-P and the quint8 C-P2."""
     X = L.export_module()
     model.eval()
     snap = L.S.path_of(SNAPSHOT)
@@ -146,9 +187,12 @@ def export_final(model, tok_dev, data, a, out):
     res = {"fp32": {"dir": fp32_dir.name, "files": files}, "quint8": {"dir": q_dir.name, "files": qfiles},
            "cp": cp, "quint8VsFp32": {"n": min(QUANT_N, len(pairs)), "chunk": 1, "maxAbsDiff": qd},
            "bytes": {"fp32": (fp32_dir / "model.onnx").stat().st_size, "quint8": (q_dir / "model.onnx").stat().st_size}}
+    res["cp2"] = quint8_check(fp32_dir / "model.onnx", q_dir / "model.onnx", tok_dev, data, out)
     L.write_json(out / "export.json", res)
+    c2 = res["cp2"]
     L.progress(f"{out}: export C-P max |diff| {cp['maxAbsDiff']:.3g} -> {'pass' if cp['pass'] else 'FAIL'}; "
-               f"quint8 vs fp32 {qd:.3g}")
+               f"quint8 vs fp32 {qd:.3g}; C-P2 quint8 {c2['quint8DevMrr']:.4f} >= {c2['floor']:.4f} -> "
+               f"{'pass' if c2['pass'] else 'FAIL'}")
     return res
 
 
@@ -187,7 +231,7 @@ def run(a, argv):
                   "bestParams": L.trainable_state(model) if a.stage == "final" else None, "losses": [],
                   "trainSeconds": 0.0, "done": False}
             L.progress(f"{out}: epoch 0 dev MRR {m0['mrr']:.4f} r@10 {m0['recall@10']:.4f}")
-        probe = L.Probe(f"rr {name}", total_steps)
+        probe = L.Probe.of(f"rr {name}", total_steps, a)
         t_run = time.monotonic()
 
         def state():
@@ -233,7 +277,8 @@ def run(a, argv):
     L.write_json(out / "result.json", res)
     L.progress(f"{out}: done; best epoch {res['best']['epoch']} dev MRR {res['best']['mrr']:.4f}, "
                f"gain {res['gain']['mrr']:+.4f} [{res['gain']['lower']:+.4f}, {res['gain']['upper']:+.4f}]")
-    ok = info.get("export", {}).get("cp", {}).get("pass", True)
+    ex = info.get("export", {})
+    ok = ex.get("cp", {}).get("pass", True) and ex.get("cp2", {}).get("pass", True)
     return 0 if ok else 1
 
 

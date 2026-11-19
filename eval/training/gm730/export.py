@@ -20,6 +20,9 @@
   distance or logit difference.
 - `compare_quantized` (C-R): op counts, quantised weights matched by node,
   multisets of the non-float initializers and of the scales, byte for byte.
+- `ours_vs_official` (recorded with C-R, not gating): our base export through the
+  recipe (`<out>/<model>/int8-ours`, the path a trained model takes) vs the
+  official int8 by cosine; that directory is the C-R2 arm on v2.
 
 usage: export.py recipe-control --model jina|gte|l6 [--n 1000] [--out DIR] [--plant flip-per-channel|flip-reduce-range]
        export.py plant-row --src model.onnx --dst planted.onnx [--factor 1.01]   (C-F input for C-P)
@@ -100,12 +103,20 @@ class Wrap:
         return _W()
 
 
+def dummy_inputs(model, names):
+    """The trace inputs, on the device of the model's parameters (a model trained on CUDA is
+    exported where it is)."""
+    import torch
+    dev = next(model.parameters()).device
+    return tuple((torch.zeros if n == "token_type_ids" else torch.ones)((2, 8), dtype=torch.long, device=dev)
+                 for n in names)
+
+
 def export_onnx(model, kind, names, output, dst, opset=OPSET):
     """torch.onnx.export of `model` to dst; returns the file's sha256."""
     import torch
     w = Wrap(model, kind, names).eval()
-    dummy = tuple(torch.ones((2, 8), dtype=torch.long) if n != "token_type_ids" else torch.zeros((2, 8), dtype=torch.long)
-                  for n in names)
+    dummy = dummy_inputs(model, names)
     axes = {n: {0: "batch", 1: "sequence"} for n in names}
     axes[output] = {0: "batch"} if kind == "ce" else {0: "batch", 1: "sequence"}
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
@@ -451,7 +462,21 @@ def recipe_control(model, n, out, plant=None, texts=None, pairs=None):
             r["pass"] = r["pass"] and r["maxAbsDiff"] <= TOL_QUANT_CE
         r["n"] = len(items)
         res.append(r)
+        if plant is None and kind == "embed":
+            res.append(ours_vs_official(model, out, snap, official, tok, items))
     return res
+
+
+def ours_vs_official(model, out, snap, official, tok, texts):
+    """Our base fp32 export (out/fp32) through the recipe, the int8 arm a trained model
+    takes, vs the official int8 by cosine: recorded (gating = False); C-R2 gates it on v2."""
+    dst = out / "int8-ours" / "model.onnx"
+    sha = quantize(model, out / "fp32" / "model.onnx", dst)
+    copy_tokenizer(snap, dst.parent)
+    d = max_cos_dist(ort_forward(ort_session(dst)), ort_forward(ort_session(official)), tok, texts)
+    return {"check": "C-R ours-int8", "model": model, "n": len(texts), "maxCosDist": d, "tol": TOL_EMBED,
+            "pass": d <= TOL_EMBED, "gating": False, "sha256": sha, "officialSha256": sha256_file(official),
+            "dir": str(dst.parent)}
 
 
 def main(argv=None):
@@ -478,7 +503,7 @@ def main(argv=None):
         if a.json:
             with open(a.json, "a") as f:
                 f.write(line + "\n")
-    ok = all(x["pass"] for x in res)
+    ok = all(x["pass"] for x in res if x.get("gating", True))
     print(f"C-R {a.model}{' plant ' + a.plant if a.plant else ''}: {'pass' if ok else 'FAIL'}", flush=True)
     return 0 if ok else 1
 

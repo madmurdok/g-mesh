@@ -19,14 +19,20 @@
 #   (--stop-after-steps, exit 75) and resumed: result.json bytes and the last
 #   parameters' sha256 must be equal. Final stages with their controls export,
 #   quantise and pass C-P. make_jobs.py + freeze.py run on the smoke results.
-# pre: C-R (export.py recipe-control, plants must fail), C-0 (report of the
-#   GM-436 runs), windows (train, dev; planted offset must fail), C-T pairs,
-#   job TOMLs (must equal the committed ones).
+# pre: C-R per model (export.py recipe-control; a failing model's route does
+#   not start, the others continue; FAILED only when every model fails), the
+#   plants (must fail with their own FAIL line), C-0 (report of the GM-436 runs,
+#   eval_checks.py c0), windows (train, dev; planted offset must fail its join
+#   check), C-T pairs, job TOMLs (must equal the committed ones).
 # teacher-data: the pulled RR-T outputs copied to $GM730_DATA/teacher (the
-#   gm730-teacher data set); C-T must have passed.
+#   gm730-teacher data set); C-T must have passed. On a C-T failure it writes
+#   the --no-teacher grid TOMLs (gm730-{jina,gte}-grid-nt.toml) and fails.
 # freeze: freeze.py on a pulled grid run, then make_jobs.py final.
 # eval: register the final run's exports as arms, then the route's v2 runs and
-#   reports (J, R3: debug-embed-eval run/report; RR: gm463_bakeoff.py quality).
+#   reports (J, R3: debug-embed-eval run/report; RR: gm463_bakeoff.py quality,
+#   after the ce-minilm reference cache is complete), then eval_checks.py:
+#   S5 on dev, C-P2, C-S, C-R2 (J, R3); any failed rule is FAILED.
+# Before each GPU job: python eval/training/gm730/budget.py check --job <toml>.
 #
 # Writes $OUT/progress.log (read by people) and $OUT/summary.txt (one line per
 # stage; FAILED on the first error). Environment: PY (the gm730 venv python),
@@ -226,26 +232,40 @@ fi
 # ---------------------------------------------------------------------------- pre
 if [ "$CMD" = pre ]; then
     stage "C-R"
+    CR_PASS=""; CR_FAIL=""
     for m in l6 gte jina; do
-        "$PY" "$HERE/export.py" recipe-control --model "$m" --n 1000 --out "$OUT/cr" --json "$OUT/cr.jsonl" >> "$OUT/cr_$m.log" 2>&1 \
-            || { summary "C-R $m FAILED: route not started (S1)"; false; }
-    done
-    for m in l6 jina; do
-        if "$PY" "$HERE/export.py" recipe-control --model "$m" --n 100 --out "$OUT/cr-plant" --plant flip-per-channel >> "$OUT/cr_$m-plant.log" 2>&1; then
-            summary "C-F: flipped per_channel did NOT fail C-R for $m"; false
+        if "$PY" "$HERE/export.py" recipe-control --model "$m" --n 1000 --out "$OUT/cr" --json "$OUT/cr.jsonl" > "$OUT/cr_$m.log" 2>&1; then
+            CR_PASS="$CR_PASS $m"
+        else
+            CR_FAIL="$CR_FAIL $m"; summary "C-R $m FAILED: its route does not start (S1); $(tail -1 "$OUT/cr_$m.log")"
         fi
     done
-    summary "C-R: l6 gte jina pass; planted flags fail"
+    echo "pass:$CR_PASS; fail:$CR_FAIL" > "$OUT/cr_status.txt"
+    [ -n "$CR_PASS" ] || { summary "C-R failed for every model: no route starts"; false; }
+    # plant_fails <log> <FAIL line regex> <cmd...>: the planted run must exit 1 and print its own FAIL line
+    plant_fails() {
+        local lg="$1" want="$2"; shift 2
+        local rc=0
+        "$@" > "$lg" 2>&1 || rc=$?
+        [ "$rc" = 1 ] && grep -qE "$want" "$lg"
+    }
+    for m in l6 jina; do
+        plant_fails "$OUT/cr_$m-plant.log" "^C-R $m plant flip-per-channel: FAIL\$" \
+            "$PY" "$HERE/export.py" recipe-control --model "$m" --n 100 --out "$OUT/cr-plant" --plant flip-per-channel \
+            || { summary "C-F: flipped per_channel did not fail C-R for $m with its FAIL line ($(tail -1 "$OUT/cr_$m-plant.log"))"; false; }
+    done
+    summary "C-R: pass:$CR_PASS; fail:${CR_FAIL:- none}; planted flags fail with their FAIL line"
     stage "C-0"
     [ -x "$BIN" ] || { summary "no g-mesh binary at $BIN (cargo build --release -p g-mesh --features embed-eval)"; false; }
     "$BIN" debug-embed-eval report --eval-dir "$V2" --json "$OUT/c0_report.json" \
         "$V2_RUNS/jina-v2-base-code-fp32" "$V2_RUNS/random" "$V2_RUNS/shuffled" "$V2_RUNS/$INT8" "$V2_RUNS/$ADAPTER" > "$OUT/c0_report.txt" 2>&1
-    summary "C-0: report written ($OUT/c0_report.txt); compare int8 0.608/0.380, adapter 0.655/0.423"
+    "$PY" "$HERE/eval_checks.py" c0 --report "$OUT/c0_report.json" > "$OUT/c0_check.txt" 2>&1 \
+        || { summary "C-0 FAILED: $(grep FAILED "$OUT/c0_check.txt" | head -2 | tr '\n' ' ')"; false; }
+    summary "C-0: int8 0.608/0.380 and adapter 0.655/0.423 reproduced ($OUT/c0_check.txt)"
     stage "windows"
     for s in train dev; do "$PY" "$HERE/windows.py" build --split "$s" >> "$OUT/windows.log" 2>&1; done
-    if "$PY" "$HERE/windows.py" build --split dev --out "$OUT/win-plant" --plant-offset >> "$OUT/windows.log" 2>&1; then
-        summary "windows: planted offset did NOT fail the join check"; false
-    fi
+    plant_fails "$OUT/windows-plant.log" "^join check: FAIL " "$PY" "$HERE/windows.py" build --split dev --out "$OUT/win-plant" --plant-offset \
+        || { summary "windows: planted offset did not fail the join check ($(grep 'join check' "$OUT/windows-plant.log" | tail -1))"; false; }
     summary "windows: train $(jget "$GM730_DATA/windows/train/manifest.json" counts.pairs) pairs, dev $(jget "$GM730_DATA/windows/dev/manifest.json" counts.pairs) pairs; join checks pass; planted offset fails"
     stage "C-T pairs"
     timed "$OUT/ct.log" "$PY" "$HERE/score_teacher.py" make-ct --out-dir "$GM730_DATA/ct" --n 1000 --threads "$THREADS"
@@ -254,7 +274,7 @@ if [ "$CMD" = pre ]; then
     "$PY" "$HERE/make_jobs.py" teacher >> "$OUT/jobs.log" 2>&1
     for r in rr jina gte; do "$PY" "$HERE/make_jobs.py" grid --route "$r" >> "$OUT/jobs.log" 2>&1; done
     git -C "$REPO" diff --exit-code -- eval/gpu/jobs >> "$OUT/jobs.log" 2>&1 || { summary "jobs: regenerated TOMLs differ from the committed ones"; false; }
-    summary "PRE DONE; next: gpu_train.py run eval/gpu/jobs/gm730-rr-teacher.toml"
+    summary "PRE DONE; routes whose C-R failed do not start:${CR_FAIL:- none}; next: budget.py check --job eval/gpu/jobs/gm730-rr-teacher.toml, then gpu_train.py run it"
     exit 0
 fi
 
@@ -264,7 +284,11 @@ fi
 if [ "$CMD" = teacher-data ]; then
     stage "teacher-data"
     src="$RUN/out/teacher"
-    [ "$(jget "$src/ct.json" pass)" = True ] || { summary "C-T failed ($(jget "$src/ct.json" maxAbsDiff)): J and R3 run with --no-teacher (alpha = 0); RR stops"; false; }
+    if [ "$(jget "$src/ct.json" pass)" != True ]; then
+        for r in jina gte; do "$PY" "$HERE/make_jobs.py" grid --route "$r" --no-teacher >> "$OUT/jobs.log" 2>&1; done
+        summary "C-T failed ($(jget "$src/ct.json" maxAbsDiff)): RR stops; J and R3 run without the teacher (alpha = 0): eval/gpu/jobs/gm730-{jina,gte}-grid-nt.toml written, then freeze/eval with --no-teacher"
+        false
+    fi
     mkdir -p "$GM730_DATA/teacher"
     cp "$src/train.f32" "$src/dev.f32" "$src/teacher.json" "$src/ct.json" "$GM730_DATA/teacher/"
     GM730_TEACHER="$GM730_DATA/teacher" "$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import trainlib as L
@@ -288,38 +312,92 @@ fi
 # ---------------------------------------------------------------------------- eval
 stage "eval $ROUTE"
 [ -x "$BIN" ] || { summary "no g-mesh binary at $BIN"; false; }
+CHECKS="$OUT/checks_$ROUTE.txt"; : > "$CHECKS"
+# check <label> <eval_checks.py args...>: one control's pass rules; a failed rule is FAILED
+check() {
+    local label="$1"; shift
+    local rc=0
+    echo "== $label" >> "$CHECKS"
+    "$PY" "$HERE/eval_checks.py" "$@" > "$CHECKS.last" 2>&1 || rc=$?
+    cat "$CHECKS.last" >> "$CHECKS"
+    if [ "$rc" != 0 ]; then
+        summary "$label FAILED: $(grep 'FAILED' "$CHECKS.last" | head -3 | tr '\n' ' ')"
+        return 1
+    fi
+    summary "$label: pass ($(tr '\n' ' ' < "$CHECKS.last" | cut -c1-300))"
+}
+# no_load_fail <log>: gm463 drops a model ORT cannot load ("LOAD FAIL"); here that is an error
+no_load_fail() {
+    if grep -q "^LOAD FAIL" "$1"; then summary "eval $ROUTE: $(grep '^LOAD FAIL' "$1" | head -2 | tr '\n' ' ')"; return 1; fi
+}
 for step in final shuffled; do
     [ "$(jget "$RUN/out/$step/export.json" cp.pass)" = True ] || { summary "$ROUTE $step: C-P failed on the instance"; false; }
 done
+check "S5 dev ($ROUTE shuffled control)" s5 --result "$RUN/out/shuffled/result.json"
+case "$ROUTE" in
+    jina|rr) check "C-P2 ($ROUTE final, shuffled)" cp2 --export "$RUN/out/final/export.json" "$RUN/out/shuffled/export.json" ;;
+esac
 REG="$HERE/register_arms.py"
 case "$ROUTE" in
     jina)
         form=$(jget "$FINAL" jina.name | cut -d- -f1)
-        "$PY" "$REG" embed --name "gm730-jina-$form-int8-structured" --base jina --src "$RUN/out/final/onnx-int8" --role quality >> "$OUT/eval.log" 2>&1
+        QUALITY_ARM="gm730-jina-$form-int8-structured"
+        "$PY" "$REG" embed --name "$QUALITY_ARM" --base jina --src "$RUN/out/final/onnx-int8" --role quality --words-shuffled >> "$OUT/eval.log" 2>&1
         "$PY" "$REG" embed --name "gm730-jina-shuf-int8-structured" --base jina --src "$RUN/out/shuffled/onnx-int8" --role informational >> "$OUT/eval.log" 2>&1
-        "$PY" "$REG" embed --name "gm730-jina-requant-base-int8-structured" --base jina --src "$OUT/cr/jina/int8" --role informational >> "$OUT/eval.log" 2>&1
-        "$PY" "$REG" embed --name "gm730-jina-$form-int8-structured-words-shuffled" --base jina --src "$RUN/out/final/onnx-int8" --role informational --words-shuffled >> "$OUT/eval.log" 2>&1
-        ARMS="gm730-jina-$form-int8-structured gm730-jina-shuf-int8-structured gm730-jina-requant-base-int8-structured gm730-jina-$form-int8-structured-words-shuffled"
+        "$PY" "$REG" embed --name "gm730-jina-requant-base-int8-structured" --base jina --src "$OUT/cr/jina/int8-ours" --role informational >> "$OUT/eval.log" 2>&1
+        ARMS="$QUALITY_ARM gm730-jina-shuf-int8-structured gm730-jina-requant-base-int8-structured $QUALITY_ARM-words-shuffled"
+        SHUF_ARM=gm730-jina-shuf-int8-structured
+        CR2_ARM=gm730-jina-requant-base-int8-structured
         BASE_ARM="$INT8" ;;
     gte)
         "$PY" "$REG" embed --name gm730-gte-student-structured --base gte --src "$RUN/out/final/onnx-fp32" --role cost >> "$OUT/eval.log" 2>&1
         "$PY" "$REG" embed --name gm730-gte-shuf-structured --base gte --src "$RUN/out/shuffled/onnx-fp32" --role informational >> "$OUT/eval.log" 2>&1
         "$PY" "$REG" embed --name gm730-gte-export-base-structured --base gte --src "$OUT/cr/gte/fp32" --role informational >> "$OUT/eval.log" 2>&1
         ARMS="gm730-gte-student-structured gm730-gte-shuf-structured gm730-gte-export-base-structured"
+        SHUF_ARM=gm730-gte-shuf-structured
+        CR2_ARM=gm730-gte-export-base-structured
         BASE_ARM="$GTE" ;;
     rr)
         "$PY" "$REG" ce --name ce-gm730-l6-distill --src "$RUN/out/final/onnx-fp32" >> "$OUT/eval.log" 2>&1
         "$PY" "$REG" ce --name ce-gm730-l6-distill-quint8 --src "$RUN/out/final/onnx-quint8" --chunk1 >> "$OUT/eval.log" 2>&1
         "$PY" "$REG" ce --name ce-gm730-l6-shuf --src "$RUN/out/shuffled/onnx-quint8" --chunk1 >> "$OUT/eval.log" 2>&1
         "$PY" "$REG" verify >> "$OUT/eval.log" 2>&1
+        stage "eval rr: teacher row (ce-gte-mb)"
+        "$PY" "$REPO/eval/embedding/fetch_models.py" --ce ce-gte-mb --work "$EVAL_DATA/work" >> "$OUT/eval.log" 2>&1
+        stage "eval rr: ce-minilm reference cache"
+        # C0 needs every ce-minilm reference pair cached before the measured run (0 scored in it):
+        # restore the GM-698 cache files when GM698_RERANK_CACHE names them, then score what is
+        # still missing in a ce-minilm-only run, which stops at C0 exactly when it had to score.
+        if [ -n "${GM698_RERANK_CACHE:-}" ]; then
+            mkdir -p "$EVAL_DATA/work/rerank_cache"
+            for f in "$GM698_RERANK_CACHE"/gm462-ce-minilm.*; do
+                [ -e "$EVAL_DATA/work/rerank_cache/$(basename "$f")" ] || cp "$f" "$EVAL_DATA/work/rerank_cache/"
+            done
+        fi
+        rc=0
+        timed "$OUT/gm463-ref.log" "$PY" "$REPO/eval/embedding/gm463_bakeoff.py" quality --work "$EVAL_DATA/work" --eval-dir "$V2" \
+            --st-runs "runs/$INT8" --models ce-minilm --k 30 --summary "$OUT/gm463_ref.txt" || rc=$?
+        missing=$(grep -E '^ce-minilm reference pairs missing at K=30: off [0-9]+, ship [0-9]+' "$OUT/gm463-ref.log" | tail -1)
+        if [ "$rc" != 0 ]; then
+            [ -n "$missing" ] && echo "$missing" | grep -qvE 'off 0, ship 0$' && grep -q "C0 ship-L6 reproduces GM-698: MISMATCH" "$OUT/gm463-ref.log" \
+                || { summary "eval rr: the ce-minilm reference run failed (exit $rc): $(tail -2 "$OUT/gm463-ref.log" | tr '\n' ' ')"; false; }
+        fi
+        no_load_fail "$OUT/gm463-ref.log"
+        summary "eval rr: ce-minilm reference cache complete (${missing:-?}; first run exit $rc); $(times_of "$OUT/gm463-ref.log")"
+        stage "eval rr"
         timed "$OUT/gm463.log" "$PY" "$REPO/eval/embedding/gm463_bakeoff.py" quality --work "$EVAL_DATA/work" --eval-dir "$V2" \
             --st-runs "runs/$INT8" --models ce-minilm,ce-gm730-l6-distill,ce-gm730-l6-distill-quint8,ce-gm730-l6-shuf,ce-gte-mb \
             --k 30 --table "$OUT/gm463_rr.md" --summary "$OUT/gm463_rr.txt"
-        summary "eval rr: gm463 quality $OUT/gm463_rr.md; $(times_of "$OUT/gm463.log")"
+        no_load_fail "$OUT/gm463.log"
+        grep -q "^C0 ship-L6 reproduces GM-698: pass" "$OUT/gm463.log" || { summary "eval rr: no C0 pass line in $OUT/gm463.log"; false; }
+        summary "eval rr: gm463 quality $OUT/gm463_rr.md (C0 pass); $(times_of "$OUT/gm463.log")"
+        check "C-S (rr, held-out NL vs ship-L6)" cs-rr --table "$OUT/gm463_rr.md" --arm ce-gm730-l6-shuf --base ship-L6 --k 30
         timed "$OUT/gm463-adapter.log" "$PY" "$REPO/eval/embedding/gm463_bakeoff.py" quality --work "$EVAL_DATA/work" --eval-dir "$V2" \
             --st-runs "$V2_RUNS/$ADAPTER" --models ce-minilm,ce-gm730-l6-distill-quint8 \
             --k 30 --table "$OUT/gm463_rr_adapter.md" --summary "$OUT/gm463_rr_adapter.txt"
+        no_load_fail "$OUT/gm463-adapter.log"
         summary "eval rr (D6a, adapter windows): $OUT/gm463_rr_adapter.md; $(times_of "$OUT/gm463-adapter.log")"
+        summary "EVAL DONE (S5, C-P2, C-S pass); uptime: $(uptime | sed 's/.*load/load/')"
         exit 0 ;;
     *) summary "--route rr|jina|gte"; false ;;
 esac
@@ -332,7 +410,7 @@ for arm in $ARMS; do
     done
     log "v2 $arm done"
 done
-"$PY" "$REG" check-run --runs "$V2_RUNS" >> "$OUT/eval.log" 2>&1
+"$PY" "$REG" check-run --runs "$V2_RUNS" --names "$(echo $ARMS | tr ' ' ',')" >> "$OUT/eval.log" 2>&1
 summary "eval $ROUTE: $n v2 runs ($ARMS); check-run ok"
 ARM_DIRS=""
 for arm in jina-v2-base-code-fp32 random shuffled "$INT8" "$GTE" "$ADAPTER" $ARMS; do ARM_DIRS="$ARM_DIRS $V2_RUNS/$arm"; done
@@ -340,4 +418,8 @@ for arm in jina-v2-base-code-fp32 random shuffled "$INT8" "$GTE" "$ADAPTER" $ARM
 "$BIN" debug-embed-eval report --eval-dir "$V2" --reference "$ADAPTER" --json "$OUT/report_${ROUTE}_vs_adapter.json" $ARM_DIRS > "$OUT/report_${ROUTE}_vs_adapter.txt" 2>&1
 "$BIN" debug-embed-eval report --eval-dir "$V2" --reference "$BASE_ARM" --json "$OUT/report_${ROUTE}_vs_base.json" $ARM_DIRS > "$OUT/report_${ROUTE}_vs_base.txt" 2>&1
 summary "eval $ROUTE: reports $OUT/report_$ROUTE{,_vs_adapter,_vs_base}.txt (gates: arms.<arm>.gates in the JSON)"
-summary "EVAL DONE; uptime: $(uptime | sed 's/.*load/load/')"
+ok=1
+check "C-S ($ROUTE v2, $SHUF_ARM vs $BASE_ARM)" cs --runs "$V2_RUNS" --eval-dir "$V2" --arm "$SHUF_ARM" --base "$BASE_ARM" || ok=0
+check "C-R2 ($ROUTE v2, $CR2_ARM vs $BASE_ARM)" cr2 --runs "$V2_RUNS" --eval-dir "$V2" --arm "$CR2_ARM" --official "$BASE_ARM" || ok=0
+[ "$ok" = 1 ] || { summary "EVAL FAILED: a control's pass rule failed ($CHECKS)"; false; }
+summary "EVAL DONE (S5, C-P2, C-S, C-R2 pass); uptime: $(uptime | sed 's/.*load/load/')"

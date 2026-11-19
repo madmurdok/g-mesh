@@ -9,9 +9,15 @@ Jobs (eval/gpu/jobs/gm730-<job>.toml):
     gte-grid, gte-final   train_encoder.py --model gte-small: 6 configs; frozen config + shuffled control
 A grid job has one step per config, named as `grid(route)` names it; a final
 job's steps are `final` and `shuffled`, with the args frozen in
-final_configs.json (freeze.py). `max_minutes` is the section 5 table.
+final_configs.json (freeze.py). `max_minutes` is the section 5 table and is
+shared by all attempts of a job (`max_minutes_scope = "job"`: a relaunch gets
+what the earlier attempts left). Every step carries `--job-steps` (this step
+and the ones after it) and `--eta-limit-minutes` (2x the job's section 5
+estimate), so the S2 probe stops the job when its ETA is over the limit.
 Without the teacher (C-T failed), `--no-teacher` keeps the alpha = 0 configs
-and drops the teacher data set.
+(route gte, which has none, gets one per learning rate) and drops the teacher
+data set; those jobs are `gm730-<route>-grid-nt` / `-final-nt`.
+Before launching any job: `budget.py check --job <toml>` (S3 and route caps).
 
 usage: make_jobs.py teacher [--out-dir DIR]
        make_jobs.py grid --route rr|jina|gte [--no-teacher] [--out-dir DIR]
@@ -34,6 +40,10 @@ GRACE_SECONDS = 30
 MAX_ATTEMPTS = 5
 MAX_MINUTES = {"rr-teacher": 60, "rr-grid": 120, "rr-final": 60, "jina-grid": 240, "jina-final": 180,
                "gte-grid": 60, "gte-final": 60}
+# S2: 2x the section 5 estimate (instance-hours) of each job, in minutes
+ETA_LIMIT_MINUTES = {"rr-teacher": 48, "rr-grid": 96, "rr-final": 48, "jina-grid": 216, "jina-final": 180,
+                     "gte-grid": 60, "gte-final": 48}
+NO_TEACHER_SUFFIX = "-nt"
 ROUTES = ("rr", "jina", "gte")
 ENTRY = {"rr": f"{REL}/train_ce.py", "jina": f"{REL}/train_encoder.py", "gte": f"{REL}/train_encoder.py"}
 COMMON = {
@@ -67,6 +77,8 @@ def grid(route, teacher=True):
         raise SystemExit(f"unknown route {route}")
     if not teacher and route == "rr":
         raise SystemExit("route rr distils the teacher; it has no form without it")
+    if not teacher and route == "gte":
+        out = [(f"lr{lr}-a0", ["--lr", lr, "--tau", "0.05", "--alpha", "0"]) for lr in ("2e-5", "5e-5", "1e-4")]
     if not teacher:
         out = [(n, a) for n, a in out if a[a.index("--alpha") + 1] == "0"]
         if not out:
@@ -104,18 +116,31 @@ def q(s):
     return json.dumps(s)
 
 
-def render(job, header, steps, data):
-    """GM-457 job TOML text."""
+def job_name(job, teacher=True):
+    return job if teacher else job + NO_TEACHER_SUFFIX
+
+
+def with_job_args(job, steps):
+    """Each step's args plus --job-steps (this step and the ones after it) and the job's
+    --eta-limit-minutes."""
+    n = len(steps)
+    return [(name, entry, list(args) + ["--job-steps", str(n - i), "--eta-limit-minutes", str(ETA_LIMIT_MINUTES[job])])
+            for i, (name, entry, args) in enumerate(steps)]
+
+
+def render(job, header, steps, data, teacher=True):
+    """GM-457 job TOML text; `job` is the section 5 key (rr-grid, ...)."""
     lines = [f"# {line}" if line else "#" for line in header] + [
-        f"name = {q('gm730-' + job)}",
+        f"name = {q('gm730-' + job_name(job, teacher))}",
         f"requirements = {q(REQUIREMENTS)}",
         "smoke = true",
         f"max_minutes = {MAX_MINUTES[job]}",
+        'max_minutes_scope = "job"',
         f"checkpoint_minutes = {CHECKPOINT_MINUTES}",
         f"grace_seconds = {GRACE_SECONDS}",
         f"max_attempts = {MAX_ATTEMPTS}",
     ]
-    for name, entry, args in steps:
+    for name, entry, args in with_job_args(job, steps):
         lines += ["", "[[steps]]", f"name = {q(name)}", f"entry = {q(entry)}",
                   "args = [" + ", ".join(q(a) for a in args) + "]", 'device = "cuda"']
     for ds in data:
@@ -135,7 +160,7 @@ def grid_job(route, teacher=True):
     steps = [(name, ENTRY[route], ["--stage", "grid"] + COMMON[route] + args) for name, args in grid(route, teacher)]
     hdr = [f"GM-730 job {route}-grid: the pre-registered dev grid, one step per config",
            f"({'with' if teacher else 'without'} the RR-T teacher; written by make_jobs.py)."]
-    return render(f"{route}-grid", hdr, steps, data_sets(f"{route}-grid", route, teacher))
+    return render(f"{route}-grid", hdr, steps, data_sets(f"{route}-grid", route, teacher), teacher)
 
 
 def final_job(route, final_configs, teacher=True):
@@ -157,7 +182,7 @@ def final_job(route, final_configs, teacher=True):
     hdr = [f"GM-730 job {route}-final: frozen config {entry['name']} and its {CONTROL[route]} control,",
            "each exported, quantised and parity-checked at the end of its step",
            f"(final_configs.json sha256 {sha}; written by make_jobs.py)."]
-    return render(f"{route}-final", hdr, steps, data_sets(f"{route}-final", route, teacher))
+    return render(f"{route}-final", hdr, steps, data_sets(f"{route}-final", route, teacher), teacher)
 
 
 def write(job, text, out_dir):
@@ -189,9 +214,9 @@ def main(argv=None):
     if a.cmd == "teacher":
         write("rr-teacher", teacher_job(), a.out_dir)
     elif a.cmd == "grid":
-        write(f"{a.route}-grid", grid_job(a.route, not a.no_teacher), a.out_dir)
+        write(job_name(f"{a.route}-grid", not a.no_teacher), grid_job(a.route, not a.no_teacher), a.out_dir)
     else:
-        write(f"{a.route}-final", final_job(a.route, a.final, not a.no_teacher), a.out_dir)
+        write(job_name(f"{a.route}-final", not a.no_teacher), final_job(a.route, a.final, not a.no_teacher), a.out_dir)
     return 0
 
 

@@ -4,6 +4,7 @@ name = "gm730-gte-grid"
 requirements = "eval/training/gm730/requirements-linux-cu121.txt"
 smoke = true
 max_minutes = 60
+max_minutes_scope = "job"
 checkpoint_minutes = 10
 grace_seconds = 30
 max_attempts = 5
@@ -11,37 +12,37 @@ max_attempts = 5
 [[steps]]
 name = "lr2e-5-a0.5"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau", "0.05", "--alpha", "0.5"]
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "6", "--eta-limit-minutes", "60"]
 device = "cuda"
 
 [[steps]]
 name = "lr2e-5-a1.0"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau", "0.05", "--alpha", "1.0"]
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau", "0.05", "--alpha", "1.0", "--job-steps", "5", "--eta-limit-minutes", "60"]
 device = "cuda"
 
 [[steps]]
 name = "lr5e-5-a0.5"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau", "0.05", "--alpha", "0.5"]
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "4", "--eta-limit-minutes", "60"]
 device = "cuda"
 
 [[steps]]
 name = "lr5e-5-a1.0"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau", "0.05", "--alpha", "1.0"]
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau", "0.05", "--alpha", "1.0", "--job-steps", "3", "--eta-limit-minutes", "60"]
 device = "cuda"
 
 [[steps]]
 name = "lr1e-4-a0.5"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "1e-4", "--tau", "0.05", "--alpha", "0.5"]
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "1e-4", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "2", "--eta-limit-minutes", "60"]
 device = "cuda"
 
 [[steps]]
 name = "lr1e-4-a1.0"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "1e-4", "--tau", "0.05", "--alpha", "1.0"]
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "1e-4", "--tau", "0.05", "--alpha", "1.0", "--job-steps", "1", "--eta-limit-minutes", "60"]
 device = "cuda"
 
 [[data]]

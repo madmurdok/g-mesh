@@ -58,7 +58,12 @@ def export_module():
 
 VERSION = "v0.4-full"
 # argparse dests that never change what a run computes; everything else is the config
-NOT_CONFIG = {"out", "device", "allow_device_change", "stop_after_steps", "ckpt_minutes", "threads"}
+NOT_CONFIG = {"out", "device", "allow_device_change", "stop_after_steps", "ckpt_minutes", "threads",
+              "job_steps", "eta_limit_minutes"}
+# exit code of a step whose S2 probe ETA for the rest of its job is over --eta-limit-minutes
+ETA_EXIT = 76
+# set to 1 to train on a teacher data set whose C-T did not pass (or was skipped)
+ALLOW_UNCHECKED_TEACHER = "GM730_ALLOW_UNCHECKED_TEACHER"
 
 
 def progress(msg):
@@ -109,9 +114,13 @@ def pairs_sha256(windows):
 
 def load_split(split, root=None):
     """(windows, {key: text row}, manifest) of one split; the files' sha256 and the pair
-    order must be the manifest's."""
+    order must be the manifest's, and its join check must have passed without the planted
+    offset (a smoke subset, `smoke: true`, has no join check)."""
     d = Path(root or windows_root()) / split
     man = json.loads((d / "manifest.json").read_text())
+    if not man.get("smoke") and not (man.get("joinCheckPass") is True and man.get("plantOffset") is False):
+        raise SystemExit(f"{d}: manifest joinCheckPass {man.get('joinCheckPass')}, plantOffset "
+                         f"{man.get('plantOffset')}: not a windows set to train or score on")
     for name, sha in man["files"].items():
         got = S.sha256_file(d / name)
         if got != sha:
@@ -134,6 +143,10 @@ def load_teacher(split, windows, root=None, permute_seed=None):
     within the window (gm436 data.permute_within, multiset kept)."""
     d = Path(root or teacher_root())
     meta = json.loads((d / "teacher.json").read_text())
+    ct = meta.get("ct") or {}
+    if ct.get("pass") is not True and os.environ.get(ALLOW_UNCHECKED_TEACHER) != "1":
+        raise SystemExit(f"{d}/teacher.json: C-T {'skipped' if 'skipped' in ct else 'did not pass'} "
+                         f"({ct.get('maxAbsDiff', ct.get('skipped'))}); {ALLOW_UNCHECKED_TEACHER}=1 to use it anyway")
     sp = meta["splits"][split]
     arr = np.fromfile(d / sp["file"], dtype="<f4")
     if S.sha256_file(d / sp["file"]) != sp["sha256"]:
@@ -426,15 +439,27 @@ def add_common_args(ap, seed_default=730):
                     help="checkpoint at the first step boundary after this many minutes (and every epoch end)")
     ap.add_argument("--stop-after-steps", type=int,
                     help="save a checkpoint and exit 75 after this global step (resume test, as a SIGTERM)")
+    ap.add_argument("--job-steps", type=int, default=1,
+                    help="steps of the job from this one to its last, this one included (job ETA); not part of the config")
+    ap.add_argument("--eta-limit-minutes", type=float,
+                    help=f"exit {ETA_EXIT} after the probe when the job ETA is over this (S2); not part of the config")
     ap.add_argument("--out", required=True)
 
 
 class Probe:
-    """S2 probe: s/step of the first `n` timed steps and the ETA, printed once."""
+    """S2 probe: s/step of the first `n` timed steps, this step's ETA and the job's (this
+    step's rest plus job_steps - 1 more steps of the same length), printed once; exits
+    ETA_EXIT when the job ETA is over limit_minutes."""
 
-    def __init__(self, label, total_steps, n=3):
+    def __init__(self, label, total_steps, n=3, job_steps=1, limit_minutes=None):
         self.label, self.total, self.n = label, total_steps, n
+        self.job_steps, self.limit = max(1, int(job_steps or 1)), limit_minutes
         self.t0, self.k, self.rate = None, 0, None
+
+    @classmethod
+    def of(cls, label, total_steps, a):
+        return cls(label, total_steps, job_steps=getattr(a, "job_steps", 1),
+                   limit_minutes=getattr(a, "eta_limit_minutes", None))
 
     def tick(self, done_steps):
         now = time.monotonic()
@@ -445,4 +470,11 @@ class Probe:
         if self.k == self.n:
             self.rate = (now - self.t0) / self.n
             eta = self.rate * max(0, self.total - done_steps)
-            progress(f"PROBE {self.label}: {self.rate:.3f} s/step, {self.total} steps, ETA {eta / 60:.1f} min")
+            job_eta = eta + self.rate * self.total * (self.job_steps - 1)
+            progress(f"PROBE {self.label}: {self.rate:.3f} s/step, {self.total} steps, ETA {eta / 60:.1f} min; "
+                     f"job ETA {job_eta / 60:.1f} min over {self.job_steps} step(s)"
+                     + (f", limit {self.limit:g} min" if self.limit else ""))
+            if self.limit and job_eta / 60 > self.limit:
+                progress(f"PROBE {self.label}: job ETA {job_eta / 60:.1f} min > --eta-limit-minutes {self.limit:g}: "
+                         f"stop (S2), exit {ETA_EXIT}")
+                sys.exit(ETA_EXIT)

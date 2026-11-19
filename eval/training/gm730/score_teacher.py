@@ -103,7 +103,7 @@ def score_main(a):
         done_before = sum(st["done"].values())
         if done_before:
             L.progress(f"{out}: resumed at {done_before}/{total} pairs")
-        probe = L.Probe("rr-teacher", -(-total // a.chunk))
+        probe = L.Probe.of("rr-teacher", -(-total // a.chunk), a)
         t_run = time.monotonic()
         for split in SPLITS:
             _, pairs = data[split]

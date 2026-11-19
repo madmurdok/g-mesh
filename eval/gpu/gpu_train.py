@@ -48,6 +48,9 @@ LIVE_STATES = ["pending", "running", "stopping", "stopped"]
 TERMINATE_TARGET = "arn:aws:scheduler:::aws-sdk:ec2:terminateInstances"
 SSM_POLICY = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 WATCH_EVERY = 30
+# An attempt with a job-scoped lifetime is launched only with at least this many minutes left.
+MIN_ATTEMPT_MINUTES = 10
+SCOPES = ("attempt", "job")
 
 
 # --- pure: config, jobs, ids ---------------------------------------------------------
@@ -120,6 +123,8 @@ def load_job(path, sets=None):
     job.setdefault("smoke", True)
     job.setdefault("disable_os_lifetime", False)
     job.setdefault("data", [])
+    if job.get("max_minutes_scope", "attempt") not in SCOPES:
+        raise SystemExit(f"{path}: max_minutes_scope must be one of {SCOPES}")
     if not job.get("steps"):
         raise SystemExit(f"{path}: no [[steps]]")
     names = [s["name"] for s in job["steps"]]
@@ -302,6 +307,30 @@ def relaunch_decision(record, attempt, max_attempts, instance_state, expired):
     if attempt >= max_attempts:
         return "stop", f"attempt limit {max_attempts} reached ({reason})"
     return "relaunch", reason
+
+
+def remaining_minutes(max_minutes, attempts, now):
+    """Minutes left of a job-scoped lifetime: max_minutes minus each earlier attempt's span
+    from launchTime to its end (endObserved, else its expiry, else now, whichever is first)."""
+    used = 0.0
+    for r in attempts:
+        start = parse_iso(r["launchTime"])
+        end = min(parse_iso(r["endObserved"]) if r.get("endObserved") else parse_iso(r["expires"]), now)
+        used += max(0.0, (end - start).total_seconds() / 60)
+    return max_minutes - used
+
+
+def attempt_minutes(job, max_minutes, attempts, now):
+    """The lifetime of the next attempt: max_minutes per attempt (scope "attempt", the
+    default), or what the earlier attempts left of it (scope "job"); LaunchError when
+    fewer than MIN_ATTEMPT_MINUTES are left."""
+    if job.get("max_minutes_scope", "attempt") != "job":
+        return max_minutes
+    left = int(remaining_minutes(max_minutes, attempts, now))
+    if left < MIN_ATTEMPT_MINUTES:
+        raise LaunchError(f"job lifetime used: {max_minutes - left} of {max_minutes} min, "
+                          f"{left} left < {MIN_ATTEMPT_MINUTES}")
+    return left
 
 
 def cost_of(intervals, prices):
@@ -786,12 +815,13 @@ def launch_attempt(ctx, attempt):
     cfg, m = ctx.cfg, ctx.m
     ec2 = ctx.ec2
     job = m["job"]
-    expires = utcnow() + timedelta(minutes=m["maxMinutes"])
+    minutes = attempt_minutes(job, m["maxMinutes"], ctx.launches["attempts"], utcnow())
+    expires = utcnow() + timedelta(minutes=minutes)
     sg = find_security_group(ec2, cfg["security_group"])
     if sg is None:
         raise SystemExit(f"{ctx.region}: security group {cfg['security_group']} missing; run setup")
     ud = user_data(bucket=ctx.bucket, bucket_region=cfg["bucket_region"], run_id=ctx.run_id, attempt=attempt,
-                   code_key=m["codeKey"], max_minutes=m["maxMinutes"], uv_version=cfg["uv_version"],
+                   code_key=m["codeKey"], max_minutes=minutes, uv_version=cfg["uv_version"],
                    grace=job["grace_seconds"], disable_os_lifetime=job.get("disable_os_lifetime", False))
     req = fleet_request(run_id=ctx.run_id, attempt=attempt, expires=expires, ami_id=m["amiId"],
                         root_device=cfg["ami"][ctx.region]["root_device"], root_gb=cfg["root_volume_gb"],
@@ -1074,9 +1104,10 @@ def cmd_run(a, cfg):
         return 0
     final = watch(ctx)
     print(f"run {ctx.run_id}: {final}")
-    pull(aws, cfg, bucket, ctx.run_id)
+    dest = pull(aws, cfg, bucket, ctx.run_id)
     ok = wait_terminated(ctx)
-    record_cost(ctx)
+    cost = record_cost(ctx)
+    (dest / "cost.json").write_text(json.dumps(cost, indent=1) + "\n")
     reap(aws, cfg)
     return 0 if final == "done" and ok else 1
 
@@ -1121,7 +1152,9 @@ def dry_run(a, cfg):
     sreq = schedule_request(run_id=run_id, attempt=1, instance_id="<instance id>", at=at,
                             role_arn=f"arn:aws:iam::<account>:role/{cfg['scheduler_role']}")
     print(f"\n== scheduler.create_schedule ({region})\n{json.dumps(sreq, indent=1)}")
+    scope = job.get("max_minutes_scope", "attempt")
     print(f"\nlifetime: in-OS shutdown at launch + {job['max_minutes']} min"
+          f" ({'shared by all attempts' if scope == 'job' else 'per attempt'})"
           f"{' (DISABLED)' if job.get('disable_os_lifetime') else ''}; cloud terminate at {iso(at)}")
     return 0
 
