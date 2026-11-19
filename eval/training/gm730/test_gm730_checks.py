@@ -118,6 +118,68 @@ class Refusals(BudgetCase):
             B.route_of("gm730-xx-grid")
 
 
+class FamilyPricing(BudgetCase):
+    CFGF = dict(CFG, instance_types=["g5.xlarge", "g5.2xlarge"])
+
+    def fjob(self, name, types, minutes=100):
+        p = self.root / f"{name}.toml"
+        t = "" if types is None else "instance_types = [" + ", ".join(f'"{x}"' for x in types) + "]\n"
+        p.write_text(f'name = "{name}"\nmax_minutes = {minutes}\nmax_minutes_scope = "job"\n{t}')
+        return p
+
+    def worst(self, name, types, minutes=100):
+        problems, info = B.check(self.fjob(name, types, minutes), self.runs, None, self.CFGF)
+        return problems, info
+
+    def test_planning_prices_per_family(self):
+        self.assertEqual(B.USD_PER_HOUR_BY_FAMILY, {"g5": 0.75, "g6e": 2.0, "g6": 0.70})
+
+    def test_a_g6e_job_costs_more_than_the_same_g5_job(self):
+        _, g5 = self.worst("gm730-gte-grid", ["g5.xlarge"])
+        _, g6e = self.worst("gm730-gte-grid-g6e", ["g6e.xlarge", "g6e.2xlarge"])
+        self.assertEqual((g5["family"], g5["usdPerHour"]), ("g5", 0.75))
+        self.assertEqual((g6e["family"], g6e["usdPerHour"]), ("g6e", 2.0))
+        self.assertAlmostEqual(g6e["worstUsd"], B.worst_usd({"max_minutes": 100}, self.CFGF, 2.0), places=9)
+        self.assertGreater(g6e["worstUsd"], g5["worstUsd"] * 2)
+
+    def test_a_job_without_instance_types_is_priced_as_the_config_family(self):
+        _, none = self.worst("gm730-gte-grid", None)
+        _, g5 = self.worst("gm730-gte-grid", ["g5.xlarge"])
+        self.assertEqual(none["family"], "g5")
+        self.assertAlmostEqual(none["worstUsd"], g5["worstUsd"], places=9)
+
+    def test_usd_per_hour_overrides_the_family_price(self):
+        j = self.fjob("gm730-gte-grid-g6e", ["g6e.xlarge"])
+        _, info = B.check(j, self.runs, 0.5, self.CFGF)
+        self.assertIsNone(info["family"])
+        self.assertAlmostEqual(info["worstUsd"], B.worst_usd({"max_minutes": 100}, self.CFGF, 0.5), places=9)
+
+    def test_route_cap_refuses_rr_grid_on_g6e_at_zero_spend(self):
+        # rr-grid on g6e: 114 min + 5 x 5 boot at $2/h + EBS = $4.66 > the $4 rr cap
+        problems, info = self.worst("gm730-rr-grid-g6e", ["g6e.xlarge", "g6e.2xlarge"], 114)
+        self.assertEqual(info["spentTotal"], 0)
+        self.assertAlmostEqual(info["worstUsd"], 4.656, places=2)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("route rr", problems[0])
+        # the same job on g5 and on g6 stays within the cap
+        for name, types, minutes in (("gm730-rr-grid", ["g5.xlarge"], 190), ("gm730-rr-grid-g6", ["g6.xlarge"], 304)):
+            problems, _ = self.worst(name, types, minutes)
+            self.assertEqual(problems, [], name)
+
+    def test_a_job_mixing_families_is_refused(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.worst("gm730-gte-grid", ["g5.xlarge", "g6e.xlarge"])
+        self.assertIn("one GPU family", str(cm.exception))
+
+    def test_an_unpriced_family_is_refused_unless_a_price_is_given(self):
+        j = self.fjob("gm730-gte-grid", ["g7.xlarge"])
+        problems, info = B.check(j, self.runs, None, self.CFGF)
+        self.assertIsNone(info)
+        self.assertIn("no planning price for GPU family g7", problems[0])
+        problems, info = B.check(j, self.runs, 1.0, self.CFGF)
+        self.assertEqual(problems, [])
+
+
 def run_main(argv):
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
