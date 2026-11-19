@@ -139,7 +139,7 @@ def job_name(job, teacher=True, family=DEFAULT_FAMILY):
 
 def scaled(minutes, family):
     """`minutes` on g5 scaled to the family, rounded up to whole minutes."""
-    # round() first: 60 * 1.6 is 96.00000000000001 in floating point
+    # round() first, so a product that is whole up to float noise is not rounded up a minute
     return math.ceil(round(minutes * FAMILIES[family]["time_factor"], 6))
 
 
