@@ -1,0 +1,79 @@
+# GM-730 job rr-grid: the pre-registered dev grid, one step per config
+# (with the RR-T teacher; written by make_jobs.py).
+# On g6e (g6e.xlarge, g6e.2xlarge): max_minutes and --eta-limit-minutes are the g5
+# values x 0.6, rounded up.
+name = "gm730-rr-grid-g6e"
+requirements = "eval/training/gm730/requirements-linux-cu121.txt"
+smoke = true
+max_minutes = 114
+max_minutes_scope = "job"
+checkpoint_minutes = 10
+grace_seconds = 30
+max_attempts = 5
+instance_types = ["g6e.xlarge", "g6e.2xlarge"]
+
+[[steps]]
+name = "lr2e-5-tt1-a0"
+entry = "eval/training/gm730/train_ce.py"
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau-t", "1", "--alpha", "0", "--job-steps", "8", "--eta-limit-minutes", "102"]
+device = "cuda"
+
+[[steps]]
+name = "lr2e-5-tt1-a0.5"
+entry = "eval/training/gm730/train_ce.py"
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau-t", "1", "--alpha", "0.5", "--job-steps", "7", "--eta-limit-minutes", "102"]
+device = "cuda"
+
+[[steps]]
+name = "lr2e-5-tt2-a0"
+entry = "eval/training/gm730/train_ce.py"
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau-t", "2", "--alpha", "0", "--job-steps", "6", "--eta-limit-minutes", "102"]
+device = "cuda"
+
+[[steps]]
+name = "lr2e-5-tt2-a0.5"
+entry = "eval/training/gm730/train_ce.py"
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau-t", "2", "--alpha", "0.5", "--job-steps", "5", "--eta-limit-minutes", "102"]
+device = "cuda"
+
+[[steps]]
+name = "lr5e-5-tt1-a0"
+entry = "eval/training/gm730/train_ce.py"
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau-t", "1", "--alpha", "0", "--job-steps", "4", "--eta-limit-minutes", "102"]
+device = "cuda"
+
+[[steps]]
+name = "lr5e-5-tt1-a0.5"
+entry = "eval/training/gm730/train_ce.py"
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau-t", "1", "--alpha", "0.5", "--job-steps", "3", "--eta-limit-minutes", "102"]
+device = "cuda"
+
+[[steps]]
+name = "lr5e-5-tt2-a0"
+entry = "eval/training/gm730/train_ce.py"
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau-t", "2", "--alpha", "0", "--job-steps", "2", "--eta-limit-minutes", "102"]
+device = "cuda"
+
+[[steps]]
+name = "lr5e-5-tt2-a0.5"
+entry = "eval/training/gm730/train_ce.py"
+args = ["--stage", "grid", "--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau-t", "2", "--alpha", "0.5", "--job-steps", "1", "--eta-limit-minutes", "102"]
+device = "cuda"
+
+[[data]]
+name = "gm730-windows"
+env = "GM730_WINDOWS"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/windows"
+include = ["train/*", "dev/*"]
+
+[[data]]
+name = "gm730-teacher"
+env = "GM730_TEACHER"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/teacher"
+include = ["*"]
+
+[[data]]
+name = "gm730-hf-l6"
+env = "GM730_HF"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/hf"
+include = ["ms-marco-MiniLM-L6-v2@233902d25c440f23af6f7d6e94d2946bac0bee0a/*"]

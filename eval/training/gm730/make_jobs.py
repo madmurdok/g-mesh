@@ -17,15 +17,21 @@ estimate), so the S2 probe stops the job when its ETA is over the limit.
 Without the teacher (C-T failed), `--no-teacher` keeps the alpha = 0 configs
 (route gte, which has none, gets one per learning rate) and drops the teacher
 data set; those jobs are `gm730-<route>-grid-nt` / `-final-nt`.
+`--family g6e|g6` writes the same job for another GPU family when g5 spot capacity
+is short: `gm730-<job>-<family>.toml`, pinned to that family's sizes by
+`instance_types`, with `max_minutes` and `--eta-limit-minutes` scaled by the
+family's time factor relative to g5 (FAMILIES). The g5 jobs carry no
+`instance_types` and run on config.toml's types.
 Before launching any job: `budget.py check --job <toml>` (S3 and route caps).
 
-usage: make_jobs.py teacher [--out-dir DIR]
-       make_jobs.py grid --route rr|jina|gte [--no-teacher] [--out-dir DIR]
-       make_jobs.py final --route rr|jina|gte --final final_configs.json [--no-teacher] [--out-dir DIR]
+usage: make_jobs.py teacher [--family F] [--out-dir DIR]
+       make_jobs.py grid --route rr|jina|gte [--no-teacher] [--family F] [--out-dir DIR]
+       make_jobs.py final --route rr|jina|gte --final final_configs.json [--no-teacher] [--family F] [--out-dir DIR]
 """
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -45,6 +51,15 @@ MAX_MINUTES = {"rr-teacher": 60, "rr-grid": 190, "rr-final": 60, "jina-grid": 24
 ETA_LIMIT_MINUTES = {"rr-teacher": 48, "rr-grid": 170, "rr-final": 48, "jina-grid": 216, "jina-final": 180,
                      "gte-grid": 60, "gte-final": 48}
 NO_TEACHER_SUFFIX = "-nt"
+# Per GPU family: the instance types a job is pinned to (None: config.toml's, the g5 sizes)
+# and the job's expected wall time relative to g5 (A10G), which scales max_minutes and
+# --eta-limit-minutes. Only the xlarge/2xlarge sizes fit the 8-vCPU G/VT spot quota.
+FAMILIES = {
+    "g5": {"instance_types": None, "time_factor": 1.0},
+    "g6e": {"instance_types": ["g6e.xlarge", "g6e.2xlarge"], "time_factor": 0.6},  # L40S 48 GB
+    "g6": {"instance_types": ["g6.xlarge", "g6.2xlarge"], "time_factor": 1.6},  # L4 24 GB
+}
+DEFAULT_FAMILY = "g5"
 ROUTES = ("rr", "jina", "gte")
 ENTRY = {"rr": f"{REL}/train_ce.py", "jina": f"{REL}/train_encoder.py", "gte": f"{REL}/train_encoder.py"}
 COMMON = {
@@ -117,31 +132,44 @@ def q(s):
     return json.dumps(s)
 
 
-def job_name(job, teacher=True):
-    return job if teacher else job + NO_TEACHER_SUFFIX
+def job_name(job, teacher=True, family=DEFAULT_FAMILY):
+    name = job if teacher else job + NO_TEACHER_SUFFIX
+    return name if family == DEFAULT_FAMILY else f"{name}-{family}"
 
 
-def with_job_args(job, steps):
+def scaled(minutes, family):
+    """`minutes` on g5 scaled to the family, rounded up to whole minutes."""
+    # round() first: 60 * 1.6 is 96.00000000000001 in floating point
+    return math.ceil(round(minutes * FAMILIES[family]["time_factor"], 6))
+
+
+def with_job_args(job, steps, family=DEFAULT_FAMILY):
     """Each step's args plus --job-steps (this step and the ones after it) and the job's
     --eta-limit-minutes."""
-    n = len(steps)
-    return [(name, entry, list(args) + ["--job-steps", str(n - i), "--eta-limit-minutes", str(ETA_LIMIT_MINUTES[job])])
+    n, eta = len(steps), scaled(ETA_LIMIT_MINUTES[job], family)
+    return [(name, entry, list(args) + ["--job-steps", str(n - i), "--eta-limit-minutes", str(eta)])
             for i, (name, entry, args) in enumerate(steps)]
 
 
-def render(job, header, steps, data, teacher=True):
+def render(job, header, steps, data, teacher=True, family=DEFAULT_FAMILY):
     """GM-457 job TOML text; `job` is the section 5 key (rr-grid, ...)."""
+    types = FAMILIES[family]["instance_types"]
+    if types:
+        header = header + [f"On {family} ({', '.join(types)}): max_minutes and --eta-limit-minutes are the g5",
+                           f"values x {FAMILIES[family]['time_factor']}, rounded up."]
     lines = [f"# {line}" if line else "#" for line in header] + [
-        f"name = {q('gm730-' + job_name(job, teacher))}",
+        f"name = {q('gm730-' + job_name(job, teacher, family))}",
         f"requirements = {q(REQUIREMENTS)}",
         "smoke = true",
-        f"max_minutes = {MAX_MINUTES[job]}",
+        f"max_minutes = {scaled(MAX_MINUTES[job], family)}",
         'max_minutes_scope = "job"',
         f"checkpoint_minutes = {CHECKPOINT_MINUTES}",
         f"grace_seconds = {GRACE_SECONDS}",
         f"max_attempts = {MAX_ATTEMPTS}",
     ]
-    for name, entry, args in with_job_args(job, steps):
+    if types:
+        lines.append("instance_types = [" + ", ".join(q(t) for t in types) + "]")
+    for name, entry, args in with_job_args(job, steps, family):
         lines += ["", "[[steps]]", f"name = {q(name)}", f"entry = {q(entry)}",
                   "args = [" + ", ".join(q(a) for a in args) + "]", 'device = "cuda"']
     for ds in data:
@@ -150,21 +178,21 @@ def render(job, header, steps, data, teacher=True):
     return "\n".join(lines) + "\n"
 
 
-def teacher_job():
+def teacher_job(family=DEFAULT_FAMILY):
     steps = [("teacher", f"{REL}/score_teacher.py", ["--seed", SEED])]
     return render("rr-teacher", ["GM-730 job RR-T: gte-mb fp32 logits for every train and dev window pair,",
                                  "plus the C-T parity pairs (written by make_jobs.py)."],
-                  steps, data_sets("rr-teacher", "rr"))
+                  steps, data_sets("rr-teacher", "rr"), family=family)
 
 
-def grid_job(route, teacher=True):
+def grid_job(route, teacher=True, family=DEFAULT_FAMILY):
     steps = [(name, ENTRY[route], ["--stage", "grid"] + COMMON[route] + args) for name, args in grid(route, teacher)]
     hdr = [f"GM-730 job {route}-grid: the pre-registered dev grid, one step per config",
            f"({'with' if teacher else 'without'} the RR-T teacher; written by make_jobs.py)."]
-    return render(f"{route}-grid", hdr, steps, data_sets(f"{route}-grid", route, teacher), teacher)
+    return render(f"{route}-grid", hdr, steps, data_sets(f"{route}-grid", route, teacher), teacher, family)
 
 
-def final_job(route, final_configs, teacher=True):
+def final_job(route, final_configs, teacher=True, family=DEFAULT_FAMILY):
     import hashlib
     final_configs = Path(final_configs)
     sidecar = final_configs.with_suffix(".sha256")
@@ -183,7 +211,7 @@ def final_job(route, final_configs, teacher=True):
     hdr = [f"GM-730 job {route}-final: frozen config {entry['name']} and its {CONTROL[route]} control,",
            "each exported, quantised and parity-checked at the end of its step",
            f"(final_configs.json sha256 {sha}; written by make_jobs.py)."]
-    return render(f"{route}-final", hdr, steps, data_sets(f"{route}-final", route, teacher), teacher)
+    return render(f"{route}-final", hdr, steps, data_sets(f"{route}-final", route, teacher), teacher, family)
 
 
 def write(job, text, out_dir):
@@ -210,14 +238,17 @@ def main(argv=None):
         p.add_argument("--no-teacher", action="store_true")
     f.add_argument("--final", required=True, type=Path)
     for p in (t, g, f):
+        p.add_argument("--family", choices=tuple(FAMILIES), default=DEFAULT_FAMILY)
         p.add_argument("--out-dir", type=Path, default=JOBS)
     a = ap.parse_args(argv)
     if a.cmd == "teacher":
-        write("rr-teacher", teacher_job(), a.out_dir)
+        write(job_name("rr-teacher", True, a.family), teacher_job(a.family), a.out_dir)
     elif a.cmd == "grid":
-        write(job_name(f"{a.route}-grid", not a.no_teacher), grid_job(a.route, not a.no_teacher), a.out_dir)
+        write(job_name(f"{a.route}-grid", not a.no_teacher, a.family), grid_job(a.route, not a.no_teacher, a.family),
+              a.out_dir)
     else:
-        write(job_name(f"{a.route}-final", not a.no_teacher), final_job(a.route, a.final, not a.no_teacher), a.out_dir)
+        write(job_name(f"{a.route}-final", not a.no_teacher, a.family),
+              final_job(a.route, a.final, not a.no_teacher, a.family), a.out_dir)
     return 0
 
 

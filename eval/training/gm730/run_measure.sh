@@ -23,11 +23,17 @@
 #   not start, the others continue; FAILED only when every model fails), the
 #   plants (must fail with their own FAIL line), C-0 (report of the GM-436 runs,
 #   eval_checks.py c0), windows (train, dev; planted offset must fail its join
-#   check), C-T pairs, job TOMLs (must equal the committed ones).
+#   check), C-T pairs, job TOMLs of every GPU family (must equal the committed
+#   ones).
 # teacher-data: the pulled RR-T outputs copied to $GM730_DATA/teacher (the
 #   gm730-teacher data set); C-T must have passed. On a C-T failure it writes
-#   the --no-teacher grid TOMLs (gm730-{jina,gte}-grid-nt.toml) and fails.
-# freeze: freeze.py on a pulled grid run, then make_jobs.py final.
+#   the --no-teacher grid TOMLs (gm730-{jina,gte}-grid-nt[-<family>].toml) and fails.
+# freeze: freeze.py on a pulled grid run, then make_jobs.py final for every GPU
+#   family (gm730-<route>-final[-<family>].toml).
+#
+# Every job TOML is written for each GPU family of make_jobs.py FAMILIES: g5
+# as gm730-<job>.toml, the fallbacks as gm730-<job>-<family>.toml. Launch the
+# one of the family that has spot capacity, without --instance-types.
 # eval: register the final run's exports as arms, then the route's v2 runs and
 #   reports (J, R3: debug-embed-eval run/report; RR: gm463_bakeoff.py quality,
 #   after the ce-minilm reference cache is complete), then eval_checks.py:
@@ -73,6 +79,7 @@ INT8=jina-v2-base-code-int8-structured
 GTE=gte-small-structured
 ADAPTER=int8-structured-adapter-full
 FINAL="$GM730_DATA/final_configs.json"
+FAMILIES="$("$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import make_jobs; print(" ".join(make_jobs.FAMILIES))' "$HERE")"
 case "$CMD" in
     --dry) OUT="${GM730_OUT:-$GM730_DATA/dry}" ;;
     pre|teacher-data|freeze|eval) OUT="${GM730_OUT:-$GM730_DATA/measure}" ;;
@@ -199,8 +206,10 @@ PYEOF
         "${ENC[@]}" --max-train-queries 16 --mode full --lr 1e-5 --tau 0.05 --alpha 0
 
     stage "jobs"
-    for r in rr jina gte; do "$PY" "$HERE/make_jobs.py" grid --route "$r" --out-dir "$S/jobs" >> "$TL" 2>&1; done
-    "$PY" "$HERE/make_jobs.py" teacher --out-dir "$S/jobs" >> "$TL" 2>&1
+    for fam in $FAMILIES; do
+        for r in rr jina gte; do "$PY" "$HERE/make_jobs.py" grid --route "$r" --family "$fam" --out-dir "$S/jobs" >> "$TL" 2>&1; done
+        "$PY" "$HERE/make_jobs.py" teacher --family "$fam" --out-dir "$S/jobs" >> "$TL" 2>&1
+    done
     for f in "$S"/jobs/*.toml; do cmp -s "$f" "$REPO/eval/gpu/jobs/$(basename "$f")" || { summary "jobs: $(basename "$f") differs from the committed TOML"; false; }; done
     # freeze + final TOMLs from the smoke results, copied under every grid config's name
     for r in rr jina gte; do
@@ -222,7 +231,11 @@ for i, (name, args) in enumerate(MJ.grid(sys.argv[2])):
 PYEOF
         rc=0; "$PY" "$HERE/freeze.py" --route "$r" --run "$S/fake-run/$r" --final "$S/jobs/final_configs.json" >> "$TL" 2>&1 || rc=$?
         [ "$rc" = 0 ] || [ "$rc" = 2 ] || { summary "freeze $r exit $rc"; false; }
-        if [ "$rc" = 0 ]; then "$PY" "$HERE/make_jobs.py" final --route "$r" --final "$S/jobs/final_configs.json" --out-dir "$S/jobs" >> "$TL" 2>&1; fi
+        if [ "$rc" = 0 ]; then
+            for fam in $FAMILIES; do
+                "$PY" "$HERE/make_jobs.py" final --route "$r" --final "$S/jobs/final_configs.json" --family "$fam" --out-dir "$S/jobs" >> "$TL" 2>&1
+            done
+        fi
     done
     summary "jobs: committed TOMLs reproduced; $(ls "$S"/jobs/*.toml | wc -l | tr -d ' ') TOMLs load via gpu_train.load_job (finals from smoke-derived final_configs.json)"
     summary "DRY DONE; uptime: $(uptime | sed 's/.*load/load/')"
@@ -271,9 +284,16 @@ if [ "$CMD" = pre ]; then
     timed "$OUT/ct.log" "$PY" "$HERE/score_teacher.py" make-ct --out-dir "$GM730_DATA/ct" --n 1000 --threads "$THREADS"
     summary "C-T pairs: $(grep 'dev pairs' "$OUT/ct.log" | tail -1)"
     stage "jobs"
-    "$PY" "$HERE/make_jobs.py" teacher >> "$OUT/jobs.log" 2>&1
-    for r in rr jina gte; do "$PY" "$HERE/make_jobs.py" grid --route "$r" >> "$OUT/jobs.log" 2>&1; done
+    jobs_written=""
+    for fam in $FAMILIES; do
+        "$PY" "$HERE/make_jobs.py" teacher --family "$fam" >> "$OUT/jobs.log" 2>&1
+        for r in rr jina gte; do "$PY" "$HERE/make_jobs.py" grid --route "$r" --family "$fam" >> "$OUT/jobs.log" 2>&1; done
+        sfx=""; [ "$fam" = g5 ] || sfx="-$fam"
+        for j in rr-teacher rr-grid jina-grid gte-grid; do jobs_written="$jobs_written eval/gpu/jobs/gm730-$j$sfx.toml"; done
+    done
     git -C "$REPO" diff --exit-code -- eval/gpu/jobs >> "$OUT/jobs.log" 2>&1 || { summary "jobs: regenerated TOMLs differ from the committed ones"; false; }
+    # a family's TOML that was never committed is untracked, which git diff does not show
+    git -C "$REPO" ls-files --error-unmatch -- $jobs_written >> "$OUT/jobs.log" 2>&1 || { summary "jobs: a regenerated TOML is not committed"; false; }
     summary "PRE DONE; routes whose C-R failed do not start:${CR_FAIL:- none}; next: budget.py check --job eval/gpu/jobs/gm730-rr-teacher.toml, then gpu_train.py run it"
     exit 0
 fi
@@ -285,8 +305,10 @@ if [ "$CMD" = teacher-data ]; then
     stage "teacher-data"
     src="$RUN/out/teacher"
     if [ "$(jget "$src/ct.json" pass)" != True ]; then
-        for r in jina gte; do "$PY" "$HERE/make_jobs.py" grid --route "$r" --no-teacher >> "$OUT/jobs.log" 2>&1; done
-        summary "C-T failed ($(jget "$src/ct.json" maxAbsDiff)): RR stops; J and R3 run without the teacher (alpha = 0): eval/gpu/jobs/gm730-{jina,gte}-grid-nt.toml written, then freeze/eval with --no-teacher"
+        for fam in $FAMILIES; do
+            for r in jina gte; do "$PY" "$HERE/make_jobs.py" grid --route "$r" --no-teacher --family "$fam" >> "$OUT/jobs.log" 2>&1; done
+        done
+        summary "C-T failed ($(jget "$src/ct.json" maxAbsDiff)): RR stops; J and R3 run without the teacher (alpha = 0): eval/gpu/jobs/gm730-{jina,gte}-grid-nt[-<family>].toml written ($FAMILIES), then freeze/eval with --no-teacher"
         false
     fi
     mkdir -p "$GM730_DATA/teacher"
@@ -304,8 +326,10 @@ if [ "$CMD" = freeze ]; then
     rc=0; "$PY" "$HERE/freeze.py" --route "$ROUTE" --run "$RUN" --final "$FINAL" $NO_TEACHER >> "$OUT/freeze.log" 2>&1 || rc=$?
     if [ "$rc" = 2 ]; then summary "freeze $ROUTE: S4 dev gate STOP ($(tail -2 "$OUT/freeze.log" | head -1))"; exit 0; fi
     [ "$rc" = 0 ]
-    "$PY" "$HERE/make_jobs.py" final --route "$ROUTE" --final "$FINAL" $NO_TEACHER >> "$OUT/freeze.log" 2>&1
-    summary "freeze $ROUTE: $(grep winner "$OUT/freeze.log" | tail -1); final TOML written"
+    for fam in $FAMILIES; do
+        "$PY" "$HERE/make_jobs.py" final --route "$ROUTE" --final "$FINAL" $NO_TEACHER --family "$fam" >> "$OUT/freeze.log" 2>&1
+    done
+    summary "freeze $ROUTE: $(grep winner "$OUT/freeze.log" | tail -1); final TOMLs written ($FAMILIES)"
     exit 0
 fi
 
