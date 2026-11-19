@@ -135,8 +135,8 @@ test, D7).
 
 Bucket `gmesh-train-<account-id>-us-east-1` (account id read at setup, not
 hard-coded). Block Public Access on, SSE-S3, versioning off, lifecycle:
-abort incomplete multipart uploads after 1 day; expire `runs/*/ckpt/` after
-30 days. Layout:
+abort incomplete multipart uploads after 1 day; expire `ckpt/` after 30 days
+(`runs/` does not expire). Layout:
 
 ```
 code/<git-sha>.tar.gz                     git archive of a clean commit (dirty tree refused)
@@ -145,9 +145,9 @@ data/<dataset>/<data-sha>/...             synced subsets + MANIFEST.json (path, 
 models/<hf-repo>@<revision>/...           GM-730: pinned HF snapshots (optional cache)
 runs/<run-id>/manifest.json               job spec, git sha, data sha, AMI id, instance types, max lifetime
 runs/<run-id>/status.json                 attempts: instance id, type, AZ, price, start/end, exit, reason
-runs/<run-id>/ckpt/checkpoint.pt          last checkpoint (+ checkpoint.prev.pt)
 runs/<run-id>/out/...                     everything else the job wrote to --out (result.json, ranks)
 runs/<run-id>/logs/attempt-<n>.log        runner + trainer stdout/stderr, uploaded every 60 s and at exit
+ckpt/<run-id>/<step>/checkpoint.pt        last checkpoint (+ checkpoint.prev.pt); own prefix so lifecycle expires only it
 ```
 
 `run-id` = `<job>-<config-sha12>-<utc yyyymmddThhmm>`. Data upload is
@@ -196,10 +196,10 @@ Instance side (`eval/gpu/runner.py`, stdlib only, started by user data):
    attempt as `interrupted` in `status.json`, `shutdown -h now`.
    Rebalance recommendations are logged only.
 2. Every 30 s, if `--out/checkpoint.pt` changed (mtime + size), copy it to
-   `runs/<id>/ckpt/` (previous one rotated to `checkpoint.prev.pt`). The
+   `ckpt/<id>/<step>/` (previous one rotated to `checkpoint.prev.pt`). The
    trainer replaces the file atomically, so an upload never reads a partial
    file (an open handle keeps the old inode).
-3. Before starting the job, download `runs/<id>/ckpt/checkpoint.pt` into
+3. Before starting the job, download `ckpt/<id>/<step>/checkpoint.pt` into
    `--out` if present; the trainer's existing "resume if `checkpoint.pt`
    exists" path does the rest.
 
@@ -324,7 +324,7 @@ g5.xlarge pinned with `--instance-types g5.xlarge`):
 
 - U: uninterrupted AWS run, `--fraction 1.0 --epochs 30 --patience 30`
   (no early stop, long enough to interrupt: ~1-3 min of epochs after setup).
-- K1 (spot notice path): same job; once `runs/<id>/ckpt/` holds epoch >= 3,
+- K1 (spot notice path): same job; once `ckpt/<id>/` holds epoch >= 3,
   the CLI starts an AWS FIS experiment with action
   `aws:ec2:send-spot-instance-interruptions` (`durationBeforeInterruption`
   = PT2M) on the instance. Runner sees the notice, stops the trainer,
@@ -413,7 +413,7 @@ New files (all under `eval/gpu/` unless noted):
 | `user_data.sh.tmpl` | `shutdown -h +N` first, `trap finish EXIT`, install uv, run `runner.py`. |
 | `config.toml` | bucket name pattern, pinned AMI id per region, default instance types, regions, `max_attempts`. |
 | `jobs/gm436-parity.toml`, `jobs/gm436-resume.toml`, `jobs/smoke.toml` | job specs: entry script + args, requirements lock, data subset, `max_hours`, `checkpoint_minutes`, device. `smoke.toml` has `mode = ok|fail|hang` for the terminate scenarios. |
-| `iam/*.json` | trust and inline policy documents (instance, scheduler, FIS). |
+| `iam/*.json` | trust and inline policy documents (instance, scheduler, FIS). The instance policy covers `ckpt/*` (Get/Put, ListBucket prefix) besides `runs/*`. |
 | `README.md` | the one-command launch, setup, verify-clean, cost. |
 | `test_gm457_launcher.py`, `test_gm457_runner.py` | tests slice (below). |
 | `eval/training/ckpt.py` | `save_ckpt`, `load_ckpt`, `rng_state`, `set_rng_state`, `StopOnSignal`, `KILLED_EXIT` (D5). |
@@ -452,7 +452,7 @@ Offline (moto / Stubber / fake IMDS on localhost / subprocess, no AWS):
 8. `relaunch_decision`: interrupted -> relaunch; no-status termination -> relaunch; failed / done -> stop; attempt limit -> stop.
 9. Runner: a fake IMDS instance-action -> job gets SIGTERM, checkpoint and logs uploaded, status `interrupted`, shutdown command called.
 10. Runner: job exit 0 -> `done`; exit 1 -> `failed`; exception in the runner -> shutdown still called.
-11. Runner: a checkpoint present under `runs/<id>/ckpt/` is placed in `--out` before the job starts.
+11. Runner: a checkpoint present under `ckpt/<id>/<step>/` is placed in `--out` before the job starts.
 12. Runner uploads a changed `checkpoint.pt` and rotates the previous one; never uploads `.tmp`.
 13. Kill (SIGTERM mid-epoch) + resume of the adapter on CPU ends with the same `wSha256` / `lastWSha256` / history as an uninterrupted run.
 14. `save_ckpt` writes only CPU tensors; `load_ckpt` loads on a CPU-only host.
@@ -522,14 +522,18 @@ Only on AWS (measure slice S6, one background script, `verify-clean` after each)
   `boto3==1.44.6`, uv 0.12.1 installer URL resolves.
 
 **Code-slice choices beyond the edit map:** checkpoints and outputs are per
-job step (`runs/<id>/ckpt/<step>/`, `out/<step>/`; the parity job runs the G
+job step (`ckpt/<id>/<step>/`, `runs/<id>/out/<step>/`; the parity job runs the G
 and A arms as two steps of one launch); `CreateFleet` needs a launch template,
 created per attempt and deleted right after the call (`reap` and
-`verify-clean` cover leftovers); S3 lifecycle prefixes cannot match
-`runs/*/ckpt/`, so the rule expires all of `runs/` after 30 days (`pull`
-copies everything but checkpoints); the runner records `terminated` when the
+`verify-clean` cover leftovers); the runner records `terminated` when the
 OS stops it (hard terminate or in-OS lifetime) and the launcher relaunches it
 as `no-status` unless the lifetime has passed; the adapter's data subset also
 needs `$GM456_DATA/work/runs/<variant>/*/{manifest.json,node_ids.txt}`
 (`cache.tables_for` reads them); `eval/gpu/smoke_job.py` is the smoke job's
 stand-in trainer.
+
+**Owner decision, 2026-11-19 (S3 lifecycle):** "Чекпоинты в отдельную папку
+ckpt/ (Recommended)". A lifecycle prefix cannot match `runs/*/ckpt/`, so
+checkpoints moved to the top-level prefix `ckpt/<run-id>/<step>/`; the
+lifecycle expires only `ckpt/` after 30 days, and `runs/` (manifest, status,
+out, logs, cost) never expires.

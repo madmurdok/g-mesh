@@ -46,7 +46,8 @@ uv run eval/gpu/gpu_train.py setup [--with-fis] [--ssm]
 
 Creates, idempotently (a second run prints `no changes`): the bucket
 `gmesh-train-<account>-us-east-1` (public access blocked, SSE-S3, lifecycle:
-abort incomplete uploads after 1 day, expire `runs/` after 30 days), the role
+abort incomplete uploads after 1 day, expire `ckpt/` after 30 days; `runs/`
+does not expire), the role
 and instance profile `gmesh-train-instance` (S3 only, see `iam/`), the role
 `gmesh-train-scheduler` (terminate tagged instances only), with `--with-fis`
 the role `gmesh-train-fis`, and the security group `gmesh-train` (no ingress)

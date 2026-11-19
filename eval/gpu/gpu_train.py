@@ -146,6 +146,11 @@ def run_id_of(job, now, tag=None):
     return rid
 
 
+def ckpt_prefix(run_id):
+    """Checkpoints live outside runs/ so the bucket lifecycle can expire only them."""
+    return f"ckpt/{run_id}/"
+
+
 def bucket_name(cfg, account):
     return cfg["bucket"].format(account=account)
 
@@ -426,7 +431,7 @@ def lifecycle_rules():
     return [
         {"ID": "abort-incomplete-mpu", "Status": "Enabled", "Filter": {"Prefix": ""},
          "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}},
-        {"ID": "expire-runs", "Status": "Enabled", "Filter": {"Prefix": "runs/"},
+        {"ID": "expire-ckpt", "Status": "Enabled", "Filter": {"Prefix": "ckpt/"},
          "Expiration": {"Days": 30}},
     ]
 
@@ -898,14 +903,13 @@ def record_cost(ctx):
 
 
 def pull(aws, cfg, bucket, run_id):
+    """runs/<run-id>/ (manifest, status, launches, cost, out, logs) to local_runs; not the checkpoints."""
     s3 = aws.client("s3", cfg["bucket_region"])
     dest = Path(os.path.expanduser(cfg["local_runs"])) / run_id
     n = 0
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=f"runs/{run_id}/"):
         for obj in page.get("Contents", []):
             rel = obj["Key"][len(f"runs/{run_id}/"):]
-            if rel.startswith("ckpt/"):
-                continue
             p = dest / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             s3.download_file(bucket, obj["Key"], str(p))
@@ -1011,6 +1015,10 @@ def cmd_status(a, cfg):
     for name in ("launches.json", "status.json", "cost.json"):
         doc = s3_get_json(s3, bucket, f"runs/{a.run_id}/{name}")
         print(f"== {name}\n{json.dumps(doc, indent=1) if doc is not None else '(absent)'}")
+    print(f"== {ckpt_prefix(a.run_id)}")
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=ckpt_prefix(a.run_id)):
+        for obj in page.get("Contents", []):
+            print(f"{obj['Key']}  {obj['Size']} bytes  {iso(obj['LastModified'])}")
     return 0
 
 

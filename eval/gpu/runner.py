@@ -10,8 +10,9 @@ uploads a changed --out/checkpoint.pt; at the end it writes this attempt into
 runs/<run-id>/status.json, uploads the log and shuts the instance down, on every
 exit path.
 
-S3 layout (one run): manifest.json, status.json, ckpt/<step>/checkpoint.pt
-(+ checkpoint.prev.pt), out/<step>/..., logs/attempt-<n>.log.
+S3 layout (one run): runs/<run-id>/{manifest.json, status.json, out/<step>/...,
+logs/attempt-<n>.log}; checkpoints at ckpt/<run-id>/<step>/checkpoint.pt
+(+ checkpoint.prev.pt), a separate prefix so a lifecycle rule can expire them.
 
 Test hooks (environment):
   GM457_IMDS          IMDS base URL (default http://169.254.169.254)
@@ -357,7 +358,7 @@ class Runner:
 
     # checkpoints
     def ckpt_key(self, step, name="checkpoint.pt"):
-        return f"{self.prefix}/ckpt/{step}/{name}"
+        return f"ckpt/{self.run_id}/{step}/{name}"
 
     def out_dir(self, step):
         return self.work / "out" / step

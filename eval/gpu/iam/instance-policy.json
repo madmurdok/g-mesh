@@ -16,14 +16,14 @@
       "Sid": "RunState",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": "arn:aws:s3:::${bucket}/runs/*"
+      "Resource": ["arn:aws:s3:::${bucket}/runs/*", "arn:aws:s3:::${bucket}/ckpt/*"]
     },
     {
       "Sid": "ListRunsAndData",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::${bucket}",
-      "Condition": {"StringLike": {"s3:prefix": ["runs/*", "data/*"]}}
+      "Condition": {"StringLike": {"s3:prefix": ["runs/*", "ckpt/*", "data/*"]}}
     }
   ]
 }
