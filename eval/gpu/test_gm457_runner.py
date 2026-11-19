@@ -110,6 +110,11 @@ if mode == "fail-upload-done":
     ckpt(b"v1")
     wait_for(lambda: log.is_file() and "checkpoint upload failed" in log.read_text(), "a failed upload")
     sys.exit(0)
+if mode == "fifo-ckpt":
+    os.mkfifo(out / "checkpoint.pt")
+    started()
+    time.sleep(300)
+    sys.exit(4)
 if mode in ("sleep", "ignore-term"):
     if mode == "ignore-term":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -421,6 +426,35 @@ class Outcomes(RunnerCase):
         except subprocess.TimeoutExpired:
             self.fail("runner kept running after SIGTERM")
         self.assert_finished("terminated", "runner-signal")
+
+    def test_runner_sigterm_during_upload_is_terminated(self):
+        """A3 with the signal landing inside try_upload: the job's checkpoint.pt is a
+        FIFO, so the checkpoint upload blocks reading it while the test holds the
+        write end open. The test's non-blocking open of the write end succeeds only
+        once the runner has the FIFO open for reading, i.e. is inside the upload.
+        The `except Exception` around the upload must not swallow the signal."""
+        self.manifest([self.step("gpu", "fifo-ckpt")])
+        self.start(poll=0.05, upload_every=0.05, log_every=1000)
+        self.wait_file(self.ctl / "started-gpu")
+        job_pid = int((self.ctl / "started-gpu").read_text())
+        fifo = self.work / "out" / "gpu" / "checkpoint.pt"
+        end = time.monotonic() + 30
+        while True:
+            try:
+                wfd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError:  # ENXIO: no reader yet
+                if self.proc.poll() is not None or time.monotonic() > end:
+                    self.fail(f"runner never opened the checkpoint for upload: {self.proc.communicate()[0]}")
+                time.sleep(0.02)
+        self.addCleanup(os.close, wfd)
+        self.proc.send_signal(signal.SIGTERM)
+        try:
+            self.finish(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.fail("runner kept running after SIGTERM during an upload")
+        self.assert_finished("terminated", "runner-signal")
+        self.assertTrue(pid_gone(job_pid), "job still running after the runner stopped")
 
 
 class SpotNotice(RunnerCase):
