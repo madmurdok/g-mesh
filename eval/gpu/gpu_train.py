@@ -23,8 +23,8 @@ pulled to `local_runs/<run-id>/`, its cost is written to cost.json, and the
 instances are checked terminated. Design: docs/design/GM-457-spot-gpu-training.md.
 
 The pure functions (run_id_of, user_data, fleet_request, schedule_request,
-relaunch_decision, cost_of, clean_problems, classify_launch_error, data_manifest)
-take no AWS client; everything that calls AWS takes one.
+relaunch_decision, cost_of, clean_problems, live_spot_requests, classify_launch_error,
+data_manifest) take no AWS client; everything that calls AWS takes one.
 """
 
 import argparse
@@ -379,6 +379,14 @@ def clean_problems(snapshot):
         for t in s.get("templates", []):
             out.append(f"{region}: launch template {t['LaunchTemplateName']} still exists")
     return out
+
+
+def live_spot_requests(requests, live_ids):
+    """The spot requests that can still hold or launch an instance: an open request
+    without an instance, or one whose instance is in `live_ids`. A request whose
+    instance is shutting-down, terminated or gone stays active for minutes after the
+    instance ends; it is not a leak."""
+    return [r for r in requests if not r.get("InstanceId") or r["InstanceId"] in live_ids]
 
 
 def expired_instances(instances, now):
@@ -1197,6 +1205,15 @@ def snapshot_region(aws, region):
     tagged_ids = {i["InstanceId"] for i in tagged}
     spot = ec2.describe_spot_instance_requests(
         Filters=[{"Name": "state", "Values": ["open", "active"]}])["SpotInstanceRequests"]
+    spot_iids = sorted({r["InstanceId"] for r in spot if r.get("InstanceId")})
+    live_spot_ids = set()
+    if spot_iids:
+        for page in ec2.get_paginator("describe_instances").paginate(
+                Filters=[{"Name": "instance-id", "Values": spot_iids},
+                         {"Name": "instance-state-name", "Values": LIVE_STATES}]):
+            for r in page["Reservations"]:
+                live_spot_ids |= {i["InstanceId"] for i in r["Instances"]}
+    spot = live_spot_requests(spot, live_spot_ids)
     vols = ec2.describe_volumes(Filters=[{"Name": "tag-key", "Values": ["gmesh-run"]},
                                          {"Name": "status", "Values": ["available"]}])["Volumes"]
     return {"tagged": tagged, "gpu": [i for i in gpu if i["InstanceId"] not in tagged_ids], "spot": spot,

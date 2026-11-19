@@ -344,8 +344,9 @@ G = AWS CUDA, A = AWS CPU):
 **Kill-mid-run resume test** (on AWS; arms on the same instance type,
 g5.xlarge pinned with `--instance-types g5.xlarge`):
 
-- U: uninterrupted AWS run, `--fraction 1.0 --epochs 30 --patience 30`
-  (no early stop, long enough to interrupt: ~1-3 min of epochs after setup).
+- U: uninterrupted AWS run, `--fraction 1.0 --epochs 400 --patience 400`
+  (no early stop, long enough to interrupt: ~0.6 s per epoch on an A10G,
+  ~4 min of epochs after setup; 30 epochs finished in ~19 s).
 - K1 (spot notice path): same job; once `ckpt/<id>/` holds epoch >= 3,
   the CLI starts an AWS FIS experiment with action
   `aws:ec2:send-spot-instance-interruptions` (`durationBeforeInterruption`
