@@ -419,6 +419,15 @@ Additive changes elsewhere:
 
 ## 10. Decisions for the owner
 
+**Owner answers, 2026-11-19** (option labels verbatim):
+
+- D1: "RR → J → R3 (Recommended)"
+- D2: "$20, жёсткий стоп $25 (Recommended)"
+- D8: "MRR > 0, r@10 ≥ −1 пт (Recommended)"
+- D3-D7: "Да, все рекомендованные (Recommended)" (D3a, D4a, D5a, D6a, D7a)
+
+Status: approved.
+
 ### D1. Route order
 
 **Today:** three GPU routes are queued with no order; only one instance can
