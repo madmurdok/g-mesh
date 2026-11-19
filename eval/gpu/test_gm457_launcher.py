@@ -695,6 +695,63 @@ class VerifyClean(MotoCase):
         self.assertIn(v, self.stdout.getvalue())
 
 
+class LiveSpotRequests(unittest.TestCase):
+    """Pure: a spot request is a leak only while it can hold or launch an instance."""
+
+    def test_terminated_instance_request_dropped(self):
+        reqs = [{"SpotInstanceRequestId": "sir-1", "InstanceId": "i-dead"}]
+        self.assertEqual(G.live_spot_requests(reqs, set()), [])
+        self.assertEqual(G.live_spot_requests(reqs, {"i-other"}), [])
+
+    def test_open_request_without_instance_kept(self):
+        reqs = [{"SpotInstanceRequestId": "sir-2"}, {"SpotInstanceRequestId": "sir-3", "InstanceId": ""}]
+        self.assertEqual(G.live_spot_requests(reqs, set()), reqs)
+
+    def test_request_with_live_instance_kept(self):
+        reqs = [{"SpotInstanceRequestId": "sir-4", "InstanceId": "i-live"},
+                {"SpotInstanceRequestId": "sir-5", "InstanceId": "i-dead"}]
+        self.assertEqual(G.live_spot_requests(reqs, {"i-live"}), [reqs[0]])
+
+
+class VerifyCleanSpot(MotoCase):
+    """verify-clean through snapshot_region: spot requests of ended instances are not leaks."""
+
+    def args(self):
+        return argparse.Namespace(profile=None, wait=0)
+
+    def instance(self):
+        """An untagged non-GPU instance, so only a spot line can report it."""
+        return self.run_instance({"other": "x"}, itype="t3.micro")
+
+    def active_request(self, request):
+        """Make describe_spot_instance_requests return `request` (moto closes requests itself)."""
+        self.aws.overrides[("ec2", "describe_spot_instance_requests")] = \
+            lambda **kw: {"SpotInstanceRequests": [request]}
+        patch = mock.patch.object(G, "Aws", lambda profile=None: self.aws)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_terminated_instance_request_not_reported(self):
+        iid = self.instance()
+        self.ec2.terminate_instances(InstanceIds=[iid])
+        self.assertEqual(self.state(iid), "terminated")
+        self.active_request({"SpotInstanceRequestId": "sir-term0001", "InstanceId": iid, "State": "active"})
+        self.assertEqual(G.cmd_verify_clean(self.args(), CFG), 0)
+        self.assertNotIn("sir-term0001", self.stdout.getvalue())
+
+    def test_running_instance_request_reported(self):
+        iid = self.instance()
+        self.assertEqual(self.state(iid), "running")
+        self.active_request({"SpotInstanceRequestId": "sir-run00001", "InstanceId": iid, "State": "active"})
+        self.assertEqual(G.cmd_verify_clean(self.args(), CFG), 1)
+        self.assertIn("sir-run00001", self.stdout.getvalue())
+
+    def test_open_request_without_instance_reported(self):
+        self.active_request({"SpotInstanceRequestId": "sir-open0001", "State": "open"})
+        self.assertEqual(G.cmd_verify_clean(self.args(), CFG), 1)
+        self.assertIn("sir-open0001", self.stdout.getvalue())
+
+
 class Launch(MotoCase):
     """A11, A12, F3: launch_attempt / adopt_instance / schedule_terminate."""
 
