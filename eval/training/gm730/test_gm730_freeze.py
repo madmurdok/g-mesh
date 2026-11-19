@@ -148,6 +148,15 @@ class Grids(unittest.TestCase):
             self.assertTrue(all(a[a.index("--alpha") + 1] == "0" for _, a in g))
         self.assertEqual(len(MJ.grid("gte", teacher=False)), 3)
 
+    def test_every_training_step_of_every_route_runs_in_bf16(self):
+        # The section 5 throughput (and so every max_minutes / ETA limit) assumes bf16 autocast.
+        import tomllib
+        for route in ("rr", "jina", "gte"):
+            steps = tomllib.loads(MJ.grid_job(route))["steps"]
+            self.assertTrue(steps)
+            for s in steps:
+                self.assertIn("--bf16", s["args"], f"{route} {s['name']}")
+
     def test_rr_has_no_teacherless_form(self):
         with self.assertRaises(SystemExit):
             MJ.grid("rr", teacher=False)
@@ -178,6 +187,8 @@ class FinalJob(unittest.TestCase):
         self.assertEqual(job["max_minutes_scope"], "job")
         names = [d["env"] for d in job["data"]]
         self.assertEqual(len(names), len(set(names)))
+        for s in job["steps"]:
+            self.assertIn("--bf16", s["args"], s["name"])
 
     def test_refuses_a_file_whose_sha256_is_not_the_sidecars(self):
         self.frozen(0.5)

@@ -47,7 +47,7 @@ NO_TEACHER_SUFFIX = "-nt"
 ROUTES = ("rr", "jina", "gte")
 ENTRY = {"rr": f"{REL}/train_ce.py", "jina": f"{REL}/train_encoder.py", "gte": f"{REL}/train_encoder.py"}
 COMMON = {
-    "rr": ["--epochs", "2", "--batch", "32", "--max-len", "256", "--seed", SEED],
+    "rr": ["--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", SEED],
     "jina": ["--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8",
              "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", SEED],
     "gte": ["--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8",
