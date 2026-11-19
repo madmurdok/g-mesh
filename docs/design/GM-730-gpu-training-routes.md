@@ -291,6 +291,18 @@ that prints s/step and the ETA (stop rule S2).
 Each attempt adds ~3-5 min (boot, venv, data sync). The caps are 3-4x the
 estimates because the throughput figures are not measured.
 
+**How the caps are enforced.** Every GM-730 job sets
+`max_minutes_scope = "job"`: `max_minutes` is the job's total lifetime across
+relaunches, and each relaunch gets what earlier attempts left (from
+`launches.json`); below 10 min the launch is refused. Before each launch
+`eval/training/gm730/budget.py` refuses (exit 3) when the route's recorded
+spend plus the job's worst case passes the route cap, when the GM-730 total
+plus the worst case passes $20, or, for R3, $15 (S3); a run dir without
+`cost.json` counts as unknown spend and is refused. Each step's probe stops
+the job (exit 76) when its job-level ETA passes `--eta-limit-minutes`.
+Worst cases at $0.70/h plus EBS: RR $3.73 (cap $4), J $5.57 (cap $8),
+R3 $2.02 (cap $3).
+
 ## 6. Route order and stop rules
 
 Order (D1a): **RR -> J -> R3**. RR first: cheapest, strongest prior
