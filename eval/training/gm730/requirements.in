@@ -1,0 +1,8 @@
+torch==2.2.2
+numpy==1.26.4
+transformers==4.48.3
+tokenizers==0.21.4
+peft==0.21.3
+onnx==1.16.2
+onnxruntime==1.19.2
+huggingface-hub==0.36.2

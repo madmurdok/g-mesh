@@ -72,14 +72,14 @@ ST = E.ST
 REF = "ce-minilm"
 SHIP_BETA = 40.0  # GM-698's FIT-tuned beta of the shipped arm
 OFF_BETA = E.SHIPPED_BETA
-MODELS = [REF] + list(R.CE_BAKEOFF)
+MODELS = [REF] + list(R.CE_BAKEOFF) + list(R.CE_LOCAL)
 RUST_SCORED = {"ce-minilm-quint8-rust"}  # logits come from the Rust dump (gm700_rust_pairs.py), never from ORT here
 NOT_SHIPPABLE = {"ce-jina-v2": "CC-BY-NC-4.0, reference only"}
 SCOPE_DEFAULT = {"ce-bge-m3": "nl"}
 PASSES_DEFAULT = {"ce-bge-m3": 1}
 BETA_MAX, BETA_MIN = 2560.0, 0.125
 # Section 3.5's latency order L6 L12 turbo gte jv2 bge; the arms run it, then mirrored.
-LAT_ORDER = ["ce-minilm", "ce-minilm-int8", "ce-minilm-quint8", "ce-minilm-quint8-rust", "ce-minilm-l12", "ce-jina-turbo", "ce-gte-mb", "ce-gte-mb-int8", "ce-jina-v2", "ce-bge-m3"]
+LAT_ORDER = ["ce-minilm", "ce-minilm-int8", "ce-minilm-quint8", "ce-minilm-quint8-rust", "ce-minilm-l12", "ce-jina-turbo", "ce-gte-mb", "ce-gte-mb-int8", "ce-jina-v2", "ce-bge-m3"] + list(R.CE_LOCAL)
 L6_PAIR_TOKENS = 101.9  # gm-698-latency.md: enr mean pair tokens, same 30 queries, K=30, one decimal
 assert sorted(MODELS) == sorted(LAT_ORDER), (MODELS, LAT_ORDER)
 C3_PAIRS = 200
@@ -101,6 +101,9 @@ C8_SPEC = {  # name -> (ONNX input names, special-token layout of an encoded pai
     "ce-gte-mb-int8": (MASK_INPUTS, BERT_PAIR),
     "ce-bge-m3": (MASK_INPUTS, ROBERTA_PAIR),
 }
+# Local students (rerank_eval.CE_LOCAL) have L6's graph and tokenizer; the chunk-1 ones are exact at chunk 1.
+C8_SPEC.update({n: C8_SPEC[REF] for n in R.CE_LOCAL})
+C3_TOL.update({n: 1e-5 for n in R.CE_LOCAL if n in R.INT8_MODELS})
 _SKIN_Q = "Organic skincare products for sensitive skin"
 # name -> ([(query, doc)], printed logits or None, tolerance, indices that must take the top ranks when logits
 # are None: jina-v2's are the same skincare document in five languages, the others are makeup trends).
@@ -150,7 +153,7 @@ def sha16(x):
 
 
 def model_dir(work, name):
-    return work / "models" / R.CE_DIR[name]
+    return R.ce_dir(work, name)
 
 
 def counter_tokenizer(work, name):
@@ -619,6 +622,19 @@ def split_table(cs, ref_outs, arms):
 
 
 # ---- quality -------------------------------------------------------------------
+def default_st_runs(work):
+    return work / "runs" / ST
+
+
+def is_default_recall(st_dir, work):
+    return Path(st_dir).resolve() == default_st_runs(work).resolve()
+
+
+def recall_label(st_dir, work):
+    """The recall arm's label: int8-structured for the default runs, else the runs dir's name."""
+    return "int8-structured" if is_default_recall(st_dir, work) else Path(st_dir).name
+
+
 def load_setup(a):
     work = a.work
     st_dir = Path(a.st_runs) if Path(a.st_runs).is_absolute() else work / a.st_runs
@@ -725,10 +741,13 @@ def quality(a):
                   for c in cs for q in c.qids] for arm in (R.REF, ST)}
     rf32 = R.fit_floors(base[R.REF])
     mkrow = lambda label, outs: E.row(label, outs, shipped, base[R.REF], rf32, base[ST], shipped)
-    r8s = mkrow("int8-structured (no rerank, shipped floors)", base[ST])
+    rlab = recall_label(st_dir, a.work)
+    default_recall = is_default_recall(st_dir, a.work)
+    S.append(f"recall arm {rlab} ({st_dir}); C0 {'runs at K=30' if default_recall else 'not run (C0 holds for the default int8 runs only)'}")
+    r8s = mkrow(f"{rlab} (no rerank, shipped floors)", base[ST])
     disabled = E.f4(cs, K, OFF_BETA, rerank=False)
     ok5 = disabled == base[ST] and E.sig(mkrow("off", disabled)) == E.sig(r8s)
-    print(f"C5 rerank disabled == int8-structured on every outcome and cell: {ok5}", flush=True)
+    print(f"C5 rerank disabled == {rlab} on every outcome and cell: {ok5}", flush=True)
     if not ok5:
         sys.exit("STOP: C5 failed")
     S.append("C5 pass")
@@ -741,7 +760,7 @@ def quality(a):
     fit_keys = [(c, q) for c in cs for q in c.qids if R.fit_nl(c.queries[q])]
     strict = E.strict_ho(cs)
     sc_ref = {arm: score_of_for(caches[REF], REF, arm) for arm in ("off", "ship")}
-    L = ["Window ceiling: held-out NL positives with an expected node in int8-structured's top K (pooled by language)", "",
+    L = [f"Window ceiling: held-out NL positives with an expected node in {rlab}'s top K (pooled by language)", "",
          "| K | share | n |", "|---|---|---|"] + [f"| {k_} | {v:.3f} | {n} |" for k_, (v, n) in ceil.items()]
     p = E.Progress("metrics", len(report_k) * (len(ces) + 1))
     step = 0
@@ -814,7 +833,7 @@ def quality(a):
         L += ["", f"Doc split, held-out NL positives, K={k_}", ""] + split_table(cs, ship, split_arms)
         L += ["", f"Mean pair tokens (query + text + specials, model's tokenizer, truncated at {R.MAX_TOKENS}), K={k_} window", "",
               "| model | scope | tokens |", "|---|---|---|"] + tok_lines
-        if k_ == 30 and REF in a.models:
+        if k_ == 30 and REF in a.models and default_recall:
             S += c0_check(rows, bref, nref)
     p.write(step)
     if a.skip_sim:
