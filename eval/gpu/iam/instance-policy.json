@@ -19,11 +19,10 @@
       "Resource": ["arn:aws:s3:::${bucket}/runs/*", "arn:aws:s3:::${bucket}/ckpt/*"]
     },
     {
-      "Sid": "ListRunsAndData",
+      "Sid": "ListBucket",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::${bucket}",
-      "Condition": {"StringLike": {"s3:prefix": ["runs/*", "ckpt/*", "data/*"]}}
+      "Resource": "arn:aws:s3:::${bucket}"
     }
   ]
 }

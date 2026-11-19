@@ -230,6 +230,12 @@ def verify_data(dest, manifest):
     return bad
 
 
+def data_sha(manifest):
+    """The content address of a data subset; same as gpu_train.data_sha."""
+    files = json.dumps(manifest["files"], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(files.encode()).hexdigest()
+
+
 def attempt_state(reason):
     """done | interrupted (resumable) | terminated (the OS stopped the runner: a hard
     terminate or the in-OS lifetime; the launcher tells them apart by the expiry) |
@@ -313,6 +319,10 @@ class Runner:
             t0 = time.monotonic()
             self.store.sync_down(ds["prefix"], dest)
             man = json.loads((dest / "MANIFEST.json").read_text())
+            got = data_sha(man)
+            if got != ds["sha"]:
+                raise StepFailure("data-sha-mismatch", f"data {ds['name']}: MANIFEST.json hashes to {got}, "
+                                                       f"not the content address {ds['sha']}")
             bad = verify_data(dest, man)
             if bad:
                 raise StepFailure("data-sha-mismatch", f"data {ds['name']}: " + "; ".join(bad[:5]))
@@ -412,6 +422,17 @@ class Runner:
         self.log_f.flush()
         self.store.put(self.log_path, f"{self.prefix}/logs/attempt-{self.attempt}.log")
 
+    def try_upload(self, what, fn, *args):
+        """Runs one upload during a step. A failure is logged and returned, never raised:
+        the next tick retries, and only finish's status write decides the attempt."""
+        try:
+            fn(*args)
+            return None
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            self.log(f"{what} upload failed: {err}")
+            return err
+
     # the job
     def step_cmd(self, step):
         cmd = [self.python, str(self.src / step["entry"]), *step.get("args", []),
@@ -460,21 +481,25 @@ class Runner:
                     self.record["notice"] = notice
                     rc = self.stop_job(proc)
                     self.log(f"step {name}: stopped, exit {rc}")
-                    self.upload_checkpoint(name)
+                    err = self.try_upload("checkpoint", self.upload_checkpoint, name)
+                    if err:
+                        self.record["uploadError"] = err
                     return rc, "spot-notice"
                 t = time.monotonic()
                 if t - last_ckpt >= self.a.upload_every:
-                    self.upload_checkpoint(name)
+                    self.try_upload("checkpoint", self.upload_checkpoint, name)
                     last_ckpt = t
                 if t - last_log >= self.a.log_every:
-                    self.upload_logs()
+                    self.try_upload("log", self.upload_logs)
                     last_log = t
                 time.sleep(self.a.poll)
         finally:
             if proc.poll() is None:
                 self.stop_job(proc)
             self.proc = None
-        self.upload_checkpoint(name)
+        err = self.try_upload("checkpoint", self.upload_checkpoint, name)
+        if err:
+            self.record["uploadError"] = err
         return proc.returncode, None
 
     def run(self):

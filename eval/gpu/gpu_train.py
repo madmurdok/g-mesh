@@ -12,6 +12,7 @@
     uv run eval/gpu/gpu_train.py reap
     uv run eval/gpu/gpu_train.py verify-clean
     uv run eval/gpu/gpu_train.py interrupt <run-id> --fis|--terminate
+    uv run eval/gpu/gpu_train.py kill-switch-test [<run-id>]
 
 `run` uploads the code (git archive of a clean HEAD), the env lock and the
 job's data subsets (content-addressed), launches attempt 1 with a one-time
@@ -31,6 +32,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import string
 import subprocess
 import sys
@@ -314,6 +316,31 @@ def cost_of(intervals, prices):
             if seg_end > seg_start:
                 total += p * (seg_end - seg_start).total_seconds() / 3600
     return total
+
+
+GPU_FAMILY = re.compile(r"^(g|gr|p|dl|trn|inf|vt)\d")
+
+
+def is_gpu(instance_type):
+    """The kill-switch Lambda's definition of a GPU-family instance."""
+    return bool(GPU_FAMILY.match(instance_type))
+
+
+def check_instance_types(types, configured):
+    """The fleet's types: the configured ones, or an explicit override of G-family types
+    of one family (one GPU model per run id, e.g. g6.xlarge alone)."""
+    types = [t.strip() for t in types if t.strip()]
+    if not types:
+        raise SystemExit("instance types: none given")
+    if set(types) <= set(configured):
+        return types
+    bad = [t for t in types if not re.fullmatch(r"g\d+[a-z]*\.[0-9a-z]+", t)]
+    if bad:
+        raise SystemExit(f"instance types {bad}: only G-family types (spot quota is G/VT only)")
+    families = sorted({t.split(".")[0] for t in types})
+    if len(families) > 1:
+        raise SystemExit(f"instance types {types}: one GPU family per run, got {families}")
+    return types
 
 
 def classify_launch_error(code, message):
@@ -758,28 +785,72 @@ def launch_attempt(ctx, attempt):
                         profile=cfg["instance_role"], sg_id=sg["GroupId"], user_data_text=ud,
                         subnets_by_type=subnets_by_type(ec2, m["instanceTypes"]))
     ClientError = client_error()
+    tpl_name = req["LaunchTemplate"]["LaunchTemplateName"]
     try:
         ec2.create_launch_template(**req["LaunchTemplate"])
-        try:
-            resp = ec2.create_fleet(**req["CreateFleet"])
-        finally:
-            ec2.delete_launch_template(LaunchTemplateName=req["LaunchTemplate"]["LaunchTemplateName"])
     except ClientError as e:
         raise LaunchError(classify_launch_error(err_code(e), str(e))) from e
-    ids = [i for inst in resp.get("Instances", []) for i in inst.get("InstanceIds", [])]
-    if not ids:
+    try:
+        resp = ec2.create_fleet(**req["CreateFleet"])
+    except ClientError as e:
+        raise LaunchError(classify_launch_error(err_code(e), str(e))) from e
+    finally:
+        try:
+            ec2.delete_launch_template(LaunchTemplateName=tpl_name)
+        except Exception as e:  # reap deletes leftover templates
+            print(f"attempt {attempt}: WARNING: launch template {tpl_name} not deleted: {e}")
+    fleet = [inst for inst in resp.get("Instances", []) if inst.get("InstanceIds")]
+    if not fleet:
         errs = resp.get("Errors", [])
         first = errs[0] if errs else {"ErrorCode": "?", "ErrorMessage": "no instance and no error"}
         raise LaunchError(classify_launch_error(first.get("ErrorCode"), first.get("ErrorMessage")))
-    iid = ids[0]
-    inst = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
-    rec = {"n": attempt, "instanceId": iid, "fleetId": resp.get("FleetId"), "instanceType": inst["InstanceType"],
-           "az": inst["Placement"]["AvailabilityZone"], "launchTime": iso(inst["LaunchTime"]),
-           "expires": iso(expires), "region": ctx.region}
-    ctx.launches["attempts"].append(rec)
-    ctx.save_launches()
-    print(f"attempt {attempt}: {iid} {rec['instanceType']} in {rec['az']}, expires {rec['expires']}")
-    schedule_terminate(ctx, rec)
+    return adopt_instance(ctx, attempt, fleet[0], resp.get("FleetId"), expires)
+
+
+def retrying(what, fn, tries=5, wait=5):
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if i + 1 == tries:
+                raise
+            print(f"{what}: {type(e).__name__}: {e}; retry {i + 2}/{tries} in {wait}s")
+            time.sleep(wait)
+
+
+def adopt_instance(ctx, attempt, fleet_inst, fleet_id, expires):
+    """Records a launched instance in launches.json, then describes it and arms its
+    terminate schedule. Invariant: once CreateFleet returned an instance, every path
+    either leaves it recorded with a schedule or terminates it; a failure after the
+    terminate exits the CLI instead of returning, so no caller launches again."""
+    iid = fleet_inst["InstanceIds"][0]
+    ov = fleet_inst.get("LaunchTemplateAndOverrides", {}).get("Overrides", {})
+    rec = {"n": attempt, "instanceId": iid, "fleetId": fleet_id, "instanceType": fleet_inst.get("InstanceType"),
+           "az": ov.get("AvailabilityZone"), "launchTime": iso(utcnow()), "expires": iso(expires),
+           "region": ctx.region}
+    try:
+        ctx.launches["attempts"].append(rec)
+        retrying(f"attempt {attempt}: save launches.json", ctx.save_launches)
+        ctx.ec2.get_waiter("instance_exists").wait(InstanceIds=[iid], WaiterConfig={"Delay": 5, "MaxAttempts": 24})
+        inst = retrying(f"attempt {attempt}: describe {iid}",
+                        lambda: ctx.ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0])
+        rec.update(instanceType=inst["InstanceType"], az=inst["Placement"]["AvailabilityZone"],
+                   launchTime=iso(inst["LaunchTime"]))
+        retrying(f"attempt {attempt}: save launches.json", ctx.save_launches)
+        print(f"attempt {attempt}: {iid} {rec['instanceType']} in {rec['az']}, expires {rec['expires']}")
+        retrying(f"attempt {attempt}: terminate schedule", lambda: schedule_terminate(ctx, rec))
+    except BaseException as e:
+        try:
+            ctx.ec2.terminate_instances(InstanceIds=[iid])
+            outcome = "terminated by the launcher"
+        except Exception as te:
+            outcome = f"TERMINATE FAILED ({te}); run `reap` or terminate it by hand"
+        rec["outcome"] = f"launcher error: {type(e).__name__}: {e}; {outcome}"
+        try:
+            ctx.save_launches()
+        except Exception as se:
+            print(f"attempt {attempt}: launches.json not saved: {se}")
+        raise SystemExit(f"attempt {attempt}: instance {iid} launched but not armed: {rec['outcome']}") from e
     return rec
 
 
@@ -789,7 +860,12 @@ def schedule_terminate(ctx, rec):
     account = ctx.aws.account()
     req = schedule_request(run_id=ctx.run_id, attempt=rec["n"], instance_id=rec["instanceId"], at=at,
                            role_arn=f"arn:aws:iam::{account}:role/{cfg['scheduler_role']}")
-    ctx.aws.client("scheduler", ctx.region).create_schedule(**req)
+    sch = ctx.aws.client("scheduler", ctx.region)
+    try:
+        sch.create_schedule(**req)
+    except client_error() as e:
+        if err_code(e) != "ConflictException":  # created by an earlier try whose answer was lost
+            raise
     rec["schedule"] = req["Name"]
     ctx.save_launches()
     print(f"attempt {rec['n']}: terminate schedule {req['Name']} at {iso(at)}")
@@ -829,6 +905,17 @@ def launch_with_retry(ctx, attempt, tries=10, wait=120):
             time.sleep(wait)
 
 
+def unrecorded_instances(ctx):
+    """Ids of instances tagged for this run, not yet terminated, that launches.json does not list."""
+    recorded = {r["instanceId"] for r in ctx.launches["attempts"]}
+    out = []
+    for i in tagged_instances(ctx.ec2, LIVE_STATES + ["shutting-down"]):
+        tags = {t["Key"]: t["Value"] for t in i.get("Tags", [])}
+        if tags.get("gmesh-run") == ctx.run_id and i["InstanceId"] not in recorded:
+            out.append(i["InstanceId"])
+    return out
+
+
 def watch(ctx):
     """Polls status.json and the instance every WATCH_EVERY seconds; relaunches per
     relaunch_decision; returns the final reason."""
@@ -837,7 +924,10 @@ def watch(ctx):
     while True:
         rec = ctx.last()
         n = rec["n"]
-        st, _ = instance_state(ctx.ec2, rec["instanceId"])
+        st, inst = instance_state(ctx.ec2, rec["instanceId"])
+        if st in (None, "terminated") and "endObserved" not in rec:
+            rec["endObserved"] = iso((termination_time(inst) if inst else None) or utcnow())
+            ctx.save_launches()
         expired = utcnow() >= parse_iso(rec["expires"])
         action, why = relaunch_decision(attempt_record(ctx, n), n, max_attempts, st, expired)
         if (action, why) != shown:
@@ -871,6 +961,20 @@ def wait_terminated(ctx, timeout=300):
         time.sleep(15)
 
 
+def attempt_end(rec, inst, status_rec):
+    """(end time, source) of an attempt's billing interval: EC2's termination time while
+    EC2 still lists the instance, else the time `watch` saw it gone, else the runner's
+    end in status.json, else now (the instance may still run)."""
+    t = termination_time(inst) if inst else None
+    if t is not None:
+        return t, "StateTransitionReason"
+    if rec.get("endObserved"):
+        return parse_iso(rec["endObserved"]), "watch"
+    if (status_rec or {}).get("end"):
+        return parse_iso(status_rec["end"]), "status"
+    return utcnow(), "now"
+
+
 def record_cost(ctx):
     """runs/<id>/cost.json: per attempt, instance hours x the spot price history of its
     type/AZ, plus root EBS GB-hours at the gp3 list price."""
@@ -879,10 +983,7 @@ def record_cost(ctx):
     for rec in ctx.launches["attempts"]:
         st, inst = instance_state(ctx.ec2, rec["instanceId"])
         start = parse_iso(rec["launchTime"])
-        end = termination_time(inst) if inst else None
-        end_source = "StateTransitionReason"
-        if end is None:
-            end, end_source = utcnow(), "observed"
+        end, end_source = attempt_end(rec, inst, attempt_record(ctx, rec["n"]))
         hist = ctx.ec2.describe_spot_price_history(InstanceTypes=[rec["instanceType"]],
                                                    AvailabilityZone=rec["az"], ProductDescriptions=["Linux/UNIX"],
                                                    StartTime=start, EndTime=end)["SpotPriceHistory"]
@@ -931,13 +1032,18 @@ def cmd_run(a, cfg):
         if m is None:
             raise SystemExit(f"run {a.resume}: no manifest in s3://{bucket}")
         ctx = Ctx(aws, cfg, m, bucket)
+        stray = unrecorded_instances(ctx)
+        if stray:
+            raise SystemExit(f"run {a.resume}: live instance(s) {', '.join(stray)} tagged for this run are not in "
+                             "launches.json; terminate them (or wait for them to end) before --resume")
         rec = ctx.last()
         if rec is None:
             launch_with_retry(ctx, 1)
     else:
         job = load_job(a.job, parse_set(a.set))
         region = a.region or cfg["default_region"]
-        types = a.instance_types.split(",") if a.instance_types else job.get("instance_types", cfg["instance_types"])
+        types = check_instance_types(a.instance_types.split(",") if a.instance_types
+                                 else job.get("instance_types", cfg["instance_types"]), cfg["instance_types"])
         run_id = run_id_of(job, utcnow(), a.tag)
         git_sha, code_key = upload_code(s3, bucket)
         env = upload_env(s3, bucket, REPO / job["requirements"])
@@ -968,7 +1074,8 @@ def dry_run(a, cfg):
         raise SystemExit("--dry-run needs a job file, not --resume")
     job = load_job(a.job, parse_set(a.set))
     region = a.region or cfg["default_region"]
-    types = a.instance_types.split(",") if a.instance_types else job.get("instance_types", cfg["instance_types"])
+    types = check_instance_types(a.instance_types.split(",") if a.instance_types
+                                 else job.get("instance_types", cfg["instance_types"]), cfg["instance_types"])
     now = utcnow()
     run_id = run_id_of(job, now, a.tag)
     bucket = bucket_name(cfg, "<account>")
@@ -1120,6 +1227,8 @@ def cmd_interrupt(a, cfg):
         raise SystemExit(f"run {a.run_id}: no manifest")
     ctx = Ctx(aws, cfg, m, bucket)
     rec = ctx.last()
+    if rec is None:
+        raise SystemExit(f"run {a.run_id}: no launched attempt")
     st, _ = instance_state(ctx.ec2, rec["instanceId"])
     if st != "running":
         raise SystemExit(f"attempt {rec['n']}: instance {rec['instanceId']} is {st}, not running")
@@ -1154,6 +1263,79 @@ def cmd_interrupt(a, cfg):
         fis.delete_experiment_template(id=tpl["id"])
 
 
+def gpu_instances_everywhere(aws):
+    """{region: [instance]} of the instances the kill-switch Lambda would terminate: GPU
+    families (is_gpu) in pending|running|stopping|stopped, in every enabled region."""
+    regions = [r["RegionName"] for r in aws.client("ec2", "us-east-1").describe_regions()["Regions"]]
+    out = {}
+    for region in sorted(regions):
+        found = []
+        for page in aws.client("ec2", region).get_paginator("describe_instances").paginate(
+                Filters=[{"Name": "instance-state-name", "Values": LIVE_STATES}]):
+            for r in page["Reservations"]:
+                found += [i for i in r["Instances"] if is_gpu(i["InstanceType"])]
+        if found:
+            out[region] = found
+    return out
+
+
+def kill_switch_problems(found, run_id):
+    """Why the kill-switch Lambda must not fire now, from {region: [instance]}. With no
+    run id (before launching the test instance) any GPU instance is a problem; with one,
+    exactly one running instance tagged for that run may exist."""
+    ours, problems = [], []
+    for region, insts in sorted(found.items()):
+        for i in insts:
+            tags = {t["Key"]: t["Value"] for t in i.get("Tags", [])}
+            desc = f"{region}: {i['InstanceId']} ({i['InstanceType']}, {i['State']['Name']}, run {tags.get('gmesh-run')})"
+            if (run_id is not None and tags.get(TAG) == "1" and tags.get("gmesh-run") == run_id
+                    and i["State"]["Name"] == "running"):
+                ours.append(desc)
+            else:
+                problems.append(f"other GPU instance {desc}")
+    if run_id is not None and len(ours) != 1:
+        problems.append(f"expected exactly one running instance of run {run_id}, found {len(ours)}")
+    return problems
+
+
+def budget_event(budget):
+    """A synthetic SNS budget notification, as the budget's topic delivers it to the Lambda."""
+    return {"Records": [{"EventSource": "aws:sns", "EventVersion": "1.0", "Sns": {
+        "Type": "Notification", "Timestamp": iso(utcnow()),
+        "Subject": f"AWS Budgets: {budget} has exceeded your alert threshold",
+        "Message": f"Synthetic budget notification for {budget} (gpu_train.py kill-switch-test)."}}]}
+
+
+def cmd_kill_switch_test(a, cfg):
+    """Without a run id: checks that no GPU instance runs anywhere (before launching the
+    test instance). With one: checks again that the run's instance is the only GPU
+    instance, invokes the kill-switch Lambda with a synthetic budget event, waits for
+    the termination, reaps the schedule and runs verify-clean."""
+    aws = Aws(a.profile)
+    problems = kill_switch_problems(gpu_instances_everywhere(aws), a.run_id)
+    for p in problems:
+        print(f"REFUSED: {p}")
+    if problems:
+        return 1
+    if a.run_id is None:
+        print("no GPU instance in any enabled region: launch the test instance, then kill-switch-test <run-id>")
+        return 0
+    ks = cfg["kill_switch"]
+    resp = aws.client("lambda", ks["region"]).invoke(FunctionName=ks["function"], InvocationType="RequestResponse",
+                                                     Payload=json.dumps(budget_event(ks["budget"])).encode())
+    body = resp["Payload"].read().decode()
+    print(f"lambda {ks['function']}: status {resp['StatusCode']} {resp.get('FunctionError', '')} {body}")
+    if resp.get("FunctionError"):
+        return 1
+    bucket = bucket_name(cfg, aws.account())
+    m = s3_get_json(aws.client("s3", cfg["bucket_region"]), bucket, f"runs/{a.run_id}/manifest.json")
+    if m is None:
+        raise SystemExit(f"run {a.run_id}: no manifest")
+    ok = wait_terminated(Ctx(aws, cfg, m, bucket))
+    reap(aws, cfg)
+    return 1 if cmd_verify_clean(a, cfg) or not ok else 0
+
+
 # --- CLI ----------------------------------------------------------------------------------------
 
 def parse(argv=None):
@@ -1180,6 +1362,9 @@ def parse(argv=None):
     sub.add_parser("reap", help="terminate expired tagged instances, delete leftover schedules")
     v = sub.add_parser("verify-clean", help="fail unless no training resource survives")
     v.add_argument("--wait", type=float, default=300, help="seconds to wait for shutting-down instances")
+    k = sub.add_parser("kill-switch-test", help="fire the budget kill-switch Lambda at the run's only GPU instance")
+    k.add_argument("run_id", nargs="?", help="omit to only check that no GPU instance runs anywhere")
+    k.add_argument("--wait", type=float, default=300, help="verify-clean: seconds for shutting-down instances")
     i = sub.add_parser("interrupt", help="test hook: interrupt the run's current instance")
     i.add_argument("run_id")
     g = i.add_mutually_exclusive_group(required=True)
@@ -1198,7 +1383,8 @@ def main(argv=None):
         reap(Aws(a.profile), cfg)
         return 0
     return {"setup": cmd_setup, "run": cmd_run, "status": cmd_status, "pull": cmd_pull,
-            "verify-clean": cmd_verify_clean, "interrupt": cmd_interrupt}[a.cmd](a, cfg)
+            "verify-clean": cmd_verify_clean, "interrupt": cmd_interrupt,
+            "kill-switch-test": cmd_kill_switch_test}[a.cmd](a, cfg)
 
 
 if __name__ == "__main__":

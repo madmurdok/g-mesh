@@ -15,15 +15,22 @@ BOOT_LOG=/var/log/gm457-boot.log
 
 exec > >(tee -a "$BOOT_LOG") 2>&1
 
-# Runs on every exit: success, failure, error or signal. Records a boot failure
-# when the runner never wrote status.json, uploads the boot log, powers off
-# (InstanceInitiatedShutdownBehavior=terminate turns that into a termination).
+# Runs on every exit: success, failure, error or signal. When the runner never
+# wrote status.json it records the boot outcome: a signal (spot reclaim, hard
+# terminate, OS shutdown) is "terminated", which the launcher may relaunch; any
+# other exit is "failed", which it does not. Then uploads the boot log and powers
+# off (InstanceInitiatedShutdownBehavior=terminate turns that into a termination).
 finish() {
   rc=$?
   set +e
   if [ ! -e "$MARKER" ]; then
-    printf '{"n": %s, "state": "failed", "reason": "boot-failed", "exit": %s, "end": "%s"}\n' \
-      "$ATTEMPT" "$rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/gm457-boot.json
+    if [ "$rc" -eq 143 ] || [ "$rc" -eq 130 ]; then
+      state=terminated reason=boot-signal
+    else
+      state=failed reason=boot-failed
+    fi
+    printf '{"n": %s, "state": "%s", "reason": "%s", "exit": %s, "end": "%s"}\n' \
+      "$ATTEMPT" "$state" "$reason" "$rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/gm457-boot.json
     aws --region "$REGION" s3 cp --only-show-errors /tmp/gm457-boot.json \
       "s3://$BUCKET/runs/$RUN_ID/status/attempt-$ATTEMPT.boot.json"
   fi

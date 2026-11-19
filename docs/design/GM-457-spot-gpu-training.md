@@ -166,7 +166,12 @@ differs; a second run prints "no changes"):
 - Role `gmesh-train-instance` + instance profile of the same name. Trust:
   `ec2.amazonaws.com`. Inline policy: `s3:GetObject` on `code/*`, `env/*`,
   `data/*`, `models/*`; `s3:GetObject`, `s3:PutObject` on `runs/*`;
-  `s3:ListBucket` with `s3:prefix` limited to `runs/` and `data/`. Nothing
+  `s3:GetObject`, `s3:PutObject` on `ckpt/*`; `s3:ListBucket` on the bucket
+  with no `s3:prefix` condition: S3 answers a read of a missing key with 404
+  only when the caller holds `s3:ListBucket`, and that implicit check carries
+  no prefix, so a prefix-conditioned grant turns every "absent" (first
+  attempt's `status.json`, first checkpoint) into 403. Listing exposes key
+  names only; the bucket holds nothing but this tool's objects. Nothing
   else: no EC2 API (termination is by OS shutdown), no IAM.
 - Role `gmesh-train-scheduler` for the cloud-side lifetime cap (D6). Trust:
   `scheduler.amazonaws.com`. Policy: `ec2:TerminateInstances` with condition
@@ -198,7 +203,10 @@ Instance side (`eval/gpu/runner.py`, stdlib only, started by user data):
 2. Every 30 s, if `--out/checkpoint.pt` changed (mtime + size), copy it to
    `ckpt/<id>/<step>/` (previous one rotated to `checkpoint.prev.pt`). The
    trainer replaces the file atomically, so an upload never reads a partial
-   file (an open handle keeps the old inode).
+   file (an open handle keeps the old inode). A failed upload during a step
+   (periodic checkpoint or log, or the checkpoint after a notice) is logged
+   and retried at the next tick; it never fails the attempt. The notice path
+   still ends `interrupted`, with the error in the attempt's `uploadError`.
 3. Before starting the job, download `ckpt/<id>/<step>/checkpoint.pt` into
    `--out` if present; the trainer's existing "resume if `checkpoint.pt`
    exists" path does the rest.
@@ -232,7 +240,15 @@ Laptop side (`gpu_train.py run/watch`): poll `status.json` and the instance
 state every 30 s (one background process, not an agent loop). On an
 `interrupted` attempt, or an instance that terminated with no status
 (hard kill, hung OS), launch attempt n+1 with the same run id, up to
-`max_attempts` (job file, default 5). On `failed` or `done`: no relaunch,
+`max_attempts` (job file, default 5). A signal during boot (before the
+runner wrote status) is recorded as `terminated` (`boot-signal`), not
+`failed`, so a spot reclaim or hard terminate while user data installs is
+relaunched like any no-status termination; other boot errors stay `failed`.
+Once `CreateFleet` returns an instance, the CLI records it in
+`launches.json` before describing it, retries the describe and the terminate
+schedule, and terminates the instance and exits if either still fails; `run
+--resume` refuses while an instance tagged for the run is alive but not in
+`launches.json`. On `failed` or `done`: no relaunch,
 pull `runs/<id>/out` and `logs` to
 `~/Projects/ClaudeProjects/g-mesh-data/gpu-runs/<run-id>/`, then verify
 termination (D6).
@@ -273,7 +289,13 @@ Kill switch verification without spending $50: invoke the existing Lambda
 with a synthetic SNS budget event (`aws lambda invoke`, payload shaped like
 the budget notification) while exactly one tagged test instance runs, then
 `verify-clean`. The Lambda terminates every GPU-family instance in all
-regions, so it runs only when no other GPU job is up (the CLI checks first).
+regions, so it runs only when no other GPU job is up (the CLI checks first):
+`gpu_train.py kill-switch-test` with no run id, before launching the test
+instance, refuses unless no GPU-family instance (the Lambda's own family
+list and states) exists in any enabled region; `kill-switch-test <run-id>`
+re-checks that the run's running instance is the only one, invokes the
+Lambda synchronously, waits for the termination, reaps the schedule and
+runs `verify-clean`.
 The budget itself is verified by read-back: `budgets describe-budget` and
 `describe-notifications-for-budget` show the 100% actual threshold and the
 SNS subscriber, `sns get-subscription-attributes` shows the Lambda

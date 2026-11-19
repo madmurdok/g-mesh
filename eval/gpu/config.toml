@@ -45,3 +45,10 @@ id = "ami-0b87420e2a817294d"
 name = "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20261113"
 root_device = "/dev/sda1"
 resolved = "2026-11-19"
+
+# The budget kill switch: SNS -> this Lambda terminates every GPU-family instance
+# in all enabled regions. kill-switch-test invokes it with a synthetic event.
+[kill_switch]
+function = "gpu-training-50-kill-gpu"
+region = "us-east-1"
+budget = "gpu-training-50"

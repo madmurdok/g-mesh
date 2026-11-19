@@ -26,16 +26,19 @@ end the run is pulled to `~/Projects/ClaudeProjects/g-mesh-data/gpu-runs/<run-id
 
 Options: `--set k=v` (a job key such as `max_minutes`, or a `[vars]` entry such
 as `mode`), `--region us-west-2` (when us-east-1 has no capacity),
-`--instance-types g5.xlarge`, `--tag k1` (two runs of one job within a minute),
+`--instance-types g5.xlarge` (the configured types, or G-family types of one
+family such as `g6.xlarge`; anything else is refused), `--tag k1` (two runs of one job within a minute),
 `--detach` (launch and exit; continue with `run --resume <run-id>`),
 `--dry-run` (print the manifest, launch template, fleet request, user data and
 terminate schedule; no AWS call).
 
 If the laptop slept or the watcher was stopped, nothing is lost:
-`uv run eval/gpu/gpu_train.py run --resume <run-id>`.
+`uv run eval/gpu/gpu_train.py run --resume <run-id>`. It refuses while an
+instance tagged for the run is alive but missing from `launches.json`.
 
 Other commands: `status <run-id>`, `pull <run-id>`, `reap`, `verify-clean`,
-`interrupt <run-id> --fis|--terminate` (test hook for the resume test).
+`interrupt <run-id> --fis|--terminate` (test hook for the resume test),
+`kill-switch-test [<run-id>]` (below).
 
 ## Setup (once per account)
 
@@ -80,6 +83,18 @@ up to 5 min for shutting-down), no spot request is open or active, no
 `gmesh-run` volume is available, and no `gmesh-*` schedule or tagged launch
 template is left.
 
+Kill-switch scenario (fires the real `gpu-training-50-kill-gpu` Lambda, which
+terminates every GPU-family instance in every enabled region):
+
+```
+uv run eval/gpu/gpu_train.py kill-switch-test            # no GPU instance anywhere, else refuses
+uv run eval/gpu/gpu_train.py run eval/gpu/jobs/smoke.toml --set mode=hang --detach
+uv run eval/gpu/gpu_train.py kill-switch-test <run-id>   # re-checks, invokes, waits, reaps, verify-clean
+```
+
+The second call invokes the Lambda (synthetic SNS budget event) only when the
+run's running instance is the only GPU-family instance in any enabled region.
+
 ## Job files
 
 `jobs/*.toml`: `name`, `requirements` (the hash-locked Linux lock),
@@ -99,7 +114,9 @@ resumably, anything else on failure (design D5, C1-C7).
 ## Cost
 
 `cost.json` (in `runs/<run-id>/` and pulled locally): per attempt the instance
-hours (launch to the termination time EC2 reports), the spot price history of
+hours (launch to the termination time EC2 reports; once EC2 no longer lists
+the instance, the time `run` saw it gone, else the runner's end in
+`status.json`), the spot price history of
 its type and AZ over that interval, and root EBS GB-hours at the gp3 list
 price. Cross-check a day's total 24-48 h later with Cost Explorer:
 
