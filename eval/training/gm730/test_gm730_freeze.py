@@ -9,7 +9,9 @@ import hashlib
 import json
 import sys
 import tempfile
+import tomllib
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -223,6 +225,65 @@ class FinalJob(unittest.TestCase):
         self.assertEqual(text.count("--eta-limit-minutes"), n)
         self.assertIn(f'"--job-steps", "{n}"', text)
         self.assertIn('"--job-steps", "1"', text)
+
+
+class Families(unittest.TestCase):
+    """GPU family fallback: per-family jobs pinned by instance_types, g5 unchanged."""
+    JOBS = Path(__file__).resolve().parents[2] / "gpu" / "jobs"
+    FACTOR = {"g6e": 0.6, "g6": 1.6}
+    # g5 max_minutes and --eta-limit-minutes of the committed g5 jobs, scaled by hand below
+    G5 = {"rr-grid": (190, 170), "rr-teacher": (60, 48)}
+
+    def render(self, job, family):
+        return MJ.grid_job("rr", family=family) if job == "rr-grid" else MJ.teacher_job(family=family)
+
+    def test_g5_jobs_are_byte_identical_to_the_committed_ones(self):
+        cases = [("gm730-rr-teacher.toml", MJ.teacher_job())] + [
+            (f"gm730-{r}-grid.toml", MJ.grid_job(r)) for r in MJ.ROUTES]
+        for name, text in cases:
+            self.assertEqual(text, (self.JOBS / name).read_text(), name)
+            self.assertNotIn("instance_types", text)
+
+    def test_fallback_job_is_named_and_pinned_to_its_family(self):
+        for fam in ("g6e", "g6"):
+            j = tomllib.loads(self.render("rr-grid", fam))
+            self.assertEqual(j["name"], f"gm730-rr-grid-{fam}")
+            self.assertEqual(j["instance_types"], [f"{fam}.xlarge", f"{fam}.2xlarge"])
+        self.assertEqual(MJ.job_name("rr-grid", False, "g6e"), "rr-grid-nt-g6e")
+        self.assertEqual(MJ.job_name("rr-grid", True, "g5"), "rr-grid")
+
+    def test_max_minutes_is_the_g5_value_scaled_and_rounded_up(self):
+        self.assertEqual(tomllib.loads(self.render("rr-grid", "g6e"))["max_minutes"], 114)  # 190 x 0.6
+        self.assertEqual(tomllib.loads(self.render("rr-grid", "g6"))["max_minutes"], 304)  # 190 x 1.6
+        self.assertEqual(tomllib.loads(self.render("rr-teacher", "g6e"))["max_minutes"], 36)  # 60 x 0.6
+        self.assertEqual(tomllib.loads(self.render("rr-grid", "g5"))["max_minutes"], 190)
+        self.assertEqual(MJ.scaled(11, "g6e"), 7)  # 6.6 rounds up
+
+    def test_float_noise_does_not_round_an_exact_product_up(self):
+        # 50 x 1.1 is 55.00000000000001 in floating point: 55 minutes, not 56 (no committed
+        # factor/limit pair hits this today, so a stand-in family pins the rounding)
+        self.assertGreater(50 * 1.1, 55)
+        fam = {"instance_types": ["gx.xlarge"], "time_factor": 1.1}
+        with mock.patch.dict(MJ.FAMILIES, {"gx": fam}):
+            self.assertEqual(MJ.scaled(50, "gx"), 55)
+            self.assertEqual(MJ.scaled(11, "gx"), 13)  # 12.1 still rounds up
+
+    def test_every_step_carries_the_scaled_eta_limit(self):
+        for fam, want in (("g6e", "102"), ("g6", "272"), ("g5", "170")):  # 170 x factor
+            steps = tomllib.loads(self.render("rr-grid", fam))["steps"]
+            self.assertEqual(len(steps), len(MJ.grid("rr")))
+            for st in steps:
+                args = st["args"]
+                self.assertEqual(args[args.index("--eta-limit-minutes") + 1], want, (fam, st["name"]))
+
+    def test_cli_family_writes_a_family_file_and_leaves_the_g5_file_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            MJ.main(["grid", "--route", "gte", "--out-dir", d])
+            MJ.main(["grid", "--route", "gte", "--family", "g6e", "--out-dir", d])
+            MJ.main(["grid", "--route", "gte", "--no-teacher", "--family", "g6", "--out-dir", d])
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()),
+                             ["gm730-gte-grid-g6e.toml", "gm730-gte-grid-nt-g6.toml", "gm730-gte-grid.toml"])
+            self.assertNotIn("instance_types", (Path(d) / "gm730-gte-grid.toml").read_text())
 
 
 if __name__ == "__main__":

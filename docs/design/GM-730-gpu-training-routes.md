@@ -303,6 +303,25 @@ the job (exit 76) when its job-level ETA passes `--eta-limit-minutes`.
 Worst cases at $0.70/h plus EBS: RR $3.73 (cap $4), J $5.57 (cap $8),
 R3 $2.02 (cap $3).
 
+**GPU family fallback (g5 -> g6e -> g6, owner 2026-11-19).** When g5 spot
+capacity is short, a job runs on g6e (L40S 48 GB) and then g6 (L4 24 GB),
+one family per run, xlarge/2xlarge only (8 vCPU G/VT quota). `make_jobs.py
+--family g6e|g6` writes `gm730-<job>-<family>.toml`, pinned by
+`instance_types` to that family, with `max_minutes` and
+`--eta-limit-minutes` = the g5 values x the family's time factor, rounded
+up: g6e 0.6 (~1.7x an A10G), g6 1.6 (~0.6x). `run_measure.sh` writes and
+checks every family's TOMLs; the g5 TOMLs are unchanged. `budget.py` prices
+a job's worst case by the family of its `instance_types` (config.toml's,
+g5, when absent) at planning prices that are the upper end of the spot
+prices seen on 2026-11-19, rounded up: g5 $0.75 (seen 0.60-0.73), g6e
+$2.00 (1.1-2.0), g6 $0.70 (0.42-0.68). Launch a fallback TOML without
+`--instance-types`, so the launch and the check see the same family; the
+manifest records `instanceTypes`. Worst cases with no prior spend: RR-A
+g5 $2.72, g6e $4.66 (over the $4 RR cap: refused), g6 $3.90; J-A g5 $3.36,
+g6e $5.66, g6 $4.84; RR-T and R3-A g5 $1.08, g6e $2.04, g6 $1.43. The
+five attempts' boot minutes (25 min) do not scale, so g6e's price dominates
+its short jobs.
+
 ## 6. Route order and stop rules
 
 Order (D1a): **RR -> J -> R3**. RR first: cheapest, strongest prior

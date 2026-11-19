@@ -1,0 +1,37 @@
+# GM-730 job RR-T: gte-mb fp32 logits for every train and dev window pair,
+# plus the C-T parity pairs (written by make_jobs.py).
+# On g6e (g6e.xlarge, g6e.2xlarge): max_minutes and --eta-limit-minutes are the g5
+# values x 0.6, rounded up.
+name = "gm730-rr-teacher-g6e"
+requirements = "eval/training/gm730/requirements-linux-cu121.txt"
+smoke = true
+max_minutes = 36
+max_minutes_scope = "job"
+checkpoint_minutes = 10
+grace_seconds = 30
+max_attempts = 5
+instance_types = ["g6e.xlarge", "g6e.2xlarge"]
+
+[[steps]]
+name = "teacher"
+entry = "eval/training/gm730/score_teacher.py"
+args = ["--seed", "730", "--job-steps", "1", "--eta-limit-minutes", "29"]
+device = "cuda"
+
+[[data]]
+name = "gm730-windows"
+env = "GM730_WINDOWS"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/windows"
+include = ["train/*", "dev/*"]
+
+[[data]]
+name = "gm730-ct-pairs"
+env = "GM730_CT"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/ct"
+include = ["*"]
+
+[[data]]
+name = "gm730-hf-gte-mb"
+env = "GM730_HF"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/hf"
+include = ["gte-reranker-modernbert-base@f7481e6055501a30fb19d090657df9ec1f79ab2c/*"]
