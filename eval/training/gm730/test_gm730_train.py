@@ -407,5 +407,109 @@ class Teacher(TinyWorld):
             self.assertEqual((r["query"], r["text"]), pairs[r["pair"]])
 
 
+    # --- GM-730/S26: non-finite teacher logits (CUDA sdpa NaN on fully masked rows) ---
+
+    def nan_scorer(self, bad, calls, when=lambda pairs: True):
+        """A scorer wrapping the real one; call number i in `bad` (and when(pairs)) gets a NaN at position 0."""
+        real = ST.scorer
+
+        def make(model, tok, device, batch):
+            inner = real(model, tok, device, batch)
+
+            def f(pairs):
+                out = inner(pairs)
+                calls.append(len(pairs))
+                if when(pairs) and (len(calls) - 1) in bad:
+                    out = out.copy()
+                    out[0] = np.nan
+                return out
+            return f
+        return mock.patch.object(ST, "scorer", make)
+
+    def written(self, out):
+        return sorted(p.name for p in Path(out).glob("*") if p.name.endswith((".f32", ".json")))
+
+    def test_a_nan_chunk_stops_the_job_naming_the_pair_and_writes_no_output(self):
+        self.make_ct()
+        out = self.out("nan")
+        calls = []
+        with self.nan_scorer({1}, calls), self.assertRaises(SystemExit) as cm:
+            self.score(out)
+        msg = str(cm.exception.code)
+        self.assertTrue(msg.startswith("non-finite teacher logits: "), msg)
+        self.assertIn("(first at pair 40)", msg)  # chunk 1 of 40 pairs, NaN at its position 0
+        self.assertEqual(self.written(out), [])
+
+    def test_the_first_bad_chunk_stops_the_run_before_the_next_chunk_is_scored(self):
+        self.make_ct()
+        calls = []
+        with self.nan_scorer({0}, calls), self.assertRaises(SystemExit):
+            self.score(self.out("ff"))
+        self.assertEqual(len(calls), 1)
+
+    def test_a_resumed_checkpoint_holding_nan_is_refused_before_any_output(self):
+        self.make_ct()
+        out = self.out("old")
+        calls = []
+        # an older run without the per-chunk guard: NaN gets into the checkpoint
+        with self.nan_scorer({0}, calls), mock.patch.object(ST, "require_finite", lambda what, x, offset=0: x), \
+                self.assertRaises(SystemExit) as cm:
+            self.score(out, "--stop-after-steps", "2")
+        self.assertEqual(cm.exception.code, STOP)
+        with self.assertRaises(SystemExit) as cm:
+            self.score(out)
+        self.assertTrue(str(cm.exception.code).startswith("non-finite teacher logits: "), cm.exception.code)
+        self.assertEqual(self.written(out), [])
+
+    def test_c_t_scoring_a_nan_fails_the_job_instead_of_reporting_a_nan_diff(self):
+        rows = self.make_ct()
+        ct_pairs = {(r["query"], r["text"]) for r in rows}
+        out = self.out("ctnan")
+        calls = []
+        with self.nan_scorer(set(range(1000)), calls, when=lambda pairs: set(pairs) == ct_pairs), \
+                self.assertRaises(SystemExit) as cm:
+            self.score(out)
+        self.assertTrue(str(cm.exception.code).startswith("non-finite teacher logits: C-T pairs"), cm.exception.code)
+        self.assertFalse((out / "ct.json").exists())
+        self.assertFalse((out / "teacher.json").exists())
+
+    def test_make_ct_refuses_to_write_a_non_finite_reference_logit(self):
+        ct = self.out("ctref")
+        calls = []
+        with self.nan_scorer({0}, calls), self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(io.StringIO()):
+            ST.main(["make-ct", "--out-dir", str(ct), "--n", "10", "--seed", "3", "--threads", "1"])
+        self.assertTrue(str(cm.exception.code).startswith("non-finite teacher logits: make-ct pairs"), cm.exception.code)
+        self.assertFalse((ct / ST.CT_FILE).exists())
+
+
+class TeacherModel(TinyWorld):
+    def test_the_teacher_loads_with_eager_attention_and_stays_finite_on_over_padded_rows(self):
+        cfg = transformers.ModernBertConfig(vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+                                            num_attention_heads=2, local_attention=4, global_attn_every_n_layers=2,
+                                            max_position_embeddings=64, pad_token_id=0, num_labels=1)
+        snap = self.root / "modernbert"
+        torch.manual_seed(0)
+        transformers.ModernBertForSequenceClassification(cfg).save_pretrained(snap)
+        with mock.patch.object(L.S, "path_of", lambda name: snap):
+            model = ST.load_model(torch.device("cpu"))
+        self.assertEqual(model.config._attn_implementation, "eager")
+        # CPU sdpa does not NaN; emulate the CUDA memory-efficient kernel on all-masked rows (pytorch#110213)
+        real = torch.nn.functional.scaled_dot_product_attention
+
+        def cuda_like(q, k, v, attn_mask=None, **kw):
+            out = real(q, k, v, attn_mask=attn_mask, **kw)
+            if attn_mask is not None:
+                dead = (attn_mask <= torch.finfo(attn_mask.dtype).min).all(-1, keepdim=True).expand_as(out)
+                out = out.masked_fill(dead, float("nan"))
+            return out
+
+        ids = torch.randint(1, 64, (2, 24))
+        mask = torch.ones(2, 24, dtype=torch.long)
+        mask[1, 6:] = 0  # 18 padding positions > local_attention // 2 == 2 past the last real token
+        with mock.patch.object(torch.nn.functional, "scaled_dot_product_attention", cuda_like), torch.no_grad():
+            logits = model(input_ids=ids, attention_mask=mask).logits
+        self.assertTrue(bool(torch.isfinite(logits).all()), logits)
+
+
 if __name__ == "__main__":
     unittest.main()
