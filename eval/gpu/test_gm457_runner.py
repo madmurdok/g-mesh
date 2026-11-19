@@ -403,12 +403,9 @@ class Outcomes(RunnerCase):
         self.assert_finished("terminated", "runner-signal")
         self.assertTrue(pid_gone(job_pid), "job still running after the runner stopped")
 
-    @unittest.expectedFailure
     def test_runner_sigterm_during_imds_poll_is_terminated(self):
-        """A3 with the signal landing inside an IMDS request. FINDING (GM-457/S14):
-        RunnerSignal subclasses Exception, so run_step's `except Exception` around the
-        IMDS poll (and try_upload's) swallows it as "imds poll: SIGTERM"; the job keeps
-        running and no terminated status is written."""
+        """A3 with the signal landing inside an IMDS request: the `except Exception`
+        around the IMDS poll must not swallow it."""
         self.manifest([self.step("gpu", "sleep")])
         self.start(poll=0.05, upload_every=1000, log_every=1000)
         self.wait_file(self.ctl / "started-gpu")

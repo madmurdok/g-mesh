@@ -333,13 +333,9 @@ class JobsAndIds(unittest.TestCase):
         with self.assertRaises(SystemExit):
             G.data_manifest(self.root / "d", ["nothing/*"])
 
-    @(unittest.expectedFailure if sys.version_info < (3, 13) else (lambda f: f))
     def test_trailing_double_star_recurses(self):
-        """The docstring's "`**` recurses", as jobs/gm436-*.toml use it ("mine/**").
-        FINDING (GM-457/S14): before Python 3.13 a pattern ending in `**` matches
-        directories only, so data_manifest finds no file and exits; gpu_train.py
-        declares requires-python >= 3.11 (uv picks the newest installed, so it
-        works where 3.13+ is present)."""
+        """The docstring's "`**` recurses", as jobs/gm436-*.toml use it ("mine/**"),
+        on every supported Python (before 3.13 a trailing `**` matches directories only)."""
         (self.root / "d" / "sub" / "deep").mkdir(parents=True)
         (self.root / "d" / "sub" / "deep" / "c.txt").write_text("c")
         m = G.data_manifest(self.root / "d", ["sub/**"])

@@ -167,7 +167,12 @@ def data_manifest(root, include):
     root = Path(os.path.expanduser(root))
     files = {}
     for pattern in include:
-        hits = [p for p in root.glob(pattern) if p.is_file()]
+        # A trailing `**` matches directories only before Python 3.13; `**/*` matches
+        # every file below on all versions.
+        glob = pattern.rstrip("/")
+        if glob.split("/")[-1] == "**":
+            glob += "/*"
+        hits = [p for p in root.glob(glob) if p.is_file()]
         if not hits:
             raise SystemExit(f"data: {root}/{pattern} matches no file")
         for p in hits:

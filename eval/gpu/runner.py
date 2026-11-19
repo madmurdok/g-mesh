@@ -72,8 +72,10 @@ print(f"smoke: forward ok on {device}, shape {tuple(h.shape)}, abs sum {float(h.
 '''
 
 
-class RunnerSignal(Exception):
-    """The runner itself got SIGTERM/SIGINT (OS shutdown, in-OS lifetime)."""
+class RunnerSignal(BaseException):
+    """The runner itself got SIGTERM/SIGINT (OS shutdown, in-OS lifetime). A
+    BaseException, so the `except Exception` guards around IMDS polls and uploads
+    never swallow it."""
 
 
 class StepFailure(Exception):
