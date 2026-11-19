@@ -42,10 +42,23 @@ CT_FILE = "ct_pairs.jsonl"
 def load_model(device):
     import torch
     from transformers import AutoModelForSequenceClassification
-    # reference_compile=False: ModernBERT would otherwise torch.compile itself on CUDA
+    # reference_compile=False: ModernBERT would otherwise torch.compile itself on CUDA.
+    # eager attention: with sdpa, a padding position more than local_attention/2 tokens past
+    # the last real token has a sliding-window mask row that is all finfo.min; the CUDA
+    # memory-efficient kernel returns NaN for such rows (pytorch#110213) and the mean pooling
+    # (NaN * mask 0) turns that into a NaN logit. Eager adds the mask and softmaxes, finite.
     m = AutoModelForSequenceClassification.from_pretrained(str(L.S.path_of(SNAPSHOT)), torch_dtype=torch.float32,
-                                                           reference_compile=False)
+                                                           reference_compile=False, attn_implementation="eager")
     return m.to(device).eval()
+
+
+def require_finite(what, logits, offset=0):
+    """Stop the job on any NaN/inf teacher logit, so none reaches the outputs or C-T."""
+    bad = np.flatnonzero(~np.isfinite(logits))
+    if len(bad):
+        raise SystemExit(f"non-finite teacher logits: {what}: {len(bad)} of {len(logits)} "
+                         f"(first at pair {offset + int(bad[0])})")
+    return logits
 
 
 def scorer(model, tok, device, batch):
@@ -72,7 +85,7 @@ def ct_check(score, root):
     """C-T on $GM730_CT/ct_pairs.jsonl."""
     p = Path(root) / CT_FILE
     rows = L.read_jsonl(p)
-    got = score([(r["query"], r["text"]) for r in rows])
+    got = require_finite("C-T pairs", score([(r["query"], r["text"]) for r in rows]))
     ref = np.array([r["logit"] for r in rows], np.float64)
     d = float(np.abs(got.astype(np.float64) - ref).max()) if rows else float("nan")
     return {"check": "C-T", "file": str(p), "sha256": L.S.sha256_file(p), "n": len(rows), "maxAbsDiff": d,
@@ -110,7 +123,8 @@ def score_main(a):
             while st["done"][split] < len(pairs):
                 s = st["done"][split]
                 part = pairs[s:s + a.chunk]
-                st["scores"][split] = np.concatenate([st["scores"][split], score(part)])
+                got = require_finite(split, score(part), s)
+                st["scores"][split] = np.concatenate([st["scores"][split], got])
                 st["done"][split] = s + len(part)
                 st["chunks"] += 1
                 probe.tick(st["chunks"])
@@ -123,6 +137,8 @@ def score_main(a):
             "determinism": L.determinism_note(a),
             "timing": {"seconds": st["seconds"], "pairs": total,
                        "pairsPerSecond": total / st["seconds"] if st["seconds"] else None}}
+    for split in SPLITS:  # a resumed checkpoint may predate the per-chunk check
+        require_finite(split, st["scores"][split])
     for split in SPLITS:
         windows, pairs = data[split]
         arr = np.asarray(st["scores"][split], "<f4")
@@ -158,7 +174,7 @@ def make_ct(a):
     score = scorer(load_model(torch.device("cpu")), L.tokenizer(L.S.path_of(SNAPSHOT), MAX_LEN), torch.device("cpu"), a.batch)
     chosen = [pairs[i] for i in pick]
     t = time.monotonic()
-    logits = score(chosen)
+    logits = require_finite("make-ct pairs", score(chosen))
     dt = time.monotonic() - t
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
