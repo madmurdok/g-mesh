@@ -216,5 +216,122 @@ class S5AndCp2(EvalChecksCase):
         self.assertEqual(run_main(["cp2", "--export", str(odd)])[0], 1)
 
 
+class V2Runs(EvalChecksCase):
+    """Fake v2 run dirs: runs/<arm>/<corpus>/{manifest.json, rankings.jsonl} over authored
+    positive queries of one corpus (the `nl` stratum), as recall_at_k.load_arm reads them."""
+
+    N = 40
+
+    def setUp(self):
+        super().setUp()
+        self.eval = self.root / "eval"
+        (self.eval / "queries").mkdir(parents=True)
+        rows = "".join(json.dumps({"id": f"q{i}", "kind": "positive", "corpus": "c", "language": "rust"}) + "\n"
+                       for i in range(self.N))
+        (self.eval / "queries" / "c.jsonl").write_text(rows)
+        sha = __import__("hashlib").sha256(rows.encode()).hexdigest()
+        self.manifest = {"corpus": "c", "queryFiles": [["queries/c.jsonl", sha]]}
+        self.runs = self.root / "runs"
+
+    def arm(self, name, rank=lambda i: 1, order=lambda i: 0, queries=None):
+        """rank(i): 1-based rank of query i's expected hit; order(i): a rotation of the other hits."""
+        d = self.runs / name / "c"
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps(self.manifest))
+        lines = []
+        for i in range(self.N) if queries is None else queries:
+            r = rank(i)
+            others = [f"x{(j + order(i)) % 10}" for j in range(11)]
+            hits = others[:r - 1] + ["want"] + others[r - 1:]
+            lines.append(json.dumps({"id": f"q{i}", "hits": [[h, 1.0] for h in hits], "expected": ["want"]}))
+        (d / "rankings.jsonl").write_text("\n".join(lines) + "\n")
+
+    def check(self, cmd, arm, other):
+        return run_main([cmd, "--runs", str(self.runs), "--eval-dir", str(self.eval), "--arm", arm,
+                         "--official" if cmd == "cr2" else "--base", other])
+
+
+class CsRule(V2Runs):
+    def test_a_shuffled_arm_that_beats_its_base_fails(self):
+        self.arm("shuf", rank=lambda i: 1)
+        self.arm("base", rank=lambda i: 5)
+        code, out = self.check("cs", "shuf", "base")
+        self.assertEqual(code, 1)
+        self.assertIn("C-S MRR: FAILED", out)
+        self.assertIn("C-S r@10: pass", out)  # both reach r@10 = 1
+        self.assertIn("FAILED: cs", out)
+
+    def test_a_shuffled_arm_that_beats_the_base_in_recall_fails_that_metric(self):
+        self.arm("shuf", rank=lambda i: 3)
+        self.arm("base", rank=lambda i: 20)
+        code, out = self.check("cs", "shuf", "base")
+        self.assertEqual(code, 1)
+        self.assertIn("C-S r@10: FAILED", out)
+
+    def test_an_equal_or_worse_arm_passes(self):
+        self.arm("same", rank=lambda i: 2)
+        self.arm("base", rank=lambda i: 2)
+        self.arm("worse", rank=lambda i: 9)
+        self.assertEqual(self.check("cs", "same", "base")[0], 0)
+        code, out = self.check("cs", "worse", "base")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("FAILED", out)
+
+    def test_arms_over_different_queries_fail(self):
+        self.arm("shuf", queries=range(self.N - 1))
+        self.arm("base")
+        code, out = self.check("cs", "shuf", "base")
+        self.assertEqual(code, 1)
+        self.assertIn("different queries", out)
+
+
+class Cr2Rule(V2Runs):
+    def test_an_identical_requant_passes_all_three_rules(self):
+        self.arm("ours")
+        self.arm("official")
+        code, out = self.check("cr2", "ours", "official")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count(": pass"), 3)
+
+    def test_metrics_outside_the_tolerance_fail(self):
+        self.arm("ours", rank=lambda i: 2)
+        self.arm("official", rank=lambda i: 1)
+        code, out = self.check("cr2", "ours", "official")
+        self.assertEqual(code, 1)
+        self.assertIn("C-R2 MRR: FAILED", out)
+        self.assertIn("FAILED: cr2", out)
+
+    def test_one_query_moving_from_rank_1_to_2_exceeds_the_mrr_tolerance(self):
+        # |d MRR| = 0.5 / 40 = 0.0125 > 0.002
+        self.arm("ours", rank=lambda i: 2 if i == 0 else 1)
+        self.arm("official")
+        self.assertIn("C-R2 MRR: FAILED", self.check("cr2", "ours", "official")[1])
+
+    def test_equal_metrics_but_other_top_10_lists_fail_the_top_10_rule(self):
+        self.arm("ours", order=lambda i: 3)
+        self.arm("official", order=lambda i: 0)
+        code, out = self.check("cr2", "ours", "official")
+        self.assertEqual(code, 1)
+        self.assertIn("C-R2 r@10: pass", out)
+        self.assertIn("C-R2 MRR: pass", out)
+        self.assertIn("C-R2 top-10: FAILED", out)
+
+    def test_top_10_may_differ_on_one_percent_of_the_queries(self):
+        self.N = 100
+        self.setUp()
+        self.arm("ours", order=lambda i: 3 if i == 0 else 0)
+        self.arm("official")
+        code, out = self.check("cr2", "ours", "official")
+        self.assertEqual(code, 0, out)
+        self.assertIn("C-R2 top-10: pass", out)
+
+    def test_different_query_sets_fail(self):
+        self.arm("ours", queries=range(self.N - 1))
+        self.arm("official")
+        code, out = self.check("cr2", "ours", "official")
+        self.assertEqual(code, 1)
+        self.assertIn("query sets differ", out)
+
+
 if __name__ == "__main__":
     unittest.main()
