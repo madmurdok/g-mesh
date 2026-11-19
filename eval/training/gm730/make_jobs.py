@@ -43,7 +43,7 @@ COMMON = {
     "gte": ["--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8",
             "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", SEED],
 }
-LORA_TARGETS = "query,key,value,dense"
+LORA_TARGETS = "query,key,value,dense,up_gated_layer,down_layer"  # the six Linear names of JinaBert (M9)
 CONTROL = {"rr": "shuffled-teacher", "jina": "shuffled", "gte": "shuffled"}
 SNAPSHOT = {"rr-teacher": "gte-mb", "rr": "l6", "jina": "jina", "gte": "gte-small"}
 D = "~/Projects/ClaudeProjects/g-mesh-data"
