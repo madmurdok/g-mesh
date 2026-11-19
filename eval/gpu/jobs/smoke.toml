@@ -1,0 +1,24 @@
+# End-to-end check of the launcher and the terminate layers. No data.
+#   mode = ok    two "epochs" with a checkpoint each, result.json, exit 0
+#   mode = fail  exit 1 after the first checkpoint (failure exit path)
+#   mode = hang  sleeps past any lifetime (in-OS / scheduler lifetime scenarios)
+# e.g. uv run eval/gpu/gpu_train.py run eval/gpu/jobs/smoke.toml --set mode=hang --set max_minutes=10
+name = "smoke"
+requirements = "eval/training/gm436/requirements-linux-cu121.txt"
+smoke = true
+max_minutes = 20
+checkpoint_minutes = 10
+grace_seconds = 60
+max_attempts = 2
+# true leaves only the cloud-side schedule (and the reaper) to stop the instance
+disable_os_lifetime = false
+
+[vars]
+mode = "ok"
+seconds = "30"
+
+[[steps]]
+name = "smoke"
+entry = "eval/gpu/smoke_job.py"
+args = ["--mode", "{mode}", "--seconds", "{seconds}"]
+device = "cuda"

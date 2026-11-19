@@ -1,0 +1,41 @@
+# GM-436 adapter, R1 full form on gte-small-structured, long enough to interrupt
+# (no early stop; ~0.6 s per epoch on an A10G, so ~4 min of epochs). Arms U,
+# K1 (FIS spot notice) and K2 (hard terminate) are three runs of this job on one
+# instance type:
+#   uv run eval/gpu/gpu_train.py run eval/gpu/jobs/gm436-resume.toml --instance-types g5.xlarge --tag u
+name = "gm436-resume"
+requirements = "eval/training/gm436/requirements-linux-cu121.txt"
+smoke = true
+max_minutes = 60
+checkpoint_minutes = 10
+grace_seconds = 60
+max_attempts = 5
+
+[[steps]]
+name = "gpu"
+entry = "eval/training/gm436/train_adapter.py"
+args = ["--base", "gte-small-structured", "--route", "r1", "--form", "full", "--fraction", "1.0",
+        "--epochs", "400", "--patience", "400", "--batch", "512", "--lr", "1e-3", "--lam", "0.001",
+        "--tau", "0.05", "--no-train-metric", "--threads", "2"]
+device = "cuda"
+
+[[data]]
+name = "gm456-v0.4-full-adapter-gte-small"
+env = "GM456_DATA"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm456"
+include = [
+  "v0.4-full/queries.jsonl",
+  "v0.4-full/manifest.json",
+  "v0.4-full/targets.jsonl",
+  "v0.4-full/mine/**",
+  "v0.4-full/nodes/**",
+  "v0.4-full/texts/**",
+  "work/runs/gte-small-structured/*/manifest.json",
+  "work/runs/gte-small-structured/*/node_ids.txt",
+]
+
+[[data]]
+name = "gm436-cache-gte-small"
+env = "GM436_DATA"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm436"
+include = ["cache/vec/gte-small-structured@*/**"]
