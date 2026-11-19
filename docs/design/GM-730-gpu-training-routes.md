@@ -276,7 +276,7 @@ that prints s/step and the ETA (stop rule S2).
 | route | job | content | est. instance-h | est. $ | `max_minutes` |
 |---|---|---|---|---|---|
 | RR | RR-T | gte-mb on ~714k window pairs + 1,000 parity pairs | 0.4 | 0.3 | 60 |
-| RR | RR-A | 8 configs x <= 2 epochs + epoch-0 base | 0.8 | 0.6 | 120 |
+| RR | RR-A | 8 configs x <= 2 epochs + epoch-0 base | 0.8 (measured bf16: 2.6) | 0.6 (2.3) | 190 (ETA limit 170, owner 2026-11-19) |
 | RR | RR-B | final + shuffled + export + quint8 + parity | 0.4 | 0.3 | 60 |
 | RR | **route cap** | | 1.6 | 1.2 | **$4** |
 | J | J-A | 8 configs (4 full, 4 LoRA) x <= 2 epochs | 1.8 | 1.3 | 240 |

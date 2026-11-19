@@ -38,10 +38,11 @@ SEED = "730"
 CHECKPOINT_MINUTES = 10
 GRACE_SECONDS = 30
 MAX_ATTEMPTS = 5
-MAX_MINUTES = {"rr-teacher": 60, "rr-grid": 120, "rr-final": 60, "jina-grid": 240, "jina-final": 180,
+MAX_MINUTES = {"rr-teacher": 60, "rr-grid": 190, "rr-final": 60, "jina-grid": 240, "jina-final": 180,
                "gte-grid": 60, "gte-final": 60}
-# S2: 2x the section 5 estimate (instance-hours) of each job, in minutes
-ETA_LIMIT_MINUTES = {"rr-teacher": 48, "rr-grid": 96, "rr-final": 48, "jina-grid": 216, "jina-final": 180,
+# S2: 2x the section 5 estimate (instance-hours) of each job, in minutes; rr-grid is
+# the measured bf16 job ETA (156 min) plus margin
+ETA_LIMIT_MINUTES = {"rr-teacher": 48, "rr-grid": 170, "rr-final": 48, "jina-grid": 216, "jina-final": 180,
                      "gte-grid": 60, "gte-final": 48}
 NO_TEACHER_SUFFIX = "-nt"
 ROUTES = ("rr", "jina", "gte")
