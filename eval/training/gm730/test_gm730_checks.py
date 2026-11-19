@@ -75,14 +75,14 @@ class Refusals(BudgetCase):
         self.assertEqual(B.REFUSED, 3)
 
     def test_route_cap(self):
-        self.spend("gm730-rr-teacher-1", 4.0 - worst(120) + 0.01)
+        self.spend("gm730-rr-teacher-1", B.ROUTE_CAP["rr"] - worst(120) + 0.01)
         problems, _ = self.check(self.job("gm730-rr-grid"))
         self.assertEqual(len(problems), 1)
         self.assertIn("route rr", problems[0])
         self.assertEqual(self.main(self.job("gm730-rr-grid"))[0], 3)
 
     def test_route_cap_is_met_exactly(self):
-        self.spend("gm730-rr-teacher-1", 4.0 - worst(120))
+        self.spend("gm730-rr-teacher-1", B.ROUTE_CAP["rr"] - worst(120))
         self.assertEqual(self.check(self.job("gm730-rr-grid"))[0], [])
 
     def test_total_cap_refuses_a_job_even_when_its_route_is_within_its_own(self):
