@@ -228,6 +228,27 @@ class CostsScript(unittest.TestCase):
         self.assertNotIn("quality cand", self.log)
 
 
+class CostsModelDir(unittest.TestCase):
+    """measure_summary sizes the model a variant's model_dir names, not work/models/<name>."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO / "eval" / "embedding"))
+        import measure_summary
+        self.M = measure_summary
+
+    def test_absolute_model_dir_from_variants(self):
+        want = os.path.expanduser("~/Projects/ClaudeProjects/g-mesh-data/gm703/models/coderankembed-fp32")
+        self.assertEqual(self.M.model_dir("coderankembed-fp32-structured", "ref"), want)
+
+    def test_relative_model_dir_is_under_eval_embedding(self):
+        self.assertEqual(self.M.model_dir("jina-v2-base-code-int8-structured", "ref"),
+                         str(REPO / "eval" / "embedding" / "work" / "models" / "jina-v2-base-code-int8"))
+
+    def test_variant_without_model_dir_keeps_the_default(self):
+        self.assertEqual(self.M.model_dir("gte-small", "ref"),
+                         str(REPO / "eval" / "embedding" / "work" / "models" / "gte-small"))
+
+
 class ReportGm436(unittest.TestCase):
     """--reference reaches the report command, ahead of the arm run dirs."""
 
