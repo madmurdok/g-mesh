@@ -287,7 +287,7 @@ that prints s/step and the ETA (stop rule S2).
 | RR | RR-T | gte-mb on ~714k window pairs + 1,000 parity pairs | 0.4 | 0.3 | 60 |
 | RR | RR-A | 8 configs x <= 2 epochs + epoch-0 base | 0.8 (measured bf16: 2.6) | 0.6 (2.3) | 190 (ETA limit 170, owner 2026-11-19) |
 | RR | RR-B | final + shuffled + export + quint8 + parity | 0.4 | 0.3 | 60 |
-| RR | **route cap** | | 1.6 | 1.2 | **$4.50** (was $4; owner 2026-11-20: grid spend $3.21 left the final job $0.22 short) |
+| RR | **route cap** | | 1.6 | 1.2 | **$4.60** (was $4, then $4.50 (owner 2026-11-20: grid spend $3.21 left the final job $0.22 short); owner 2026-11-20 (GM-734 D1, "Поднять лимит RR до $4.60 (Recommended)"): spend $3.670 + the QAT job worst case $0.887 = $4.557) |
 | J | J-A | 8 configs (4 full, 4 LoRA) x <= 2 epochs | 1.8 (measured probe ETA 139.5 min on g6e without checkpointing; x 1.4 with `--grad-checkpoint` = 195 min) | 1.3 | 395 (ETA limit 360; g6e 237/216, g6 632/576). Owner 2026-11-20 after the alpha 0.5 OOM on L40S 44 GiB: "Включить gradient checkpointing и перезапустить (Recommended)" (hyperparameters and grid unchanged); GM-730/S62 sized the limits from 139.5 min x 1.4 (CPU fwd+bwd ratio 1.36) with the earlier margins. Worst case g5 $5.32, g6e $8.78, g6 $7.78: with $0.81 J spend, g6e and g6 are refused by the $8 cap |
 | J | J-B | final + shuffled + 2 exports + 2 int8 + CPU int8 dev | 1.5 | 1.1 | 180 |
 | J | **route cap** | | 3.3 | 2.4 | **$8** |
