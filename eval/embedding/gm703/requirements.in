@@ -1,0 +1,11 @@
+# GM-703 export and parity venv (docs/design/GM-703-coderankembed.md, section 3.1).
+# torch 2.2.2 is the last macOS x86_64 wheel; the transformers and
+# sentence-transformers pins are GM-436's; onnxruntime is GM-730's probe pin.
+torch==2.2.2
+numpy==1.26.4
+transformers==4.46.3
+sentence-transformers==3.3.1
+einops
+safetensors
+onnx==1.16.2
+onnxruntime==1.19.2

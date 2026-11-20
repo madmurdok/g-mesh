@@ -336,12 +336,12 @@ the end:
 | 3 | `cargo build --release --bin g-mesh` (this branch, no core change) | | ~10 min incremental |
 | 4 | `debug-embed-eval run --eval-dir eval/embedding/v2 --variant coderankembed-int8-structured --force` over all 6 corpora (about 15.6k nodes plus the v2 queries) | harness | ~25-35 min (jina int8 ran 76 ms/node in GM-398) |
 | 5 | P3 on that run's `query_vectors.bin` (stop rule S4) | `parity.py --rust-queries` | ~2 min |
-| 6 | **early stop S6**: `report --reference jina-v2-base-code-int8-structured`. If the Q1 point Δ r@10 is <= 0, a quality candidate cannot pass, so skip steps 7-8, write "no-go" and finish | `report` | ~1 min |
-| 7 | the fp32 arm, same as step 4 | harness | ~40-50 min |
+| 6 | **S6**: `report --reference jina-v2-base-code-int8-structured`. If the Q1 point Δ r@10 is <= 0, the verdict is "no-go", but the script **goes on to the cost pass** (owner, 2026-11-20: "Всегда замерять") | `report` | ~1 min |
+| 7 | ~~the fp32 arm~~: not run (owner, 2026-11-20: "Только int8 (Recommended)") | | |
 | 8 | cost: 3 interleaved rounds of `--corpus g-mesh --embed-only --force` (6,774 nodes) for jina int8-structured and CodeRankEmbed int8, plus query latency; `costs.toml` | `REF=jina-v2-base-code-int8-structured VARIANTS=coderankembed-int8-structured EVAL_DIR=eval/embedding/v2 SKIP_QUALITY=1 measure_costs.sh` | ~55 min (about 3 x 2 x 9 min) |
-| 9 | the full table set of 6.2 | `report_gm436.py --reference jina-v2-base-code-int8-structured --arm coderankembed-int8-structured --arm coderankembed-fp32-structured --arm jina-v2-base-code-int8-structured`, then `report --costs costs.toml` | ~5 min |
+| 9 | the full table set of 6.2 | `report_gm436.py --reference jina-v2-base-code-int8-structured --arm coderankembed-int8-structured --arm jina-v2-base-code-int8-structured`, then `report --costs costs.toml` | ~5 min |
 
-The total is about 2.5-3 hours on a quiet machine, or about 1 hour if S6 stops it.
+The total is about 2-2.5 hours on a quiet machine (no fp32 arm; the cost pass always runs).
 Results go to `docs/results/gm-703-coderankembed.md`. Runs and models stay in the
 git-ignored shared work dir.
 
@@ -354,7 +354,7 @@ git-ignored shared work dir.
 | S3 | the Rust harness cannot load the graph (ORT 1.20 rejects an op) | one retry at opset 14, then stop with ORT's error. A loader change would be needed, which is out of scope |
 | S4 | P3: any query has a Rust/Python cosine < 0.99999 | stop before scoring and diagnose as GM-700 did: tokenization first, then the kernel |
 | S5 | D7 validity fails for the arm | no verdict ("inconclusive = keep jina") |
-| S6 | Q1 point Δ r@10 <= 0 vs int8-structured | no-go without the cost pass |
+| S6 | Q1 point Δ r@10 <= 0 vs int8-structured | no-go; the cost pass still runs (owner decision 2) |
 
 Go/no-go: **go** only if CodeRankEmbed int8 passes every D9 quality-candidate gate
 against jina int8-structured, the cost gate included. Anything else is **no-go**:
@@ -389,3 +389,48 @@ because padded keys are masked, and the `model.rs:1862` test already covers that
    rescue a quality candidate.
 3. **Hosting, if "go"**: our own HF repo, or a GitHub release asset for the exported
    ONNX. This is needed only for the adoption task.
+
+Owner answers (2026-11-20, verbatim): 1. "Только int8 (Recommended)": int8 is the only
+eval arm; the fp32 ONNX is still exported, as the parity intermediate. 2. "Всегда
+замерять": the cost pass runs even when S6 says no-go. 3. "Решить после результата
+(Recommended)".
+
+## 11. Implementation notes (S2)
+
+Where the implementation differs from sections 3-7, and why:
+
+- **Model files** live in `~/Projects/ClaudeProjects/g-mesh-data/gm703/models/coderankembed-{fp32,int8}`
+  (not `g-mesh-eval-data/v2/work/models`); the variant rows point `model_dir` there. The HF
+  cache is `g-mesh-data/gm703/hf`, the venv `g-mesh-data/gm703/venv`.
+- **`eval/embedding/v2/variants.toml` is a symlink** to `eval/embedding/variants.toml`, so
+  the two rows are appended to that one file.
+- **The fp32 row stays registered** (`role = "informational"`) only for P3: the gated
+  Rust-vs-Python check runs on the fp32 graph, on one corpus (`task-tracker-mcp`, into
+  `$OUT/p3-runs`, not the shared runs). P3 on the int8 runs (all corpora) is reported, not
+  gated: Rust links ORT 1.20 and the venv has 1.19.2, so int8 kernels may differ.
+- **Q-F's Gather check** counts a `Gather` whose table is an 8-bit initializer (the
+  `DequantizeLinear` follows the `Gather`). On the shipped jina int8 file it reports 72
+  `MatMulInteger`, 48 `DynamicQuantizeLinear`, weights in [-64, 64], 2 quantized Gathers.
+- **P1d lengths**: length 1 is `[CLS]` alone; 512 and 1024 are the longest sample text's
+  ids cut to L-1 plus `[SEP]`. The hand-made empty text is 2 tokens (`[CLS][SEP]`).
+- **P1c** encodes 10 sample texts of 3-256 tokens (below sentence-transformers' own cap).
+- **`measure.sh`** takes `--from N --until N`, and `--check-export <dir>` (the T6 check
+  alone). `measure_costs.sh` gained `REF`, `EVAL_DIR`, `SKIP_QUALITY` and `CONTROLS` (v2
+  has no `words-shuffled`/`bm25` runs, so step 8 passes `random shuffled`).
+
+### 11.1 S2 results (2026-11-20, load 25-97)
+
+- Weights `model.safetensors` 546,938,168 bytes, sha256 `827529bc...3fb17ebe`; code and
+  tokenizer sha256s matched the pins.
+- fp32 `model.onnx` 548,110,535 bytes, sha256 `a7e74b49...7c4bf2d`; int8 138,964,289 bytes
+  (0.86x jina int8), sha256 `e626b8fd...7f03cc0`. Export real 237 s (user 78 s).
+- P1 max abs 3.9e-7, min cosine 0.999999999996; P1b 0.0; P1c min cosine 0.9999999999992;
+  P1d max abs 1.4e-5 / 9.5e-6 / 3.0e-5 / 2.5e-4 at lengths 1 / 7 / 512 / 1024. **Pass.**
+- Q-F: 60 `MatMulInteger`, 48 `DynamicQuantizeLinear`, weights in [-64, 64], 2 Gathers
+  quantized. **Pass.**
+- Q-D: CodeRankEmbed int8 vs fp32 median **0.9625**, p1 **0.9193**; jina median 0.9905,
+  p1 0.9490. **Fails both rules** (median < 0.98; p1 more than 0.02 below jina's 0.9290
+  bound). **Stop rule S2: the int8 arm is stopped; the owner decides.**
+- P3 (fp32 graph, task-tracker-mcp, 444 queries, Rust debug build vs onnxruntime 1.19.2):
+  min cosine 0.9999999999991, max abs 2.1e-7. **Pass.** No query is bit-equal, because
+  Python normalizes in float64; the differences are at float32 rounding.
