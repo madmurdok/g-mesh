@@ -522,13 +522,13 @@ adapter_sha256 = "3756ae702b519db3bcccc250925abe67275924a2df84ac878fc658a95a3aa2
 # records the sha256s). onnx_file names the export, so a re-export under another
 # file name changes the variant fingerprint; gm703/measure.sh also checks
 # model.onnx's sha256 against EXPORT.json before a run.
-# The int8 row is the eval arm (a D9 quality candidate against
-# jina-v2-base-code-int8-structured). The fp32 row is not an eval arm: it exists
-# for the Rust-vs-Python query parity check (P3) on the unquantized graph.
+# The fp32 row is the eval arm (a D9 quality candidate against
+# jina-v2-base-code-int8-structured). The int8 row is stopped: its export failed
+# the int8-vs-fp32 drift check Q-D (design note, section 11.1), so it is not run.
 [[variant]]
 name = "coderankembed-int8-structured"
 arm = "model"
-role = "quality"
+role = "informational"
 hf_repo = "nomic-ai/CodeRankEmbed"
 revision = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
 onnx_file = "gm703-export/model_int8.onnx"
@@ -543,7 +543,7 @@ text = "structured"
 [[variant]]
 name = "coderankembed-fp32-structured"
 arm = "model"
-role = "informational"
+role = "quality"
 hf_repo = "nomic-ai/CodeRankEmbed"
 revision = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
 onnx_file = "gm703-export/model_fp32.onnx"

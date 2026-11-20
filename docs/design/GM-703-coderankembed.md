@@ -404,10 +404,13 @@ Where the implementation differs from sections 3-7, and why:
   cache is `g-mesh-data/gm703/hf`, the venv `g-mesh-data/gm703/venv`.
 - **`eval/embedding/v2/variants.toml` is a symlink** to `eval/embedding/variants.toml`, so
   the two rows are appended to that one file.
-- **The fp32 row stays registered** (`role = "informational"`) only for P3: the gated
-  Rust-vs-Python check runs on the fp32 graph, on one corpus (`task-tracker-mcp`, into
-  `$OUT/p3-runs`, not the shared runs). P3 on the int8 runs (all corpora) is reported, not
-  gated: Rust links ORT 1.20 and the venv has 1.19.2, so int8 kernels may differ.
+- **Rows after S2** (section 11.2): `coderankembed-fp32-structured` is the gated arm
+  (`role = "quality"`); `coderankembed-int8-structured` stays registered as
+  `informational`, stopped by Q-D and not run. P3 is gated (0.99999) on the fp32 arm's
+  runs; on int8 runs it would be reported only (Rust links ORT 1.20, the venv 1.19.2).
+- **`measure.sh` runs one arm**, `ARM` (default `coderankembed-fp32-structured`). A Q-F/Q-D
+  failure at step 2 stops only an int8 `ARM`. `DRY=1` logs each step's command instead of
+  running it.
 - **Q-F's Gather check** counts a `Gather` whose table is an 8-bit initializer (the
   `DequantizeLinear` follows the `Gather`). On the shipped jina int8 file it reports 72
   `MatMulInteger`, 48 `DynamicQuantizeLinear`, weights in [-64, 64], 2 quantized Gathers.
@@ -434,3 +437,20 @@ Where the implementation differs from sections 3-7, and why:
 - P3 (fp32 graph, task-tracker-mcp, 444 queries, Rust debug build vs onnxruntime 1.19.2):
   min cosine 0.9999999999991, max abs 2.1e-7. **Pass.** No query is bit-equal, because
   Python normalizes in float64; the differences are at float32 rounding.
+
+### 11.2 Owner decision after the S2 stop (2026-11-20)
+
+Q-D failed (CodeRankEmbed int8 vs fp32 median 0.9625 < 0.98; p1 0.9193 against jina's
+0.9490 - 0.02 = 0.9290). The owner chose, verbatim: "Сначала сравнить fp32 с jina
+(Recommended)".
+
+- The measure slice runs **CodeRankEmbed fp32** as the arm against
+  jina-v2-base-code-int8-structured: D9 with v2-FIT refit floors, GM-434 columns, per
+  language, the confirm and GM-398 subsets, and the cost pass always ("Всегда замерять").
+  This replaces owner decision 1 ("Только int8") for the eval arm.
+- fp32 does not beat jina: **no-go**, with no int8 work.
+- fp32 beats jina: a new int8 recipe is a **separate follow-up task**; fp32 itself is not
+  a shipping proposal (section 8, S2).
+- Run: `ARM=coderankembed-fp32-structured measure.sh --from 3` (steps 0-2 are done; their
+  outputs are in `g-mesh-data/gm703/s2`).
+
