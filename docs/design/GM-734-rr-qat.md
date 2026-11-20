@@ -247,7 +247,8 @@ the $20 S3 rule. Earlier: cap $4.60 (D1) at the $0.75 price and 45 min.
 - **S-F:** smoke fidelity (3.1.2) or zero-step export (3.1.3) fails -> no
   GPU launch; fix the emulation first.
 - **S-B:** `budget.py check` refuses -> no launch.
-- **S2:** probe job ETA > 30 min (> 4.5 s/step) -> exit 76; no relaunch
+- **S2:** probe ETA of the whole job (elapsed + training + remaining dev rows
+  at the measured step-0 cost + `--export-minutes` 7) > 52 min -> exit 76; no relaunch
   without the owner (fallback g: bf16 integer-domain, or 200 steps).
 - **S-G:** C-P2 fails on the instance -> no second QAT run without the owner
   (options then: more steps / higher lr, ship fp32 L6 with its cost gate,
@@ -275,7 +276,7 @@ the $20 S3 rule. Earlier: cap $4.60 (D1) at the $0.75 price and 45 min.
 | `make_jobs.py` | docstring 1-30, `MAX_MINUTES` 47, `ETA_LIMIT_MINUTES` 52 | `rr-qat`: 60 / 52 (S3 review; was 45 / 30) |
 | `make_jobs.py` | `data_sets` 114-129 | `rr-qat` adds the init set (`GM730_INIT`) |
 | `make_jobs.py` | new `qat_job` after `final_job` 196-215; `main` 231-253 | `qat --init-run DIR [--family F]`; reads `out/final/train.json` `bestParamsSha256` and checks `onnx-fp32/model.onnx` sha against `export.json` |
-| `budget.py` | `ROUTE_CAP` 31, docstring 15 | rr 4.5 -> 4.6 (if D1 = A) |
+| `budget.py` | `ROUTE_CAP` 31, docstring 15, g5 price | rr 4.5 -> 5.00, g5 $0.92/h (S3 review, owner: "Лимит 60 мин и $5.00, ETA с учётом проверок (Recommended)") |
 | `export.py`, `eval_checks.py`, `register_arms.py`, `freeze.py` | - | unchanged: `eval_checks.py cp2 --export <run>/out/qat/export.json`; `register_arms.py ce --name ce-gm730-l6-distill-qat-quint8 --src <run>/out/qat/onnx-quint8 --chunk1`; no freeze (single pre-registered config) |
 | `test_gm734_qat.py` | new | section 6 |
 | `test_gm730_train.py` | `Resume` 112-125 | qat kill / resume case on `TinyWorld` |
