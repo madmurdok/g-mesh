@@ -270,6 +270,11 @@ against. Overfit means the verdict is null whatever T2-T7 say.
   The two cosines are collinear (equal whenever the rerank keeps the cosine
   top), so only their sum is checked. Owner decision (2026-11-20, verbatim):
   "Проверять суммарный вклад косинуса (Recommended)".
+- The rule above stops the run only for a deciding model (full NL/NAME, the
+  C0 controls). An informative model (L-noCE) that fails it is reported as
+  "stopped by rule" with its coefficients and no metrics, and the rest is
+  measured (exit 0 if the deciding models pass). Owner decision (2026-11-20,
+  verbatim): "Остановить только эту модель, остальное измерять (Recommended)".
 - During S2 one diagnostic `--ignore-stops` run read held-out once (it found
   the per-coefficient rule firing on the collinear cosines); no model,
   feature or threshold change was made after it, only the stop rule above.

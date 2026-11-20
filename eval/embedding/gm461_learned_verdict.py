@@ -19,7 +19,9 @@ Arms (page / verdict):
 
 Controls: 1 F4/int8 reproduce GM-701/GM-697; 2 C0 exact (a: verdict, b: D6 rule); 3 shuffled FIT labels;
 4 fitter (gradient here; scikit-learn via gm461_sklearn_check.py on --dump-fit); 5 differ count.
-Stop rules (design): control 1-2 mismatch or a non-positive net cosine (cos1 + cos_t) or logit coefficient -> no tables, exit 2
+Stop rules (design): control 1-2 mismatch or a non-positive net cosine (cos1 + cos_t) or logit coefficient of a
+deciding model (full, C0) -> no tables, exit 2; an informative model (L-noCE) failing it is reported as stopped
+by rule with its coefficients and no metrics
 (--ignore-stops builds the tables anyway for diagnosis and still exits 2).
 
   python3 gm461_learned_verdict.py --work <v2 work> --out <scratch>/gm461.json [--md <path>]
@@ -63,6 +65,11 @@ NOCE = ["cos1", "gap_cos", "doc0"] + [f"clang:{l}" for l in ONEHOT]
 # Terms whose coefficient sum must be positive: the net cosine effect (cos1 and cos_t are collinear, so
 # only their sum is checked) and the CE logit.
 POSITIVE_COEF = {"full": (("cos1", "cos_t"), ("logit_t",)), "C0": (("cos1",),), "noCE": (("cos1",),)}
+
+
+# Informative (non-deciding) models: a stop rule failure stops only that arm; it is reported with its
+# coefficients and no metrics. A deciding model (full, C0) failing stops the whole run.
+INFORMATIVE = {"noCE"}
 
 
 def sign_stops(pop, kind, coef):
@@ -334,7 +341,8 @@ def fit_population(rows, pop, resamples, shuffles, coef_boot, stops):
     cyh = np.array([r["cos_right"] for r in ho_rows], dtype=bool)
     f4f = np.array([r["floor"] for r in fit_rows], dtype=bool)
     f4h = np.array([r["floor"] for r in ho_rows], dtype=bool)
-    out = dict(n_fit=len(fit_rows), n_ho=len(ho_rows), right_fit=int(yf.sum()), right_ho=int(yh.sum()))
+    out = dict(n_fit=len(fit_rows), n_ho=len(ho_rows), right_fit=int(yf.sum()), right_ho=int(yh.sum()),
+               stopped_arms={})
 
     models, zs = {}, {}
     for kind, lab_f in (("full", yf), ("C0", yf), ("noCE", cyf)):
@@ -348,15 +356,21 @@ def fit_population(rows, pop, resamples, shuffles, coef_boot, stops):
                                     coef_std=m.coef(), grad_norm=m.grad_norm, mu=m.mu.tolist(), sd=m.sd.tolist())
         if m.grad_norm >= 1e-8:
             stops.append(f"{pop} {kind}: gradient norm {m.grad_norm:.3g} >= 1e-8")
-        stops.extend(sign_stops(pop, kind, m.coef()))
+        reasons = sign_stops(pop, kind, m.coef())
+        if reasons and kind in INFORMATIVE:
+            out["stopped_arms"][kind] = reasons
+        else:
+            stops.extend(reasons)
+    noce = "noCE" not in out["stopped_arms"]
 
     # thresholds (FIT only)
     kept_f4 = int((yf & ~f4f).sum())
     kept_int8 = int((cyf & ~f4f).sum())
     zf, zh = zs["full"]
     th = {"L-m": matched_threshold(zf[yf], kept_f4), "L-d6": d6_threshold(zf[yf]),
-          "C0-m": matched_threshold(zs["C0"][0][yf], kept_f4),
-          "L-noCE": matched_threshold(zs["noCE"][0][cyf], kept_int8)}
+          "C0-m": matched_threshold(zs["C0"][0][yf], kept_f4)}
+    if noce:
+        th["L-noCE"] = matched_threshold(zs["noCE"][0][cyf], kept_int8)
     out["thresholds"] = th
     out["kept_target_fit"] = {"F4": kept_f4, "int8": kept_int8}
 
@@ -388,20 +402,26 @@ def fit_population(rows, pop, resamples, shuffles, coef_boot, stops):
     out["fit"] = {k: point(yf, v) for k, v in ref_f.items()}
     out["ho"] = {k: point(yh, v) for k, v in ref_h.items()}
     out["fit"]["int8"], out["ho"]["int8"] = point(cyf, f4f), point(cyh, f4h)
-    out["fit"]["L-noCE"] = point(cyf, zs["noCE"][0] < th["L-noCE"])
-    out["ho"]["L-noCE"] = point(cyh, zs["noCE"][1] < th["L-noCE"])
     out["boot_vs_F4"] = boot_vs(yh, ref_h, "F4", resamples)
-    out["boot_noCE_vs_int8"] = boot_vs(cyh, {"int8": f4h, "L-noCE": zs["noCE"][1] < th["L-noCE"]}, "int8", resamples)
+    if noce:
+        out["fit"]["L-noCE"] = point(cyf, zs["noCE"][0] < th["L-noCE"])
+        out["ho"]["L-noCE"] = point(cyh, zs["noCE"][1] < th["L-noCE"])
+        out["boot_noCE_vs_int8"] = boot_vs(cyh, {"int8": f4h, "L-noCE": zs["noCE"][1] < th["L-noCE"]}, "int8",
+                                           resamples)
     out["differ_vs_F4"] = {k: dict(n=int((v != f4h).sum()), right=int(((v != f4h) & yh).sum()))
                            for k, v in ref_h.items() if k != "F4"}
 
     # T9 overfitting: AUROC, log-loss, kept/caught FIT vs held-out
     ov = {}
     for kind, (yf_, yh_) in (("full", (yf, yh)), ("C0", (yf, yh)), ("noCE", (cyf, cyh))):
+        if kind in out["stopped_arms"]:
+            continue
         a_f, a_h = S.auroc(zs[kind][0], yf_), S.auroc(zs[kind][1], yh_)
         ov[kind] = dict(auroc_fit=a_f, auroc_ho=a_h, auroc_gap=a_f - a_h,
                         logloss_fit=log_loss(zs[kind][0], yf_), logloss_ho=log_loss(zs[kind][1], yh_))
     for arm in ("L-m", "L-d6", "C0-m", "L-noCE"):
+        if arm not in th:
+            continue
         ov[arm] = dict(kept_fit=out["fit"][arm]["kept"], kept_ho=out["ho"][arm]["kept"],
                        caught_fit=out["fit"][arm]["caught"], caught_ho=out["ho"][arm]["caught"])
     ov["overfit_full"] = bool(ov["full"]["auroc_gap"] > 0.05 or ov["L-m"]["kept_ho"] < ov["L-m"]["kept_fit"] - 0.05)
@@ -444,7 +464,7 @@ def fit_population(rows, pop, resamples, shuffles, coef_boot, stops):
         share_ge_observed=float(np.mean(np.array(deltas) >= obs)) if shuffles else None)
 
     zmaps = {"full": {}, "C0": {}, "noCE": {}}
-    for kind in zmaps:
+    for kind in [k for k in zmaps if k not in out["stopped_arms"]]:
         for side_rows, zv in zip((fit_rows, ho_rows), zs[kind]):
             for r, v in zip(side_rows, zv):
                 zmaps[kind][r["key"]] = float(v)
@@ -531,6 +551,9 @@ def markdown(res):
                      f"{'-' if not b else '[%+.1f, %+.1f]' % tuple(100 * x for x in b['caught_delta_ci'])} | "
                      f"{'-' if not b else '[%+.1f, %+.1f]' % tuple(100 * x for x in b['kept_delta_ci'])} | "
                      f"{'-' if not d else '%d (%d)' % (d['n'], d['right'])} |")
+        if "L-noCE" not in p["ho"]:
+            L.append(f"| {pop} | L-noCE vs int8 | stopped by rule | - | - | - | - |")
+            continue
         b = p["boot_noCE_vs_int8"]["L-noCE"]
         L.append(f"| {pop} | L-noCE vs int8 | {kn(p['ho']['L-noCE']['kept_k'])} | {kn(p['ho']['L-noCE']['caught_k'])} | "
                  f"[{100 * b['caught_delta_ci'][0]:+.1f}, {100 * b['caught_delta_ci'][1]:+.1f}] | "
@@ -544,14 +567,14 @@ def markdown(res):
           "|---|---|---|---|---|---|---|"]
     for pop in ("NL", "NAME"):
         ov = res[pop]["overfit"]
-        for kind in ("full", "C0", "noCE"):
+        for kind in [k for k in ("full", "C0", "noCE") if k in ov]:
             o = ov[kind]
             L.append(f"| {pop} | {kind} | {o['auroc_fit']:.3f} | {o['auroc_ho']:.3f} | {o['auroc_gap']:+.3f} | "
                      f"{o['logloss_fit']:.3f} | {o['logloss_ho']:.3f} |")
     L += ["", "| pop | arm | kept FIT | kept HO | caught FIT | caught HO |", "|---|---|---|---|---|---|"]
     for pop in ("NL", "NAME"):
         ov = res[pop]["overfit"]
-        for arm in ("L-m", "L-d6", "C0-m", "L-noCE"):
+        for arm in [k for k in ("L-m", "L-d6", "C0-m", "L-noCE") if k in ov]:
             o = ov[arm]
             L.append(f"| {pop} | {arm} | {pct(o['kept_fit'])} | {pct(o['kept_ho'])} | {pct(o['caught_fit'])} | "
                      f"{pct(o['caught_ho'])} |")
@@ -564,7 +587,11 @@ def markdown(res):
             ci = res[pop]["coef_boot"].get(c)
             L.append(f"| {c} | {v:+.3f} | {'-' if not ci else '[%+.3f, %+.3f]' % tuple(ci)} |")
         L.append("")
-    L += ["## Controls", ""]
+    L += ["## Arms stopped by rule (informative models: coefficients only, no metrics)", ""]
+    for pop in ("NL", "NAME"):
+        for kind, why in res[pop]["stopped_arms"].items():
+            L.append(f"- {pop} {kind}: {'; '.join(why)}; coefficients {json.dumps(res[pop][f'model_{kind}']['coef_std'])}")
+    L += ["", "## Controls", ""]
     for k, v in res["controls"].items():
         L.append(f"- {k}: {json.dumps(v, default=str)}")
     L += ["", "## Verdict inputs (the measure slice decides)", "", f"```\n{json.dumps(res['verdict_inputs'], indent=1)}\n```"]
@@ -616,10 +643,13 @@ def main():
     zc0 = {k: v for pop in ("NL", "NAME") for k, v in key(pop, zmaps[pop]["C0shift"]).items()}
     zc0m = {k: v for pop in ("NL", "NAME") for k, v in key(pop, zmaps[pop]["C0"]).items()}
     znc = {k: v for pop in ("NL", "NAME") for k, v in key(pop, zmaps[pop]["noCE"]).items()}
-    th = lambda arm: {f"clf:{p}": res[p]["thresholds"][arm] for p in ("NL", "NAME")}
+    th = lambda arm: {f"clf:{p}": res[p]["thresholds"][arm] for p in ("NL", "NAME") if arm in res[p]["thresholds"]}
     arms = {"int8": (int8, floors), "F4": (f4, floors), "C0": as_verdict(f4, zc0, {"clf:NL": 0.0, "clf:NAME": 0.0}),
             "C0-m": as_verdict(f4, zc0m, th("C0-m")), "L-m": as_verdict(f4, zf, th("L-m")),
-            "L-d6": as_verdict(f4, zf, th("L-d6")), "L-noCE": as_verdict(int8, znc, th("L-noCE"))}
+            "L-d6": as_verdict(f4, zf, th("L-d6"))}
+    if th("L-noCE"):  # rows of a population whose L-noCE was stopped get no verdict (empty cells)
+        arms["L-noCE"] = as_verdict(int8, znc, th("L-noCE"))
+    res["stopped_arms"] = {p: res[p]["stopped_arms"] for p in ("NL", "NAME")}
 
     # control 2: C0 exact
     c2b = c0_d6_check(rows, int8, models["NL"]["C0"])
