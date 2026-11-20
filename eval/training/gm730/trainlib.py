@@ -270,6 +270,49 @@ def load_trainable(model, sd):
             p.copy_(sd[n].to(p.device, p.dtype))
 
 
+def onnx_params(model, onnx_path):
+    """{name: tensor} of the model's trainable parameters read from an fp32 export of it
+    (export.export_dir: the model sits under `m.` in the traced wrapper). A parameter is the
+    initializer `m.<name>`; a Linear weight that is not one is the transposed constant B
+    input of the MatMul node `/m/<module path, '.' -> '/'>/MatMul` (located by graph
+    structure, never by value)."""
+    import onnx
+    import torch
+    from onnx import numpy_helper
+    g = onnx.load(str(onnx_path)).graph
+    inits = {i.name: i for i in g.initializer}
+    matmul_b = {}
+    for n in g.node:
+        if n.op_type == "MatMul" and n.name.startswith("/m/") and n.name.endswith("/MatMul") and n.input[1] in inits:
+            matmul_b[n.name[len("/m/"):-len("/MatMul")].replace("/", ".")] = n.input[1]
+    out = {}
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "m." + name in inits:
+            arr = numpy_helper.to_array(inits["m." + name])
+        else:
+            mod, _, leaf = name.rpartition(".")
+            if leaf != "weight" or mod not in matmul_b:
+                raise SystemExit(f"{onnx_path}: no initializer or MatMul weight for parameter {name}")
+            arr = numpy_helper.to_array(inits[matmul_b[mod]]).T
+        if tuple(arr.shape) != tuple(p.shape):
+            raise SystemExit(f"{onnx_path}: {name} has shape {tuple(arr.shape)}, the model's is {tuple(p.shape)}")
+        out[name] = torch.from_numpy(np.array(arr, dtype=np.float32, order="C", copy=True))
+    return out
+
+
+def init_from_onnx(model, onnx_path, want_sha=None):
+    """Load the trainable parameters of an fp32 export (onnx_params) into the model; refused
+    unless their params_sha256 equals want_sha (when given). Returns the sha."""
+    sd = onnx_params(model, onnx_path)
+    sha = params_sha256(sd)
+    if want_sha and sha != want_sha:
+        raise SystemExit(f"{onnx_path}: parameters sha256 {sha} != --init-params-sha256 {want_sha}")
+    load_trainable(model, sd)
+    return sha
+
+
 def params_sha256(sd):
     """sha256 over the sorted names and the float32 bytes of a state dict."""
     h = hashlib.sha256()
