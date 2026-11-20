@@ -239,6 +239,8 @@ Cost (owner, same answer): RR cap **$5.00**; the g5 planning price in
 `budget.py` is the observed $0.92/h of the RR final's g5.2xlarge (was $0.75).
 Worst case for `max_minutes 60`, 5 attempts: (60 + 5 x 5) min x ($0.92 + EBS
 $0.0104)/h = **$1.318**; RR spent $3.670 + $1.318 = **$4.988 <= $5.00**.
+Then (owner 2026-11-21, no g5 spot capacity: "Поднять лимит RR до $5.25 и запустить g6 (Recommended)"): RR cap **$5.25**; the job runs as
+`gm730-rr-qat-g6` (L4, limits scaled 1.6x: 96 / 84 min), worst case $1.43 at $0.70/h, $3.670 + $1.43 = $5.10.
 Expected ~45 min at $0.92/h ≈ $0.70. GM-730 total $5.95 + $1.32 stays under
 the $20 S3 rule. Earlier: cap $4.60 (D1) at the $0.75 price and 45 min.
 
