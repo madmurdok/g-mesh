@@ -287,7 +287,7 @@ that prints s/step and the ETA (stop rule S2).
 | RR | RR-T | gte-mb on ~714k window pairs + 1,000 parity pairs | 0.4 | 0.3 | 60 |
 | RR | RR-A | 8 configs x <= 2 epochs + epoch-0 base | 0.8 (measured bf16: 2.6) | 0.6 (2.3) | 190 (ETA limit 170, owner 2026-11-19) |
 | RR | RR-B | final + shuffled + export + quint8 + parity | 0.4 | 0.3 | 60 |
-| RR | **route cap** | | 1.6 | 1.2 | **$4.60** (was $4, then $4.50 (owner 2026-11-20: grid spend $3.21 left the final job $0.22 short); owner 2026-11-20 (GM-734 D1, "Поднять лимит RR до $4.60 (Recommended)"): spend $3.670 + the QAT job worst case $0.887 = $4.557) |
+| RR | **route cap** | | 1.6 | 1.2 | **$5.00** (was $4, then $4.50 (owner 2026-11-20: grid spend $3.21 left the final job $0.22 short); then $4.60, owner 2026-11-20 (GM-734 D1, "Поднять лимит RR до $4.60 (Recommended)"): spend $3.670 + the QAT job worst case $0.887 = $4.557); then $5.00: owner 2026-11-20 on the GM-734 S3 review, "Лимит 60 мин и $5.00, ETA с учётом проверок (Recommended)": the QAT job at 60 min, priced at the observed g5 $0.92/h, has worst case $1.318, $3.670 + $1.318 = $4.988) |
 | J | J-A | 8 configs (4 full, 4 LoRA) x <= 2 epochs | 1.8 (measured probe ETA 139.5 min on g6e without checkpointing; x 1.4 with `--grad-checkpoint` = 195 min) | 1.3 | 395 (ETA limit 360; g6e 237/216, g6 632/576). Owner 2026-11-20 after the alpha 0.5 OOM on L40S 44 GiB: "Включить gradient checkpointing и перезапустить (Recommended)" (hyperparameters and grid unchanged); GM-730/S62 sized the limits from 139.5 min x 1.4 (CPU fwd+bwd ratio 1.36) with the earlier margins. Worst case g5 $5.32, g6e $8.78, g6 $7.78: with $0.81 J spend, g6e and g6 are refused by the $8 cap |
 | J | J-B | final + shuffled + 2 exports + 2 int8 + CPU int8 dev | 1.5 | 1.1 | 180 |
 | J | **route cap** | | 3.3 | 2.4 | **$8** |
@@ -323,7 +323,9 @@ checks every family's TOMLs; the g5 TOMLs are unchanged. `budget.py` prices
 a job's worst case by the family of its `instance_types` (config.toml's,
 g5, when absent) at planning prices that are the upper end of the spot
 prices seen on 2026-11-19, rounded up: g5 $0.75 (seen 0.60-0.73), g6e
-$2.00 (1.1-2.0), g6 $0.70 (0.42-0.68). Launch a fallback TOML without
+$2.00 (1.1-2.0), g6 $0.70 (0.42-0.68). Since the GM-734 S3 review (owner
+2026-11-20) g5 is priced at $0.92, what the RR final run paid on g5.2xlarge;
+the worst cases below are at $0.75. Launch a fallback TOML without
 `--instance-types`, so the launch and the check see the same family; the
 manifest records `instanceTypes`. Worst cases with no prior spend: RR-A
 g5 $2.72, g6e $4.66 (over the $4 RR cap: refused), g6 $3.90; J-A g5 $3.36,
