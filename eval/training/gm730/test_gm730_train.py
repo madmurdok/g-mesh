@@ -513,3 +513,110 @@ class TeacherModel(TinyWorld):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def tiny_bert(seed=0):
+    cfg = transformers.BertConfig(vocab_size=50, hidden_size=16, num_hidden_layers=2, num_attention_heads=2,
+                                  intermediate_size=32, max_position_embeddings=32, pad_token_id=0)
+    torch.manual_seed(seed)
+    return transformers.BertModel(cfg)
+
+
+@needs_stack
+class GradCheckpoint(unittest.TestCase):
+    """--grad-checkpoint changes memory and time, never the loss or the gradients (dropout 0.1
+    is active; the recompute replays the RNG). In-process, a 2-layer random BERT."""
+
+    def loss_and_grads(self, lora, ckpt):
+        m = tiny_bert()
+        if lora:
+            from peft import LoraConfig, get_peft_model
+            m = get_peft_model(m, LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, bias="none",
+                                             target_modules=["query", "key", "value", "dense"]))
+        TE.grad_checkpoint(m, on=ckpt)
+        m.train()
+        ids = torch.randint(1, 50, (3, 9), generator=torch.Generator().manual_seed(5))
+        mask = torch.ones_like(ids)
+        torch.manual_seed(11)  # the dropout masks
+        loss = m(input_ids=ids, attention_mask=mask).last_hidden_state.pow(2).mean()
+        loss.backward()
+        return loss.item(), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    def same(self, lora):
+        l0, g0 = self.loss_and_grads(lora, False)
+        l1, g1 = self.loss_and_grads(lora, True)
+        self.assertEqual(l0, l1)
+        self.assertGreater(len(g0), 0)
+        self.assertEqual(set(g0), set(g1))
+        for n in g0:
+            torch.testing.assert_close(g1[n], g0[n], rtol=0, atol=1e-6)
+        if lora:
+            self.assertTrue(all("lora_" in n for n in g1), "only adapters train")
+        return g1
+
+    def test_full_training_gives_the_same_loss_and_gradients_on_and_off(self):
+        self.same(lora=False)
+
+    def test_lora_behind_frozen_embeddings_gets_the_same_gradients_on_and_off(self):
+        g = self.same(lora=True)
+        self.assertTrue(any(p.abs().sum() > 0 for p in g.values()))
+
+    def test_only_a_training_forward_with_grad_is_checkpointed_and_off_restores_the_layer(self):
+        from torch.utils import checkpoint as C
+        m = tiny_bert()
+        keys = list(m.state_dict())
+        ids = torch.randint(1, 50, (2, 6))
+        with mock.patch.object(C, "checkpoint", wraps=C.checkpoint) as ck:
+            TE.grad_checkpoint(m, on=True)
+            self.assertEqual(list(m.state_dict()), keys)
+            m.train()
+            m(input_ids=ids)
+            self.assertEqual(ck.call_count, 2)  # one per layer
+            m.eval()
+            m(input_ids=ids)
+            with torch.no_grad():
+                m.train()
+                m(input_ids=ids)
+            self.assertEqual(ck.call_count, 2)
+            TE.grad_checkpoint(m, on=False)
+            m.train()
+            m(input_ids=ids)
+            self.assertEqual(ck.call_count, 2)
+        self.assertTrue(all("forward" not in layer.__dict__ for layer in TE.encoder_layers(m)))
+
+    def test_the_flag_is_not_part_of_the_config_and_its_sha256(self):
+        base = ["--model", "gte-small", "--stage", "grid", "--out", "x", "--alpha", "0.5"] + ENC
+        off, on = TE.parse(base), TE.parse(base + ["--grad-checkpoint"])
+        self.assertFalse(off.grad_checkpoint)
+        self.assertTrue(on.grad_checkpoint)
+        self.assertEqual(L.config_of(off), L.config_of(on))
+        self.assertNotIn("grad_checkpoint", L.config_of(on)[0])
+
+
+class GradCheckpointRun(TinyWorld):
+    def test_a_run_with_the_flag_ends_in_the_same_weights_and_config_and_records_the_flag(self):
+        args = ["--model", "gte-small", "--stage", "grid", "--alpha", "0.5"] + ENC
+        a, b = self.out("off", "step"), self.out("on", "step")
+        self.spawn("train_encoder.py", args, a)
+        self.spawn("train_encoder.py", args + ["--grad-checkpoint"], b)
+        ta, tb = self.read(a, "train.json"), self.read(b, "train.json")
+        self.assertFalse(ta["gradCheckpoint"])
+        self.assertTrue(tb["gradCheckpoint"])
+        self.assertEqual(ta["configSha256"], tb["configSha256"])
+        self.assertEqual(ta["lastParamsSha256"], tb["lastParamsSha256"])
+
+    def test_the_flag_turns_checkpointing_on_for_training_and_off_before_the_export(self):
+        calls = []
+        real = TE.grad_checkpoint
+
+        def spy(model, on=True):
+            calls.append(on)
+            return real(model, on)
+        args = ["--model", "gte-small", "--stage", "final", "--alpha", "0.5", "--grad-checkpoint"] + ENC
+        with mock.patch.object(TE, "grad_checkpoint", spy):
+            TE.main(args + ["--out", str(self.out("spy", "step"))])
+        self.assertEqual(calls, [True, False])
+        calls.clear()
+        with mock.patch.object(TE, "grad_checkpoint", spy):
+            TE.main([x for x in args if x != "--grad-checkpoint"] + ["--out", str(self.out("spy2", "step"))])
+        self.assertEqual(calls, [False])

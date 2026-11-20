@@ -288,3 +288,52 @@ class Families(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GradCheckpointJobs(unittest.TestCase):
+    """GM-730 --grad-checkpoint: every J step carries it, RR and gte steps do not, and the J
+    time limits are the un-checkpointed ones x 1.4 (g6e probe ETA 139.5 min -> 195 min)."""
+    JOBS = Path(__file__).resolve().parents[2] / "gpu" / "jobs"
+    LIMITS = {"g5": (395, 360), "g6e": (237, 216), "g6": (632, 576)}  # (max_minutes, --eta-limit-minutes)
+
+    def steps(self, text):
+        return tomllib.loads(text)["steps"]
+
+    def test_every_jina_grid_step_on_every_family_carries_the_flag(self):
+        for fam in MJ.FAMILIES:
+            steps = self.steps(MJ.grid_job("jina", family=fam))
+            self.assertTrue(steps)
+            for s in steps:
+                self.assertIn("--grad-checkpoint", s["args"], f"{fam} {s['name']}")
+        for teacher in (True, False):
+            for s in self.steps(MJ.grid_job("jina", teacher=teacher)):
+                self.assertIn("--grad-checkpoint", s["args"], s["name"])
+
+    def test_rr_and_gte_steps_do_not_carry_the_flag(self):
+        for route in ("rr", "gte"):
+            for fam in MJ.FAMILIES:
+                for s in self.steps(MJ.grid_job(route, family=fam)):
+                    self.assertNotIn("--grad-checkpoint", s["args"], f"{route} {fam} {s['name']}")
+        for s in self.steps(MJ.teacher_job()):
+            self.assertNotIn("--grad-checkpoint", s["args"])
+
+    def test_the_jina_final_job_carries_the_flag_in_both_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            final = Path(tmp) / "final_configs.json"
+            run = RunDir(Path(tmp), "jina", {MJ.grid("jina")[0][0]: 0.5})
+            F.freeze("jina", run.dir, final)
+            steps = self.steps(MJ.final_job("jina", final))
+        self.assertEqual([s["name"] for s in steps], ["final", "shuffled"])
+        for s in steps:
+            self.assertIn("--grad-checkpoint", s["args"], s["name"])
+
+    def test_jina_grid_limits_per_family(self):
+        for fam, (max_minutes, eta) in self.LIMITS.items():
+            job = tomllib.loads(MJ.grid_job("jina", family=fam))
+            self.assertEqual(job["max_minutes"], max_minutes, fam)
+            for s in job["steps"]:
+                self.assertEqual(s["args"][s["args"].index("--eta-limit-minutes") + 1], str(eta), f"{fam} {s['name']}")
+
+    def test_the_committed_jina_grid_jobs_are_the_generated_ones(self):
+        for fam, name in (("g5", "gm730-jina-grid.toml"), ("g6e", "gm730-jina-grid-g6e.toml"), ("g6", "gm730-jina-grid-g6.toml")):
+            self.assertEqual(MJ.grid_job("jina", family=fam), (self.JOBS / name).read_text(), name)
