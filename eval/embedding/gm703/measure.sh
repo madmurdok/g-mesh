@@ -158,7 +158,7 @@ if step 6; then
 fi
 
 if step 8; then
-    timed s8-costs env REF="$JINA" VARIANTS="$ARM" EVAL_DIR="$V2" SKIP_QUALITY=1 CONTROLS="random shuffled" \
+    timed s8-costs env GMESH_BIN="$BIN" REF="$JINA" VARIANTS="$ARM" EVAL_DIR="$V2" SKIP_QUALITY=1 CONTROLS="random shuffled" \
         RUNS="$RUNS" OUT="$OUT/costs" bash "$REPO/eval/embedding/measure_costs.sh"
 fi
 

@@ -7,7 +7,7 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE/../.." || exit
-BIN=$PWD/target/release/g-mesh
+BIN=${GMESH_BIN:-$PWD/target/release/g-mesh}
 DEFAULT_REF=jina-v2-base-code-fp32
 REF=${REF:-$DEFAULT_REF}
 EVAL_DIR=${EVAL_DIR:-eval/embedding}
