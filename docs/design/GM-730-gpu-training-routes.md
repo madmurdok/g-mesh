@@ -279,7 +279,7 @@ that prints s/step and the ETA (stop rule S2).
 | RR | RR-A | 8 configs x <= 2 epochs + epoch-0 base | 0.8 (measured bf16: 2.6) | 0.6 (2.3) | 190 (ETA limit 170, owner 2026-11-19) |
 | RR | RR-B | final + shuffled + export + quint8 + parity | 0.4 | 0.3 | 60 |
 | RR | **route cap** | | 1.6 | 1.2 | **$4.50** (was $4; owner 2026-11-20: grid spend $3.21 left the final job $0.22 short) |
-| J | J-A | 8 configs (4 full, 4 LoRA) x <= 2 epochs | 1.8 | 1.3 | 240 |
+| J | J-A | 8 configs (4 full, 4 LoRA) x <= 2 epochs | 1.8 (measured probe ETA 139.5 min on g6e) | 1.3 | 283 (ETA limit 258; g6e 170/155, owner 2026-11-20) |
 | J | J-B | final + shuffled + 2 exports + 2 int8 + CPU int8 dev | 1.5 | 1.1 | 180 |
 | J | **route cap** | | 3.3 | 2.4 | **$8** |
 | R3 | R3-A | 6 configs x <= 3 epochs | 0.5 (measured: 1.85) | 0.4 (1.4) | 140 (ETA limit 125, owner 2026-11-20) |
