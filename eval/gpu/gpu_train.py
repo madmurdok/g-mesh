@@ -399,11 +399,19 @@ def fleet_instance_ids(fleet):
     return {iid for i in fleet.get("Instances", []) for iid in i.get("InstanceIds", [])}
 
 
-def reapable_fleets(fleets, live_ids, now, min_age=timedelta(minutes=10)):
+def reapable_fleets(fleets, live_ids, ended_ids, now, min_age=timedelta(minutes=10)):
     """The gmesh fleets reap may delete: none of their instances is in `live_ids`, and
-    older than `min_age`, so a fleet another launcher process has just created (its
-    instance not yet listed) is never touched."""
-    return [f for f in fleets if not fleet_instance_ids(f) & live_ids and now - f["CreateTime"] > min_age]
+    either every instance is in `ended_ids` (at any age) or the fleet is older than
+    `min_age`. A young fleet with no instance, or with one listed neither live nor
+    ended, may belong to another launcher process mid-launch and is never touched."""
+    out = []
+    for f in fleets:
+        iids = fleet_instance_ids(f)
+        if iids & live_ids:
+            continue
+        if (iids and iids <= ended_ids) or now - f["CreateTime"] > min_age:
+            out.append(f)
+    return out
 
 
 def expired_instances(instances, now):
@@ -1099,8 +1107,8 @@ def cmd_run(a, cfg):
     ok = wait_terminated(ctx)
     released = not release_run(ctx, f"run {ctx.run_id}")
     record_cost(ctx)
-    reap(aws, cfg)
-    return 0 if final == "done" and ok and released else 1
+    reaped = not reap(aws, cfg)
+    return 0 if final == "done" and ok and released and reaped else 1
 
 
 def dry_run(a, cfg):
@@ -1216,7 +1224,10 @@ def release_spot(ec2, instance_ids, fleet_ids, label):
     DeleteFleets of an instant fleet must terminate its instances (TerminateInstances
     false is not supported for type instant). Cancelling a one-time request does not
     terminate its instance. Idempotent: a closed/cancelled request is not listed and a
-    fleet that no longer exists counts as deleted. Never raises; returns the problems."""
+    fleet that no longer exists counts as deleted. When a cancel fails no fleet is
+    deleted: the open fleet keeps the request visible to verify-clean (through the
+    fleet's instance ids) after EC2 stops listing the terminated instance. Never
+    raises; returns the problems."""
     problems = []
     instance_ids = sorted({i for i in instance_ids if i})
     fleet_ids = sorted({f for f in fleet_ids if f})
@@ -1231,6 +1242,9 @@ def release_spot(ec2, instance_ids, fleet_ids, label):
                 print(f"{label}: cancelled spot request(s) {', '.join(ids)}")
         except Exception as e:
             problems.append(f"spot requests of {', '.join(part)} not cancelled: {type(e).__name__}: {e}")
+    if problems and fleet_ids:
+        problems.append(f"fleet(s) {', '.join(fleet_ids)} kept while a spot request may be active")
+        fleet_ids = []
     for part in chunks(fleet_ids, 25):  # DeleteFleets takes at most 25 instant fleets
         try:
             resp = ec2.delete_fleets(FleetIds=part, TerminateInstances=True)
@@ -1272,21 +1286,22 @@ def release_ended(ec2, terminated_ids, live_ids, now, label):
     reapable_fleets, and deletes those fleets. Never touches a fleet with an instance
     in `live_ids`."""
     try:
-        ended = [i["InstanceId"] for i in tagged_instances(ec2, ["shutting-down", "terminated"])]
-        stale = reapable_fleets(gmesh_fleets(ec2), live_ids, now)
+        ended = {i["InstanceId"] for i in tagged_instances(ec2, ["shutting-down", "terminated"])} | set(terminated_ids)
+        stale = reapable_fleets(gmesh_fleets(ec2), live_ids, ended, now)
     except Exception as e:
         print(f"{label}: WARNING: spot requests and fleets not checked: {type(e).__name__}: {e}")
         return [f"not checked: {e}"]
     fleet_iids = [iid for f in stale for iid in fleet_instance_ids(f)]
-    return release_spot(ec2, list(terminated_ids) + ended + fleet_iids, [f["FleetId"] for f in stale], label)
+    return release_spot(ec2, sorted(ended) + fleet_iids, [f["FleetId"] for f in stale], label)
 
 
 def reap(aws, cfg):
     """Terminates tagged instances past gmesh-expires, cancels the spot requests of
     ended tagged instances and deletes their ended fleets (release_ended), deletes
     schedules whose instance is gone and launch templates older than 10 minutes, in
-    every configured region."""
+    every configured region. Returns release_ended's problems (empty when clean)."""
     now = utcnow()
+    problems = []
     for region in cfg["regions"]:
         ec2 = aws.client("ec2", region)
         live = tagged_instances(ec2, LIVE_STATES)
@@ -1295,7 +1310,7 @@ def reap(aws, cfg):
             ec2.terminate_instances(InstanceIds=ids)
             print(f"reap {region}: terminated expired {', '.join(ids)}")
         live_ids = {i["InstanceId"] for i in live} - set(ids)
-        release_ended(ec2, ids, live_ids, now, f"reap {region}")
+        problems += [f"{region}: {p}" for p in release_ended(ec2, ids, live_ids, now, f"reap {region}")]
         sch = aws.client("scheduler", region)
         for s in gmesh_schedules(sch):
             target = json.loads(sch.get_schedule(Name=s["Name"])["Target"].get("Input") or "{}")
@@ -1306,6 +1321,7 @@ def reap(aws, cfg):
             if now - t["CreateTime"] > timedelta(minutes=10):
                 ec2.delete_launch_template(LaunchTemplateId=t["LaunchTemplateId"])
                 print(f"reap {region}: deleted launch template {t['LaunchTemplateName']}")
+    return problems
 
 
 def snapshot_region(aws, region):
@@ -1474,8 +1490,8 @@ def cmd_kill_switch_test(a, cfg):
     if m is None:
         raise SystemExit(f"run {a.run_id}: no manifest")
     ok = wait_terminated(Ctx(aws, cfg, m, bucket))
-    reap(aws, cfg)
-    return 1 if cmd_verify_clean(a, cfg) or not ok else 0
+    reaped = not reap(aws, cfg)
+    return 1 if cmd_verify_clean(a, cfg) or not ok or not reaped else 0
 
 
 # --- CLI ----------------------------------------------------------------------------------------
@@ -1522,8 +1538,7 @@ def main(argv=None):
     a = parse(argv)
     cfg = load_config(a.config)
     if a.cmd == "reap":
-        reap(Aws(a.profile), cfg)
-        return 0
+        return 1 if reap(Aws(a.profile), cfg) else 0
     return {"setup": cmd_setup, "run": cmd_run, "status": cmd_status, "pull": cmd_pull,
             "verify-clean": cmd_verify_clean, "interrupt": cmd_interrupt,
             "kill-switch-test": cmd_kill_switch_test}[a.cmd](a, cfg)

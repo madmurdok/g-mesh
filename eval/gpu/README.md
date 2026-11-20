@@ -69,8 +69,10 @@ A launch refused with an explicit deny means the budget kill switch fired
    after its `gmesh-expires` tag.
 4. `reap` (run at the start and end of `run`) terminates tagged instances past
    `gmesh-expires`, cancels the spot requests of ended tagged instances, deletes
-   tagged fleets with no live instance (older than 10 min) and deletes leftover
-   schedules and launch templates.
+   tagged fleets whose instances all ended (or, with no instance listed, older
+   than 10 min) and deletes leftover schedules and launch templates. It exits 1
+   when a spot request or fleet could not be released; a fleet is kept while
+   its request's cancel failed, so verify-clean keeps reporting it.
 5. `run` cancels an attempt's spot request and deletes its instant fleet when
    the attempt ends (before a relaunch, and after the last attempt): an active
    request keeps holding the spot vCPU quota after its instance terminated.
