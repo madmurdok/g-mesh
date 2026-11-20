@@ -641,7 +641,150 @@ class Uploads(MotoCase, GitRepo):
         self.assertEqual([a for (n, a, k) in self.aws.log if a in ("put_object", "upload_file")], [])
 
 
-class Reap(MotoCase):
+class SpotFakes:
+    """Fakes of the spot-request and fleet calls (moto's instant fleets are not a faithful model):
+    `self.requests` / `self.fleets` hold what AWS would list; cancels and deletes are recorded in
+    `self.cancelled`, `self.deleted` and, in order, `self.events`. Mix into a MotoCase."""
+
+    def fake_spot(self):
+        self.requests, self.fleets, self.cancelled, self.deleted, self.events = [], {}, [], [], []
+        case = self
+
+        def describe(**kw):
+            f = {x["Name"]: x["Values"] for x in kw.get("Filters", [])}
+            return {"SpotInstanceRequests": [
+                r for r in case.requests if r["State"] in f.get("state", ["open", "active"])
+                and ("instance-id" not in f or r.get("InstanceId") in f["instance-id"])]}
+
+        def cancel(**kw):
+            case.cancelled.append(list(kw["SpotInstanceRequestIds"]))
+            case.events.append(("cancel", list(kw["SpotInstanceRequestIds"])))
+            for r in case.requests:
+                if r["SpotInstanceRequestId"] in kw["SpotInstanceRequestIds"]:
+                    r["State"] = "cancelled"
+            return {}
+
+        def delete(**kw):
+            case.deleted.append(dict(kw))
+            case.events.append(("delete", list(kw["FleetIds"])))
+            for fid in kw["FleetIds"]:
+                case.fleets.pop(fid, None)
+            return {"SuccessfulFleetDeletions": [{"FleetId": f} for f in kw["FleetIds"]],
+                    "UnsuccessfulFleetDeletions": []}
+
+        class Pages:
+            def paginate(self, **kw):
+                return [{"Fleets": list(case.fleets.values())}]
+
+        def paginator(name):
+            return Pages() if name == "describe_fleets" else case.ec2.get_paginator(name)
+
+        for k, fn in (("describe_spot_instance_requests", describe), ("cancel_spot_instance_requests", cancel),
+                      ("delete_fleets", delete), ("get_paginator", paginator)):
+            self.aws.overrides[("ec2", k)] = fn
+
+    def add_request(self, rid, iid, state="active"):
+        self.requests.append({"SpotInstanceRequestId": rid, "InstanceId": iid, "State": state})
+
+    def add_fleet(self, fid, iids=(), age=timedelta(hours=1), run=RUN_ID):
+        self.fleets[fid] = {"FleetId": fid, "FleetState": "active", "CreateTime": datetime.now(timezone.utc) - age,
+                            "Tags": [{"Key": "gmesh-train", "Value": "1"}, {"Key": "gmesh-run", "Value": run}],
+                            "Instances": [{"InstanceIds": list(iids)}] if iids else []}
+
+    def patch_aws(self):
+        patch = mock.patch.object(G, "Aws", lambda profile=None: self.aws)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+
+class ReapableFleets(unittest.TestCase):
+    """Pure: which fleets reap may delete (GM-732)."""
+    NOW = T0
+    OLD, YOUNG = T0 - timedelta(hours=1), T0 - timedelta(minutes=1)
+
+    def fleet(self, fid, created, iids=()):
+        return {"FleetId": fid, "CreateTime": created, "Instances": [{"InstanceIds": list(iids)}] if iids else []}
+
+    def reapable(self, fleets, live=(), ended=()):
+        return [f["FleetId"] for f in G.reapable_fleets(fleets, set(live), set(ended), self.NOW)]
+
+    def test_fleet_with_a_live_instance_is_never_reaped(self):
+        self.assertEqual(self.reapable([self.fleet("f", self.OLD, ["i-1"])], live=["i-1"]), [])
+        self.assertEqual(self.reapable([self.fleet("f", self.OLD, ["i-1", "i-2"])], live=["i-1"], ended=["i-2"]), [])
+
+    def test_old_fleet_without_a_live_instance_is_reaped_whatever_its_instances(self):
+        fleets = [self.fleet("none", self.OLD), self.fleet("unlisted", self.OLD, ["i-9"])]
+        self.assertEqual(self.reapable(fleets), ["none", "unlisted"])
+
+    def test_young_fleet_is_reaped_only_when_all_its_instances_ended(self):
+        fleets = [self.fleet("ended", self.YOUNG, ["i-1", "i-2"]), self.fleet("partly", self.YOUNG, ["i-1", "i-3"]),
+                  self.fleet("none", self.YOUNG), self.fleet("unlisted", self.YOUNG, ["i-4"])]
+        self.assertEqual(self.reapable(fleets, ended=["i-1", "i-2"]), ["ended"])
+
+
+class ReleaseSpot(unittest.TestCase):
+    """release_spot on a hand-made client: what it asks AWS for, and what counts as a problem."""
+
+    class Ec2:
+        def __init__(self, requests=(), delete_resp=None, cancel_error=None):
+            self.requests, self.cancel_error = list(requests), cancel_error
+            self.delete_resp = delete_resp or {"SuccessfulFleetDeletions": [], "UnsuccessfulFleetDeletions": []}
+            self.describes, self.cancels, self.deletes = [], [], []
+
+        def describe_spot_instance_requests(self, **kw):
+            self.describes.append(kw)
+            return {"SpotInstanceRequests": [{"SpotInstanceRequestId": r} for r in self.requests]}
+
+        def cancel_spot_instance_requests(self, **kw):
+            if self.cancel_error:
+                raise self.cancel_error
+            self.cancels.append(kw)
+
+        def delete_fleets(self, **kw):
+            self.deletes.append(kw)
+            return self.delete_resp
+
+    def release(self, ec2, iids=("i-1",), fleets=("fleet-1",)):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return G.release_spot(ec2, list(iids), list(fleets), "t")
+
+    def test_requests_are_matched_by_instance_id_and_cancelled(self):
+        ec2 = self.Ec2(requests=["sir-b", "sir-a"])
+        self.assertEqual(self.release(ec2, iids=["i-2", "i-1"], fleets=[]), [])
+        flt = {f["Name"]: f["Values"] for f in ec2.describes[0]["Filters"]}
+        self.assertEqual(flt["instance-id"], ["i-1", "i-2"])
+        self.assertEqual(flt["state"], ["open", "active"])
+        self.assertEqual(ec2.cancels, [{"SpotInstanceRequestIds": ["sir-a", "sir-b"]}])
+
+    def test_no_open_request_means_no_cancel_call(self):
+        ec2 = self.Ec2()
+        self.assertEqual(self.release(ec2), [])
+        self.assertEqual(ec2.cancels, [])
+
+    def test_fleets_are_deleted_with_terminate_instances(self):
+        """An instant fleet cannot be deleted with TerminateInstances=False."""
+        ec2 = self.Ec2()
+        self.release(ec2)
+        self.assertEqual(ec2.deletes, [{"FleetIds": ["fleet-1"], "TerminateInstances": True}])
+
+    def test_fleet_already_gone_is_not_a_problem_other_errors_are(self):
+        gone = {"SuccessfulFleetDeletions": [], "UnsuccessfulFleetDeletions": [
+            {"FleetId": "fleet-1", "Error": {"Code": "fleetIdDoesNotExist", "Message": "m"}}]}
+        self.assertEqual(self.release(self.Ec2(delete_resp=gone)), [])
+        bad = {"SuccessfulFleetDeletions": [], "UnsuccessfulFleetDeletions": [
+            {"FleetId": "fleet-1", "Error": {"Code": "unexpectedError", "Message": "m"}}]}
+        problems = self.release(self.Ec2(delete_resp=bad))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("fleet-1", problems[0])
+
+    def test_failed_cancel_keeps_every_fleet_and_is_reported_not_raised(self):
+        ec2 = self.Ec2(requests=["sir-a"], cancel_error=client_error("UnauthorizedOperation"))
+        problems = self.release(ec2, fleets=["fleet-1", "fleet-2"])
+        self.assertEqual(ec2.deletes, [])
+        self.assertTrue(any("not cancelled" in p for p in problems))
+
+
+class Reap(MotoCase, SpotFakes):
     """Behaviour 19, A13."""
 
     def test_reap_terminates_only_expired_tagged(self):
@@ -672,6 +815,46 @@ class Reap(MotoCase):
             G.reap(self.aws, CFG)
         self.assertEqual([t["LaunchTemplateName"] for t in self.ec2.describe_launch_templates()["LaunchTemplates"]],
                          ["other"])
+
+    def test_reap_cancels_ended_requests_and_deletes_stale_fleets(self):
+        """GM-732: reap cancels the active request of a tagged ended instance and deletes a fleet
+        with no live instance; a fleet with a live instance (and its request) is left alone."""
+        self.fake_spot()
+        far = "2099-01-01T00:00:00Z"
+        dead = self.run_instance({"gmesh-train": "1", "gmesh-run": "r", "gmesh-expires": far})
+        live = self.run_instance({"gmesh-train": "1", "gmesh-run": "r2", "gmesh-expires": far})
+        self.ec2.terminate_instances(InstanceIds=[dead])
+        self.add_request("sir-dead", dead)
+        self.add_request("sir-live", live)
+        self.add_fleet("fleet-old")
+        self.add_fleet("fleet-live", [live])
+        self.add_fleet("fleet-young", age=timedelta(minutes=1))
+        self.assertEqual(G.reap(self.aws, dict(CFG, regions=["us-east-1"])), [])
+        self.assertEqual(self.cancelled, [["sir-dead"]])
+        self.assertEqual(sorted(self.fleets), ["fleet-live", "fleet-young"])
+        self.assertEqual(self.deleted, [{"FleetIds": ["fleet-old"], "TerminateInstances": True}])
+
+    def test_reap_deletes_a_young_fleet_whose_instance_was_just_expired(self):
+        self.fake_spot()
+        iid = self.run_instance({"gmesh-train": "1", "gmesh-run": "r", "gmesh-expires": "2026-01-01T00:00:00Z"})
+        self.add_request("sir-exp", iid)
+        self.add_fleet("fleet-1", [iid], age=timedelta(minutes=1))
+        self.assertEqual(G.reap(self.aws, dict(CFG, regions=["us-east-1"])), [])
+        self.assertEqual(self.cancelled, [["sir-exp"]])
+        self.assertEqual(self.fleets, {})
+
+    def test_reap_reports_a_failed_release(self):
+        self.fake_spot()
+        iid = self.run_instance({"gmesh-train": "1", "gmesh-run": "r", "gmesh-expires": "2026-01-01T00:00:00Z"})
+        self.add_request("sir-exp", iid)
+        self.add_fleet("fleet-1", [iid])
+
+        def broken(**kw):
+            raise client_error("UnauthorizedOperation")
+
+        self.aws.overrides[("ec2", "cancel_spot_instance_requests")] = broken
+        self.assertTrue(G.reap(self.aws, dict(CFG, regions=["us-east-1"])))
+        self.assertEqual(self.deleted, [])
 
 
 class VerifyClean(MotoCase):
@@ -752,7 +935,34 @@ class VerifyCleanSpot(MotoCase):
         self.assertIn("sir-open0001", self.stdout.getvalue())
 
 
-class Launch(MotoCase):
+class VerifyCleanRelease(MotoCase, SpotFakes):
+    """GM-732: verify-clean fails on what the launcher should have released."""
+
+    def run_verify(self):
+        self.patch_aws()
+        return G.cmd_verify_clean(argparse.Namespace(profile=None, wait=0), dict(CFG, regions=["us-east-1"]))
+
+    def test_active_request_of_our_terminated_instance_is_reported(self):
+        self.fake_spot()
+        iid = self.run_instance({"gmesh-train": "1", "gmesh-run": RUN_ID})
+        self.ec2.terminate_instances(InstanceIds=[iid])
+        self.assertEqual(self.state(iid), "terminated")
+        self.add_request("sir-ours001", iid)
+        self.assertEqual(self.run_verify(), 1)
+        self.assertIn("sir-ours001", self.stdout.getvalue())
+
+    def test_active_gmesh_fleet_is_reported(self):
+        self.fake_spot()
+        self.add_fleet("fleet-leak001")
+        self.assertEqual(self.run_verify(), 1)
+        self.assertIn("fleet-leak001", self.stdout.getvalue())
+
+    def test_clean_when_released(self):
+        self.fake_spot()
+        self.assertEqual(self.run_verify(), 0)
+
+
+class Launch(MotoCase, SpotFakes):
     """A11, A12, F3: launch_attempt / adopt_instance / schedule_terminate."""
 
     def setUp(self):
@@ -873,6 +1083,35 @@ class Launch(MotoCase):
         self.assertTrue(str(cm.exception).startswith("budget kill switch is active"))
         self.assertEqual(self.templates(), [])
 
+    def launch_with_request(self):
+        self.fake_spot()
+
+        def fleet(**kw):
+            resp = self.fleet_ok(**kw)
+            self.add_request("sir-launch01", self.launched)
+            return resp
+
+        self.aws.overrides[("ec2", "create_fleet")] = fleet
+
+    def test_unarmed_instance_has_its_request_cancelled_then_fleet_deleted(self):
+        self.launch_with_request()
+
+        def broken(**kw):
+            raise client_error("ValidationException")
+
+        self.aws.overrides[("scheduler", "create_schedule")] = broken
+        self.check_orphan_terminated()
+        self.assertEqual(self.events, [("cancel", ["sir-launch01"]), ("delete", ["fleet-1"])])
+
+    def test_empty_fleet_is_deleted(self):
+        self.fake_spot()
+        self.aws.overrides[("ec2", "create_fleet")] = lambda **kw: {
+            "FleetId": "fleet-empty", "Instances": [], "Errors": [
+                {"ErrorCode": "InsufficientInstanceCapacity", "ErrorMessage": "x"}]}
+        with self.assertRaises(G.LaunchError):
+            G.launch_attempt(self.ctx(), 1)
+        self.assertEqual(self.events, [("delete", ["fleet-empty"])])
+
     def test_only_capacity_errors_are_retried(self):
         tries = []
 
@@ -891,7 +1130,7 @@ class Launch(MotoCase):
         self.assertEqual(len(tries), 3)
 
 
-class RunCommands(MotoCase):
+class RunCommands(MotoCase, SpotFakes):
     """F3 (--resume with an unrecorded instance), F9, A6, A19 through the CLI entry points."""
 
     def setUp(self):
@@ -902,6 +1141,72 @@ class RunCommands(MotoCase):
 
     def main(self, *argv):
         return G.main(list(argv))
+
+    def test_main_reap_exits_1_on_a_release_problem(self):
+        self.patch_aws()
+        with mock.patch.object(G, "reap", return_value=["us-east-1: fleet(s) f kept"]):
+            self.assertEqual(self.main("reap"), 1)
+        with mock.patch.object(G, "reap", return_value=[]):
+            self.assertEqual(self.main("reap"), 0)
+
+    def patch_aws(self):
+        patch = mock.patch.object(G, "Aws", lambda profile=None: self.aws)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def end_of_run(self, reap_problems=(), cancel_fails=False):
+        """cmd_run --resume of a run whose watch ends `done`; returns (exit code, events)."""
+        self.fake_spot()
+        self.patch_aws()
+        iid = self.run_instance({"gmesh-train": "1", "gmesh-run": RUN_ID})
+        self.ec2.terminate_instances(InstanceIds=[iid])
+        self.add_request("sir-end00001", iid)
+        self.add_fleet("fleet-end")
+        self.s3.put_object(Bucket=BUCKET, Key=f"runs/{RUN_ID}/launches.json", Body=json.dumps({
+            "runId": RUN_ID, "attempts": [{"n": 1, "instanceId": iid, "fleetId": "fleet-end",
+                                           "expires": "2099-01-01T00:00:00Z"}]}).encode())
+        if cancel_fails:
+            def broken(**kw):
+                raise client_error("UnauthorizedOperation")
+
+            self.aws.overrides[("ec2", "cancel_spot_instance_requests")] = broken
+        a = argparse.Namespace(profile=None, dry_run=False, resume=RUN_ID, detach=False)
+        with mock.patch.object(G, "watch", return_value="done"), mock.patch.object(G, "pull"), \
+                mock.patch.object(G, "wait_terminated", return_value=True), \
+                mock.patch.object(G, "record_cost"), mock.patch.object(G, "reap", return_value=list(reap_problems)):
+            return G.cmd_run(a, CFG)
+
+    def test_run_end_releases_the_run_and_exits_0(self):
+        self.assertEqual(self.end_of_run(), 0)
+        self.assertEqual(self.events, [("cancel", ["sir-end00001"]), ("delete", ["fleet-end"])])
+
+    def test_run_end_exits_1_when_the_release_failed(self):
+        self.assertEqual(self.end_of_run(cancel_fails=True), 1)
+        self.assertEqual(self.deleted, [])
+
+    def test_run_end_exits_1_when_reap_reports_a_problem(self):
+        self.assertEqual(self.end_of_run(reap_problems=["us-east-1: not checked"]), 1)
+
+    def test_relaunch_cancels_the_ended_attempts_request_before_launching(self):
+        self.fake_spot()
+        iid = self.run_instance({"gmesh-train": "1", "gmesh-run": RUN_ID})
+        self.ec2.terminate_instances(InstanceIds=[iid])
+        self.add_request("sir-relaunch", iid)
+        self.add_fleet("fleet-1")
+        self.s3.put_object(Bucket=BUCKET, Key=f"runs/{RUN_ID}/launches.json", Body=json.dumps({
+            "runId": RUN_ID, "attempts": [{"n": 1, "instanceId": iid, "fleetId": "fleet-1",
+                                           "expires": "2099-01-01T00:00:00Z"}]}).encode())
+        ctx = G.Ctx(self.aws, CFG, self.m, BUCKET)
+        seen = []
+
+        def launch(c, n):
+            seen.append((n, list(self.events)))
+            raise G.LaunchError("stop here")
+
+        with mock.patch.object(G, "relaunch_decision", return_value=("relaunch", "interrupted")), \
+                mock.patch.object(G, "launch_with_retry", launch):
+            self.assertEqual(G.watch(ctx), "relaunch failed: stop here")
+        self.assertEqual(seen, [(2, [("cancel", ["sir-relaunch"]), ("delete", ["fleet-1"])])])
 
     def test_resume_refuses_unrecorded_live_instance(self):
         iid = self.run_instance({"gmesh-train": "1", "gmesh-run": RUN_ID, "gmesh-expires": "2099-01-01T00:00:00Z"})
