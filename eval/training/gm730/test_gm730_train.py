@@ -511,9 +511,6 @@ class TeacherModel(TinyWorld):
         self.assertTrue(bool(torch.isfinite(logits).all()), logits)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def tiny_bert(seed=0):
     cfg = transformers.BertConfig(vocab_size=50, hidden_size=16, num_hidden_layers=2, num_attention_heads=2,
@@ -620,3 +617,7 @@ class GradCheckpointRun(TinyWorld):
         with mock.patch.object(TE, "grad_checkpoint", spy):
             TE.main([x for x in args if x != "--grad-checkpoint"] + ["--out", str(self.out("spy2", "step"))])
         self.assertEqual(calls, [False])
+
+
+if __name__ == "__main__":
+    unittest.main()
