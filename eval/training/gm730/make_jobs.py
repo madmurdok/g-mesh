@@ -44,13 +44,14 @@ SEED = "730"
 CHECKPOINT_MINUTES = 10
 GRACE_SECONDS = 30
 MAX_ATTEMPTS = 5
-MAX_MINUTES = {"rr-teacher": 60, "rr-grid": 190, "rr-final": 60, "jina-grid": 283, "jina-final": 180,
+MAX_MINUTES = {"rr-teacher": 60, "rr-grid": 190, "rr-final": 60, "jina-grid": 395, "jina-final": 180,
                "gte-grid": 140, "gte-final": 60}
 # S2: 2x the section 5 estimate (instance-hours) of each job, in minutes; rr-grid is
 # the measured bf16 job ETA (156 min) plus margin; gte-grid is the measured probe ETA
-# (111 min) plus margin; jina-grid is the g6e probe ETA (139.5 min) with limits 155/170 min
-# on g6e (owner 2026-11-20), i.e. 258/283 on g5
-ETA_LIMIT_MINUTES = {"rr-teacher": 48, "rr-grid": 170, "rr-final": 48, "jina-grid": 258, "jina-final": 180,
+# (111 min) plus margin; jina-grid is the g6e probe ETA without checkpointing (139.5 min)
+# x 1.4 for --grad-checkpoint = 195 min, +11% (ETA limit) and +22% (max_minutes):
+# 216/237 min on g6e, i.e. 360/395 on g5
+ETA_LIMIT_MINUTES = {"rr-teacher": 48, "rr-grid": 170, "rr-final": 48, "jina-grid": 360, "jina-final": 180,
                      "gte-grid": 125, "gte-final": 48}
 NO_TEACHER_SUFFIX = "-nt"
 # Per GPU family: the instance types a job is pinned to (None: config.toml's, the g5 sizes)
@@ -67,7 +68,7 @@ ENTRY = {"rr": f"{REL}/train_ce.py", "jina": f"{REL}/train_encoder.py", "gte": f
 COMMON = {
     "rr": ["--epochs", "2", "--batch", "32", "--max-len", "256", "--bf16", "--seed", SEED],
     "jina": ["--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8",
-             "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", SEED],
+             "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--grad-checkpoint", "--seed", SEED],
     "gte": ["--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8",
             "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", SEED],
 }

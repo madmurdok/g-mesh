@@ -5,7 +5,7 @@
 name = "gm730-jina-grid-g6e"
 requirements = "eval/training/gm730/requirements-linux-cu121.txt"
 smoke = true
-max_minutes = 170
+max_minutes = 237
 max_minutes_scope = "job"
 checkpoint_minutes = 10
 grace_seconds = 30
@@ -15,49 +15,49 @@ instance_types = ["g6e.xlarge", "g6e.2xlarge"]
 [[steps]]
 name = "full-lr1e-5-a0"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--mode", "full", "--lr", "1e-5", "--tau", "0.05", "--alpha", "0", "--job-steps", "8", "--eta-limit-minutes", "155"]
+args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--grad-checkpoint", "--seed", "730", "--mode", "full", "--lr", "1e-5", "--tau", "0.05", "--alpha", "0", "--job-steps", "8", "--eta-limit-minutes", "216"]
 device = "cuda"
 
 [[steps]]
 name = "full-lr1e-5-a0.5"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--mode", "full", "--lr", "1e-5", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "7", "--eta-limit-minutes", "155"]
+args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--grad-checkpoint", "--seed", "730", "--mode", "full", "--lr", "1e-5", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "7", "--eta-limit-minutes", "216"]
 device = "cuda"
 
 [[steps]]
 name = "full-lr2e-5-a0"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--mode", "full", "--lr", "2e-5", "--tau", "0.05", "--alpha", "0", "--job-steps", "6", "--eta-limit-minutes", "155"]
+args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--grad-checkpoint", "--seed", "730", "--mode", "full", "--lr", "2e-5", "--tau", "0.05", "--alpha", "0", "--job-steps", "6", "--eta-limit-minutes", "216"]
 device = "cuda"
 
 [[steps]]
 name = "full-lr2e-5-a0.5"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--mode", "full", "--lr", "2e-5", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "5", "--eta-limit-minutes", "155"]
+args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--grad-checkpoint", "--seed", "730", "--mode", "full", "--lr", "2e-5", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "5", "--eta-limit-minutes", "216"]
 device = "cuda"
 
 [[steps]]
 name = "lora-r16-a0"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--mode", "lora", "--rank", "16", "--lora-targets", "query,key,value,dense,up_gated_layer,down_layer", "--lr", "2e-4", "--tau", "0.05", "--alpha", "0", "--job-steps", "4", "--eta-limit-minutes", "155"]
+args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--grad-checkpoint", "--seed", "730", "--mode", "lora", "--rank", "16", "--lora-targets", "query,key,value,dense,up_gated_layer,down_layer", "--lr", "2e-4", "--tau", "0.05", "--alpha", "0", "--job-steps", "4", "--eta-limit-minutes", "216"]
 device = "cuda"
 
 [[steps]]
 name = "lora-r16-a0.5"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--mode", "lora", "--rank", "16", "--lora-targets", "query,key,value,dense,up_gated_layer,down_layer", "--lr", "2e-4", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "3", "--eta-limit-minutes", "155"]
+args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--grad-checkpoint", "--seed", "730", "--mode", "lora", "--rank", "16", "--lora-targets", "query,key,value,dense,up_gated_layer,down_layer", "--lr", "2e-4", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "3", "--eta-limit-minutes", "216"]
 device = "cuda"
 
 [[steps]]
 name = "lora-r32-a0"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--mode", "lora", "--rank", "32", "--lora-targets", "query,key,value,dense,up_gated_layer,down_layer", "--lr", "2e-4", "--tau", "0.05", "--alpha", "0", "--job-steps", "2", "--eta-limit-minutes", "155"]
+args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--grad-checkpoint", "--seed", "730", "--mode", "lora", "--rank", "32", "--lora-targets", "query,key,value,dense,up_gated_layer,down_layer", "--lr", "2e-4", "--tau", "0.05", "--alpha", "0", "--job-steps", "2", "--eta-limit-minutes", "216"]
 device = "cuda"
 
 [[steps]]
 name = "lora-r32-a0.5"
 entry = "eval/training/gm730/train_encoder.py"
-args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--mode", "lora", "--rank", "32", "--lora-targets", "query,key,value,dense,up_gated_layer,down_layer", "--lr", "2e-4", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "1", "--eta-limit-minutes", "155"]
+args = ["--stage", "grid", "--model", "jina", "--epochs", "2", "--batch", "32", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--grad-checkpoint", "--seed", "730", "--mode", "lora", "--rank", "32", "--lora-targets", "query,key,value,dense,up_gated_layer,down_layer", "--lr", "2e-4", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "1", "--eta-limit-minutes", "216"]
 device = "cuda"
 
 [[data]]

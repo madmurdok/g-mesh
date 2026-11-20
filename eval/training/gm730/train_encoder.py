@@ -21,6 +21,12 @@ decay; --bf16 autocasts the training forward (dev vectors are fp32).
 --mode lora: peft LoRA of rank --rank on --lora-targets (module names),
 lora_alpha = 2 * rank, no dropout; only the adapters train and are checkpointed.
 
+--grad-checkpoint: non-reentrant activation checkpointing of every encoder layer
+(grad_checkpoint): a training forward keeps only each layer's input and the layer is
+recomputed in backward, so a step's activation memory no longer grows with ~12 layers
+of saved tensors per doc (route J's teacher steps: ~970 docs, up to 58k padded tokens). Same
+loss and gradients (RNG state preserved); slower step. Not part of the config.
+
 Dev: every dev query ranked against every node of its repo (texts.jsonl order,
 ties to the earlier node; gm436 dev_metric.repo_eval) by torch fp32 vectors;
 epoch 0 is the untrained model (the base row); best epoch by dev MRR, epoch 0
@@ -39,7 +45,8 @@ C-P2 (dev MRR of the int8 ONNX on the CPU vs the fp32 torch dev MRR, against the
 base's own fp32-vs-int8 gap + 0.01).
 
 usage: train_encoder.py --model jina|gte-small --stage grid|final --lr X --tau X --alpha X --out DIR
-                        [--mode full|lora --rank R --lora-targets a,b] [--control shuffled] [options]
+                        [--mode full|lora --rank R --lora-targets a,b] [--control shuffled]
+                        [--grad-checkpoint] [options]
 """
 
 import argparse
@@ -71,6 +78,36 @@ def load_model(model_name, a, device):
                          target_modules=[t for t in a.lora_targets.split(",") if t])
         m = get_peft_model(m, cfg)
     return m.to(device)
+
+
+def encoder_layers(model):
+    """The transformer blocks (encoder.layer) of a BertModel / JinaBertModel, LoRA-wrapped or not."""
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    return list(base.encoder.layer)
+
+
+def grad_checkpoint(model, on=True):
+    """Turn per-layer activation checkpointing on (or off) by overriding each encoder
+    layer's forward on the instance, so module names and state_dict keys are unchanged.
+    Only a forward in training mode with grad enabled checkpoints; dev eval and the ONNX
+    export run the plain layer. torch.utils.checkpoint with use_reentrant=False: inputs
+    need not require grad (LoRA, frozen embeddings), autocast and the RNG state are
+    replayed in the recompute. Not transformers' gradient_checkpointing_enable: jina's
+    remote code has the old _set_gradient_checkpointing(module, value) signature, for
+    which transformers 4.48 drops gradient_checkpointing_kwargs and the remote encoder
+    calls the reentrant checkpoint (no gradient to LoRA adapters behind frozen inputs)."""
+    import torch
+    from torch.utils.checkpoint import checkpoint
+    for layer in encoder_layers(model):
+        layer.__dict__.pop("forward", None)
+        if not on:
+            continue
+
+        def forward(*args, _f=layer.forward, _m=layer, **kwargs):
+            if _m.training and torch.is_grad_enabled():
+                return checkpoint(_f, *args, use_reentrant=False, **kwargs)
+            return _f(*args, **kwargs)
+        layer.forward = forward
 
 
 def embed_fn(model, autocast):
@@ -250,6 +287,7 @@ def export_final(model, base_mrr, best_mrr, toks, data, a, out):
     snap = L.S.path_of(snap_name)
     if a.mode == "lora":
         model = model.merge_and_unload()
+    grad_checkpoint(model, on=False)
     model.eval()
     fp32_dir = out / "onnx-fp32"
     shutil.rmtree(fp32_dir, ignore_errors=True)
@@ -299,6 +337,8 @@ def run(a, argv):
     data = Data(a)
     toks = (L.tokenizer(L.S.path_of(snap), a.max_len_query), L.tokenizer(L.S.path_of(snap), a.max_len_doc))
     model = load_model(a.model, a, device)
+    if a.grad_checkpoint:
+        grad_checkpoint(model)
     model.train()
     autocast = L.autocast(a, device)
     steps_per_epoch = -(-len(data.train_q) // a.batch)
@@ -365,7 +405,7 @@ def run(a, argv):
             "queries": {"train": len(data.train_q), "dev": len(data.dev_q), "devNodes": len(data.dev_nodes),
                         "teacherWindows": len(data.windows), "dropped": data.dropped},
             "stepsPerEpoch": steps_per_epoch, "meanDocsPerStep": float(np.mean(st["docsPerStep"])) if st["docsPerStep"] else None,
-            "trainSeconds": st["trainSeconds"], "determinism": L.determinism_note(a),
+            "trainSeconds": st["trainSeconds"], "gradCheckpoint": a.grad_checkpoint, "determinism": L.determinism_note(a),
             "checkpointBytes": (out / "checkpoint.pt").stat().st_size}
     ok = True
     if a.stage == "final":
@@ -398,6 +438,8 @@ def parse(argv):
     ap.add_argument("--max-len-doc", type=int, default=256)
     ap.add_argument("--bf16", action="store_true", help="bf16 autocast for the training forward")
     ap.add_argument("--fwd-batch", type=int, default=128, help="texts per length-sorted training forward chunk")
+    ap.add_argument("--grad-checkpoint", action="store_true",
+                    help="recompute each encoder layer in backward instead of keeping its activations; not part of the config")
     ap.add_argument("--eval-batch", type=int, default=128)
     ap.add_argument("--warmup", type=float, default=0.05)
     ap.add_argument("--weight-decay", type=float, default=0.01)

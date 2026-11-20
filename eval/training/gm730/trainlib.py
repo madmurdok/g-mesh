@@ -59,7 +59,7 @@ def export_module():
 VERSION = "v0.4-full"
 # argparse dests that never change what a run computes; everything else is the config
 NOT_CONFIG = {"out", "device", "allow_device_change", "stop_after_steps", "ckpt_minutes", "threads",
-              "job_steps", "eta_limit_minutes"}
+              "job_steps", "eta_limit_minutes", "grad_checkpoint"}
 # exit code of a step whose S2 probe ETA for the rest of its job is over --eta-limit-minutes
 ETA_EXIT = 76
 # set to 1 to train on a teacher data set whose C-T did not pass (or was skipped)

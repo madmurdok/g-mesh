@@ -116,6 +116,15 @@ scoring), whose output also feeds the two encoder routes (D5).
     α {0, 0.5} -> 4 configs;
   - batch 32 queries x 8 docs (+ in-batch), up to 2 epochs, best epoch by
     dev MRR, max_len 128 docs / 64 queries (M7), bf16 autocast, seed 730.
+  - `--grad-checkpoint` on every J job (owner 2026-11-20, after the alpha
+    0.5 steps, ~970 docs per step with the teacher windows, ran out of
+    memory on an L40S 44 GiB): non-reentrant per-layer activation
+    checkpointing (`train_encoder.grad_checkpoint`), same loss and
+    gradients bit for bit on CPU (tiny BERT with dropout, real jina full
+    and LoRA), step ~1.4x slower. Saved activations, measured on CPU:
+    ~593 KB/token + 864 B per (doc x len^2) without it, ~40-80 KB/token
+    with it; the largest alpha 0.5 step (58k padded tokens) needs ~13 GB
+    instead of ~48 GB.
 - **Dev:** `dev_metric.py` on vectors from the torch model (fp32). The
   base row is the same torch path at epoch 0, so gains are compared within
   one path (the GM-436 dev numbers came from int8 vectors).
@@ -279,7 +288,7 @@ that prints s/step and the ETA (stop rule S2).
 | RR | RR-A | 8 configs x <= 2 epochs + epoch-0 base | 0.8 (measured bf16: 2.6) | 0.6 (2.3) | 190 (ETA limit 170, owner 2026-11-19) |
 | RR | RR-B | final + shuffled + export + quint8 + parity | 0.4 | 0.3 | 60 |
 | RR | **route cap** | | 1.6 | 1.2 | **$4.50** (was $4; owner 2026-11-20: grid spend $3.21 left the final job $0.22 short) |
-| J | J-A | 8 configs (4 full, 4 LoRA) x <= 2 epochs | 1.8 (measured probe ETA 139.5 min on g6e) | 1.3 | 283 (ETA limit 258; g6e 170/155, owner 2026-11-20) |
+| J | J-A | 8 configs (4 full, 4 LoRA) x <= 2 epochs | 1.8 (measured probe ETA 139.5 min on g6e without checkpointing; x 1.4 with `--grad-checkpoint` = 195 min) | 1.3 | 395 (ETA limit 360; g6e 237/216, g6 632/576). Owner 2026-11-20 after the alpha 0.5 OOM on L40S 44 GiB: "Включить gradient checkpointing и перезапустить (Recommended)" (hyperparameters and grid unchanged); GM-730/S62 sized the limits from 139.5 min x 1.4 (CPU fwd+bwd ratio 1.36) with the earlier margins. Worst case g5 $5.32, g6e $8.78, g6 $7.78: with $0.81 J spend, g6e and g6 are refused by the $8 cap |
 | J | J-B | final + shuffled + 2 exports + 2 int8 + CPU int8 dev | 1.5 | 1.1 | 180 |
 | J | **route cap** | | 3.3 | 2.4 | **$8** |
 | R3 | R3-A | 6 configs x <= 3 epochs | 0.5 (measured: 1.85) | 0.4 (1.4) | 140 (ETA limit 125, owner 2026-11-20) |
