@@ -282,7 +282,7 @@ that prints s/step and the ETA (stop rule S2).
 | J | J-A | 8 configs (4 full, 4 LoRA) x <= 2 epochs | 1.8 | 1.3 | 240 |
 | J | J-B | final + shuffled + 2 exports + 2 int8 + CPU int8 dev | 1.5 | 1.1 | 180 |
 | J | **route cap** | | 3.3 | 2.4 | **$8** |
-| R3 | R3-A | 6 configs x <= 3 epochs | 0.5 | 0.4 | 60 |
+| R3 | R3-A | 6 configs x <= 3 epochs | 0.5 (measured: 1.85) | 0.4 (1.4) | 140 (ETA limit 125, owner 2026-11-20) |
 | R3 | R3-B | final + shuffled + 2 exports + parity | 0.4 | 0.3 | 60 |
 | R3 | **route cap** | | 0.9 | 0.7 | **$3** |
 | all | reserve | relaunches after spot interruption, probe overruns, one rerun | | | **$5** |

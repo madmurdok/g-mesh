@@ -45,11 +45,12 @@ CHECKPOINT_MINUTES = 10
 GRACE_SECONDS = 30
 MAX_ATTEMPTS = 5
 MAX_MINUTES = {"rr-teacher": 60, "rr-grid": 190, "rr-final": 60, "jina-grid": 240, "jina-final": 180,
-               "gte-grid": 60, "gte-final": 60}
+               "gte-grid": 140, "gte-final": 60}
 # S2: 2x the section 5 estimate (instance-hours) of each job, in minutes; rr-grid is
-# the measured bf16 job ETA (156 min) plus margin
+# the measured bf16 job ETA (156 min) plus margin; gte-grid is the measured probe ETA
+# (111 min) plus margin
 ETA_LIMIT_MINUTES = {"rr-teacher": 48, "rr-grid": 170, "rr-final": 48, "jina-grid": 216, "jina-final": 180,
-                     "gte-grid": 60, "gte-final": 48}
+                     "gte-grid": 125, "gte-final": 48}
 NO_TEACHER_SUFFIX = "-nt"
 # Per GPU family: the instance types a job is pinned to (None: config.toml's, the g5 sizes)
 # and the job's expected wall time relative to g5 (A10G), which scales max_minutes and
