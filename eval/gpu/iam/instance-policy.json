@@ -15,7 +15,7 @@
     {
       "Sid": "RunState",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Action": ["s3:GetObject", "s3:GetObjectTagging", "s3:PutObject"],
       "Resource": ["arn:aws:s3:::${bucket}/runs/*", "arn:aws:s3:::${bucket}/ckpt/*"]
     },
     {
