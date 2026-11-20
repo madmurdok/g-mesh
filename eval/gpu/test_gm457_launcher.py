@@ -114,6 +114,12 @@ class InstancePolicy(unittest.TestCase):
             f"arn:aws:s3:::bkt/{p}/*" for p in ("code", "env", "data", "models", "runs", "ckpt")))
         self.assertEqual(self.grants("s3:PutObject"), ["arn:aws:s3:::bkt/ckpt/*", "arn:aws:s3:::bkt/runs/*"])
 
+    def test_object_tagging_read_only_on_run_state(self):
+        # `aws s3 cp` between S3 keys (checkpoint -> checkpoint.prev) reads the source's tags.
+        self.assertEqual(self.grants("s3:GetObjectTagging"),
+                         ["arn:aws:s3:::bkt/ckpt/*", "arn:aws:s3:::bkt/runs/*"])
+        self.assertEqual(self.grants("s3:PutObjectTagging"), [])
+
     def test_list_bucket_without_prefix_condition(self):
         self.assertEqual(self.grants("s3:ListBucket"), ["arn:aws:s3:::bkt"])
         for st in self.p["Statement"]:
