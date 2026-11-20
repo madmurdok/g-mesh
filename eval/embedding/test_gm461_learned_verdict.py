@@ -8,6 +8,7 @@ Run: ~/Projects/ClaudeProjects/g-mesh-data/gm436/venv/bin/python -I eval/embeddi
 """
 
 import copy
+import json
 import math
 import sys
 import unittest
@@ -277,6 +278,22 @@ def run_fp(rows, pop="NL"):
     stops = []
     res = V.fit_population(rows, pop, resamples=20, shuffles=2, coef_boot=5, stops=stops)
     return res, stops
+
+
+class RedactHeldoutTests(unittest.TestCase):
+    def test_stopped_run_output_does_not_depend_on_heldout_rows(self):
+        def redacted(rows):
+            out = run_fp(rows)[0][0]
+            res = {"NL": out, "NAME": out, "stops": ["x"],
+                   "controls": {"1_reproduce": {"ho": out["ho"]}, "3_shuffle": out["control_shuffle"],
+                                "5_differ_L-m_vs_F4": out["differ_vs_F4"]}}
+            return json.dumps(V.redact_heldout(res), sort_keys=True, default=str)
+
+        self.assertEqual(redacted(gen_rows()), redacted(gen_rows(ho_shift=True)))
+
+    def test_unredacted_output_does_depend_on_heldout_rows(self):
+        a, b = run_fp(gen_rows())[0][0], run_fp(gen_rows(ho_shift=True))[0][0]
+        self.assertNotEqual(json.dumps(a["ho"], default=str), json.dumps(b["ho"], default=str))
 
 
 class FitPopulationTests(unittest.TestCase):

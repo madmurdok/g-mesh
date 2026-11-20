@@ -598,6 +598,22 @@ def markdown(res):
     return "\n".join(L) + "\n"
 
 
+HELDOUT_POP_KEYS = ("ho", "right_ho", "boot_vs_F4", "boot_noCE_vs_int8", "differ_vs_F4", "overfit", "control_shuffle")
+HELDOUT_CONTROL_KEYS = ("1_reproduce", "3_shuffle", "5_differ_L-m_vs_F4")
+
+
+def redact_heldout(res):
+    """Copy of `res` without held-out scores: a stopped run must not reveal held-out results."""
+    out = {k: v for k, v in res.items() if k not in ("NL", "NAME", "controls")}
+    for pop in ("NL", "NAME"):
+        if pop in res:
+            out[pop] = {k: v for k, v in res[pop].items() if k not in HELDOUT_POP_KEYS}
+    if "controls" in res:
+        out["controls"] = {k: v for k, v in res["controls"].items() if k not in HELDOUT_CONTROL_KEYS}
+    out["redacted"] = sorted(HELDOUT_POP_KEYS + HELDOUT_CONTROL_KEYS)
+    return out
+
+
 # ---- main ----------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -684,7 +700,7 @@ def main():
         np.savez(a.dump_fit, **flat)
 
     if stops and not a.ignore_stops:
-        text = json.dumps(res, indent=1, default=str)
+        text = json.dumps(redact_heldout(res), indent=1, default=str)
         if a.out:
             a.out.write_text(text)
         print(text)
