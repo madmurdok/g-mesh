@@ -90,6 +90,22 @@ class TinyExport(unittest.TestCase):
             self.assertEqual(got.shape, (1, n, E.HIDDEN))
             self.assertLess(float(np.abs(got - want).max()), 1e-4, f"length {n}")
 
+    def test_t1_the_rotary_tables_are_constants_of_the_graph(self):
+        """T1: the tables were built (for 2048 positions) before tracing, so the
+        graph holds them as initializers and slices them by the runtime length;
+        it does not recompute cos/sin from the position count. The length test
+        above cannot tell the arms apart on this torch version (it traces the
+        table build dynamically); this one can."""
+        import onnx
+
+        proto = onnx.load(str(self.fp32))
+        ops = {n.op_type for n in proto.graph.node}
+        self.assertNotIn("Cos", ops)
+        self.assertNotIn("Sin", ops)
+        self.assertIn("Slice", ops)
+        longest = max((max(t.dims) for t in proto.graph.initializer if len(t.dims) >= 2), default=0)
+        self.assertGreaterEqual(longest, E.ROTARY_POSITIONS)
+
     def test_t2_a_padded_batch_equals_batch_of_one(self):
         """T2: dynamic batch and sequence axes - a batch of 3 with padding
         gives each row the vectors it gets alone, at its real positions."""
