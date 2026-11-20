@@ -369,4 +369,7 @@ Outputs: `/private/tmp/claude-502/gm461s5/{full.json,full.md,run.log}`.
 
 ## Owner decision
 
-Pending.
+2026-11-20, verbatim: "Текст: задача на внедрение, имена: оставить F4 (Recommended)".
+Natural-language queries get a follow-up task to ship the learned verdict; that task must
+deal with the TypeScript/Rust misled rise on an eval not used to choose shipping parameters.
+Name queries keep F4.
