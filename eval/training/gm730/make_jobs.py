@@ -48,14 +48,16 @@ CHECKPOINT_MINUTES = 10
 GRACE_SECONDS = 30
 MAX_ATTEMPTS = 5
 MAX_MINUTES = {"rr-teacher": 60, "rr-grid": 190, "rr-final": 60, "jina-grid": 395, "jina-final": 180,
-               "gte-grid": 140, "gte-final": 60, "rr-qat": 45}
+               "gte-grid": 140, "gte-final": 60, "rr-qat": 60}
 # S2: 2x the section 5 estimate (instance-hours) of each job, in minutes; rr-grid is
 # the measured bf16 job ETA (156 min) plus margin; gte-grid is the measured probe ETA
 # (111 min) plus margin; jina-grid is the g6e probe ETA without checkpointing (139.5 min)
 # x 1.4 for --grad-checkpoint = 195 min, +11% (ETA limit) and +22% (max_minutes):
-# 216/237 min on g6e, i.e. 360/395 on g5
+# 216/237 min on g6e, i.e. 360/395 on g5. rr-qat's probe forecasts the whole process (elapsed,
+# training, dev rows, export), so its limit is max_minutes less boot (BOOT_MINUTES 5 in
+# budget.py) and 3 min of margin
 ETA_LIMIT_MINUTES = {"rr-teacher": 48, "rr-grid": 170, "rr-final": 48, "jina-grid": 360, "jina-final": 180,
-                     "gte-grid": 125, "gte-final": 48, "rr-qat": 30}
+                     "gte-grid": 125, "gte-final": 48, "rr-qat": 52}
 NO_TEACHER_SUFFIX = "-nt"
 # Per GPU family: the instance types a job is pinned to (None: config.toml's, the g5 sizes)
 # and the job's expected wall time relative to g5 (A10G), which scales max_minutes and
@@ -237,7 +239,8 @@ def home_relative(path):
 def qat_job(init_run, family=DEFAULT_FAMILY):
     """rr-qat: one step `qat` from <init_run>/out/final (a pulled rr-final run): its
     train.json bestParamsSha256 pins the start, and its onnx-fp32/model.onnx must be the
-    file export.json recorded."""
+    file export.json recorded, holding parameters that hash to it (as train_ce.py
+    --init-params-sha256 checks on the instance)."""
     import hashlib
     final = Path(init_run).expanduser() / "out" / "final"
     onnx_dir = final / "onnx-fp32"
@@ -254,6 +257,12 @@ def qat_job(init_run, family=DEFAULT_FAMILY):
             h.update(chunk)
     if h.hexdigest() != recorded:
         raise SystemExit(f"{onnx_dir / 'model.onnx'}: sha256 {h.hexdigest()} != export.json's {recorded}")
+    sys.path.insert(0, str(HERE))
+    import torch
+    import train_ce as TC
+    got = TC.L.params_sha256(TC.L.onnx_params(TC.load_model(torch.device("cpu")), onnx_dir / "model.onnx"))
+    if got != want:
+        raise SystemExit(f"{onnx_dir / 'model.onnx'}: parameters sha256 {got} != train.json bestParamsSha256 {want}")
     steps = [("qat", ENTRY["rr"], ["--stage", "qat", "--init-onnx", "$GM730_INIT/model.onnx",
                                    "--init-params-sha256", want] + QAT)]
     hdr = ["GM-734 job rr-qat: quantization-aware fine-tune of the RR final model, exported,",

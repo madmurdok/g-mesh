@@ -39,7 +39,9 @@ without one the highest full-dev emulated quint8 MRR. The selected parameters go
 fresh (unwrapped, default-attention) model and through the --stage final export, C-P and
 C-P2 unchanged; export.json adds qatFidelity (emulated torch vs ORT quint8 logits at
 chunk 1). result.json's base is the base L6's emulated quint8 row, its best the selected
-step (`epoch` holds the step).
+step (`epoch` holds the step). The checkpoint is saved after every dev row. The S2 probe's
+job ETA is the whole process: time elapsed so far, the remaining training steps, the
+remaining dev rows at the step-0 row's measured cost, and --export-minutes.
 
 usage: train_ce.py --stage grid|final --lr X --tau-t X --alpha X --out DIR [--control shuffled-teacher] [options]
        train_ce.py --stage qat --init-onnx F --init-params-sha256 H --steps N --lr X --tau-t X --alpha X --out DIR [options]
@@ -358,6 +360,7 @@ def run_qat(a, argv):
         raise SystemExit("--stage qat has no control")
     if not a.init_onnx or a.steps is None or a.steps < 0 or a.eval_every < 1:
         raise SystemExit("--stage qat needs --init-onnx, --steps >= 0 and --eval-every >= 1")
+    t_proc = time.monotonic()
     cfg, cfg_sha = L.config_of(a)
     out = Path(a.out)
     device = L.setup_torch(a)
@@ -411,7 +414,13 @@ def run_qat(a, argv):
                    f"selected step {st['selected']['step']}")
 
     with L.Checkpointer(a, cfg_sha) as ck:
+        t_run = time.monotonic()
         st = ck.load()
+
+        def state():
+            return dict(st, params=L.trainable_state(model), opt=opt.state_dict(), sched=sched.state_dict(),
+                        trainSeconds=st["trainSeconds"] + time.monotonic() - t_run)
+
         if st is not None:
             L.load_trainable(model, st["params"])
             opt.load_state_dict(st["opt"])
@@ -433,25 +442,28 @@ def run_qat(a, argv):
             L.progress(f"{out}: base L6 dev MRR fp32 {st['baseRows']['fp32']['mrr']:.4f}, emulated quint8 "
                        f"{st['baseRows']['quint8Emu']['mrr']:.4f}")
             eval_point(st, 0)
-        probe = L.Probe.of(f"rr qat {name}", a.steps, a)
-        t_run = time.monotonic()
-
-        def state():
-            return dict(st, params=L.trainable_state(model), opt=opt.state_dict(), sched=sched.state_dict(),
-                        trainSeconds=st["trainSeconds"] + time.monotonic() - t_run)
-
-        if st["step"] == 0 and a.steps == 0:
             ck.save(state())
+        eval_cost = st["history"][0]["devSeconds"]
+
+        def outside_training(done):
+            """Seconds of this process outside the remaining training steps: elapsed so far,
+            the remaining eval points at the step-0 eval point's measured cost, and the export."""
+            evals = sum(1 for k in range(done + 1, a.steps + 1) if eval_due(k))
+            return time.monotonic() - t_proc + evals * eval_cost + a.export_minutes * 60
+
+        def eval_due(k):
+            return k % a.eval_every == 0 or k == a.steps
+
+        probe = L.Probe.of(f"rr qat {name}", a.steps, a, extra=outside_training)
         while st["step"] < a.steps:
             g = st["step"]
             st["losses"].append(train_step(model, opt, sched, tok, data, batch_at(g), device, a, autocast))
             st["step"] = g + 1
             probe.tick(st["step"])
-            if st["step"] % a.eval_every == 0 or st["step"] == a.steps:
+            if eval_due(st["step"]):
                 eval_point(st, st["step"])
-            ck.at_step(st["step"], state)
-            if st["step"] == a.steps:
                 ck.save(state())
+            ck.at_step(st["step"], state)
         st["trainSeconds"] += time.monotonic() - t_run
 
     sel = st["selected"]
@@ -481,7 +493,7 @@ def run_qat(a, argv):
     return 0 if ex["cp"]["pass"] and ex["cp2"]["pass"] else 1
 
 
-QAT_ARGS = ("init_onnx", "init_params_sha256", "steps", "eval_every", "cp2_allowance", "cp2_safety")
+QAT_ARGS = ("init_onnx", "init_params_sha256", "steps", "eval_every", "cp2_allowance", "cp2_safety", "export_minutes")
 
 
 def parse(argv):
@@ -514,6 +526,8 @@ def parse(argv):
     q.add_argument("--cp2-allowance", type=float, default=0.0023,
                    help="the C-P2 floor's distance below fp32 (instance base gap + CP2_MARGIN)")
     q.add_argument("--cp2-safety", type=float, default=0.005, help="emulation / instance noise taken off the margin")
+    q.add_argument("--export-minutes", type=float, default=7.0,
+                   help="export + C-P + C-P2 + qatFidelity time the S2 probe adds to the job ETA; not part of the config")
     L.add_common_args(ap)
     a = ap.parse_args(argv)
     if a.stage != "qat":

@@ -207,28 +207,40 @@ vs ORT quint8 logits on the `QUANT_N` pairs at chunk 1 (max and median |diff|).
 `eval/gpu/jobs/gm730-rr-qat.toml`: one step `qat`, `train_ce.py --stage qat
 --init-onnx $GM730_INIT/model.onnx --init-params-sha256 <bestParamsSha256>
 --steps 400 --eval-every 100 --lr 1e-5 --tau-t 1 --alpha 0.5 --batch 32
---max-len 256 --micro-queries 4 --micro-batch 128 --seed 730 --job-steps 1
---eta-limit-minutes 30`, device cuda; `max_minutes = 45`, `max_attempts = 5`,
+--max-len 256 --micro-queries 4 --micro-batch 128 --cp2-safety 0.005 --seed 730
+--job-steps 1 --eta-limit-minutes 52`, device cuda; `max_minutes = 60`, `max_attempts = 5`,
 `max_minutes_scope = "job"`, data sets windows, teacher, hf l6 and
 `gm730-rr-final-onnx-fp32` (`env GM730_INIT`, local_root the run's
 `out/final/onnx-fp32`, include `model.onnx`). g5 family; `--family` as today.
+`make_jobs.py qat` refuses a run whose `onnx-fp32/model.onnx` differs from
+`export.json` or whose rebuilt parameters do not hash to `bestParamsSha256`.
 
 ETA (g5.2xlarge, A10G): RR final measured 0.909 s/step in bf16; fp32 without
-TF32 plus fake-quant estimated **2.5-3.5 s/step** -> 400 steps 17-23 min;
-dev rows 5 x ~45 s + base rows ~1 min ≈ 5 min; export + C-P + C-P2 6 min
-(RR: 338 s); setup + boot ~7 min. **≈ 35-41 min wall, ~0.65 h.**
+TF32 plus fake-quant estimated **2.5-3.5 s/step** -> 400 steps 17-23 min.
+The emulated eager forward is ~3.15x the plain fp32 SDPA one (GM-734/S3, CPU)
+and RR final's bf16 full-dev pass took 22 s, so an emulated full-dev pass is
+~2-3 min: base rows (two full-dev passes) ~4 min, 5 dev rows ~12-17 min;
+export + C-P + C-P2 + qatFidelity ~7 min (RR: 338 s without qatFidelity);
+boot + venv + data ~5 min. **≈ 40-50 min wall.**
 
-Cost: at the observed $0.92/h of the RR final's g5.2xlarge, **~$0.60
-expected** (at the $0.75 planning price $0.49). `budget.py check` worst case
-for `max_minutes 45`, 5 attempts: (45 + 5 x 5) min x ($0.75 + EBS
-$0.0104)/h = **$0.887**; RR spent $3.670 + $0.887 = **$4.557 > cap $4.50**.
+Time limits (owner 2026-11-20 on the S3 review: "Лимит 60 мин и $5.00, ETA с
+учётом проверок (Recommended)"): `max_minutes = 60` (job scope). The S2 probe
+(after the third timed step) forecasts the whole process: time elapsed so far
+(data, base rows, the step-0 row), the remaining training steps at the
+measured s/step, the remaining dev rows at the step-0 row's measured cost, and
+`--export-minutes` (7). Over `--eta-limit-minutes 52` (= 60 - 5 boot - 3
+margin) it exits 76 before the job can run out of time mid-export. The
+checkpoint is saved after the step-0 row and after every dev row, so a spot
+interruption repeats at most the steps since the last row (or 10 min).
+A relaunched attempt's forecast does not know the minutes earlier attempts
+used; the job-scope lifetime still bounds them.
 
-- Option A (recommended): raise the RR route cap to **$4.60** (`budget.py`
-  `ROUTE_CAP["rr"]`), keep 5 attempts.
-- Option B: keep $4.50 with `max_attempts = 3`: worst $0.760, $4.430 fits;
-  two spot interruptions end the job.
-
-GM-730 total stays far under the $20 S3 rule ($5.16 + $0.89).
+Cost (owner, same answer): RR cap **$5.00**; the g5 planning price in
+`budget.py` is the observed $0.92/h of the RR final's g5.2xlarge (was $0.75).
+Worst case for `max_minutes 60`, 5 attempts: (60 + 5 x 5) min x ($0.92 + EBS
+$0.0104)/h = **$1.318**; RR spent $3.670 + $1.318 = **$4.988 <= $5.00**.
+Expected ~45 min at $0.92/h ≈ $0.70. GM-730 total $5.95 + $1.32 stays under
+the $20 S3 rule. Earlier: cap $4.60 (D1) at the $0.75 price and 45 min.
 
 ### 3.3 Stop rules
 
@@ -260,7 +272,7 @@ GM-730 total stays far under the $20 S3 rule ($5.16 + $0.89).
 | `train_ce.py` | `parse` 285-308 | stage choice `qat`; `--init-onnx`, `--init-params-sha256`, `--steps`, `--eval-every`, `--cp2-allowance` (0.0023), `--cp2-safety` (0.005) |
 | `trainlib.py` | after `load_trainable` 262-271 | `init_from_onnx(model, path, want_sha)` |
 | `trainlib.py` | `forward_sorted` 322-334 | hand the feed's mask to a callback (or `qat.mask_context` inside the fn); behaviour unchanged |
-| `make_jobs.py` | docstring 1-30, `MAX_MINUTES` 47, `ETA_LIMIT_MINUTES` 52 | `rr-qat`: 45 / 30 |
+| `make_jobs.py` | docstring 1-30, `MAX_MINUTES` 47, `ETA_LIMIT_MINUTES` 52 | `rr-qat`: 60 / 52 (S3 review; was 45 / 30) |
 | `make_jobs.py` | `data_sets` 114-129 | `rr-qat` adds the init set (`GM730_INIT`) |
 | `make_jobs.py` | new `qat_job` after `final_job` 196-215; `main` 231-253 | `qat --init-run DIR [--family F]`; reads `out/final/train.json` `bestParamsSha256` and checks `onnx-fp32/model.onnx` sha against `export.json` |
 | `budget.py` | `ROUTE_CAP` 31, docstring 15 | rr 4.5 -> 4.6 (if D1 = A) |

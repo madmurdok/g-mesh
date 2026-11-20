@@ -59,7 +59,7 @@ def export_module():
 VERSION = "v0.4-full"
 # argparse dests that never change what a run computes; everything else is the config
 NOT_CONFIG = {"out", "device", "allow_device_change", "stop_after_steps", "ckpt_minutes", "threads",
-              "job_steps", "eta_limit_minutes", "grad_checkpoint"}
+              "job_steps", "eta_limit_minutes", "grad_checkpoint", "export_minutes"}
 # exit code of a step whose S2 probe ETA for the rest of its job is over --eta-limit-minutes
 ETA_EXIT = 76
 # set to 1 to train on a teacher data set whose C-T did not pass (or was skipped)
@@ -491,18 +491,20 @@ def add_common_args(ap, seed_default=730):
 
 class Probe:
     """S2 probe: s/step of the first `n` timed steps, this step's ETA and the job's (this
-    step's rest plus job_steps - 1 more steps of the same length), printed once; exits
+    step's rest plus job_steps - 1 more steps of the same length, plus extra(done_steps)
+    seconds when given: the step's time outside its training steps), printed once; exits
     ETA_EXIT when the job ETA is over limit_minutes."""
 
-    def __init__(self, label, total_steps, n=3, job_steps=1, limit_minutes=None):
+    def __init__(self, label, total_steps, n=3, job_steps=1, limit_minutes=None, extra=None):
         self.label, self.total, self.n = label, total_steps, n
         self.job_steps, self.limit = max(1, int(job_steps or 1)), limit_minutes
+        self.extra = extra
         self.t0, self.k, self.rate = None, 0, None
 
     @classmethod
-    def of(cls, label, total_steps, a):
+    def of(cls, label, total_steps, a, extra=None):
         return cls(label, total_steps, job_steps=getattr(a, "job_steps", 1),
-                   limit_minutes=getattr(a, "eta_limit_minutes", None))
+                   limit_minutes=getattr(a, "eta_limit_minutes", None), extra=extra)
 
     def tick(self, done_steps):
         now = time.monotonic()
@@ -514,8 +516,11 @@ class Probe:
             self.rate = (now - self.t0) / self.n
             eta = self.rate * max(0, self.total - done_steps)
             job_eta = eta + self.rate * self.total * (self.job_steps - 1)
+            extra = float(self.extra(done_steps)) if self.extra else 0.0
+            job_eta += extra
             progress(f"PROBE {self.label}: {self.rate:.3f} s/step, {self.total} steps, ETA {eta / 60:.1f} min; "
                      f"job ETA {job_eta / 60:.1f} min over {self.job_steps} step(s)"
+                     + (f" (incl. {extra / 60:.1f} min outside training steps)" if self.extra else "")
                      + (f", limit {self.limit:g} min" if self.limit else ""))
             if self.limit and job_eta / 60 > self.limit:
                 progress(f"PROBE {self.label}: job ETA {job_eta / 60:.1f} min > --eta-limit-minutes {self.limit:g}: "
