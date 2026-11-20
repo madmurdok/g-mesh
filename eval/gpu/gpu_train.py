@@ -363,7 +363,7 @@ def classify_launch_error(code, message):
 
 def clean_problems(snapshot):
     """What verify-clean reports, from {region: {"tagged", "gpu", "spot", "volumes",
-    "schedules", "templates"}} lists of described resources."""
+    "schedules", "templates", "fleets"}} lists of described resources."""
     out = []
     for region, s in sorted(snapshot.items()):
         for i in s.get("tagged", []):
@@ -378,15 +378,32 @@ def clean_problems(snapshot):
             out.append(f"{region}: schedule {sc['Name']} still exists")
         for t in s.get("templates", []):
             out.append(f"{region}: launch template {t['LaunchTemplateName']} still exists")
+        for f in s.get("fleets", []):
+            out.append(f"{region}: fleet {f['FleetId']} is {f['FleetState']}")
     return out
 
 
-def live_spot_requests(requests, live_ids):
-    """The spot requests that can still hold or launch an instance: an open request
-    without an instance, or one whose instance is in `live_ids`. A request whose
-    instance is shutting-down, terminated or gone stays active for minutes after the
-    instance ends; it is not a leak."""
-    return [r for r in requests if not r.get("InstanceId") or r["InstanceId"] in live_ids]
+def live_spot_requests(requests, live_ids, ours=frozenset()):
+    """The spot requests verify-clean reports: an open request without an instance, one
+    whose instance is in `live_ids`, or one whose instance is in `ours` (a gmesh-train
+    instance or a gmesh fleet's instance, whatever its state). A request of some other
+    ended instance stays active for minutes after the instance ends and is not ours; a
+    gmesh request still active after its instance ended is a leak, since the launcher
+    cancels it: an active request holds the spot vCPU quota the next job needs."""
+    return [r for r in requests
+            if not r.get("InstanceId") or r["InstanceId"] in live_ids or r["InstanceId"] in ours]
+
+
+def fleet_instance_ids(fleet):
+    """Instance ids an instant fleet launched (DescribeFleets lists them for type instant)."""
+    return {iid for i in fleet.get("Instances", []) for iid in i.get("InstanceIds", [])}
+
+
+def reapable_fleets(fleets, live_ids, now, min_age=timedelta(minutes=10)):
+    """The gmesh fleets reap may delete: none of their instances is in `live_ids`, and
+    older than `min_age`, so a fleet another launcher process has just created (its
+    instance not yet listed) is never touched."""
+    return [f for f in fleets if not fleet_instance_ids(f) & live_ids and now - f["CreateTime"] > min_age]
 
 
 def expired_instances(instances, now):
@@ -814,6 +831,7 @@ def launch_attempt(ctx, attempt):
             print(f"attempt {attempt}: WARNING: launch template {tpl_name} not deleted: {e}")
     fleet = [inst for inst in resp.get("Instances", []) if inst.get("InstanceIds")]
     if not fleet:
+        release_spot(ec2, [], [resp.get("FleetId")], f"attempt {attempt}")
         errs = resp.get("Errors", [])
         first = errs[0] if errs else {"ErrorCode": "?", "ErrorMessage": "no instance and no error"}
         raise LaunchError(classify_launch_error(first.get("ErrorCode"), first.get("ErrorMessage")))
@@ -858,6 +876,8 @@ def adopt_instance(ctx, attempt, fleet_inst, fleet_id, expires):
             outcome = "terminated by the launcher"
         except Exception as te:
             outcome = f"TERMINATE FAILED ({te}); run `reap` or terminate it by hand"
+        if release_spot(ctx.ec2, [iid], [fleet_id], f"attempt {attempt}"):
+            outcome += "; spot request/fleet not released, run `reap`"
         rec["outcome"] = f"launcher error: {type(e).__name__}: {e}; {outcome}"
         try:
             ctx.save_launches()
@@ -953,6 +973,7 @@ def watch(ctx):
         ctx.save_launches()
         if action == "stop":
             return why
+        release_run(ctx, f"attempt {n}")  # the ended attempt's spot request holds the vCPU quota
         try:
             launch_with_retry(ctx, n + 1)
         except LaunchError as e:
@@ -1076,9 +1097,10 @@ def cmd_run(a, cfg):
     print(f"run {ctx.run_id}: {final}")
     pull(aws, cfg, bucket, ctx.run_id)
     ok = wait_terminated(ctx)
+    released = not release_run(ctx, f"run {ctx.run_id}")
     record_cost(ctx)
     reap(aws, cfg)
-    return 0 if final == "done" and ok else 1
+    return 0 if final == "done" and ok and released else 1
 
 
 def dry_run(a, cfg):
@@ -1168,9 +1190,102 @@ def gmesh_templates(ec2):
     return ec2.describe_launch_templates(Filters=[{"Name": f"tag:{TAG}", "Values": ["1"]}])["LaunchTemplates"]
 
 
+FLEET_OPEN_STATES = ["submitted", "active", "modifying"]
+
+
+def gmesh_fleets(ec2, run_id=None):
+    """Fleets tagged gmesh-train=1 (and gmesh-run=`run_id` when given) not yet deleted;
+    an instant fleet stays active until DeleteFleets."""
+    out = []
+    for page in ec2.get_paginator("describe_fleets").paginate(
+            Filters=[{"Name": "fleet-state", "Values": FLEET_OPEN_STATES}]):
+        for f in page["Fleets"]:
+            tags = {t["Key"]: t["Value"] for t in f.get("Tags", [])}
+            if tags.get(TAG) == "1" and (run_id is None or tags.get("gmesh-run") == run_id):
+                out.append(f)
+    return out
+
+
+def chunks(items, n):
+    return [items[i:i + n] for i in range(0, len(items), n)]
+
+
+def release_spot(ec2, instance_ids, fleet_ids, label):
+    """Cancels the open/active spot requests of `instance_ids`, then deletes the instant
+    fleets `fleet_ids`. Call it only for instances that ended or are being terminated:
+    DeleteFleets of an instant fleet must terminate its instances (TerminateInstances
+    false is not supported for type instant). Cancelling a one-time request does not
+    terminate its instance. Idempotent: a closed/cancelled request is not listed and a
+    fleet that no longer exists counts as deleted. Never raises; returns the problems."""
+    problems = []
+    instance_ids = sorted({i for i in instance_ids if i})
+    fleet_ids = sorted({f for f in fleet_ids if f})
+    for part in chunks(instance_ids, 100):
+        try:
+            reqs = ec2.describe_spot_instance_requests(Filters=[
+                {"Name": "instance-id", "Values": part},
+                {"Name": "state", "Values": ["open", "active"]}])["SpotInstanceRequests"]
+            ids = sorted(r["SpotInstanceRequestId"] for r in reqs)
+            if ids:
+                ec2.cancel_spot_instance_requests(SpotInstanceRequestIds=ids)
+                print(f"{label}: cancelled spot request(s) {', '.join(ids)}")
+        except Exception as e:
+            problems.append(f"spot requests of {', '.join(part)} not cancelled: {type(e).__name__}: {e}")
+    for part in chunks(fleet_ids, 25):  # DeleteFleets takes at most 25 instant fleets
+        try:
+            resp = ec2.delete_fleets(FleetIds=part, TerminateInstances=True)
+        except Exception as e:
+            problems.append(f"fleet(s) {', '.join(part)} not deleted: {type(e).__name__}: {e}")
+            continue
+        done = [f["FleetId"] for f in resp.get("SuccessfulFleetDeletions", [])]
+        if done:
+            print(f"{label}: deleted fleet(s) {', '.join(done)}")
+        for f in resp.get("UnsuccessfulFleetDeletions", []):
+            err = f.get("Error", {})
+            if err.get("Code") != "fleetIdDoesNotExist":
+                problems.append(f"fleet {f.get('FleetId')} not deleted: {err.get('Code')}: {err.get('Message')}")
+    for p in problems:
+        print(f"{label}: WARNING: {p}")
+    return problems
+
+
+def release_run(ctx, label):
+    """release_spot for every attempt of the run: the instances and fleets launches.json
+    records plus any fleet tagged for the run (one created but never recorded). Only
+    once no attempt of the run can still be running."""
+    ids = {r["instanceId"] for r in ctx.launches["attempts"]}
+    fleets = {r.get("fleetId") for r in ctx.launches["attempts"]}
+    problems = []
+    try:
+        for f in gmesh_fleets(ctx.ec2, ctx.run_id):
+            fleets.add(f["FleetId"])
+            ids |= fleet_instance_ids(f)
+    except Exception as e:
+        problems.append(f"fleets of {ctx.run_id} not listed: {type(e).__name__}: {e}")
+        print(f"{label}: WARNING: {problems[-1]}")
+    return problems + release_spot(ctx.ec2, ids, fleets, label)
+
+
+def release_ended(ec2, terminated_ids, live_ids, now, label):
+    """reap's spot cleanup in one region: cancels the open/active spot requests of tagged
+    instances that ended (or `terminated_ids`, just terminated) and of the instances of
+    reapable_fleets, and deletes those fleets. Never touches a fleet with an instance
+    in `live_ids`."""
+    try:
+        ended = [i["InstanceId"] for i in tagged_instances(ec2, ["shutting-down", "terminated"])]
+        stale = reapable_fleets(gmesh_fleets(ec2), live_ids, now)
+    except Exception as e:
+        print(f"{label}: WARNING: spot requests and fleets not checked: {type(e).__name__}: {e}")
+        return [f"not checked: {e}"]
+    fleet_iids = [iid for f in stale for iid in fleet_instance_ids(f)]
+    return release_spot(ec2, list(terminated_ids) + ended + fleet_iids, [f["FleetId"] for f in stale], label)
+
+
 def reap(aws, cfg):
-    """Terminates tagged instances past gmesh-expires, deletes schedules whose instance
-    is gone and launch templates older than 10 minutes, in every configured region."""
+    """Terminates tagged instances past gmesh-expires, cancels the spot requests of
+    ended tagged instances and deletes their ended fleets (release_ended), deletes
+    schedules whose instance is gone and launch templates older than 10 minutes, in
+    every configured region."""
     now = utcnow()
     for region in cfg["regions"]:
         ec2 = aws.client("ec2", region)
@@ -1180,6 +1295,7 @@ def reap(aws, cfg):
             ec2.terminate_instances(InstanceIds=ids)
             print(f"reap {region}: terminated expired {', '.join(ids)}")
         live_ids = {i["InstanceId"] for i in live} - set(ids)
+        release_ended(ec2, ids, live_ids, now, f"reap {region}")
         sch = aws.client("scheduler", region)
         for s in gmesh_schedules(sch):
             target = json.loads(sch.get_schedule(Name=s["Name"])["Target"].get("Input") or "{}")
@@ -1213,12 +1329,16 @@ def snapshot_region(aws, region):
                          {"Name": "instance-state-name", "Values": LIVE_STATES}]):
             for r in page["Reservations"]:
                 live_spot_ids |= {i["InstanceId"] for i in r["Instances"]}
-    spot = live_spot_requests(spot, live_spot_ids)
+    fleets = gmesh_fleets(ec2)
+    ours = tagged_ids | {i["InstanceId"] for i in tagged_instances(ec2, ["terminated"])}
+    for f in fleets:
+        ours |= fleet_instance_ids(f)
+    spot = live_spot_requests(spot, live_spot_ids, ours)
     vols = ec2.describe_volumes(Filters=[{"Name": "tag-key", "Values": ["gmesh-run"]},
                                          {"Name": "status", "Values": ["available"]}])["Volumes"]
     return {"tagged": tagged, "gpu": [i for i in gpu if i["InstanceId"] not in tagged_ids], "spot": spot,
             "volumes": vols, "schedules": gmesh_schedules(aws.client("scheduler", region)),
-            "templates": gmesh_templates(ec2)}
+            "templates": gmesh_templates(ec2), "fleets": fleets}
 
 
 def cmd_verify_clean(a, cfg):

@@ -68,8 +68,13 @@ A launch refused with an explicit deny means the budget kill switch fired
 3. An EventBridge Scheduler one-time schedule terminates the instance 10 min
    after its `gmesh-expires` tag.
 4. `reap` (run at the start and end of `run`) terminates tagged instances past
-   `gmesh-expires` and deletes leftover schedules and launch templates.
-5. The `gpu-training-50` budget kill switch ($50/month, hours of lag).
+   `gmesh-expires`, cancels the spot requests of ended tagged instances, deletes
+   tagged fleets with no live instance (older than 10 min) and deletes leftover
+   schedules and launch templates.
+5. `run` cancels an attempt's spot request and deletes its instant fleet when
+   the attempt ends (before a relaunch, and after the last attempt): an active
+   request keeps holding the spot vCPU quota after its instance terminated.
+6. The `gpu-training-50` budget kill switch ($50/month, hours of lag).
 
 After any AWS experiment:
 
@@ -79,9 +84,10 @@ uv run eval/gpu/gpu_train.py verify-clean
 
 fails unless, in us-east-1 and us-west-2, no `gmesh-train=1` instance and no
 G/P-family instance is pending/running/stopping/stopped/shutting-down (it waits
-up to 5 min for shutting-down), no spot request is open or active, no
-`gmesh-run` volume is available, and no `gmesh-*` schedule or tagged launch
-template is left.
+up to 5 min for shutting-down), no spot request is open, or active for a live
+instance or for a `gmesh-train` / gmesh fleet instance (whatever its state), no
+tagged fleet is submitted/active/modifying, no `gmesh-run` volume is available,
+and no `gmesh-*` schedule or tagged launch template is left.
 
 Kill-switch scenario (fires the real `gpu-training-50-kill-gpu` Lambda, which
 terminates every GPU-family instance in every enabled region):
