@@ -19,7 +19,7 @@ Arms (page / verdict):
 
 Controls: 1 F4/int8 reproduce GM-701/GM-697; 2 C0 exact (a: verdict, b: D6 rule); 3 shuffled FIT labels;
 4 fitter (gradient here; scikit-learn via gm461_sklearn_check.py on --dump-fit); 5 differ count.
-Stop rules (design): control 1-2 mismatch or a non-positive cosine/logit coefficient -> no tables, exit 2
+Stop rules (design): control 1-2 mismatch or a non-positive net cosine (cos1 + cos_t) or logit coefficient -> no tables, exit 2
 (--ignore-stops builds the tables anyway for diagnosis and still exits 2).
 
   python3 gm461_learned_verdict.py --work <v2 work> --out <scratch>/gm461.json [--md <path>]
@@ -60,7 +60,19 @@ ONEHOT = [l for l in LANGS if l != "go"]  # go = reference level
 FULL = ["cos1", "cos_t", "logit_t", "gap_cos", "gap_logit", "has_doc"] + [f"lang:{l}" for l in ONEHOT]
 C0_COLS = ["cos1"] + [f"clang:{l}" for l in ONEHOT]
 NOCE = ["cos1", "gap_cos", "doc0"] + [f"clang:{l}" for l in ONEHOT]
-POSITIVE_COEF = {"full": ("cos1", "cos_t", "logit_t"), "C0": ("cos1",), "noCE": ("cos1",)}
+# Terms whose coefficient sum must be positive: the net cosine effect (cos1 and cos_t are collinear, so
+# only their sum is checked) and the CE logit.
+POSITIVE_COEF = {"full": (("cos1", "cos_t"), ("logit_t",)), "C0": (("cos1",),), "noCE": (("cos1",),)}
+
+
+def sign_stops(pop, kind, coef):
+    """Stop reasons for a non-positive net cosine or logit coefficient (standardised)."""
+    out = []
+    for terms in POSITIVE_COEF[kind]:
+        v = sum(coef[t] for t in terms)
+        if v <= 0:
+            out.append(f"{pop} {kind}: coefficient of {' + '.join(terms)} = {v:.4g} <= 0")
+    return out
 
 
 def cols_for(kind, pop):
@@ -336,9 +348,7 @@ def fit_population(rows, pop, resamples, shuffles, coef_boot, stops):
                                     coef_std=m.coef(), grad_norm=m.grad_norm, mu=m.mu.tolist(), sd=m.sd.tolist())
         if m.grad_norm >= 1e-8:
             stops.append(f"{pop} {kind}: gradient norm {m.grad_norm:.3g} >= 1e-8")
-        for c in POSITIVE_COEF[kind]:
-            if m.coef()[c] <= 0:
-                stops.append(f"{pop} {kind}: coefficient of {c} = {m.coef()[c]:.4g} <= 0")
+        stops.extend(sign_stops(pop, kind, m.coef()))
 
     # thresholds (FIT only)
     kept_f4 = int((yf & ~f4f).sum())

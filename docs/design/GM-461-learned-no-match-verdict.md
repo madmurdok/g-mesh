@@ -265,7 +265,14 @@ against. Overfit means the verdict is null whatever T2-T7 say.
 ## Stop rules
 
 - Any control 1-2 mismatch, a missing CE pair, a model sha mismatch, or a
-  non-positive cosine or logit coefficient: stop, report, no tables.
+  non-positive net cosine coefficient (cos1 + cos_t where both are inputs;
+  cos1 alone in C0 and L-noCE) or logit coefficient: stop, report, no tables.
+  The two cosines are collinear (equal whenever the rerank keeps the cosine
+  top), so only their sum is checked. Owner decision (2026-11-20, verbatim):
+  "Проверять суммарный вклад косинуса (Recommended)".
+- During S2 one diagnostic `--ignore-stops` run read held-out once (it found
+  the per-coefficient rule firing on the collinear cosines); no model,
+  feature or threshold change was made after it, only the stop rule above.
 - Fewer than 50 held-out wrong-or-absent tops clearing F4 in a population, or
   fewer than 100 held-out right tops: that population's verdict is
   "unreadable" (expected: NL 333 cleared wrong/absent, 186 kept right; NAME
