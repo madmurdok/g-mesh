@@ -513,7 +513,7 @@ def parse(argv):
     q.add_argument("--eval-every", type=int, default=100, help="dev rows every this many steps (and at 0 and the end)")
     q.add_argument("--cp2-allowance", type=float, default=0.0023,
                    help="the C-P2 floor's distance below fp32 (instance base gap + CP2_MARGIN)")
-    q.add_argument("--cp2-safety", type=float, default=0.0015, help="emulation / instance noise taken off the margin")
+    q.add_argument("--cp2-safety", type=float, default=0.005, help="emulation / instance noise taken off the margin")
     L.add_common_args(ap)
     a = ap.parse_args(argv)
     if a.stage != "qat":

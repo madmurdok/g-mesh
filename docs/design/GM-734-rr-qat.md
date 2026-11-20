@@ -158,7 +158,10 @@ vs ORT quint8 logits on the `QUANT_N` pairs at chunk 1 (max and median |diff|).
   windows. Also once at start: base L6 fp32 and emulated quint8 on full dev
   (acceptance rows).
 - **Selection (pre-registered):** predicted C-P2 margin on the first 300
-  windows m = q300 - (f300 - 0.0023 - 0.0015 safety). Among eval points with
+  windows m = q300 - (f300 - 0.0023) - safety, safety 0.005 (`--cp2-safety`;
+  owner 2026-11-20: "Строже, как сделал агент (Recommended)" for the sign,
+  "Принять шум, запас 0.005 (Recommended)" for the value, which covers the
+  ~0.0026 SD level-flip noise of the 300-window MRR, section 3.1.2). Among eval points with
   m >= 0, the highest full-dev emulated quint8 MRR (ties to the earlier);
   if none, the highest full-dev emulated quint8 MRR (the gate will most
   likely fail; stop rule S-G). Step 0 (= RR final) is a candidate.
@@ -173,11 +176,23 @@ vs ORT quint8 logits on the `QUANT_N` pairs at chunk 1 (max and median |diff|).
 ### 3.1 CPU smoke (laptop, before any GPU spend; free)
 
 1. `init_from_onnx` on the RR fp32 export: sha 337e0d1e...c3a2.
-2. Fidelity: emulated quint8 (fake quant on) vs ORT A0 quint8 on the first
-   300 dev windows: |dMRR| <= 0.002 (ORT laptop 0.47683); on 200 pairs at
-   chunk 1 max |logit diff| <= 0.02 (fp32 vs quint8 is 0.18) and median
-   <= 1e-3. Batch invariance: the same pairs in a padded batch of 64 vs one
-   at a time, max |diff| <= 1e-5. Bypass = plain model, max |diff| <= 1e-6.
+2. Fidelity (gate, owner 2026-11-20: "Принять шум, запас 0.005
+   (Recommended)"): the ORT A0 quint8 MRR on the first 300 dev windows lies
+   within 2 SD of the emulation's realisations (fake quant on; batch 64, 256,
+   chunk 1 and fp32-ulp parameter jitter, each a different set of level flips).
+   Measured (GM-734/S2, laptop): emulation 0.48180 (batch 256 and 64),
+   0.48528 (chunk 1), 0.48257 / 0.48007 / 0.47835 (jitter seeds 1-3): mean
+   ~0.4816, SD ~0.0026; ORT 0.47683 (1.8 SD below the mean): **pass**.
+   A value within fp32 rounding of a quantisation boundary changes one level,
+   so no non-bit-exact implementation matches ORT pair for pair (ORT laptop vs
+   instance differ by 0.0015 on the same file). Per layer, fed ORT's own
+   layer inputs, every tensor equals ORT's to ~1e-6 apart from such flips;
+   pooler and classifier to 1e-7. Informational, not a gate: on 200 pairs at
+   chunk 1, emulated vs ORT logits max 0.137, median 0.0142, p90 0.0474 (the
+   emulation's own batch-16 vs chunk-1 flip noise: max 0.096, median 0.0131,
+   p90 0.0468; ORT fp32 vs quint8: max 0.18, median 0.031). Masked ranges:
+   batch-64 vs chunk-1 range ends of the layer-0 quantisers agree to 4e-7
+   (later ones differ only after a flip). Bypass = plain eager model: 0.
 3. Zero-step export: `--steps 0` on the RR init reproduces RR final's
    `onnx-fp32/model.onnx` sha256 and its laptop C-P2 numbers (quint8 0.47683).
 4. Tiny run: `--max-train-queries 64 --max-dev-queries 40 --steps 4
@@ -242,7 +257,7 @@ GM-730 total stays far under the $20 S3 rule ($5.16 + $0.89).
 | `train_ce.py` | `export_final` 171-196 | export a fresh `load_model` with the selected params; add `qatFidelity` record |
 | `train_ce.py` | `run` 199-282 | `if a.stage == "qat": return run_qat(a, argv)` |
 | `train_ce.py` | new `run_qat` after `run` | init, base rows, step loop with `Checkpointer` / `Probe`, eval rows, selection (2), `result.json` (base = base L6 rows, best = selected step, quint8-emulated evals), `train.json` (history, initSha, selected step, determinism), `export_final` |
-| `train_ce.py` | `parse` 285-308 | stage choice `qat`; `--init-onnx`, `--init-params-sha256`, `--steps`, `--eval-every`, `--cp2-safety` (0.0015) |
+| `train_ce.py` | `parse` 285-308 | stage choice `qat`; `--init-onnx`, `--init-params-sha256`, `--steps`, `--eval-every`, `--cp2-allowance` (0.0023), `--cp2-safety` (0.005) |
 | `trainlib.py` | after `load_trainable` 262-271 | `init_from_onnx(model, path, want_sha)` |
 | `trainlib.py` | `forward_sorted` 322-334 | hand the feed's mask to a callback (or `qat.mask_context` inside the fn); behaviour unchanged |
 | `make_jobs.py` | docstring 1-30, `MAX_MINUTES` 47, `ETA_LIMIT_MINUTES` 52 | `rr-qat`: 45 / 30 |

@@ -225,7 +225,7 @@ def final_job(route, final_configs, teacher=True, family=DEFAULT_FAMILY):
 
 
 QAT = ["--steps", "400", "--eval-every", "100", "--lr", "1e-5", "--tau-t", "1", "--alpha", "0.5", "--batch", "32",
-       "--max-len", "256", "--micro-queries", "4", "--micro-batch", "128", "--seed", SEED]
+       "--max-len", "256", "--micro-queries", "4", "--micro-batch", "128", "--cp2-safety", "0.005", "--seed", SEED]
 
 
 def home_relative(path):

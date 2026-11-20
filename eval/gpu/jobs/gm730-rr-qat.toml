@@ -13,7 +13,7 @@ max_attempts = 5
 [[steps]]
 name = "qat"
 entry = "eval/training/gm730/train_ce.py"
-args = ["--stage", "qat", "--init-onnx", "$GM730_INIT/model.onnx", "--init-params-sha256", "337e0d1e4750574b7bb3292bbacecf426ae74f4e747c39f54964b65b0253c3a2", "--steps", "400", "--eval-every", "100", "--lr", "1e-5", "--tau-t", "1", "--alpha", "0.5", "--batch", "32", "--max-len", "256", "--micro-queries", "4", "--micro-batch", "128", "--seed", "730", "--job-steps", "1", "--eta-limit-minutes", "30"]
+args = ["--stage", "qat", "--init-onnx", "$GM730_INIT/model.onnx", "--init-params-sha256", "337e0d1e4750574b7bb3292bbacecf426ae74f4e747c39f54964b65b0253c3a2", "--steps", "400", "--eval-every", "100", "--lr", "1e-5", "--tau-t", "1", "--alpha", "0.5", "--batch", "32", "--max-len", "256", "--micro-queries", "4", "--micro-batch", "128", "--cp2-safety", "0.005", "--seed", "730", "--job-steps", "1", "--eta-limit-minutes", "30"]
 device = "cuda"
 
 [[data]]
