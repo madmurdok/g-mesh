@@ -46,7 +46,7 @@ use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::seed::SeedGate;
 use crate::daemon::semantic;
-use crate::daemon::watch_loop::{spawn_watch_consumer, ConsumerStart};
+use crate::daemon::watch_loop::{spawn_watch_consumer, ConsumerStart, WATCH_CANARY_DIR};
 use crate::daemon::workspace_reindex;
 use crate::embedding::EmbeddingPipeline;
 use crate::indexing_status::{IndexingStatus, Phase};
@@ -307,7 +307,10 @@ impl ActivationCtx {
         // enumeration and the watcher's existence had no observer at all and
         // was lost. Kept across a failed attempt: a retry reuses it.
         if self.watcher.is_none() {
-            self.watcher = Some(ProjectWatcher::new(&self.root).context("failed to start the file watcher")?);
+            self.watcher = Some(
+                ProjectWatcher::with_canary(&self.root, self.registry.state_dir().join(WATCH_CANARY_DIR))
+                    .context("failed to start the file watcher")?,
+            );
         }
 
         // The walk is structural-only; embedding is the backfill pass's

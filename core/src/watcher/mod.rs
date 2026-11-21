@@ -3,11 +3,12 @@ pub mod burst;
 pub mod debounce;
 pub mod ignore_layers;
 pub mod rescan;
+pub mod starvation;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -54,11 +55,27 @@ pub struct ProjectWatcher {
     // Set by `next_change` on every signal it receives, ignored paths
     // included, before any filtering; cleared by [`Self::take_signal_seen`].
     signal_seen: AtomicBool,
+    // The canary directory (canonical) and the flag the OS callback sets when
+    // an event under it arrives; `None` when the watcher has no canary.
+    // Canary events never reach `events` or `signal_seen`.
+    canary: Option<(PathBuf, Arc<AtomicBool>)>,
 }
 
 impl ProjectWatcher {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
-        Self::new_inner(root, None)
+        Self::new_inner(root, None, None)
+    }
+
+    /// [`new`](Self::new), plus a canary: `canary_dir` is created and watched
+    /// non-recursively by the same OS watcher, so in the same event stream as
+    /// the root, before the root is. It must not be under the root. When it
+    /// cannot be set up the watcher runs without one, logged
+    /// ([`Self::canary`] is then `None`); that is not an error.
+    ///
+    /// Adding a watched path restarts the OS stream, so this must run before
+    /// any walk or reconcile that the stream is meant to cover.
+    pub fn with_canary(root: impl AsRef<Path>, canary_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::new_inner(root, Some(canary_dir.as_ref()), None)
     }
 
     /// Test-only seam: lets tests simulate the exact error notify's inotify
@@ -69,10 +86,14 @@ impl ProjectWatcher {
     /// portably/non-flakily in CI.
     #[cfg(test)]
     fn new_simulating_watch_error(root: impl AsRef<Path>, simulated_error: notify::Error) -> Result<Self> {
-        Self::new_inner(root, Some(simulated_error))
+        Self::new_inner(root, None, Some(simulated_error))
     }
 
-    fn new_inner(root: impl AsRef<Path>, simulated_watch_error: Option<notify::Error>) -> Result<Self> {
+    fn new_inner(
+        root: impl AsRef<Path>,
+        canary_dir: Option<&Path>,
+        simulated_watch_error: Option<notify::Error>,
+    ) -> Result<Self> {
         // notify's OS backends (FSEvents on macOS in particular) report
         // canonicalized paths - e.g. /var/... comes back as /private/var/...
         // since /var is a symlink. Building the gitignore matcher against a
@@ -87,17 +108,42 @@ impl ProjectWatcher {
 
         let ignores = RwLock::new(IgnoreLayers::load(root));
 
+        let mut canary = canary_dir.and_then(|dir| match prepare_canary_dir(dir, root) {
+            Ok(dir) => Some((dir, Arc::new(AtomicBool::new(false)))),
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh: no watcher canary in {} ({err:#}) - starvation is detected by event silence alone",
+                    dir.display()
+                );
+                None
+            }
+        });
+
         let (tx, rx) = channel();
         let mut watcher = {
             let tx = tx.clone();
             let root = root.to_path_buf();
+            let canary = canary.clone();
             notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    forward_event(event, &root, &tx);
+                    let canary = canary.as_ref().map(|(dir, heard)| (dir.as_path(), heard.as_ref()));
+                    forward_or_hear(event, &root, canary, &tx);
                 }
             })
         }
         .context("failed to create file watcher")?;
+
+        // Before the root: one stream holds both, and each `watch` restarts it.
+        if let Some((dir, _)) = &canary {
+            if let Err(err) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                crate::log_line!(
+                    "g-mesh: could not watch the watcher canary {} ({err}) - starvation is detected by \
+                     event silence alone",
+                    dir.display()
+                );
+                canary = None;
+            }
+        }
 
         let watch_result = match simulated_watch_error {
             Some(err) => Err(err),
@@ -150,7 +196,26 @@ impl ProjectWatcher {
             root: root.to_path_buf(),
             ignores,
             signal_seen: AtomicBool::new(false),
+            canary,
         })
+    }
+
+    /// The canary the starvation watchdog probes, when the watcher has one
+    /// ([`Self::with_canary`]).
+    pub fn canary(&self) -> Option<Box<dyn starvation::Canary + Send>> {
+        let (dir, heard) = self.canary.as_ref()?;
+        Some(Box::new(starvation::FileCanary::new(dir.clone(), Arc::clone(heard))))
+    }
+
+    /// Test-only seam: a watcher whose OS watch is stopped and its queue
+    /// drained, so `next_change` sees only the signals a test injects.
+    #[cfg(test)]
+    pub(crate) fn injected_only(root: &Path) -> ProjectWatcher {
+        let mut watcher = ProjectWatcher::new(root).unwrap();
+        let root = watcher.root.clone();
+        watcher._watcher.unwatch(&root).unwrap();
+        while watcher.events.try_recv().is_ok() {}
+        watcher
     }
 
     /// Whether the project's walks would leave `path` out, by the layers as
@@ -358,6 +423,40 @@ pub fn forward_event(event: notify::Event, root: &Path, tx: &Sender<WatchSignal>
     }
 }
 
+/// Creates `dir` and returns it canonicalized (the OS reports events in that
+/// spelling); an error when it is the root or under it, where the root's own
+/// watch would report the probes as project changes.
+fn prepare_canary_dir(dir: &Path, root: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let dir = dir.canonicalize().with_context(|| format!("failed to canonicalize {}", dir.display()))?;
+    if dir.starts_with(root) {
+        anyhow::bail!("it is inside the project root {}", root.display());
+    }
+    Ok(dir)
+}
+
+/// The OS callback's routing of one event: paths under the canary directory
+/// only set the canary's `heard` flag and are dropped; the rest go to
+/// [`forward_event`]. An event made only of canary paths forwards nothing.
+pub fn forward_or_hear(
+    mut event: notify::Event,
+    root: &Path,
+    canary: Option<(&Path, &AtomicBool)>,
+    tx: &Sender<WatchSignal>,
+) {
+    if let Some((dir, heard)) = canary {
+        let before = event.paths.len();
+        event.paths.retain(|path| !path.starts_with(dir));
+        if event.paths.len() != before {
+            heard.store(true, Ordering::Relaxed);
+            if event.paths.is_empty() {
+                return;
+            }
+        }
+    }
+    forward_event(event, root, tx);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,16 +490,10 @@ mod tests {
         changes_until(watcher, &sentinel, SYNC_TIMEOUT).expect("the sync sentinel never surfaced");
     }
 
-    /// A watcher whose OS watch is stopped and its queue drained, so
-    /// `next_change` sees only the signals a test injects. The filter and
-    /// remap tests run on exactly the paths they name, whatever the OS event
-    /// service is doing.
+    /// The filter and remap tests run on exactly the paths they name,
+    /// whatever the OS event service is doing.
     fn injected_only(root: &Path) -> ProjectWatcher {
-        let mut watcher = ProjectWatcher::new(root).unwrap();
-        let root = watcher.root.clone();
-        watcher._watcher.unwatch(&root).unwrap();
-        while watcher.events.try_recv().is_ok() {}
-        watcher
+        ProjectWatcher::injected_only(root)
     }
 
     /// What `next_change` makes of `path` as the OS reports it: the
