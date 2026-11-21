@@ -1,0 +1,34 @@
+# GM-730 job RR-T: gte-mb fp32 logits for every train and dev window pair,
+# plus the C-T parity pairs (written by make_jobs.py).
+name = "gm730-rr-teacher"
+requirements = "eval/training/gm730/requirements-linux-cu121.txt"
+smoke = true
+max_minutes = 60
+max_minutes_scope = "job"
+checkpoint_minutes = 10
+grace_seconds = 30
+max_attempts = 5
+
+[[steps]]
+name = "teacher"
+entry = "eval/training/gm730/score_teacher.py"
+args = ["--seed", "730", "--job-steps", "1", "--eta-limit-minutes", "48"]
+device = "cuda"
+
+[[data]]
+name = "gm730-windows"
+env = "GM730_WINDOWS"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/windows"
+include = ["train/*", "dev/*"]
+
+[[data]]
+name = "gm730-ct-pairs"
+env = "GM730_CT"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/ct"
+include = ["*"]
+
+[[data]]
+name = "gm730-hf-gte-mb"
+env = "GM730_HF"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/hf"
+include = ["gte-reranker-modernbert-base@f7481e6055501a30fb19d090657df9ec1f79ab2c/*"]

@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -44,9 +45,14 @@ STATUS_MARKER = "/var/run/gm457-status-written"
 
 SMOKE = r'''
 import subprocess, sys
-import torch, transformers, sentence_transformers
+import torch, transformers
+if "--sentence-transformers" in sys.argv:
+    import sentence_transformers
+    st = sentence_transformers.__version__
+else:
+    st = "not in the lock"
 print(f"smoke: torch {torch.__version__} cuda {torch.version.cuda} transformers {transformers.__version__} "
-      f"sentence-transformers {sentence_transformers.__version__}", flush=True)
+      f"sentence-transformers {st}", flush=True)
 if "--cuda" in sys.argv:
     drv = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
                          capture_output=True, text=True, check=True).stdout.strip().splitlines()[0]
@@ -366,7 +372,16 @@ class Runner:
         if not self.manifest.get("smoke", True):
             return
         cuda = any(s.get("device") == "cuda" for s in self.manifest["steps"])
-        self.sh([self.python, "-c", SMOKE] + (["--cuda"] if cuda else []), "smoke-failed", env=self.job_env())
+        args = (["--cuda"] if cuda else []) + (["--sentence-transformers"] if self.lock_has("sentence-transformers") else [])
+        self.sh([self.python, "-c", SMOKE] + args, "smoke-failed", env=self.job_env())
+
+    def lock_has(self, package):
+        """The job's env lock pins `package` (the smoke imports only what the lock installs)."""
+        lock = self.work / "requirements.txt"
+        if not lock.exists():
+            return True
+        pat = re.compile(rf"^{re.escape(package)}==", re.IGNORECASE | re.MULTILINE)
+        return bool(pat.search(lock.read_text()))
 
     # checkpoints
     def ckpt_key(self, step, name="checkpoint.pt"):

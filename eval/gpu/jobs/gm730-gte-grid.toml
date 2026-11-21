@@ -1,0 +1,70 @@
+# GM-730 job gte-grid: the pre-registered dev grid, one step per config
+# (with the RR-T teacher; written by make_jobs.py).
+name = "gm730-gte-grid"
+requirements = "eval/training/gm730/requirements-linux-cu121.txt"
+smoke = true
+max_minutes = 140
+max_minutes_scope = "job"
+checkpoint_minutes = 10
+grace_seconds = 30
+max_attempts = 5
+
+[[steps]]
+name = "lr2e-5-a0.5"
+entry = "eval/training/gm730/train_encoder.py"
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "6", "--eta-limit-minutes", "125"]
+device = "cuda"
+
+[[steps]]
+name = "lr2e-5-a1.0"
+entry = "eval/training/gm730/train_encoder.py"
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "2e-5", "--tau", "0.05", "--alpha", "1.0", "--job-steps", "5", "--eta-limit-minutes", "125"]
+device = "cuda"
+
+[[steps]]
+name = "lr5e-5-a0.5"
+entry = "eval/training/gm730/train_encoder.py"
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "4", "--eta-limit-minutes", "125"]
+device = "cuda"
+
+[[steps]]
+name = "lr5e-5-a1.0"
+entry = "eval/training/gm730/train_encoder.py"
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "5e-5", "--tau", "0.05", "--alpha", "1.0", "--job-steps", "3", "--eta-limit-minutes", "125"]
+device = "cuda"
+
+[[steps]]
+name = "lr1e-4-a0.5"
+entry = "eval/training/gm730/train_encoder.py"
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "1e-4", "--tau", "0.05", "--alpha", "0.5", "--job-steps", "2", "--eta-limit-minutes", "125"]
+device = "cuda"
+
+[[steps]]
+name = "lr1e-4-a1.0"
+entry = "eval/training/gm730/train_encoder.py"
+args = ["--stage", "grid", "--model", "gte-small", "--epochs", "3", "--batch", "64", "--docs-per-query", "8", "--max-len-doc", "256", "--max-len-query", "64", "--bf16", "--seed", "730", "--lr", "1e-4", "--tau", "0.05", "--alpha", "1.0", "--job-steps", "1", "--eta-limit-minutes", "125"]
+device = "cuda"
+
+[[data]]
+name = "gm730-windows"
+env = "GM730_WINDOWS"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/windows"
+include = ["train/*", "dev/*"]
+
+[[data]]
+name = "gm456-v0.4-full-gm730"
+env = "GM456_DATA"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm456"
+include = ["v0.4-full/queries.jsonl", "v0.4-full/manifest.json", "v0.4-full/targets.jsonl"]
+
+[[data]]
+name = "gm730-teacher"
+env = "GM730_TEACHER"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/teacher"
+include = ["*"]
+
+[[data]]
+name = "gm730-hf-gte-small"
+env = "GM730_HF"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/hf"
+include = ["gte-small@17e1f347d17fe144873b1201da91788898c639cd/*"]

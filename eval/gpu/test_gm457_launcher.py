@@ -22,6 +22,7 @@ Run (needs boto3 and moto; the runner tests run under the same command):
 import argparse
 import base64
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -1022,6 +1023,49 @@ class Launch(MotoCase, SpotFakes):
                           and i > next(j for j, x in enumerate(log) if x[1] == "create_fleet"))
         self.assertLess(first_save, first_look)
 
+    def prior_attempt(self, used_minutes):
+        """launches.json with one earlier attempt that ran `used_minutes`, ending at T0 - 5 min."""
+        end = T0 - timedelta(minutes=5)
+        rec = {"n": 1, "instanceId": "i-old", "launchTime": G.iso(end - timedelta(minutes=used_minutes)),
+               "endObserved": G.iso(end), "expires": G.iso(T0 + timedelta(hours=9)), "outcome": "interrupted"}
+        self.s3.put_object(Bucket=BUCKET, Key=f"runs/{RUN_ID}/launches.json",
+                           Body=json.dumps({"runId": RUN_ID, "attempts": [rec]}).encode())
+
+    def launched_lifetime(self):
+        """(minutes in the user data's shutdown line, the attempt's recorded expiry)."""
+        kw = [k for (n, a, k) in self.aws.log if a == "create_launch_template"][-1]
+        text = base64.b64decode(kw["LaunchTemplateData"]["UserData"]).decode()
+        line = next(x.strip() for x in text.splitlines() if x.strip().startswith("shutdown -h +"))
+        return int(line.rsplit("+", 1)[1]), self.launches()["attempts"][-1]["expires"]
+
+    def test_job_scope_gives_the_next_attempt_what_the_earlier_ones_left(self):
+        self.m.update(maxMinutes=240)
+        self.m["job"]["max_minutes_scope"] = "job"
+        self.prior_attempt(90)
+        with mock.patch.object(G, "utcnow", lambda: T0):
+            G.launch_attempt(self.ctx(), 2)
+        minutes, expires = self.launched_lifetime()
+        self.assertEqual(minutes, 150)
+        self.assertEqual(expires, G.iso(T0 + timedelta(minutes=150)))
+
+    def test_attempt_scope_keeps_max_minutes_per_attempt(self):
+        self.m.update(maxMinutes=240)
+        self.prior_attempt(90)
+        with mock.patch.object(G, "utcnow", lambda: T0):
+            G.launch_attempt(self.ctx(), 2)
+        minutes, expires = self.launched_lifetime()
+        self.assertEqual(minutes, 240)
+        self.assertEqual(expires, G.iso(T0 + timedelta(minutes=240)))
+
+    def test_job_scope_refuses_a_launch_once_the_lifetime_is_used(self):
+        self.m.update(maxMinutes=240)
+        self.m["job"]["max_minutes_scope"] = "job"
+        self.prior_attempt(235)
+        with mock.patch.object(G, "utcnow", lambda: T0), self.assertRaises(G.LaunchError) as cm:
+            G.launch_attempt(self.ctx(), 2)
+        self.assertIn("job lifetime used", str(cm.exception))
+        self.assertEqual([a for (n, a, k) in self.aws.log if a in ("create_fleet", "create_launch_template")], [])
+
     def check_orphan_terminated(self):
         with self.assertRaises(SystemExit):
             G.launch_attempt(self.ctx(), 1)
@@ -1177,9 +1221,13 @@ class RunCommands(MotoCase, SpotFakes):
 
             self.aws.overrides[("ec2", "cancel_spot_instance_requests")] = broken
         a = argparse.Namespace(profile=None, dry_run=False, resume=RUN_ID, detach=False)
-        with mock.patch.object(G, "watch", return_value="done"), mock.patch.object(G, "pull"), \
+        dest = tempfile.TemporaryDirectory()
+        self.addCleanup(dest.cleanup)
+        with mock.patch.object(G, "watch", return_value="done"), \
+                mock.patch.object(G, "pull", return_value=Path(dest.name)), \
                 mock.patch.object(G, "wait_terminated", return_value=True), \
-                mock.patch.object(G, "record_cost"), mock.patch.object(G, "reap", return_value=list(reap_problems)):
+                mock.patch.object(G, "record_cost", return_value={"totalUsd": 0.0}), \
+                mock.patch.object(G, "reap", return_value=list(reap_problems)):
             return G.cmd_run(a, CFG)
 
     def test_run_end_releases_the_run_and_exits_0(self):
@@ -1231,6 +1279,23 @@ class RunCommands(MotoCase, SpotFakes):
             self.main("interrupt", RUN_ID, "--terminate")
         self.assertIn("no launched attempt", str(cm.exception))
 
+    def test_run_writes_cost_json_into_the_pulled_run_dir(self):
+        rec = {"n": 1, "instanceId": "i-1", "launchTime": G.iso(T0), "expires": G.iso(T0 + timedelta(hours=1))}
+        self.s3.put_object(Bucket=BUCKET, Key=f"runs/{RUN_ID}/launches.json",
+                           Body=json.dumps({"runId": RUN_ID, "attempts": [rec]}).encode())
+        self.s3.put_object(Bucket=BUCKET, Key=f"runs/{RUN_ID}/out/s/r.json", Body=b"{}")
+        cost = {"totalUsd": 1.25, "hours": 0.5}
+        args = argparse.Namespace(dry_run=False, profile=None, resume=RUN_ID, detach=False)
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(G, "watch", return_value="done"), \
+                mock.patch.object(G, "wait_terminated", return_value=True), \
+                mock.patch.object(G, "record_cost", return_value=cost), \
+                mock.patch.object(G, "reap", return_value=[]):
+            self.assertEqual(G.cmd_run(args, {**CFG, "local_runs": d}), 0)
+            dest = Path(d) / RUN_ID
+            self.assertEqual(json.loads((dest / "cost.json").read_text()), cost)
+            self.assertTrue((dest / "out" / "s" / "r.json").exists())
+
     def test_attempt_record_falls_back_to_boot_record(self):
         ctx = G.Ctx(self.aws, CFG, self.m, BUCKET)
         self.assertIsNone(G.attempt_record(ctx, 1))
@@ -1252,6 +1317,143 @@ class RunCommands(MotoCase, SpotFakes):
         self.assertEqual(got, ["manifest.json", "out/s/r.json", "status.json"])
         G.cmd_status(argparse.Namespace(profile=None, run_id=RUN_ID), CFG)
         self.assertIn(f"ckpt/{RUN_ID}/s/checkpoint.pt", self.stdout.getvalue())
+
+
+class JobLifetime(unittest.TestCase):
+    """max_minutes_scope = "job": remaining_minutes, attempt_minutes, load_job."""
+
+    NOW = h(5)
+
+    def att(self, start, end=None, expires=None):
+        r = {"launchTime": G.iso(start), "expires": G.iso(expires or start + timedelta(minutes=500))}
+        if end is not None:
+            r["endObserved"] = G.iso(end)
+        return r
+
+    def test_remaining_is_the_max_minus_each_attempts_launch_to_end_span(self):
+        done = self.att(h(0), end=h(0) + timedelta(minutes=45))
+        self.assertEqual(G.remaining_minutes(240, [done], self.NOW), 195)
+        second = self.att(h(2), end=h(2) + timedelta(minutes=30))
+        self.assertEqual(G.remaining_minutes(240, [done, second], self.NOW), 165)
+        self.assertEqual(G.remaining_minutes(240, [], self.NOW), 240)
+
+    def test_an_attempt_without_an_end_counts_to_its_expiry_or_to_now_whichever_is_first(self):
+        gone = self.att(h(0), expires=h(0) + timedelta(minutes=60))
+        self.assertEqual(G.remaining_minutes(240, [gone], self.NOW), 180)
+        live = self.att(h(4), expires=h(9))
+        self.assertEqual(G.remaining_minutes(240, [live], self.NOW), 240 - 60)
+
+    def test_the_scope_decides_the_next_attempts_lifetime(self):
+        used = [self.att(h(0), end=h(0) + timedelta(minutes=90))]
+        for job in ({}, {"max_minutes_scope": "attempt"}):
+            self.assertEqual(G.attempt_minutes(job, 240, used, self.NOW), 240)
+        self.assertEqual(G.attempt_minutes({"max_minutes_scope": "job"}, 240, used, self.NOW), 150)
+        self.assertEqual(G.attempt_minutes({"max_minutes_scope": "job"}, 240, [], self.NOW), 240)
+
+    def test_the_remainder_is_truncated_to_whole_minutes(self):
+        used = [self.att(h(0), end=h(0) + timedelta(minutes=89, seconds=30))]
+        self.assertEqual(G.attempt_minutes({"max_minutes_scope": "job"}, 240, used, self.NOW), 150)
+
+    def test_under_ten_minutes_left_is_a_launch_error_and_ten_is_allowed(self):
+        job = {"max_minutes_scope": "job"}
+        ten = [self.att(h(0), end=h(0) + timedelta(minutes=230))]
+        self.assertEqual(G.attempt_minutes(job, 240, ten, self.NOW), 10)
+        nine = [self.att(h(0), end=h(0) + timedelta(minutes=231))]
+        with self.assertRaises(G.LaunchError) as cm:
+            G.attempt_minutes(job, 240, nine, self.NOW)
+        self.assertIn("job lifetime used", str(cm.exception))
+        self.assertEqual(G.MIN_ATTEMPT_MINUTES, 10)
+
+    def test_load_job_accepts_attempt_and_job_and_refuses_another_scope(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "j.toml"
+            body = ('name = "j"\nrequirements = "r.txt"\nmax_minutes = 60\nmax_minutes_scope = "%s"\n'
+                    '[[steps]]\nname = "s"\nentry = "e.py"\n')
+            for scope in ("attempt", "job"):
+                p.write_text(body % scope)
+                self.assertEqual(G.load_job(p)["max_minutes_scope"], scope)
+            p.write_text(body % "weekly")
+            with self.assertRaises(SystemExit):
+                G.load_job(p)
+            p.write_text(body.replace('max_minutes_scope = "%s"\n', ""))
+            self.assertNotIn("max_minutes_scope", G.load_job(p))
+
+    def test_the_committed_gm730_jobs_are_job_scoped(self):
+        jobs = sorted((HERE / "jobs").glob("gm730-*.toml"))
+        self.assertTrue(jobs)
+        for p in jobs:
+            self.assertEqual(G.load_job(p)["max_minutes_scope"], "job", p.name)
+
+
+class RunnerSmoke(unittest.TestCase):
+    """The smoke imports sentence-transformers only when the job's lock pins it."""
+
+    def setUp(self):
+        import runner as R
+        self.R = R
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.work = Path(self.tmp.name)
+
+    def runner(self, lock=None, steps=({"device": "cpu"},), smoke=True):
+        r = self.R.Runner.__new__(self.R.Runner)
+        r.work, r.python = self.work, "py"
+        r.manifest = {"smoke": smoke, "steps": list(steps)}
+        r.job_env = lambda: {}
+        r.calls = []
+        r.sh = lambda cmd, reason, env=None: r.calls.append((cmd, reason))
+        if lock is not None:
+            (self.work / "requirements.txt").write_text(lock)
+        return r
+
+    def test_lock_has_matches_a_pin_at_line_start_case_insensitively(self):
+        self.assertTrue(self.runner("torch==2.2\nsentence-transformers==3.0.1\n").lock_has("sentence-transformers"))
+        self.assertTrue(self.runner("Sentence-Transformers==3.0.1 \\\n").lock_has("sentence-transformers"))
+        self.assertFalse(self.runner("torch==2.2\ntransformers==4.48\n").lock_has("sentence-transformers"))
+        self.assertFalse(self.runner("# sentence-transformers==3\n x sentence-transformers==3\n").lock_has("sentence-transformers"))
+        self.assertFalse(self.runner("sentence-transformers-extra==1\n").lock_has("sentence-transformers"))
+
+    def test_without_a_lock_file_it_is_strict(self):
+        self.assertTrue(self.runner().lock_has("sentence-transformers"))
+
+    def test_smoke_passes_the_flag_iff_the_lock_pins_it(self):
+        r = self.runner("torch==2\n")
+        r.smoke()
+        cmd, reason = r.calls[0]
+        self.assertEqual((cmd, reason), (["py", "-c", self.R.SMOKE], "smoke-failed"))
+        r = self.runner("sentence-transformers==3\n")
+        r.smoke()
+        self.assertEqual(r.calls[0][0][3:], ["--sentence-transformers"])
+        r = self.runner("sentence-transformers==3\n", steps=({"device": "cuda"},))
+        r.smoke()
+        self.assertEqual(r.calls[0][0][3:], ["--cuda", "--sentence-transformers"])
+        r = self.runner("torch==2\n", steps=({"device": "cuda"},))
+        r.smoke()
+        self.assertEqual(r.calls[0][0][3:], ["--cuda"])
+
+    def test_smoke_is_skipped_when_the_manifest_turns_it_off(self):
+        r = self.runner("torch==2\n", smoke=False)
+        r.smoke()
+        self.assertEqual(r.calls, [])
+
+    @unittest.skipUnless(importlib.util.find_spec("torch") and importlib.util.find_spec("transformers"),
+                         "torch and transformers are not installed")
+    def test_the_smoke_script_imports_sentence_transformers_only_with_the_flag(self):
+        (self.work / "sentence_transformers.py").write_text('raise ImportError("sentence-transformers is not installed")\n')
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["PYTHONPATH"] = str(self.work)
+
+        def run(*flags):
+            return subprocess.run([sys.executable, "-c", self.R.SMOKE, *flags], env=env, capture_output=True, text=True,
+                                  cwd=self.work, timeout=300)
+
+        ok = run()
+        self.assertEqual(ok.returncode, 0, ok.stderr[-2000:])
+        self.assertIn("sentence-transformers not in the lock", ok.stdout)
+        self.assertIn("smoke: forward ok on cpu", ok.stdout)
+        bad = run("--sentence-transformers")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("sentence-transformers is not installed", bad.stderr)
 
 
 if __name__ == "__main__":
