@@ -109,8 +109,10 @@ def build_calib_sample(**kw):
     return build("train", CALIB_SHAPE, **kw)
 
 
-def build_select_sample(**kw):
-    return build("dev", SELECT_SHAPE, **kw)
+def build_select_sample(gate_sample=None, **kw):
+    """The selection draw minus every text the frozen gate sample holds (the two hand rows)."""
+    gate = {r["text"] for r in P.load_sample(gate_sample or P.SAMPLE)}
+    return [r for r in build("dev", SELECT_SHAPE, **kw) if r["text"] not in gate]
 
 
 def write(rows, path):

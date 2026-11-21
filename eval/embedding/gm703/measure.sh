@@ -79,6 +79,17 @@ case "$ARM" in
     "$SQ_U8") ARM_MODEL="${ARM_MODEL:-$GM736_MODELS/coderankembed-int8-sq-u8}"; ARM_INT8=1 ;;
     *) echo "ARM must be $FP32, $INT8, $SQ_S7 or $SQ_U8, not $ARM" >&2; exit 2 ;;
 esac
+# variants.toml fixes the GM-736 arms' model_dir, and the Rust run loads that one; an ARM_MODEL
+# or GM736_DATA pointing elsewhere would make the check and the run read different files.
+case "$ARM" in
+    "$SQ_S7") FIXED_DIR="$HOME/Projects/ClaudeProjects/g-mesh-data/gm736/models/coderankembed-int8-sq-s7" ;;
+    "$SQ_U8") FIXED_DIR="$HOME/Projects/ClaudeProjects/g-mesh-data/gm736/models/coderankembed-int8-sq-u8" ;;
+    *) FIXED_DIR="$ARM_MODEL" ;;
+esac
+if [ "$ARM_MODEL" != "$FIXED_DIR" ]; then
+    echo "ARM_MODEL $ARM_MODEL differs from variants.toml's model_dir $FIXED_DIR for $ARM; unset ARM_MODEL/GM736_DATA" >&2
+    exit 2
+fi
 P3_RUNS="${P3_RUNS:-$RUNS}"
 P3_CORPORA="${P3_CORPORA:-$V2_CORPORA}"
 DRY="${DRY:-0}"

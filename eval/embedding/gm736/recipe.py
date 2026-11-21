@@ -41,7 +41,7 @@ SELECT = HERE / "select_sample.jsonl"
 FROZEN_SAMPLE_SHA256 = "48908b01922fc50fee5ae523101da2d128b131a9f298c245918212f6a77e98a9"
 GATE_MIN_MEDIAN = 0.99
 R2_TARGET_MEDIAN = GATE_MIN_MEDIAN + 0.002
-SIZE_BUDGET = 162_000_000
+SIZE_BUDGET = 161_895_621  # bytes of the shipped jina int8 model.onnx (D5: no larger)
 
 
 def model_dir(models, weights):

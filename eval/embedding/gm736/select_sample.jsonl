@@ -158,5 +158,3 @@
 {"id": "query:more-itertools:more-itertools-0012-s2", "bin": "query", "tokens": 33, "text": "Represent this query for searching relevant code: How can I get all group labels after reading the whole input and storing valid items in per-key queues?"}
 {"id": "query:more-itertools:more-itertools-0020-s2p", "bin": "query", "tokens": 23, "text": "Represent this query for searching relevant code: Frozen set listing modules to import lazily, reducing import overhead."}
 {"id": "query:more-itertools:more-itertools-0030-p2", "bin": "query", "tokens": 16, "text": "Represent this query for searching relevant code: alias for tuple batches"}
-{"id": "hand:empty", "bin": "hand", "tokens": 2, "text": ""}
-{"id": "hand:seven", "bin": "hand", "tokens": 7, "text": "read the whole file now"}
