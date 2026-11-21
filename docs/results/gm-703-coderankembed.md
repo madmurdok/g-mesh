@@ -107,4 +107,12 @@ Cost gate C-quality (not part of the verdict): pass 1.60x (limit 1.5), RSS 2.55x
 
 ## Owner decision
 
-Owner decision: pending. Hosting is decided after the result, per the owner's earlier answer.
+Owner decision (2026-11-21): "Задачи в бэклог: int8 + дообучение CRE (Recommended)".
+
+- No-go for CodeRankEmbed as a drop-in replacement; jina stays the default model.
+- The size gap is fp32-only: the CRE int8 export is 139 MB (jina int8 162 MB). Its
+  quality was never measured end to end because it failed Q-D (median cosine 0.9625).
+- The GM-730 J model (fine-tuned jina, int8) reaches v2 MRR 0.501 and r@10 0.733,
+  above CRE fp32 here (0.453 / 0.673).
+- Follow-ups in the backlog: a quality-keeping CRE int8 recipe measured on v2, then
+  fine-tuning CRE with the GM-730 recipe and comparing it with J.
