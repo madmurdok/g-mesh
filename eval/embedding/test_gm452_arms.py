@@ -148,14 +148,14 @@ def report(arm, floors, cwp, cwa, other_arm="base-arm"):
 class Gm697Report(TmpCase):
     def setUp(self):
         super().setUp()
-        self.run, self.ev, _ = write_fixture(self.tmp, full_arm(), run_name="arm-j")
+        self.run_dir, self.ev, _ = write_fixture(self.tmp, full_arm(), run_name="arm-j")
         self.d6 = expected_d6()
 
     def go(self, rep, *extra):
         p = self.tmp / "report.json"
         p.write_text(json.dumps(rep))
         js = self.tmp / "out.json"
-        code, out, err = run_script(HERE / "gm697_floor_refit.py", "--run", self.run, "--eval-dir", self.ev,
+        code, out, err = run_script(HERE / "gm697_floor_refit.py", "--run", self.run_dir, "--eval-dir", self.ev,
                                     "--report", p, "--json", js, *extra)
         return code, out, err, (json.loads(js.read_text()) if js.exists() else None)
 
@@ -222,10 +222,10 @@ class SfrAfter(TmpCase):
         # name queries (no whitespace -> HARD below floor), rank-1 right: misled iff below the floor.
         specs = [q("go", True, False, "right", 0.55), q("python", True, False, "right", 0.575),
                  q("rust", True, False, "right", 0.70), q("typescript", True, False, "right", 0.70)]
-        self.run, self.ev, _ = write_fixture(self.tmp, specs)
+        self.run_dir, self.ev, _ = write_fixture(self.tmp, specs)
 
     def after(self, *args):
-        code, out, err = run_script(HERE / "shipped_floor_rates.py", "--run", self.run, "--eval-dir", self.ev,
+        code, out, err = run_script(HERE / "shipped_floor_rates.py", "--run", self.run_dir, "--eval-dir", self.ev,
                                     "--after", *args)
         self.assertEqual(code, 0, err)
         return out
@@ -440,7 +440,7 @@ class DefaultUnchanged(TmpCase):
                 self.skipTest(f"git show {BEFORE} failed: {p.stderr}")
             (oe / name).write_text(p.stdout)
         self.old = oe
-        self.run, self.ev, _ = write_fixture(self.tmp / "fx", full_arm())
+        self.run_dir, self.ev, _ = write_fixture(self.tmp / "fx", full_arm())
 
     def both(self, script, *args):
         """Runs the old and new script; output files named OUT are compared too."""
@@ -457,7 +457,7 @@ class DefaultUnchanged(TmpCase):
         return res[1]
 
     def test_gm697_default_unchanged(self):
-        code, out, _, files = self.both("gm697_floor_refit.py", "--run", self.run, "--eval-dir", self.ev,
+        code, out, _, files = self.both("gm697_floor_refit.py", "--run", self.run_dir, "--eval-dir", self.ev,
                                         "--json", "OUT/o.json", "--table", "OUT/o.md")
         self.assertIn("C1 pooled D6 fit == S19", out)  # controls compare against the S19 constants
         self.assertEqual(set(files), {"o.json", "o.md"})
@@ -466,7 +466,7 @@ class DefaultUnchanged(TmpCase):
         for extra in ([], ["--json", "OUT/o.json"], ["--options"], ["--after"], ["--floors", "fitted"],
                       ["--floors", "shipped-int8"], ["--custom", "go=0.5,python=0.6,rust=0.5,typescript=0.5"]):
             with self.subTest(extra=extra):
-                self.both("shipped_floor_rates.py", "--run", self.run, "--eval-dir", self.ev, *extra)
+                self.both("shipped_floor_rates.py", "--run", self.run_dir, "--eval-dir", self.ev, *extra)
 
 
 if __name__ == "__main__":
