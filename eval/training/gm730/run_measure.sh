@@ -164,8 +164,8 @@ PYEOF
         [ "$rc" = 75 ] || { summary "$label: kill run exited $rc, expected 75"; false; }
         test -f "$S/$label-b/checkpoint.pt"; test ! -f "$S/$label-b/result.json"
         "$PY" "$HERE/$script" "$@" --threads "$THREADS" --out "$S/$label-b" >> "$TL" 2>&1
-        local ra rb
-        ra=$(jget "$S/$label-a/result.json" best.mrr); rb=$(jget "$S/$label-b/result.json" best.mrr)
+        local ra
+        ra=$(jget "$S/$label-a/result.json" best.mrr)
         "$PY" - "$S/$label-a/result.json" "$S/$label-b/result.json" <<'PYEOF' || { summary "$label: resumed result.json differs from the uninterrupted one"; false; }
 import json, sys
 a, b = (json.load(open(p)) for p in sys.argv[1:3])
@@ -179,7 +179,7 @@ PYEOF
     # final_run <label> <script> <args...>: a final stage with its control; C-P must pass
     final_run() {
         local label="$1" script="$2"; shift 2
-        rm -rf "$S/$label"
+        rm -rf "${S:?}/${label:?}"
         local rc=0
         timed "$TL" "$PY" "$HERE/$script" "$@" --threads "$THREADS" --out "$S/$label" || rc=$?
         [ "$rc" = 0 ] || [ "$rc" = 1 ] || { summary "$label: exit $rc"; false; }
@@ -237,7 +237,7 @@ PYEOF
             done
         fi
     done
-    summary "jobs: committed TOMLs reproduced; $(ls "$S"/jobs/*.toml | wc -l | tr -d ' ') TOMLs load via gpu_train.load_job (finals from smoke-derived final_configs.json)"
+    summary "jobs: committed TOMLs reproduced; $(find "$S"/jobs -maxdepth 1 -name '*.toml' | wc -l | tr -d ' ') TOMLs load via gpu_train.load_job (finals from smoke-derived final_configs.json)"
     summary "DRY DONE; uptime: $(uptime | sed 's/.*load/load/')"
     exit 0
 fi
@@ -403,8 +403,9 @@ case "$ROUTE" in
             --st-runs "runs/$INT8" --models ce-minilm --k 30 --summary "$OUT/gm463_ref.txt" || rc=$?
         missing=$(grep -E '^ce-minilm reference pairs missing at K=30: off [0-9]+, ship [0-9]+' "$OUT/gm463-ref.log" | tail -1)
         if [ "$rc" != 0 ]; then
-            [ -n "$missing" ] && echo "$missing" | grep -qvE 'off 0, ship 0$' && grep -q "C0 ship-L6 reproduces GM-698: MISMATCH" "$OUT/gm463-ref.log" \
-                || { summary "eval rr: the ce-minilm reference run failed (exit $rc): $(tail -2 "$OUT/gm463-ref.log" | tr '\n' ' ')"; false; }
+            if ! { [ -n "$missing" ] && echo "$missing" | grep -qvE 'off 0, ship 0$' && grep -q "C0 ship-L6 reproduces GM-698: MISMATCH" "$OUT/gm463-ref.log"; }; then
+                summary "eval rr: the ce-minilm reference run failed (exit $rc): $(tail -2 "$OUT/gm463-ref.log" | tr '\n' ' ')"; false
+            fi
         fi
         no_load_fail "$OUT/gm463-ref.log"
         summary "eval rr: ce-minilm reference cache complete (${missing:-?}; first run exit $rc); $(times_of "$OUT/gm463-ref.log")"
