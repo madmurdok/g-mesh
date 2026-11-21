@@ -6,6 +6,8 @@ gm461_learned_verdict.py, the paired per-language bootstrap
 gm452_paired_bootstrap.py, and that the default (no new flag) output equals
 the pre-change scripts (efbdf7ff~); GM-452/S7: gm461 --per-query-out, the bootstrap's
 stack mode (--base-stack/--stack/--base-arm/--stack-arm) and its NaN-resample count.
+GM-452/S12: gm461 --floors-json/--floors-arm, --beta, --tune-beta-on-fit (FIT queries
+only) and the base-arm gating of controls 1 and 2b.
 
 Synthetic fixtures only: tiny run/eval dirs in a temp dir; g-mesh-data and the
 held-out eval data are never read. numpy must import; the regression group
@@ -14,7 +16,9 @@ needs git and the efbdf7ff~ commit.
 Run: ~/Projects/ClaudeProjects/g-mesh-data/gm436/venv/bin/python -I eval/embedding/test_gm452_arms.py
 """
 
+import contextlib
 import hashlib
+import io
 import json
 import shutil
 import subprocess
@@ -23,6 +27,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -748,6 +753,260 @@ class NanResamples(TmpCase):
         js = json.loads(out.read_text())
         self.assert_counts(js, err, R, "NL/go")
         self.assertNotIn("nan resamples", stdout)
+
+
+# ---- 9. gm461 arm floors, beta, FIT-only beta (GM-452/S12) -------------------------------------
+def beta_corpus(specs, name="c"):
+    """One corpus; specs: (qid, held_out, positive, mechanical, [(nid, cos)], {nid: logit}, expected).
+    Returns (corpus, score_of) with score_of recording every (qid, nid) it scores."""
+    queries, lists, expected, logits, node_lang = {}, {}, {}, {}, {}
+    for qid, ho, pos, mech, lst, lg, exp in specs:
+        queries[qid] = dict(text="find the thing", mechanical=mech, language="go", positive=pos, held_out=ho)
+        lists[qid], expected[qid] = lst, set(exp)
+        for nid, _ in lst:
+            logits[(qid, nid)] = lg[nid]
+            node_lang[nid] = "go"
+    c = SimpleNamespace(name=name, qids=list(queries), queries=queries, lists={V.B.ST: lists},
+                        expected=expected, node_lang=node_lang, trimmed_doc={})
+    seen = []
+
+    def sc(c_, q_, nid):
+        seen.append(q_)
+        return logits[(q_, nid)]
+    return c, sc, seen
+
+
+# a (cos 0.9) is the cosine top, b (0.8) the CE's: blend picks a iff beta * 0.1 > 10, i.e. beta > 100
+AB = [("a", 0.9), ("b", 0.8)]
+AB_LOGITS = {"a": 0.0, "b": 10.0}
+
+
+class ArmFloors(TmpCase):
+    FLAT = {"go": 0.5, "python": 0.45, "rust": 0.55, "typescript": 0.4}
+
+    def write(self, obj):
+        p = self.tmp / f"f{len(list(self.tmp.iterdir()))}.json"
+        p.write_text(json.dumps(obj))
+        return p
+
+    def test_flat_json(self):
+        self.assertEqual(V.load_floors(self.write(self.FLAT)), self.FLAT)
+        got = V.load_floors(self.write({k: str(v) for k, v in self.FLAT.items()}))
+        self.assertEqual(got, self.FLAT)  # values coerced to float
+        self.assertTrue(all(type(v) is float for v in got.values()))
+
+    def test_report_with_arm_reads_that_arms_d6_floors(self):
+        rep = self.write(report("arm-j", self.FLAT, (1, 2), (3, 4), other_arm="base-arm"))
+        self.assertEqual(V.load_floors(rep, "arm-j"), self.FLAT)
+        self.assertEqual(V.load_floors(rep, "base-arm"), {l: 0.1 for l in LANGS})
+
+    def test_report_without_arm_exits(self):
+        rep = self.write(report("arm-j", self.FLAT, (1, 2), (3, 4)))
+        with self.assertRaises(SystemExit) as cm:
+            V.load_floors(rep)
+        self.assertIn("--floors-arm", str(cm.exception.code))
+
+    def test_missing_language_exits(self):
+        short = {k: v for k, v in self.FLAT.items() if k != "rust"}
+        for obj, arm in ((short, None), (report("arm-j", short, (1, 2), (3, 4)), "arm-j")):
+            with self.subTest(report=arm is not None):
+                with self.assertRaises(SystemExit) as cm:
+                    V.load_floors(self.write(obj), arm)
+                self.assertIn("!= languages", str(cm.exception.code))
+
+
+class BetaFeatures(unittest.TestCase):
+    def rows(self, **kw):
+        qid = make_id("q", False, set())  # FIT side for the sha256 rule features() checks
+        c, sc, _ = beta_corpus([(qid, False, True, False, AB, AB_LOGITS, ["b"])])
+        rows, _ = V.features([c], sc, {("c", qid): False}, {"go": 0.5}, **kw)
+        return rows[0]
+
+    def test_blend_uses_given_beta(self):
+        r = self.rows(beta=1.0)  # 10 + 0.8 > 0 + 0.9: b shown
+        self.assertTrue(r["right"])
+        self.assertEqual((r["cos_t"], r["logit_t"]), (0.8, 10.0))
+        r = self.rows(beta=200.0)  # 0 + 180 > 10 + 160: a shown
+        self.assertFalse(r["right"])
+        self.assertEqual((r["cos_t"], r["logit_t"]), (0.9, 0.0))
+
+    def test_default_beta_is_shipped_40(self):
+        self.assertEqual(V.S.BETA, 40.0)
+        self.assertEqual(self.rows(), self.rows(beta=40.0))
+
+
+class TuneBetaOnFit(unittest.TestCase):
+    def corpus(self):
+        # FIT wants a (beta > 100); two held-out queries want b (beta < 100) and would outvote it on MRR.
+        return beta_corpus([
+            ("fit-1", False, True, False, AB, AB_LOGITS, ["a"]),
+            ("ho-1", True, True, False, AB, AB_LOGITS, ["b"]),
+            ("ho-2", True, True, False, AB, AB_LOGITS, ["b"]),
+            ("name-1", False, True, True, AB, AB_LOGITS, ["b"]),   # mechanical: not FIT NL
+            ("abs-1", False, False, False, AB, AB_LOGITS, []),     # absent: not scored
+        ])
+
+    def test_held_out_never_scored_and_would_change_beta(self):
+        c, sc, seen = self.corpus()
+        (beta, fit_key, added), n = V.tune_beta_on_fit([c], sc)
+        self.assertEqual(n, 1)
+        self.assertEqual(set(seen), {"fit-1"})
+        self.assertEqual(beta, 160.0)  # smallest grid beta > 100
+        self.assertEqual(fit_key, (1.0, 1.0))
+        self.assertEqual(added, [])
+        # control on the fixture: with the held-out queries in, the tuned beta differs
+        all_nl = [(c, q) for q in c.qids if V.R.scored(c.queries[q])]
+        self.assertNotEqual(V.B.tune_beta(all_nl, V.S.K, sc)[0], beta)
+
+
+class Gm461ArmMain(TmpCase):
+    """main() with the data and fit stubbed; control 2b is forced to fail so the run stops after the
+    controls are assembled, and redact_heldout is the identity so control 1 is visible."""
+
+    def run_main(self, *extra, tuned=((160.0, (0.5, 0.25), []), 7)):
+        got = {}
+
+        def feats(cs, sc, flags, floors, beta=None):
+            got["features"] = (floors, beta)
+            return [], []
+
+        def arms(cs, sc, flags, pop_of, beta=None):
+            got["arm_outs"] = beta
+            return [], []
+
+        def fit(rows, pop, *a):
+            r = {"ho": {"F4": {"kept_k": [0, 0], "caught_k": [0, 0]}}, "thresholds": {}, "stopped_arms": [],
+                 "control2a_rows_checked": 0, "control2a_mismatch_n": 0, "control_shuffle": {},
+                 "differ_vs_F4": {"L-m": 0}}
+            r.update({f"model_{k}": {"grad_norm": 0.0} for k in ("full", "C0", "noCE")})
+            return r, {"full": {}, "C0shift": {}, "C0": {}, "noCE": {}}, {}, {"C0": None}
+
+        def c2b(rows, int8, model, pinned=True):
+            got["pinned"] = pinned
+            return {"ok": False}
+
+        def tune(cs, sc):
+            got["tuned"] = True
+            return tuned
+
+        out = self.tmp / "o.json"
+        err = io.StringIO()
+        with mock.patch.object(V.G, "setup", return_value=(None, None, None, "sha")), \
+                mock.patch.object(V.SFR, "structured_floors", return_value={"go": 0.11}), \
+                mock.patch.object(V, "features", side_effect=feats), \
+                mock.patch.object(V, "arm_outs", side_effect=arms), \
+                mock.patch.object(V, "fit_population", side_effect=fit), \
+                mock.patch.object(V, "tune_beta_on_fit", side_effect=tune), \
+                mock.patch.object(V.R, "gm434", return_value={"misled": (9, 9)}), \
+                mock.patch.object(V.Q5, "fixed_floors_gates", return_value={}), \
+                mock.patch.object(V, "c0_d6_check", side_effect=c2b), \
+                mock.patch.object(V, "redact_heldout", side_effect=lambda r: r), \
+                mock.patch.object(sys, "argv", [V.__file__, "--work", str(self.tmp), "--out", str(out),
+                                                *map(str, extra)]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                V.main()
+        got["code"], got["err"] = cm.exception.code, err.getvalue()
+        got["res"] = json.loads(out.read_text()) if out.exists() else None
+        return got
+
+    def floors_file(self):
+        p = self.tmp / "floors.json"
+        p.write_text(json.dumps(ArmFloors.FLAT))
+        return p
+
+    def test_default_is_base_arm(self):
+        g = self.run_main()
+        res = g["res"]
+        self.assertEqual(g["code"], 2)
+        self.assertNotIn("arm", res)
+        self.assertEqual(g["features"], ({"go": 0.11}, V.S.BETA))
+        self.assertEqual(g["arm_outs"], V.S.BETA)
+        self.assertTrue(g["pinned"])
+        self.assertNotIn("skipped", res["controls"]["1_reproduce"])
+        self.assertIs(res["controls"]["1_reproduce"]["ok"], False)
+        self.assertTrue(any(s.startswith("control 1") for s in res["stops"]))
+        self.assertNotIn("tuned", g)
+
+    def check_non_base(self, g):
+        res = g["res"]
+        self.assertEqual(g["code"], 2)
+        self.assertIn("arm", res)
+        self.assertFalse(g["pinned"])
+        c1 = res["controls"]["1_reproduce"]
+        self.assertIn("skipped", c1)
+        self.assertIsNone(c1["ok"])
+        self.assertFalse(any(s.startswith("control 1") for s in res["stops"]))
+        self.assertIn("control 1 skipped", g["err"])
+        return res["arm"]
+
+    def test_floors_json_is_non_base(self):
+        g = self.run_main("--floors-json", self.floors_file())
+        arm = self.check_non_base(g)
+        self.assertEqual(g["features"], (ArmFloors.FLAT, V.S.BETA))
+        self.assertEqual(g["res"]["floors"], ArmFloors.FLAT)
+        self.assertEqual(arm["floors_json"], str(self.floors_file()))
+        self.assertEqual((arm["beta"], arm["beta_tuned_on_fit"], arm["st_runs"]), (V.S.BETA, None, None))
+
+    def test_report_floors_arm_is_forwarded(self):
+        p = self.tmp / "rep.json"
+        p.write_text(json.dumps(report("arm-j", ArmFloors.FLAT, (1, 2), (3, 4))))
+        g = self.run_main("--floors-json", p, "--floors-arm", "arm-j")
+        self.assertEqual(self.check_non_base(g)["floors_arm"], "arm-j")
+        self.assertEqual(g["features"][0], ArmFloors.FLAT)
+
+    def test_beta_is_non_base(self):
+        g = self.run_main("--beta", "5")
+        arm = self.check_non_base(g)
+        self.assertEqual((g["features"][1], g["arm_outs"], arm["beta"]), (5.0, 5.0, 5.0))
+        self.assertNotIn("tuned", g)
+
+    def test_beta_40_is_base(self):
+        self.assertNotIn("arm", self.run_main("--beta", "40")["res"])
+
+    def test_st_runs_is_non_base(self):
+        self.assertEqual(self.check_non_base(self.run_main("--st-runs", "runs/j"))["st_runs"], "runs/j")
+
+    def test_tune_beta_on_fit_uses_and_records_tuned_beta(self):
+        g = self.run_main("--tune-beta-on-fit")
+        arm = self.check_non_base(g)
+        self.assertEqual((g["features"][1], g["arm_outs"], arm["beta"]), (160.0, 160.0, 160.0))
+        self.assertEqual(arm["beta_tuned_on_fit"], {"beta": 160.0, "fit_r10": 0.5, "fit_mrr": 0.25,
+                                                    "grid_added": [], "fit_queries": 7})
+        self.assertIn("FIT-tuned beta 160", g["err"])
+
+    def test_beta_and_tune_are_exclusive(self):
+        g = self.run_main("--beta", "5", "--tune-beta-on-fit")
+        self.assertIn("exclusive", str(g["code"]))
+        self.assertNotIn("tuned", g)
+        self.assertNotIn("features", g)
+        self.assertIsNone(g["res"])
+
+
+class C0D6Pinned(unittest.TestCase):
+    """Control 2b: the base arm checks the v2 int8 constants; another arm only its own R.fit_floors."""
+
+    def setUp(self):
+        tops = [0.30, 0.35, 0.40, 0.45]  # < 34 rows: D6 index 0 -> floor 0.30 (!= v2 go 0.51)
+        self.int8 = [dict(id=f"q{i}", corpus="c", language="go", positive=True, mechanical=False,
+                          held_out=False, rank=1, top=t) for i, t in enumerate(tops)]
+        self.rows = [{"key": ("c", f"q{i}"), "cos1": t} for i, t in enumerate(tops)]
+        self.model = SimpleNamespace(cols=["cos1"], z=lambda X: X[:, 0])  # z monotone in cos1
+
+    def test_pinned_requires_v2_constants(self):
+        r = V.c0_d6_check(self.rows, self.int8, self.model)
+        self.assertEqual(r["implied"], {"go": 0.30})
+        self.assertEqual(r["implied"], r["fit_floors"])
+        self.assertEqual(r["v2_refit"], V.V2_D6_INT8)
+        self.assertFalse(r["ok"])
+
+    def test_unpinned_checks_own_fit_floors_only(self):
+        r = V.c0_d6_check(self.rows, self.int8, self.model, pinned=False)
+        self.assertTrue(r["ok"])
+        self.assertIn("skipped", r["v2_refit"])
+        # still a real check: a z that disagrees with cosine order fails it
+        bad = SimpleNamespace(cols=["cos1"], z=lambda X: -X[:, 0])
+        self.assertFalse(V.c0_d6_check(self.rows, self.int8, bad, pinned=False)["ok"])
 
 
 # ---- 5. default output unchanged vs the pre-change scripts --------------------------------------
