@@ -12,7 +12,7 @@ the hourly price plus the root volume's EBS, since a job's attempts share max_mi
 GPU family the job runs on (USD_PER_HOUR_BY_FAMILY): the family of the job's `instance_types`,
 else of config.toml's, the same list gpu_train.py run launches when not given
 --instance-types; --usd-per-hour overrides it. Refused (exit 3) when:
-  - the job's route spend + its worst case > the route cap (rr $4.50, jina $8.95, gte $3);
+  - the job's route spend + its worst case > the route cap (rr $5.25, jina $8.95, gte $3);
   - the cumulative spend + its worst case > $20 (S3: no new job at $20);
   - for route gte (R3): the cumulative spend + its worst case > $15 (S3: R3 is skipped at $15).
 A run of the job itself must be pulled before the next launch: this check reads the laptop only.
@@ -28,13 +28,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 GPU_CONFIG = REPO / "eval" / "gpu" / "config.toml"
-ROUTE_CAP = {"rr": 4.5, "jina": 8.95, "gte": 3.0}
+ROUTE_CAP = {"rr": 5.25, "jina": 8.95, "gte": 3.0}
 NO_NEW_JOB = 20.0
 R3_SKIP = 15.0
 BOOT_MINUTES = 5  # boot, venv and data sync before the in-OS lifetime matters, per attempt
 # Planning $/h of a spot hour per GPU family: the upper end of the us-east-1 spot prices the
-# owner observed on 2026-11-19 (g5 0.60-0.73, g6e 1.1-2.0, g6 0.42-0.68), rounded up.
-USD_PER_HOUR_BY_FAMILY = {"g5": 0.75, "g6e": 2.0, "g6": 0.70}
+# owner observed on 2026-11-19 (g6e 1.1-2.0, g6 0.42-0.68), rounded up; g5 is the $0.92/h the
+# RR final run paid on g5.2xlarge (its cost.json, $0.9206/h).
+USD_PER_HOUR_BY_FAMILY = {"g5": 0.92, "g6e": 2.0, "g6": 0.70}
 REFUSED = 3
 
 

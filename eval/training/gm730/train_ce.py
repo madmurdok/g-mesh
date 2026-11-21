@@ -25,10 +25,30 @@ official file's closed form), export.json (C-P torch vs fp32 ONNX on 1,000 dev
 pairs, quint8 vs fp32 at chunk 1, and C-P2: the quint8 dev MRR at chunk 1 on the
 first 300 dev windows vs the fp32 export's, against the base L6's own gap).
 
+--stage qat (docs/design/GM-734-rr-qat.md): quantization-aware fine-tune of a trained
+RR model. Starts from the parameters of its fp32 export (--init-onnx, refused unless
+their sha256 is --init-params-sha256), trains --steps steps of the same loss through
+qat.py's emulation of export.quantize("l6") (fp32, no --bf16), over the epoch-1 batch
+order of --seed. Dev rows at step 0, every --eval-every steps and at the last step:
+emulated quint8 MRR over all dev windows, plus fp32 and emulated quint8 on the first
+CP2_WINDOWS (the C-P2 subset); once at the start the base L6's fp32 and emulated quint8
+over all dev windows. Selection: the predicted C-P2 margin on the subset
+m = q300 - (f300 - --cp2-allowance) - --cp2-safety only filters; among rows with
+m >= 0 the highest full-dev emulated quint8 MRR wins (ties to the earlier step), and
+without one the highest full-dev emulated quint8 MRR. The selected parameters go into a
+fresh (unwrapped, default-attention) model and through the --stage final export, C-P and
+C-P2 unchanged; export.json adds qatFidelity (emulated torch vs ORT quint8 logits at
+chunk 1). result.json's base is the base L6's emulated quint8 row, its best the selected
+step (`epoch` holds the step). The checkpoint is saved after every dev row. The S2 probe's
+job ETA is the whole process: time elapsed so far, the remaining training steps, the
+remaining dev rows at the step-0 row's measured cost, and --export-minutes.
+
 usage: train_ce.py --stage grid|final --lr X --tau-t X --alpha X --out DIR [--control shuffled-teacher] [options]
+       train_ce.py --stage qat --init-onnx F --init-params-sha256 H --steps N --lr X --tau-t X --alpha X --out DIR [options]
 """
 
 import argparse
+import os
 import shutil
 import sys
 import time
@@ -49,10 +69,13 @@ CP2_WINDOWS = 300  # dev windows of the quint8 C-P2 check (chunk 1)
 CP2_MARGIN = 0.01
 
 
-def load_model(device):
+def load_model(device, attn_implementation=None):
+    """The base L6 cross-encoder, fp32; `attn_implementation` "eager" for the qat wrappers,
+    None (transformers' default) for everything that is exported."""
     import torch
     from transformers import AutoModelForSequenceClassification
-    m = AutoModelForSequenceClassification.from_pretrained(str(L.S.path_of(SNAPSHOT)), torch_dtype=torch.float32)
+    kw = {"attn_implementation": attn_implementation} if attn_implementation else {}
+    m = AutoModelForSequenceClassification.from_pretrained(str(L.S.path_of(SNAPSHOT)), torch_dtype=torch.float32, **kw)
     return m.to(device)
 
 
@@ -81,14 +104,15 @@ class Data:
         return [(w["text"], self.texts[k]["ship"]) for k in w["keys"]]
 
 
-def dev_eval(model, tok, data, device, a):
-    """[(query id, target, rank)] over the dev windows."""
+def dev_eval(model, tok, data, device, a, windows=None):
+    """[(query id, target, rank)] over `windows` (default: all dev windows), in order."""
     import torch
     model.eval()
     out = []
     pad = L.pad_id(tok)
-    for s in range(0, len(data.dev), a.eval_queries):
-        ws = data.dev[s:s + a.eval_queries]
+    windows = data.dev if windows is None else windows
+    for s in range(0, len(windows), a.eval_queries):
+        ws = windows[s:s + a.eval_queries]
         encs = tok.encode_batch([p for w in ws for p in data.pairs(w)])
         with torch.no_grad():
             z = L.forward_sorted(lambda feed: model(**feed).logits[:, 0].float(), encs, a.eval_batch, pad, device,
@@ -168,8 +192,19 @@ def quint8_check(fp32_onnx, q_onnx, tok, data, out):
             "margin": CP2_MARGIN, "floor": floor, "pass": mrr["quint8"] >= floor, "cpuSeconds": time.monotonic() - t}
 
 
-def export_final(model, tok_dev, data, a, out):
-    """onnx-fp32 + onnx-quint8 of the loaded (best) model, C-P and the quint8 C-P2."""
+def qat_fidelity(emulated, q_onnx, ptok, pairs):
+    """Emulated quint8 (a qat-wrapped torch model) vs the ORT quint8 file, one pair per run
+    (chunk 1): max and median |logit diff|."""
+    X = L.export_module()
+    ft, fo = X.torch_forward(emulated, EXPORT_KEY), X.ort_forward(X.ort_session(q_onnx))
+    d = np.array([float(np.abs(ft(feed).reshape(-1) - fo(feed).reshape(-1)).max()) for feed in X.batches(ptok, pairs, 1)])
+    return {"n": len(d), "chunk": 1, "maxAbsDiff": float(d.max()) if len(d) else 0.0,
+            "medianAbsDiff": float(np.median(d)) if len(d) else 0.0}
+
+
+def export_final(model, tok_dev, data, a, out, fidelity_model=None):
+    """onnx-fp32 + onnx-quint8 of the loaded (best) model, C-P and the quint8 C-P2; with
+    `fidelity_model` (the qat-wrapped model holding the same parameters) also qatFidelity."""
     X = L.export_module()
     model.eval()
     snap = L.S.path_of(SNAPSHOT)
@@ -187,6 +222,8 @@ def export_final(model, tok_dev, data, a, out):
     res = {"fp32": {"dir": fp32_dir.name, "files": files}, "quint8": {"dir": q_dir.name, "files": qfiles},
            "cp": cp, "quint8VsFp32": {"n": min(QUANT_N, len(pairs)), "chunk": 1, "maxAbsDiff": qd},
            "bytes": {"fp32": (fp32_dir / "model.onnx").stat().st_size, "quint8": (q_dir / "model.onnx").stat().st_size}}
+    if fidelity_model is not None:
+        res["qatFidelity"] = qat_fidelity(fidelity_model, q_dir / "model.onnx", ptok, pairs[:QUANT_N])
     res["cp2"] = quint8_check(fp32_dir / "model.onnx", q_dir / "model.onnx", tok_dev, data, out)
     L.write_json(out / "export.json", res)
     c2 = res["cp2"]
@@ -198,6 +235,8 @@ def export_final(model, tok_dev, data, a, out):
 
 def run(a, argv):
     import torch
+    if a.stage == "qat":
+        return run_qat(a, argv)
     cfg, cfg_sha = L.config_of(a)
     out = Path(a.out)
     device = L.setup_torch(a)
@@ -282,9 +321,184 @@ def run(a, argv):
     return 0 if ok else 1
 
 
+def selection_key(row):
+    """Order of the qat selection: rows with a non-negative predicted C-P2 margin first, then
+    the full-dev emulated quint8 MRR; the selected row is the first maximum."""
+    return (bool(row["eligible"]), row["quint8Emu"]["mrr"])
+
+
+def select_row(rows):
+    """Index of the selected qat dev row (first maximum of selection_key), or None."""
+    best = None
+    for i, r in enumerate(rows):
+        if best is None or selection_key(r) > selection_key(rows[best]):
+            best = i
+    return best
+
+
+def predicted_margin(q300, f300, a):
+    """Predicted C-P2 margin on the subset: emulated quint8 minus the gate's floor
+    (fp32 - allowance), less a safety for the instance-vs-emulation noise."""
+    return q300 - (f300 - a.cp2_allowance) - a.cp2_safety
+
+
+def init_path(arg):
+    """--init-onnx with `~` and `$VAR` expanded (a job passes `$GM730_INIT/model.onnx`; the
+    config keeps the unexpanded text, so it is the same on the laptop and the instance)."""
+    p = os.path.expandvars(os.path.expanduser(arg))
+    if "$" in p:
+        raise SystemExit(f"--init-onnx {arg}: an environment variable is not set")
+    return Path(p)
+
+
+def run_qat(a, argv):
+    import torch
+    import qat as Q
+    if a.bf16:
+        raise SystemExit("--stage qat trains in fp32 (bf16 would blur the 255-level grid); drop --bf16")
+    if a.control != "none":
+        raise SystemExit("--stage qat has no control")
+    if not a.init_onnx or a.steps is None or a.steps < 0 or a.eval_every < 1:
+        raise SystemExit("--stage qat needs --init-onnx, --steps >= 0 and --eval-every >= 1")
+    t_proc = time.monotonic()
+    cfg, cfg_sha = L.config_of(a)
+    out = Path(a.out)
+    device = L.setup_torch(a)
+    name, grid_args = L.grid_identity(ROUTE, argv, out)
+    data = Data(a)
+    tok = L.tokenizer(L.S.path_of(SNAPSHOT), a.max_len)
+    model = load_model(device, "eager")
+    init_sha = L.init_from_onnx(model, init_path(a.init_onnx), a.init_params_sha256)
+    Q.wrap(model)
+    model.train()
+    autocast = L.autocast(a, device)
+    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, L.linear_warmup(max(1, a.steps), a.warmup))
+    lengths = [sum(len(data.texts[k]["ship"]) for k in w["keys"]) for w in data.train]
+    per_epoch = -(-len(data.train) // a.batch)
+    orders = {}
+
+    def batch_at(g):
+        """The g-th (0-based) batch: epoch 1 + g // per_epoch of the (seed, epoch) order."""
+        epoch = 1 + g // per_epoch
+        if epoch not in orders:
+            orders[epoch] = L.bucketed_batches(lengths, a.batch, a.seed, epoch)
+        return [data.train[i] for i in orders[epoch][g % per_epoch]]
+
+    sub = data.dev[:CP2_WINDOWS]
+    L.progress(f"{out}: qat from {a.init_onnx} (params {init_sha[:12]}), {len(data.train)} train / {len(data.dev)} "
+               f"dev windows, {a.steps} steps, eval every {a.eval_every}")
+
+    def eval_rows(m):
+        """(full-dev emulated quint8 evals, fp32 evals on the subset)."""
+        evq = dev_eval(m, tok, data, device, a)
+        with Q.bypass(m):
+            evf = dev_eval(m, tok, data, device, a, windows=sub)
+        return evq, evf
+
+    def eval_point(st, step):
+        t = time.monotonic()
+        evq, evf = eval_rows(model)
+        q300, f300 = L.summarize(evq[:len(sub)])["mrr"], L.summarize(evf)["mrr"]
+        margin = predicted_margin(q300, f300, a)
+        row = {"step": step, "quint8Emu": L.summarize(evq), "fp32Sub": L.summarize(evf),
+               "quint8EmuSub": L.summarize(evq[:len(sub)]), "subWindows": len(sub), "margin": margin,
+               "eligible": margin >= 0,
+               "loss": float(np.mean(st["losses"])) if st["losses"] else None, "devSeconds": time.monotonic() - t}
+        st["history"].append(row)
+        st["losses"] = []
+        if st["selected"] is None or selection_key(row) > selection_key(st["selected"]):
+            st.update(selected=row, bestEvals=evq, bestParams=L.trainable_state(model))
+        L.progress(f"{out}: step {step}/{a.steps} loss {row['loss']} emulated quint8 dev MRR "
+                   f"{row['quint8Emu']['mrr']:.4f}; subset q {q300:.4f} fp32 {f300:.4f} margin {margin:+.4f}; "
+                   f"selected step {st['selected']['step']}")
+
+    with L.Checkpointer(a, cfg_sha) as ck:
+        t_run = time.monotonic()
+        st = ck.load()
+
+        def state():
+            return dict(st, params=L.trainable_state(model), opt=opt.state_dict(), sched=sched.state_dict(),
+                        trainSeconds=st["trainSeconds"] + time.monotonic() - t_run)
+
+        if st is not None:
+            L.load_trainable(model, st["params"])
+            opt.load_state_dict(st["opt"])
+            sched.load_state_dict(st["sched"])
+            L.progress(f"{out}: resumed at step {st['step']}")
+        else:
+            t = time.monotonic()
+            base = Q.wrap(load_model(device, "eager"))
+            bq = dev_eval(base, tok, data, device, a)
+            with Q.bypass(base):
+                bf = dev_eval(base, tok, data, device, a)
+            del base
+            st = {"step": 0, "history": [], "losses": [], "selected": None, "bestEvals": None, "bestParams": None,
+                  "baseEvals": bq,
+                  "baseRows": {"fp32": L.summarize(bf), "quint8Emu": L.summarize(bq),
+                               "fp32Sub": L.summarize(bf[:len(sub)]), "quint8EmuSub": L.summarize(bq[:len(sub)]),
+                               "devSeconds": time.monotonic() - t},
+                  "trainSeconds": 0.0}
+            L.progress(f"{out}: base L6 dev MRR fp32 {st['baseRows']['fp32']['mrr']:.4f}, emulated quint8 "
+                       f"{st['baseRows']['quint8Emu']['mrr']:.4f}")
+            eval_point(st, 0)
+            ck.save(state())
+        eval_cost = st["history"][0]["devSeconds"]
+
+        def outside_training(done):
+            """Seconds of this process outside the remaining training steps: elapsed so far,
+            the remaining eval points at the step-0 eval point's measured cost, and the export."""
+            evals = sum(1 for k in range(done + 1, a.steps + 1) if eval_due(k))
+            return time.monotonic() - t_proc + evals * eval_cost + a.export_minutes * 60
+
+        def eval_due(k):
+            return k % a.eval_every == 0 or k == a.steps
+
+        probe = L.Probe.of(f"rr qat {name}", a.steps, a, extra=outside_training)
+        while st["step"] < a.steps:
+            g = st["step"]
+            st["losses"].append(train_step(model, opt, sched, tok, data, batch_at(g), device, a, autocast))
+            st["step"] = g + 1
+            probe.tick(st["step"])
+            if eval_due(st["step"]):
+                eval_point(st, st["step"])
+                ck.save(state())
+            ck.at_step(st["step"], state)
+        st["trainSeconds"] += time.monotonic() - t_run
+
+    sel = st["selected"]
+    if st["history"][select_row(st["history"])]["step"] != sel["step"]:
+        raise SystemExit("qat selection: the running choice differs from select_row over the history")
+    res = L.result_json(ROUTE, name, grid_args, sel["step"], st["baseEvals"], st["bestEvals"], a.seed, a.resamples)
+    res["best"]["step"] = sel["step"]
+    info = {"config": cfg, "configSha256": cfg_sha, "stage": a.stage, "control": a.control, "history": st["history"],
+            "baseRows": st["baseRows"], "initOnnx": str(a.init_onnx), "initParamsSha256": init_sha,
+            "selectedStep": sel["step"], "selectedEligible": sel["eligible"],
+            "bestParamsSha256": L.params_sha256(st["bestParams"]),
+            "lastParamsSha256": L.params_sha256(L.trainable_state(model)), "params": L.count_params(model),
+            "queries": {"train": len(data.train), "dev": len(data.dev)}, "steps": a.steps,
+            "stepsPerEpoch": per_epoch, "trainSeconds": st["trainSeconds"], "determinism": L.determinism_note(a),
+            "checkpointBytes": (out / "checkpoint.pt").stat().st_size}
+    L.load_trainable(model, st["bestParams"])
+    Q.enabled(model, True)
+    model.eval()
+    fresh = load_model(device)
+    L.load_trainable(fresh, st["bestParams"])
+    info["export"] = export_final(fresh, tok, data, a, out, fidelity_model=model)
+    L.write_json(out / "train.json", info)
+    L.write_json(out / "result.json", res)
+    L.progress(f"{out}: done; selected step {sel['step']} ({'margin ok' if sel['eligible'] else 'no row passed the margin'}),"
+               f" emulated quint8 dev MRR {sel['quint8Emu']['mrr']:.4f}")
+    ex = info["export"]
+    return 0 if ex["cp"]["pass"] and ex["cp2"]["pass"] else 1
+
+
+QAT_ARGS = ("init_onnx", "init_params_sha256", "steps", "eval_every", "cp2_allowance", "cp2_safety", "export_minutes")
+
+
 def parse(argv):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--stage", choices=["grid", "final"], required=True)
+    ap.add_argument("--stage", choices=["grid", "final", "qat"], required=True)
     ap.add_argument("--control", choices=["none", "shuffled-teacher"], default="none")
     ap.add_argument("--lr", type=float, required=True)
     ap.add_argument("--tau-t", dest="tau_t", type=float, default=1.0, help="teacher temperature")
@@ -304,8 +518,23 @@ def parse(argv):
     ap.add_argument("--dev-repos", nargs="*")
     ap.add_argument("--max-train-queries", type=int)
     ap.add_argument("--max-dev-queries", type=int)
+    q = ap.add_argument_group("--stage qat")
+    q.add_argument("--init-onnx", help="fp32 export whose parameters the fine-tune starts from")
+    q.add_argument("--init-params-sha256", help="refuse --init-onnx unless its parameters have this params_sha256")
+    q.add_argument("--steps", type=int, help="optimiser steps")
+    q.add_argument("--eval-every", type=int, default=100, help="dev rows every this many steps (and at 0 and the end)")
+    q.add_argument("--cp2-allowance", type=float, default=0.0023,
+                   help="the C-P2 floor's distance below fp32 (instance base gap + CP2_MARGIN)")
+    q.add_argument("--cp2-safety", type=float, default=0.005, help="emulation / instance noise taken off the margin")
+    q.add_argument("--export-minutes", type=float, default=7.0,
+                   help="export + C-P + C-P2 + qatFidelity time the S2 probe adds to the job ETA; not part of the config")
     L.add_common_args(ap)
-    return ap.parse_args(argv)
+    a = ap.parse_args(argv)
+    if a.stage != "qat":
+        # a grid / final config (and its sha) does not depend on the qat options
+        for k in QAT_ARGS:
+            delattr(a, k)
+    return a
 
 
 def main(argv=None):

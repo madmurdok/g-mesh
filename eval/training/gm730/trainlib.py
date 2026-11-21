@@ -59,7 +59,7 @@ def export_module():
 VERSION = "v0.4-full"
 # argparse dests that never change what a run computes; everything else is the config
 NOT_CONFIG = {"out", "device", "allow_device_change", "stop_after_steps", "ckpt_minutes", "threads",
-              "job_steps", "eta_limit_minutes", "grad_checkpoint"}
+              "job_steps", "eta_limit_minutes", "grad_checkpoint", "export_minutes"}
 # exit code of a step whose S2 probe ETA for the rest of its job is over --eta-limit-minutes
 ETA_EXIT = 76
 # set to 1 to train on a teacher data set whose C-T did not pass (or was skipped)
@@ -270,6 +270,49 @@ def load_trainable(model, sd):
             p.copy_(sd[n].to(p.device, p.dtype))
 
 
+def onnx_params(model, onnx_path):
+    """{name: tensor} of the model's trainable parameters read from an fp32 export of it
+    (export.export_dir: the model sits under `m.` in the traced wrapper). A parameter is the
+    initializer `m.<name>`; a Linear weight that is not one is the transposed constant B
+    input of the MatMul node `/m/<module path, '.' -> '/'>/MatMul` (located by graph
+    structure, never by value)."""
+    import onnx
+    import torch
+    from onnx import numpy_helper
+    g = onnx.load(str(onnx_path)).graph
+    inits = {i.name: i for i in g.initializer}
+    matmul_b = {}
+    for n in g.node:
+        if n.op_type == "MatMul" and n.name.startswith("/m/") and n.name.endswith("/MatMul") and n.input[1] in inits:
+            matmul_b[n.name[len("/m/"):-len("/MatMul")].replace("/", ".")] = n.input[1]
+    out = {}
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "m." + name in inits:
+            arr = numpy_helper.to_array(inits["m." + name])
+        else:
+            mod, _, leaf = name.rpartition(".")
+            if leaf != "weight" or mod not in matmul_b:
+                raise SystemExit(f"{onnx_path}: no initializer or MatMul weight for parameter {name}")
+            arr = numpy_helper.to_array(inits[matmul_b[mod]]).T
+        if tuple(arr.shape) != tuple(p.shape):
+            raise SystemExit(f"{onnx_path}: {name} has shape {tuple(arr.shape)}, the model's is {tuple(p.shape)}")
+        out[name] = torch.from_numpy(np.array(arr, dtype=np.float32, order="C", copy=True))
+    return out
+
+
+def init_from_onnx(model, onnx_path, want_sha=None):
+    """Load the trainable parameters of an fp32 export (onnx_params) into the model; refused
+    unless their params_sha256 equals want_sha (when given). Returns the sha."""
+    sd = onnx_params(model, onnx_path)
+    sha = params_sha256(sd)
+    if want_sha and sha != want_sha:
+        raise SystemExit(f"{onnx_path}: parameters sha256 {sha} != --init-params-sha256 {want_sha}")
+    load_trainable(model, sd)
+    return sha
+
+
 def params_sha256(sd):
     """sha256 over the sorted names and the float32 bytes of a state dict."""
     h = hashlib.sha256()
@@ -448,18 +491,20 @@ def add_common_args(ap, seed_default=730):
 
 class Probe:
     """S2 probe: s/step of the first `n` timed steps, this step's ETA and the job's (this
-    step's rest plus job_steps - 1 more steps of the same length), printed once; exits
+    step's rest plus job_steps - 1 more steps of the same length, plus extra(done_steps)
+    seconds when given: the step's time outside its training steps), printed once; exits
     ETA_EXIT when the job ETA is over limit_minutes."""
 
-    def __init__(self, label, total_steps, n=3, job_steps=1, limit_minutes=None):
+    def __init__(self, label, total_steps, n=3, job_steps=1, limit_minutes=None, extra=None):
         self.label, self.total, self.n = label, total_steps, n
         self.job_steps, self.limit = max(1, int(job_steps or 1)), limit_minutes
+        self.extra = extra
         self.t0, self.k, self.rate = None, 0, None
 
     @classmethod
-    def of(cls, label, total_steps, a):
+    def of(cls, label, total_steps, a, extra=None):
         return cls(label, total_steps, job_steps=getattr(a, "job_steps", 1),
-                   limit_minutes=getattr(a, "eta_limit_minutes", None))
+                   limit_minutes=getattr(a, "eta_limit_minutes", None), extra=extra)
 
     def tick(self, done_steps):
         now = time.monotonic()
@@ -471,8 +516,11 @@ class Probe:
             self.rate = (now - self.t0) / self.n
             eta = self.rate * max(0, self.total - done_steps)
             job_eta = eta + self.rate * self.total * (self.job_steps - 1)
+            extra = float(self.extra(done_steps)) if self.extra else 0.0
+            job_eta += extra
             progress(f"PROBE {self.label}: {self.rate:.3f} s/step, {self.total} steps, ETA {eta / 60:.1f} min; "
                      f"job ETA {job_eta / 60:.1f} min over {self.job_steps} step(s)"
+                     + (f" (incl. {extra / 60:.1f} min outside training steps)" if self.extra else "")
                      + (f", limit {self.limit:g} min" if self.limit else ""))
             if self.limit and job_eta / 60 > self.limit:
                 progress(f"PROBE {self.label}: job ETA {job_eta / 60:.1f} min > --eta-limit-minutes {self.limit:g}: "

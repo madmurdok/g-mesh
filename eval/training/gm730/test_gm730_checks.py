@@ -132,12 +132,12 @@ class FamilyPricing(BudgetCase):
         return problems, info
 
     def test_planning_prices_per_family(self):
-        self.assertEqual(B.USD_PER_HOUR_BY_FAMILY, {"g5": 0.75, "g6e": 2.0, "g6": 0.70})
+        self.assertEqual(B.USD_PER_HOUR_BY_FAMILY, {"g5": 0.92, "g6e": 2.0, "g6": 0.70})
 
     def test_a_g6e_job_costs_more_than_the_same_g5_job(self):
         _, g5 = self.worst("gm730-gte-grid", ["g5.xlarge"])
         _, g6e = self.worst("gm730-gte-grid-g6e", ["g6e.xlarge", "g6e.2xlarge"])
-        self.assertEqual((g5["family"], g5["usdPerHour"]), ("g5", 0.75))
+        self.assertEqual((g5["family"], g5["usdPerHour"]), ("g5", 0.92))
         self.assertEqual((g6e["family"], g6e["usdPerHour"]), ("g6e", 2.0))
         self.assertAlmostEqual(g6e["worstUsd"], B.worst_usd({"max_minutes": 100}, self.CFGF, 2.0), places=9)
         self.assertGreater(g6e["worstUsd"], g5["worstUsd"] * 2)
@@ -155,10 +155,10 @@ class FamilyPricing(BudgetCase):
         self.assertAlmostEqual(info["worstUsd"], B.worst_usd({"max_minutes": 100}, self.CFGF, 0.5), places=9)
 
     def test_route_cap_refuses_rr_grid_on_g6e_at_zero_spend(self):
-        # rr-grid on g6e: 114 min + 5 x 5 boot at $2/h + EBS = $4.66 > the $4 rr cap
-        problems, info = self.worst("gm730-rr-grid-g6e", ["g6e.xlarge", "g6e.2xlarge"], 114)
+        # rr-grid on g6e: 140 min + 5 x 5 boot at $2/h + EBS > the $5.25 rr cap
+        problems, info = self.worst("gm730-rr-grid-g6e", ["g6e.xlarge", "g6e.2xlarge"], 140)
         self.assertEqual(info["spentTotal"], 0)
-        self.assertAlmostEqual(info["worstUsd"], 4.656, places=2)
+        self.assertGreater(info["worstUsd"], B.ROUTE_CAP["rr"])
         self.assertEqual(len(problems), 1)
         self.assertIn("route rr", problems[0])
         # the same job on g5 and on g6 stays within the cap

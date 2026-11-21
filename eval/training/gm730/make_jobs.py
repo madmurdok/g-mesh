@@ -7,6 +7,8 @@ Jobs (eval/gpu/jobs/gm730-<job>.toml):
     rr-grid, rr-final     train_ce.py: 8-config dev grid; frozen config + shuffled-teacher control
     jina-grid, jina-final train_encoder.py --model jina: 4 full + 4 LoRA; frozen config + shuffled control
     gte-grid, gte-final   train_encoder.py --model gte-small: 6 configs; frozen config + shuffled control
+    rr-qat                train_ce.py --stage qat: quantization-aware fine-tune of the RR final model
+                          (docs/design/GM-734-rr-qat.md), started from that run's onnx-fp32 export
 A grid job has one step per config, named as `grid(route)` names it; a final
 job's steps are `final` and `shuffled`, with the args frozen in
 final_configs.json (freeze.py). `max_minutes` is the section 5 table and is
@@ -27,6 +29,7 @@ Before launching any job: `budget.py check --job <toml>` (S3 and route caps).
 usage: make_jobs.py teacher [--family F] [--out-dir DIR]
        make_jobs.py grid --route rr|jina|gte [--no-teacher] [--family F] [--out-dir DIR]
        make_jobs.py final --route rr|jina|gte --final final_configs.json [--no-teacher] [--family F] [--out-dir DIR]
+       make_jobs.py qat --init-run <pulled rr-final run dir> [--family F] [--out-dir DIR]
 """
 
 import argparse
@@ -45,14 +48,16 @@ CHECKPOINT_MINUTES = 10
 GRACE_SECONDS = 30
 MAX_ATTEMPTS = 5
 MAX_MINUTES = {"rr-teacher": 60, "rr-grid": 190, "rr-final": 60, "jina-grid": 395, "jina-final": 180,
-               "gte-grid": 140, "gte-final": 60}
+               "gte-grid": 140, "gte-final": 60, "rr-qat": 60}
 # S2: 2x the section 5 estimate (instance-hours) of each job, in minutes; rr-grid is
 # the measured bf16 job ETA (156 min) plus margin; gte-grid is the measured probe ETA
 # (111 min) plus margin; jina-grid is the g6e probe ETA without checkpointing (139.5 min)
 # x 1.4 for --grad-checkpoint = 195 min, +11% (ETA limit) and +22% (max_minutes):
-# 216/237 min on g6e, i.e. 360/395 on g5
+# 216/237 min on g6e, i.e. 360/395 on g5. rr-qat's probe forecasts the whole process (elapsed,
+# training, dev rows, export), so its limit is max_minutes less boot (BOOT_MINUTES 5 in
+# budget.py) and 3 min of margin
 ETA_LIMIT_MINUTES = {"rr-teacher": 48, "rr-grid": 170, "rr-final": 48, "jina-grid": 360, "jina-final": 180,
-                     "gte-grid": 125, "gte-final": 48}
+                     "gte-grid": 125, "gte-final": 48, "rr-qat": 52}
 NO_TEACHER_SUFFIX = "-nt"
 # Per GPU family: the instance types a job is pinned to (None: config.toml's, the g5 sizes)
 # and the job's expected wall time relative to g5 (A10G), which scales max_minutes and
@@ -113,8 +118,9 @@ def hf_set(snapshot):
     return {"name": f"gm730-hf-{snapshot}", "env": "GM730_HF", "local_root": f"{D}/gm730/hf", "include": [f"{d}/*"]}
 
 
-def data_sets(job, route, teacher=True):
-    """The `[[data]]` entries a job reads."""
+def data_sets(job, route, teacher=True, init_root=None):
+    """The `[[data]]` entries a job reads; `init_root` (rr-qat) is the onnx-fp32 directory
+    the fine-tune starts from, shipped as $GM730_INIT."""
     windows = {"name": "gm730-windows", "env": "GM730_WINDOWS", "local_root": f"{D}/gm730/windows",
                "include": ["train/*", "dev/*"]}
     out = [windows]
@@ -128,6 +134,9 @@ def data_sets(job, route, teacher=True):
     if teacher:
         out.append({"name": "gm730-teacher", "env": "GM730_TEACHER", "local_root": f"{D}/gm730/teacher", "include": ["*"]})
     out.append(hf_set(SNAPSHOT[route]))
+    if init_root is not None:
+        out.append({"name": "gm730-rr-final-onnx-fp32", "env": "GM730_INIT", "local_root": init_root,
+                    "include": ["model.onnx"]})
     return out
 
 
@@ -217,6 +226,51 @@ def final_job(route, final_configs, teacher=True, family=DEFAULT_FAMILY):
     return render(f"{route}-final", hdr, steps, data_sets(f"{route}-final", route, teacher), teacher, family)
 
 
+QAT = ["--steps", "400", "--eval-every", "100", "--lr", "1e-5", "--tau-t", "1", "--alpha", "0.5", "--batch", "32",
+       "--max-len", "256", "--micro-queries", "4", "--micro-batch", "128", "--cp2-safety", "0.005", "--seed", SEED]
+
+
+def home_relative(path):
+    """`path` with the home directory written as `~`, as the other local_roots are."""
+    path, home = Path(path).expanduser().resolve(), Path.home().resolve()
+    return f"~/{path.relative_to(home)}" if path.is_relative_to(home) else str(path)
+
+
+def qat_job(init_run, family=DEFAULT_FAMILY):
+    """rr-qat: one step `qat` from <init_run>/out/final (a pulled rr-final run): its
+    train.json bestParamsSha256 pins the start, and its onnx-fp32/model.onnx must be the
+    file export.json recorded, holding parameters that hash to it (as train_ce.py
+    --init-params-sha256 checks on the instance)."""
+    import hashlib
+    final = Path(init_run).expanduser() / "out" / "final"
+    onnx_dir = final / "onnx-fp32"
+    for f in (final / "train.json", final / "export.json", onnx_dir / "model.onnx"):
+        if not f.exists():
+            raise SystemExit(f"{f}: missing; --init-run must be a pulled rr-final run")
+    want = json.loads((final / "train.json").read_text()).get("bestParamsSha256")
+    if not want:
+        raise SystemExit(f"{final / 'train.json'}: no bestParamsSha256")
+    recorded = json.loads((final / "export.json").read_text())["fp32"]["files"]["model.onnx"]
+    h = hashlib.sha256()
+    with open(onnx_dir / "model.onnx", "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != recorded:
+        raise SystemExit(f"{onnx_dir / 'model.onnx'}: sha256 {h.hexdigest()} != export.json's {recorded}")
+    sys.path.insert(0, str(HERE))
+    import torch
+    import train_ce as TC
+    got = TC.L.params_sha256(TC.L.onnx_params(TC.load_model(torch.device("cpu")), onnx_dir / "model.onnx"))
+    if got != want:
+        raise SystemExit(f"{onnx_dir / 'model.onnx'}: parameters sha256 {got} != train.json bestParamsSha256 {want}")
+    steps = [("qat", ENTRY["rr"], ["--stage", "qat", "--init-onnx", "$GM730_INIT/model.onnx",
+                                   "--init-params-sha256", want] + QAT)]
+    hdr = ["GM-734 job rr-qat: quantization-aware fine-tune of the RR final model, exported,",
+           "quantised and parity-checked (C-P, C-P2) at the end of its step",
+           f"(start: {Path(init_run).name}, params sha256 {want}; written by make_jobs.py)."]
+    return render("rr-qat", hdr, steps, data_sets("rr-qat", "rr", True, home_relative(onnx_dir)), True, family)
+
+
 def write(job, text, out_dir):
     """Write the TOML and check it loads as a GM-457 job."""
     out_dir = Path(out_dir)
@@ -236,16 +290,20 @@ def main(argv=None):
     t = sub.add_parser("teacher")
     g = sub.add_parser("grid")
     f = sub.add_parser("final")
+    qa = sub.add_parser("qat")
+    qa.add_argument("--init-run", required=True, type=Path, help="the pulled rr-final run dir")
     for p in (g, f):
         p.add_argument("--route", required=True, choices=ROUTES)
         p.add_argument("--no-teacher", action="store_true")
     f.add_argument("--final", required=True, type=Path)
-    for p in (t, g, f):
+    for p in (t, g, f, qa):
         p.add_argument("--family", choices=tuple(FAMILIES), default=DEFAULT_FAMILY)
         p.add_argument("--out-dir", type=Path, default=JOBS)
     a = ap.parse_args(argv)
     if a.cmd == "teacher":
         write(job_name("rr-teacher", True, a.family), teacher_job(a.family), a.out_dir)
+    elif a.cmd == "qat":
+        write(job_name("rr-qat", True, a.family), qat_job(a.init_run, a.family), a.out_dir)
     elif a.cmd == "grid":
         write(job_name(f"{a.route}-grid", not a.no_teacher, a.family), grid_job(a.route, not a.no_teacher, a.family),
               a.out_dir)
