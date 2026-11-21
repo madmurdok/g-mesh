@@ -270,6 +270,27 @@ def as_verdict(outs, z, floors):
     return res, dict(floors)
 
 
+def per_query_rows(arms):
+    """GM-452/S7: one dict per (arm, query) with a verdict, for gm452_paired_bootstrap.py --stack.
+    below = the arm's verdict refuses the page; misled = rank-1 positive refused; cw = wrong top shown
+    (positive, rank != 1) or absent page shown, i.e. not refused. ho = held-out side of the query's population."""
+    rows = []
+    for arm, (outs, fls) in arms.items():
+        for o in outs:
+            f = fls.get(o["top_language"]) if o["top_language"] else None
+            if o["top"] is None or f is None:
+                continue
+            below = bool(o["top"] < f)
+            rank1 = o["rank"] == 1
+            pos = bool(o["positive"])
+            mech = bool(o["mechanical"])
+            rows.append(dict(arm=arm, id=o["id"], corpus=o["corpus"], language=o["language"],
+                             pop="NAME" if mech else "NL", ho=bool(G.name_held_out(o["id"]) if mech else o["held_out"]),
+                             positive=pos, rank1=bool(rank1), below=below,
+                             misled=bool(pos and rank1 and below), cw=bool((not below) and not (pos and rank1))))
+    return rows
+
+
 # ---- scoring helpers ---------------------------------------------------------------------------
 def point(right, refused):
     right, refused = np.asarray(right, bool), np.asarray(refused, bool)
@@ -626,6 +647,8 @@ def main():
     ap.add_argument("--shuffles", type=int, default=200)
     ap.add_argument("--coef-boot", type=int, default=1000)
     ap.add_argument("--dump-fit", type=Path, help="write the FIT design matrices + fits as .npz (control 4)")
+    ap.add_argument("--per-query-out", type=Path,
+                    help="write per-query stack outcomes of every arm as JSONL (input of gm452_paired_bootstrap.py --stack)")
     ap.add_argument("--ignore-stops", action="store_true",
                     help="diagnostic only: build the tables despite a stop rule (still exits 2); not for the measure run")
     a = ap.parse_args()
@@ -666,6 +689,8 @@ def main():
             "L-d6": as_verdict(f4, zf, th("L-d6"))}
     if th("L-noCE"):  # rows of a population whose L-noCE was stopped get no verdict (empty cells)
         arms["L-noCE"] = as_verdict(int8, znc, th("L-noCE"))
+    if a.per_query_out:
+        a.per_query_out.write_text("".join(json.dumps(r) + "\n" for r in per_query_rows(arms)))
     res["stopped_arms"] = {p: res[p]["stopped_arms"] for p in ("NL", "NAME")}
 
     # control 2: C0 exact
