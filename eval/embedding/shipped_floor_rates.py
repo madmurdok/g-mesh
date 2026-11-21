@@ -114,7 +114,7 @@ def main():
             ))
 
     if a.after:
-        evaluate_after(rows)
+        evaluate_after(rows, floors, default_floor)
         return
 
     if a.options:
@@ -303,7 +303,7 @@ def rust_is_specifier(t):
     return bool(t) and not rust_is_prose(t) and (t.startswith("@") or "/" in t)
 
 
-def rust_signal(r):
+def rust_signal(r, floors=None, default_floor=DEFAULT_FLOOR):
     """similarity.rs::verdict + low_similarity on a first page (cursor None).
 
     HARD = noMatch (specifier, or a name query below its floor), SOFT =
@@ -316,16 +316,17 @@ def rust_signal(r):
         return "HARD"
     if r["top"] is None:
         return "NONE"
-    if r["top"] >= SHIPPED.get(r["tl"], DEFAULT_FLOOR):
+    if r["top"] >= (SHIPPED if floors is None else floors).get(r["tl"], default_floor):
         return "NONE"
     return "SOFT" if rust_is_prose(r["text"]) else "HARD"
 
 
-def evaluate_after(rows):
+def evaluate_after(rows, floors=SHIPPED, default_floor=DEFAULT_FLOOR):
     """Before (S1, option a: every below-floor page is noMatch) against after
     (the shipped Rust rule), per query language, plus the rule check against
     S2's simulated option f."""
-    F = lambda r: SHIPPED.get(r["tl"], DEFAULT_FLOOR)
+    F = lambda r: floors.get(r["tl"], default_floor)
+    after = lambda r: rust_signal(r, floors, default_floor)
 
     def sim_f(r):  # S2 option f, exactly as evaluate_options scores it
         if r["top"] is None:
@@ -340,7 +341,7 @@ def evaluate_after(rows):
     empty = [r for r in rows if r["top"] is None]
     ws_diff = [r for r in rows if r["prose"] != rust_is_prose(r["text"])]
     spec = [r for r in rows if rust_is_specifier(r["text"])]
-    sig_diff = [r for r in rows if r["top"] is not None and sim_f(r) != rust_signal(r)]
+    sig_diff = [r for r in rows if r["top"] is not None and sim_f(r) != after(r)]
     exotic = [r for r in rows if any(c.isspace() and c not in " " for c in r["text"])]
     print(f"queries: {len(rows)}")
     print(f"prose predicate (python strip/isspace vs rust trim/is_whitespace) disagreements: {len(ws_diff)}")
@@ -381,7 +382,7 @@ def evaluate_after(rows):
     for sname, sf in sets.items():
         for lang in langs + ["all"]:
             sel = [r for r in rows if sf(r) and (lang == "all" or r["lang"] == lang)]
-            b, x = tally(sel, before), tally(sel, rust_signal)
+            b, x = tally(sel, before), tally(sel, after)
             print(f"| {sname} | {lang} | {f(b['misled'], b['R'])} | {f(x['misled'], x['R'])} "
                   f"| {f(b['cw_abs'], b['abs'])} | {f(x['cw_abs'], x['abs'])} "
                   f"| {f(b['cw_pos'], b['pos'])} | {f(x['cw_pos'], x['pos'])} "
@@ -390,9 +391,9 @@ def evaluate_after(rows):
     print("Option f reproduced with the Rust rule (compare evaluate_options' f rows):")
     for sname, sf in sets.items():
         sel = [r for r in rows if sf(r)]
-        c = tally(sel, rust_signal)
-        soft_ok = sum(rust_signal(r) == "SOFT" and r["pos"] and r["rank1"] for r in sel)
-        hard_ok = sum(rust_signal(r) == "HARD" and not (r["pos"] and r["rank1"]) for r in sel)
+        c = tally(sel, after)
+        soft_ok = sum(after(r) == "SOFT" and r["pos"] and r["rank1"] for r in sel)
+        hard_ok = sum(after(r) == "HARD" and not (r["pos"] and r["rank1"]) for r in sel)
         print(f"| f (rust) | {sname} | {f(c['misled'], c['R'])} | {f(c['cw_pos'], c['pos'])} | {f(c['cw_abs'], c['abs'])} "
               f"| {soft_ok} | {c['SOFT'] - soft_ok} | {hard_ok} |")
 

@@ -41,11 +41,12 @@ def name_held_out(qid):
     return hashlib.sha256(qid.encode()).digest()[0] % 2 == 1
 
 
-def setup(work, cache_dir):
+def setup(work, cache_dir, st_runs=None):
+    """st_runs: the recall arm's runs dir (absolute, or relative to work); default runs/<B.ST>."""
     sha = R.sha256_file(work / "models" / "ms-marco-MiniLM-L6-v2-quint8" / "model.onnx")
     if sha != S.SHIPPED_SHA:
         sys.exit(f"STOP: model.onnx sha256 {sha} != shipped {S.SHIPPED_SHA}")
-    ns = argparse.Namespace(work=work, eval_dir=HERE / "v2", st_runs=f"runs/{B.ST}", corpora=None)
+    ns = argparse.Namespace(work=work, eval_dir=HERE / "v2", st_runs=st_runs or f"runs/{B.ST}", corpora=None)
     st_dir, corpora_dir = B.load_setup(ns)
     cs = B.load_corpora(work, ns.eval_dir, st_dir, corpora_dir, S.K)
     B.build_model_texts(cs, work, S.PY, ["ship"])
@@ -147,11 +148,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", type=Path, required=True)
     ap.add_argument("--cache-dir", type=Path)
+    ap.add_argument("--st-runs", help="recall arm runs dir (default runs/jina-v2-base-code-int8-structured)")
     ap.add_argument("--resamples", type=int, default=10000)
     ap.add_argument("--shuffles", type=int, default=200)
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
-    cs, sc, sk, sha = setup(a.work, a.cache_dir)
+    cs, sc, sk, sha = setup(a.work, a.cache_dir, a.st_runs)
     floors = SFR.structured_floors()
     rows = collect(cs, sc, sk, floors)
     res = {"sha256": sha, "seed": SEED, "resamples": a.resamples, "shuffles": a.shuffles, "floors": floors}

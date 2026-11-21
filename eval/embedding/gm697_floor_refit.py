@@ -12,6 +12,13 @@ gm468_name_floors (rates, wilson_hi).
 usage: gm697_floor_refit.py --run <runs/jina-v2-base-code-int8-structured>
            --eval-dir eval/embedding/v2 [--fp32-run <runs/jina-v2-base-code-fp32>]
            [--json out.json] [--table out.md]
+           [--report report_<arm>.json [--report-arm <arm dir name>]]
+
+Without --report the controls C1-C3 compare against the base arm's constants
+read from docs/results. With --report they compare the chosen arm against
+that report's `arms[<arm>]`: C1 the D6 floors, C2 (refit) the confident-wrong
+positives and absent counts; C2 at shipped floors and C3 have no source in a
+report and are not run.
 
 Splits: authored queries by the harness's held_out flag; mechanical (name)
 queries by sha256(id)[0] odd = held-out, computed here (mirror of
@@ -176,6 +183,16 @@ def parse_expected():
     return d6, tail(sh, sh_line), tail(rf, rf_line), list(m.groups())
 
 
+def expected_from_report(path, arm):
+    """D6 floors and (CW positives, CW absent) at those floors from report_*.json."""
+    arms = json.loads(Path(path).read_text())["arms"]
+    if arm not in arms:
+        sys.exit(f"arm {arm!r} not in {path}: {sorted(arms)}")
+    fl_ = arms[arm]["floors"]
+    cw = lambda k: (fl_[k]["events"], fl_[k]["total"])
+    return fl_["floors"], [cw("confidentWrongPositives"), cw("confidentWrongAbsent")]
+
+
 def check(label, got, want, results):
     ok = got == want
     results.append((label, ok, got, want))
@@ -199,6 +216,8 @@ def main():
     ap.add_argument("--fp32-run")
     ap.add_argument("--json")
     ap.add_argument("--table")
+    ap.add_argument("--report", help="report_*.json of the arm: controls read their expected values from it")
+    ap.add_argument("--report-arm", help="arm key in the report (default: the --run directory name)")
     a = ap.parse_args()
 
     outs = load(a.run, a.eval_dir)
@@ -212,16 +231,22 @@ def main():
     # --- controls ---
     results = []
     selftest(results)
-    exp_d6, exp_sh, exp_rf, exp_c3 = parse_expected()
-    check("C1 pooled D6 fit == S19", d6, exp_d6, results)
-    c_sh = stats(outs, shipped, LANGS)
     c_rf = stats(outs, d6, LANGS)
-    got_sh = [tuple(c_sh["soft_ok"][::-1][::-1]), tuple(c_sh["cwp"]), tuple(c_sh["cwa"])]
-    got_rf = [tuple(c_rf["soft_ok"]), tuple(c_rf["cwp"]), tuple(c_rf["cwa"])]
-    check("C2 shape-blind (FA, CW pos, CW abs) at shipped == S19", got_sh, exp_sh, results)
-    check("C2 shape-blind (FA, CW pos, CW abs) at D6 refit == S19", got_rf, exp_rf, results)
-    got_c3 = [f"{nf_all[l][1]:.3f}" for l in LANGS]
-    check("C3 name fit, all mechanical, rank-1 raw == GM-468 strict", got_c3, exp_c3, results)
+    if a.report:
+        exp_d6, exp_cw = expected_from_report(a.report, a.report_arm or Path(a.run).resolve().name)
+        check("C1 pooled D6 fit == report floors", d6, exp_d6, results)
+        got_cw = [tuple(c_rf["cwp"]), tuple(c_rf["cwa"])]
+        check("C2 (CW pos, CW abs) at D6 refit == report", got_cw, exp_cw, results)
+    else:
+        exp_d6, exp_sh, exp_rf, exp_c3 = parse_expected()
+        check("C1 pooled D6 fit == S19", d6, exp_d6, results)
+        c_sh = stats(outs, shipped, LANGS)
+        got_sh = [tuple(c_sh["soft_ok"][::-1][::-1]), tuple(c_sh["cwp"]), tuple(c_sh["cwa"])]
+        got_rf = [tuple(c_rf["soft_ok"]), tuple(c_rf["cwp"]), tuple(c_rf["cwa"])]
+        check("C2 shape-blind (FA, CW pos, CW abs) at shipped == S19", got_sh, exp_sh, results)
+        check("C2 shape-blind (FA, CW pos, CW abs) at D6 refit == S19", got_rf, exp_rf, results)
+        got_c3 = [f"{nf_all[l][1]:.3f}" for l in LANGS]
+        check("C3 name fit, all mechanical, rank-1 raw == GM-468 strict", got_c3, exp_c3, results)
 
     # --- table ---
     rows, js = [], {"controls": [(l, ok, str(g), str(w)) for l, ok, g, w in results],
