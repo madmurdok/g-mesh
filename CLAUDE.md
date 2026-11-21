@@ -85,9 +85,12 @@ The suite runs as named sections (`scripts/test-sections.sh`,
   -D <dir>`, then `scripts/test-heavy-report.py .config/nextest.toml
   <dir>/*.xml`. `scripts/test-local.sh --full` stays available to run by hand.
 
-- **Release gate:** `scripts/cut-release.sh` runs no suite. It tags only when
-  ci.yml passed a full run on the release branch tip that `main` merged (same
-  tree), waiting for a run still in progress (`--ci-timeout`, default 90 min).
+- **Release gate:** `scripts/cut-release.sh` runs no suite and no local
+  sections check. It tags only when ci.yml passed a full run on the release
+  branch tip that `main` merged (same tree) and that run's "Test sections
+  cover the whole suite" step succeeded, waiting for a run still in progress
+  (`--ci-timeout`, default 90 min). The push of that merge to `main` reuses
+  the same green run (same tree) and skips its own tests.
 
 - **CI** runs `scripts/test-sections.sh run` per section under `--profile ci`.
 

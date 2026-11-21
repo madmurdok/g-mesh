@@ -811,7 +811,7 @@ fn a_dry_run_without_the_plugin_node_modules_still_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// cut-release.sh runs no suite (GM-675): `check`, then the CI gate, then the tag
+// cut-release.sh runs no suite and no sections check: the CI gate, then the tag
 
 /// Runs `cut-release.sh`'s `main` from a copy of `scripts/` in `root`, with a
 /// working directory that is not the repo root, and every command it would
@@ -823,15 +823,15 @@ fn run_cut_release(root: &Path, args: &[&str], gate_status: i32) -> (Output, Vec
     run_cut_release_with(root, args, gate_status, &[])
 }
 
-/// `run_cut_release` with extra environment: `SECTIONS_STATUS` is the exit
-/// status of `test-sections.sh`, `VERSION_DRIFT=1` makes the version check die.
+/// `run_cut_release` with extra environment: `VERSION_DRIFT=1` makes the
+/// version check die.
 fn run_cut_release_with(
     root: &Path,
     args: &[&str],
     gate_status: i32,
     env: &[(&str, &str)],
 ) -> (Output, Vec<String>) {
-    let stub = "#!/bin/sh\necho \"test-sections $*\" >> \"$GM628_RECORD\"\nexit ${SECTIONS_STATUS:-0}\n";
+    let stub = "#!/bin/sh\necho \"test-sections $*\" >> \"$GM628_RECORD\"\nexit 0\n";
     let sections = root.join("scripts/test-sections.sh");
     fs::write(&sections, stub).unwrap();
     fs::set_permissions(&sections, fs::Permissions::from_mode(0o755)).unwrap();
@@ -876,22 +876,21 @@ fn run_cut_release_with(
     (output, lines)
 }
 
-/// The cut runs `test-sections.sh check` and no section and no `cargo test`;
-/// the CI gate runs after `check` and before the tag, with the timeout.
+/// The cut runs no `test-sections.sh` command and no `cargo test`; the CI
+/// gate runs before the tag, with the timeout.
 #[test]
-fn a_cut_release_runs_check_then_the_ci_gate_then_tags_and_runs_no_suite() {
+fn a_cut_release_runs_the_ci_gate_then_tags_and_runs_no_suite_or_check() {
     let root = fake_root(false);
     let (output, record) = run_cut_release(root.path(), &["9.9.9", "--ci-timeout", "7"], 0);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert!(
-        !record.iter().any(|l| l.starts_with("cargo") || l.starts_with("test-sections run")),
+        !record.iter().any(|l| l.starts_with("cargo") || l.starts_with("test-sections")),
         "{record:?}"
     );
     let pos = |needle: &str| {
         record.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle}: {record:?}"))
     };
-    assert!(pos("test-sections check") < pos("gate 9.9.9 main 7"), "{record:?}");
-    assert!(pos("gate ") < pos(" tag -a "), "{record:?}");
+    assert!(pos("gate 9.9.9 main 7") < pos(" tag -a "), "{record:?}");
 }
 
 /// `--skip-tests` is gone: it dies with the GM-675 message and nothing runs.
@@ -915,16 +914,6 @@ fn a_failing_ci_gate_leaves_no_tag() {
     let (output, record) = run_cut_release(root.path(), &["9.9.9"], 1);
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     assert!(!record.iter().any(|l| l.contains(" tag -a ")), "{record:?}");
-}
-
-/// A failing `test-sections.sh check` dies before the CI gate and the tag.
-#[test]
-fn a_failing_sections_check_dies_before_the_ci_gate() {
-    let root = fake_root(false);
-    let (output, record) = run_cut_release_with(root.path(), &["9.9.9"], 0, &[("SECTIONS_STATUS", "1")]);
-    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
-    assert!(record.iter().any(|l| l.contains("test-sections check")), "{record:?}");
-    assert!(!record.iter().any(|l| l.starts_with("gate ") || l.contains(" tag -a ")), "{record:?}");
 }
 
 /// Every cheap check runs before the CI gate: a version drift dies without

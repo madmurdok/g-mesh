@@ -15,7 +15,8 @@
 #
 # Invariants:
 # - The sections partition the suite: every test, ignored ones included, is in
-#   exactly one section. `check` proves it; CI and `cut-release.sh` run it.
+#   exactly one section. `check` proves it; CI runs it, and `cut-release.sh`
+#   requires CI's step to have passed.
 # - SECTIONS is the one section list. Each section has exactly one ci.yml step
 #   named "tests: <section>" that runs it and whose `if:` selects it by name,
 #   and every step that runs a section runs a listed one. `check-ci` proves it

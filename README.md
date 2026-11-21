@@ -433,8 +433,9 @@ Oniguruma, tree-sitter grammars) for that target.
    silently. It verifies the crate
    version (core's and every release-versioned member's, plus each
    workspace plugin's own version rule), working tree and
-   branch state, runs `scripts/test-sections.sh check`, waits for (or
-   requires) a green full `ci.yml` run on the release tip (dispatch it with
+   branch state, waits for (or
+   requires) a green full `ci.yml` run on the release tip whose "Test sections
+   cover the whole suite" step succeeded (dispatch it with
    `gh workflow run ci.yml --ref release-<version>`; `--ci-timeout <min>`,
    default 90), runs no test suite itself, and creates an annotated
    `v<version>` tag locally — it does not push by default, since pushing the

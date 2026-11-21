@@ -96,6 +96,9 @@
 # full ci.yml run (every section, doctests and `cargo test -p g-mesh` on the
 # Linux row) that passed on the release branch tip `main` merged, with the
 # merge's tree equal to that tip's tree, so the tested code is the tagged code.
+# That run's "Test sections cover the whole suite" step (the partition check,
+# `scripts/test-sections.sh check`) must have succeeded, not been skipped, so
+# this script does not run the check itself.
 # A run still in progress is waited for (poll every 60 s, up to --ci-timeout
 # minutes), so the wait is the last step before `git tag` and every cheap check
 # fails first. The batch-end step dispatches that run
@@ -204,12 +207,13 @@
 #   - core's own normal dependency graph reaching serde_json's
 #     `preserve_order` feature (GM-302) - see that comment above for why this
 #     is checked directly instead of trusted to stay absent
-#   - the test sections' coverage check failing (`scripts/test-sections.sh check`)
 #   - `main` not being a `merge: release-<v> into main` merge whose tree equals
 #     its release-side parent's tree, or origin/release-<v> not being that parent
 #   - no green full ci.yml run on that parent (GM-675): none at all, only
 #     partial runs, only failed/cancelled ones, or one still running when
 #     --ci-timeout expires
+#   - a green full run whose "Test sections cover the whole suite" step did
+#     not succeed (skipped, failed or absent)
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -580,8 +584,8 @@ check_self_versioned_plugin_versions() {
 # all-edge-kinds reading without ever reaching a linked artifact - so this is
 # the command that actually answers "does core's shipped JSON key order
 # differ", not the broader one. Cheap and fast on purpose (no build, just
-# resolver output) so it runs before the ten-plus-minute test suite rather
-# than after it.
+# resolver output) so it runs before the CI gate's wait rather than after
+# it.
 #
 # Demonstrated to have teeth, not just to pass today: temporarily adding
 # `features = ["preserve_order"]` to core/Cargo.toml's own `serde_json` line
@@ -713,6 +717,10 @@ check_release_merge_shape() {
 # asks release.yml's question with the same query.
 CI_FULL_SUITE_JOB="Full test suite ran"
 
+# The name of ci.yml's partition-check step on the Linux test row. Must stay
+# equal to that step's name.
+CI_SECTIONS_STEP="Test sections cover the whole suite"
+
 # GM-675: the single place cut-release calls GitHub. $GH replaces
 # the `gh` binary (tests point it at a fake; a fake `gh` on PATH works too).
 cut_release_gh() {
@@ -735,13 +743,18 @@ ci_runs_for_sha() {
 	die "could not query ci.yml runs for ${sha:0:7} after 3 attempts (is 'gh auth status' logged in?)"
 }
 
-# 1 if run $2's latest attempt has a successful "$CI_FULL_SUITE_JOB" job.
+# Run $2's latest attempt, as "<full> <sections>": <full> is 1 if it has a
+# successful "$CI_FULL_SUITE_JOB" job, else 0; <sections> is `success` if any
+# job has a successful "$CI_SECTIONS_STEP" step, `missing` if no job has that
+# step, else the step's conclusions joined by commas (null as `none`).
 ci_run_has_full_suite() {
-	local slug="$1" run_id="$2" n="" try
+	local slug="$1" run_id="$2" filter out="" n="" sections="" try
+	filter="$(printf '"\\([.jobs[] | select(.name == "%s" and .conclusion == "success")] | length) \\([.jobs[].steps[]? | select(.name == "%s") | .conclusion // "none"] | if any(.[]; . == "success") then "success" elif length == 0 then "missing" else unique | join(",") end)"' \
+		"$CI_FULL_SUITE_JOB" "$CI_SECTIONS_STEP")"
 	for try in 1 2 3; do
-		if n="$(cut_release_gh api "repos/$slug/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
-			--jq "[.jobs[] | select(.name == \"$CI_FULL_SUITE_JOB\" and .conclusion == \"success\")] | length")"; then
-			[ "$n" -gt 0 ] && echo 1 || echo 0
+		if out="$(cut_release_gh api "repos/$slug/actions/runs/$run_id/jobs?filter=latest&per_page=100" --jq "$filter")" &&
+			read -r n sections <<<"$out" && [[ "$n" =~ ^[0-9]+$ ]] && [ -n "$sections" ]; then
+			if [ "$n" -gt 0 ]; then echo "1 $sections"; else echo "0 $sections"; fi
 			return 0
 		fi
 		[ "$try" -eq 3 ] || sleep "${CUT_RELEASE_CI_POLL_SECS:-60}"
@@ -751,9 +764,11 @@ ci_run_has_full_suite() {
 
 # GM-675: wait for a green full ci.yml run on T = merge_rev^2, then return.
 # States, in this order: green (a completed/success run whose full-suite job
-# succeeded: return), running (any run not completed: poll again), partial
-# (green runs without the full-suite job: die, dispatch hint), failed (only
-# completed non-success runs: die naming them), missing (no run: die).
+# and "$CI_SECTIONS_STEP" step succeeded: return), running (any run not
+# completed: poll again), unchecked (green full runs whose sections step did
+# not succeed: die naming the step), partial (green runs without the
+# full-suite job: die, dispatch hint), failed (only completed non-success
+# runs: die naming them), missing (no run: die).
 # A green full run wins over any other run on the same SHA (a red run followed
 # by a green one is a flake someone re-ran).
 wait_for_green_full_ci() {
@@ -773,7 +788,7 @@ wait_for_green_full_ci() {
 		local runs id status conclusion attempt
 		runs="$(ci_runs_for_sha "$slug" "$tip")" || exit 1
 
-		local running_id="" running_desc="" partial=0 failed_desc="" any=0 cancelled=0
+		local running_id="" running_desc="" partial=0 failed_desc="" any=0 cancelled=0 unchecked_desc=
 		while read -r id status conclusion attempt; do
 			[ -n "$id" ] || continue
 			any=1
@@ -783,13 +798,19 @@ wait_for_green_full_ci() {
 					running_desc="$status, attempt $attempt"
 				}
 			elif [ "$conclusion" = "success" ]; then
-				local full
-				full="$(ci_run_has_full_suite "$slug" "$id")" || exit 1
-				if [ "$full" = "1" ]; then
+				local answer full sections
+				answer="$(ci_run_has_full_suite "$slug" "$id")" || exit 1
+				read -r full sections <<<"$answer"
+				if [ "$full" = "1" ] && [ "$sections" = "success" ]; then
 					log "$branch at ${tip:0:7} is on origin and passed a full ci.yml run ($id)"
 					return 0
 				fi
-				partial=1
+				if [ "$full" = "1" ]; then
+					unchecked_desc="$unchecked_desc
+  run $id: '$CI_SECTIONS_STEP' $sections https://github.com/$slug/actions/runs/$id"
+				else
+					partial=1
+				fi
 			else
 				[ "$conclusion" != "cancelled" ] || cancelled=1
 				failed_desc="$failed_desc
@@ -806,6 +827,10 @@ wait_for_green_full_ci() {
 			log "waiting for ci.yml run $running_id ($running_desc), ${elapsed_min}m of ${timeout_min}m"
 			sleep "$poll"
 			continue
+		fi
+		if [ -n "$unchecked_desc" ]; then
+			die "ci.yml passed a full run on $branch at ${tip:0:7}, but its step '$CI_SECTIONS_STEP' did not succeed, so the test sections' partition was not checked:$unchecked_desc
+re-run it ('gh workflow run ci.yml --ref $branch'), wait for it to pass, then re-run this"
 		fi
 		if [ "$partial" -eq 1 ]; then
 			die "ci.yml passed on $branch at ${tip:0:7}, but only as a partial run (test sections selected by changed paths) - run every section: 'gh workflow run ci.yml --ref $branch', wait for it to pass (https://github.com/$slug/actions/workflows/ci.yml?query=branch%3A$branch), then re-run this"
@@ -923,19 +948,13 @@ main() {
 	check_crate_backed_plugin_versions "$crate_version"
 	check_self_versioned_plugin_versions
 
-	# GM-302: cheap (no build) and fast, so it runs before the ten-plus-minute
-	# suite below rather than after it - see this script's header comment and
+	# GM-302: cheap (no build) and fast, so it runs before the CI gate's wait
+	# below rather than after it - see this script's header comment and
 	# the function's own for the full investigation.
 	check_core_feature_isolation
 
-	# The sections partition the suite (`check`): a test in no section or in two
-	# would be a hole in what CI runs. It builds the test binaries (a few
-	# minutes), needs no plugin node_modules.
-	log "checking that the test sections cover the whole suite"
-	"$REPO_ROOT/scripts/test-sections.sh" check ||
-		die "scripts/test-sections.sh check failed - a test is in no section or in two; fix the filtersets before cutting a release"
-
-	# GM-675: the suite itself ran on GitHub CI (see the header comment).
+	# The suite and the sections' partition check ran on GitHub CI (see the
+	# header comment).
 	wait_for_green_full_ci "$version" main "$ci_timeout"
 
 	log "tagging $tag on $(git -C "$REPO_ROOT" rev-parse --short main)"

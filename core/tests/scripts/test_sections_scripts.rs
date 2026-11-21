@@ -720,7 +720,7 @@ fn core_spawns_selectors_take_the_plugins_of_build_targets_and_no_other() {
 /// The real tree: lists the whole workspace suite once plus once per section,
 /// on the current build. Ignored because that is thirteen full listings; CI
 /// runs the same `scripts/test-sections.sh check` as its own step on the
-/// linux row, and cut-release runs it before waiting for CI. Run it with
+/// linux row, and cut-release requires that step to have passed. Run it with
 /// `cargo nextest run -p g-mesh --test scripts -E 'test(/^test_sections_scripts::/)' --run-ignored only`.
 #[test]
 #[ignore = "lists the whole suite 13 times; CI's coverage-check step runs the same check"]

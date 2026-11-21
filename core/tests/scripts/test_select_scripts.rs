@@ -947,9 +947,19 @@ exec jq -r "$4" "{fixtures}/$file"
         git_out(&self.dir.path().join("repo"), &["tag", "-l"])
     }
 
-    /// The jobs of run `id`, as (name, conclusion).
+    /// The jobs of run `id`, as (name, conclusion). A job named `tests`
+    /// carries ci.yml's partition-check step with the job's conclusion.
     fn jobs(&self, id: u64, jobs: &[(&str, &str)]) {
-        let jobs: Vec<_> = jobs.iter().map(|(n, c)| json!({ "name": n, "conclusion": c })).collect();
+        let jobs: Vec<_> = jobs
+            .iter()
+            .map(|(n, c)| {
+                if *n == "tests" {
+                    json!({ "name": n, "conclusion": c, "steps": [{ "name": SECTIONS_STEP, "conclusion": c }] })
+                } else {
+                    json!({ "name": n, "conclusion": c })
+                }
+            })
+            .collect();
         fs::write(
             self.dir.path().join(format!("fixtures/jobs-{id}.json")),
             json!({ "jobs": jobs }).to_string(),
@@ -987,6 +997,7 @@ exec jq -r "$4" "{fixtures}/$file"
 }
 
 const FULL_JOB: &str = "Full test suite ran";
+const SECTIONS_STEP: &str = "Test sections cover the whole suite";
 
 #[test]
 fn a_tip_with_a_green_full_suite_job_passes_the_gate() {
