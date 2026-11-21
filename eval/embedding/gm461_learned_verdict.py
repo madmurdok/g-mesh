@@ -619,6 +619,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", type=Path, required=True)
     ap.add_argument("--cache-dir", type=Path)
+    ap.add_argument("--st-runs", help="recall arm runs dir (default runs/jina-v2-base-code-int8-structured)")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--md", type=Path, help="markdown tables (default: --out with .md)")
     ap.add_argument("--resamples", type=int, default=10000)
@@ -629,7 +630,7 @@ def main():
                     help="diagnostic only: build the tables despite a stop rule (still exits 2); not for the measure run")
     a = ap.parse_args()
 
-    cs, sc, flags, sha = G.setup(a.work, a.cache_dir)
+    cs, sc, flags, sha = G.setup(a.work, a.cache_dir, a.st_runs)
     floors = SFR.structured_floors()
     rows, disagree = features(cs, sc, flags, floors)
     pop_of = {r["key"]: r["pop"] for r in rows}
