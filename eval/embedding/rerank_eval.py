@@ -115,6 +115,33 @@ CE_BAKEOFF["ce-minilm-quint8-rust"] = CE_BAKEOFF["ce-minilm-quint8"]
 CE_DIR["ce-minilm-quint8-rust"] = CE_DIR["ce-minilm-quint8"]
 CE_FILES["ce-minilm-quint8-rust"] = CE_FILES["ce-minilm-quint8"]
 INT8_MODELS.add("ce-minilm-quint8-rust")
+
+
+def load_ce_local(path):
+    """name -> (dir, {file: pinned sha256}) of the local cross-encoders in `path`
+    (eval/training/gm730/register_arms.py writes it); the chunk-1 ones join INT8_MODELS.
+    No file, no entries."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    out = {}
+    for name, e in json.loads(path.read_text()).items():
+        if name in CES or name in CE_BAKEOFF:
+            raise SystemExit(f"{path}: {name} shadows a Hugging Face cross-encoder")
+        out[name] = (Path(os.path.expanduser(e["dir"])), dict(e["files"]))
+        if e.get("chunk1"):
+            INT8_MODELS.add(name)
+    return out
+
+
+CE_LOCAL = load_ce_local(Path(__file__).resolve().parent / "ce_local.json")
+
+
+def ce_dir(work, name):
+    """A cross-encoder's files: the local registry's dir, else <work>/models/<CE_DIR[name]>."""
+    return CE_LOCAL[name][0] if name in CE_LOCAL else work / "models" / CE_DIR[name]
+
+
 MAX_TOKENS = 512
 BETAS = [0.0, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0]
 GRID_A = [-0.01, -0.005, 0.0, 0.005, 0.01, 0.02]
@@ -424,10 +451,14 @@ class CrossEncoder:
         graph optimisation, deterministic compute); off keeps ORT's defaults."""
         import onnxruntime as ort
         from tokenizers import Tokenizer
-        d = work / "models" / CE_DIR[name]
+        d = ce_dir(work, name)
         self.files = {f: sha256_file(d / f) for f in ("model.onnx", "tokenizer.json", "config.json")}
         if (d / "model.onnx_data").exists():
             self.files["model.onnx_data"] = sha256_file(d / "model.onnx_data")
+        if name in CE_LOCAL:
+            bad = {f: s for f, s in CE_LOCAL[name][1].items() if self.files.get(f) != s}
+            if bad:
+                raise SystemExit(f"STOP: {name}: files in {d} differ from their pins {sorted(bad)}")
         self.chunk = chunk or (1 if name in INT8_MODELS else DEFAULT_CHUNK)
         self.tok = Tokenizer.from_file(str(d / "tokenizer.json"))
         self.tok.enable_truncation(MAX_TOKENS)

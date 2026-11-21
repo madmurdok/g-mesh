@@ -1,0 +1,44 @@
+# GM-734 job rr-qat: quantization-aware fine-tune of the RR final model, exported,
+# quantised and parity-checked (C-P, C-P2) at the end of its step
+# (start: gm730-rr-final-3e75efa5b2cc-20261119T2040, params sha256 337e0d1e4750574b7bb3292bbacecf426ae74f4e747c39f54964b65b0253c3a2; written by make_jobs.py).
+# On g6 (g6.xlarge, g6.2xlarge): max_minutes and --eta-limit-minutes are the g5
+# values x 1.6, rounded up.
+name = "gm730-rr-qat-g6"
+requirements = "eval/training/gm730/requirements-linux-cu121.txt"
+smoke = true
+max_minutes = 96
+max_minutes_scope = "job"
+checkpoint_minutes = 10
+grace_seconds = 30
+max_attempts = 5
+instance_types = ["g6.xlarge", "g6.2xlarge"]
+
+[[steps]]
+name = "qat"
+entry = "eval/training/gm730/train_ce.py"
+args = ["--stage", "qat", "--init-onnx", "$GM730_INIT/model.onnx", "--init-params-sha256", "337e0d1e4750574b7bb3292bbacecf426ae74f4e747c39f54964b65b0253c3a2", "--steps", "400", "--eval-every", "100", "--lr", "1e-5", "--tau-t", "1", "--alpha", "0.5", "--batch", "32", "--max-len", "256", "--micro-queries", "4", "--micro-batch", "128", "--cp2-safety", "0.005", "--seed", "730", "--job-steps", "1", "--eta-limit-minutes", "84"]
+device = "cuda"
+
+[[data]]
+name = "gm730-windows"
+env = "GM730_WINDOWS"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/windows"
+include = ["train/*", "dev/*"]
+
+[[data]]
+name = "gm730-teacher"
+env = "GM730_TEACHER"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/teacher"
+include = ["*"]
+
+[[data]]
+name = "gm730-hf-l6"
+env = "GM730_HF"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gm730/hf"
+include = ["ms-marco-MiniLM-L6-v2@233902d25c440f23af6f7d6e94d2946bac0bee0a/*"]
+
+[[data]]
+name = "gm730-rr-final-onnx-fp32"
+env = "GM730_INIT"
+local_root = "~/Projects/ClaudeProjects/g-mesh-data/gpu-runs/gm730-rr-final-3e75efa5b2cc-20261119T2040/out/final/onnx-fp32"
+include = ["model.onnx"]

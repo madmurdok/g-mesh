@@ -348,6 +348,39 @@ mod tests {
         assert_eq!(reference.revision.as_deref(), Some(crate::cli::model::MODEL_REVISION));
     }
 
+    /// GM-703 (design note, sections 9 and 11.2): both CodeRankEmbed rows run
+    /// the encoder the export was checked against - CLS pooling, 768 wide,
+    /// 1024 tokens, no token types - with the model card's query prefix and the
+    /// structured text. The fp32 row is the gated quality arm; the int8 row,
+    /// stopped by Q-D, is informational. Control: changing the fp32 row's role
+    /// to "informational" fails this (so would changing a row's pooling to
+    /// "mean").
+    #[test]
+    fn the_coderankembed_rows_are_the_exported_encoder() {
+        let file = VariantsFile::parse(VARIANTS).unwrap();
+        let spec = EncoderSpec {
+            pooling: Pooling::Cls,
+            dimension: 768,
+            max_sequence_length: 1024,
+            token_type_ids: false,
+        };
+        for (name, role) in [
+            ("coderankembed-fp32-structured", Role::Quality),
+            ("coderankembed-int8-structured", Role::Informational),
+        ] {
+            let v = file.get(name).unwrap();
+            assert_eq!(v.arm, Arm::Model, "{name}");
+            assert_eq!(v.role, role, "{name}");
+            assert_eq!(v.encoder_spec().unwrap(), spec, "{name}");
+            assert_eq!(v.query_prefix, "Represent this query for searching relevant code: ", "{name}");
+            assert_eq!(v.document_prefix, "", "{name}");
+            assert_eq!(v.text, TextForm::Structured, "{name}");
+            assert_eq!(v.context, ContextForm::None, "{name}");
+            assert_eq!(v.hf_repo.as_deref(), Some("nomic-ai/CodeRankEmbed"), "{name}");
+            assert_eq!(v.revision.as_deref(), Some("3c4b60807d71f79b43f3c4363786d9493691f8b1"), "{name}");
+        }
+    }
+
     #[test]
     fn every_broken_arm_of_d7_is_declared() {
         let file = VariantsFile::parse(VARIANTS).unwrap();

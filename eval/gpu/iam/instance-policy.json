@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadInputs",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::${bucket}/code/*",
+        "arn:aws:s3:::${bucket}/env/*",
+        "arn:aws:s3:::${bucket}/data/*",
+        "arn:aws:s3:::${bucket}/models/*"
+      ]
+    },
+    {
+      "Sid": "RunState",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:GetObjectTagging", "s3:PutObject"],
+      "Resource": ["arn:aws:s3:::${bucket}/runs/*", "arn:aws:s3:::${bucket}/ckpt/*"]
+    },
+    {
+      "Sid": "ListBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::${bucket}"
+    }
+  ]
+}

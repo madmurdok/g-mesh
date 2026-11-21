@@ -1,0 +1,54 @@
+# Launcher settings for gpu_train.py. Job specs live in jobs/*.toml.
+
+# {account} is filled from sts get-caller-identity at run time.
+bucket = "gmesh-train-{account}-us-east-1"
+bucket_region = "us-east-1"
+regions = ["us-east-1", "us-west-2"]
+default_region = "us-east-1"
+
+# Same GPU (A10G 24 GB) in both sizes, so runs stay comparable. Spot quota is
+# 8 vCPU of G/VT per region: one g5.2xlarge, or one or two g5.xlarge.
+instance_types = ["g5.xlarge", "g5.2xlarge"]
+max_attempts = 5
+
+python = "3.11.15"
+uv_version = "0.12.1"
+
+# AMI minimum root size (75 GB) + 20 GB for the venv, data and outputs.
+root_volume_gb = 95
+# gp3 list price, us-east-1, $/GB-month; cost.json uses it for EBS GB-hours.
+ebs_gp3_usd_gb_month = 0.08
+
+# The cloud-side terminate fires this many minutes after the in-OS lifetime.
+schedule_margin_minutes = 10
+
+instance_role = "gmesh-train-instance"
+scheduler_role = "gmesh-train-scheduler"
+fis_role = "gmesh-train-fis"
+security_group = "gmesh-train"
+
+local_runs = "~/Projects/ClaudeProjects/g-mesh-data/gpu-runs"
+
+# "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)", resolved from
+# the public SSM parameter below. Refresh only on purpose:
+#   aws ssm get-parameter --region <r> --name <ssm_parameter>
+ssm_parameter = "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"
+
+[ami.us-east-1]
+id = "ami-0a654363d2b9a01db"
+name = "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20261113"
+root_device = "/dev/sda1"
+resolved = "2026-11-19"
+
+[ami.us-west-2]
+id = "ami-0b87420e2a817294d"
+name = "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20261113"
+root_device = "/dev/sda1"
+resolved = "2026-11-19"
+
+# The budget kill switch: SNS -> this Lambda terminates every GPU-family instance
+# in all enabled regions. kill-switch-test invokes it with a synthetic event.
+[kill_switch]
+function = "gpu-training-50-kill-gpu"
+region = "us-east-1"
+budget = "gpu-training-50"

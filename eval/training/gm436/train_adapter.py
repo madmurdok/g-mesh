@@ -41,12 +41,13 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))
 import cache as K  # noqa: E402
 import data as D  # noqa: E402
 import dev_metric as M  # noqa: E402
+from ckpt import KILLED_EXIT, load_ckpt, rng_state, save_ckpt, set_rng_state  # noqa: E402
 
 C = K.C
-KILLED_EXIT = 75
 
 
 def progress(msg):
@@ -136,7 +137,7 @@ class Adapter(torch.nn.Module):
 
 def r1_loss(qa_n, cols_n, pos, valid, tau):
     logits = qa_n @ cols_n.T / tau
-    neg_inf = torch.tensor(float("-inf"))
+    neg_inf = logits.new_tensor(float("-inf"))
     all_ = torch.logsumexp(torch.where(valid, logits, neg_inf), dim=1)
     good = torch.logsumexp(torch.where(pos, logits, neg_inf), dim=1)
     return (all_ - good).mean()
@@ -169,9 +170,9 @@ def kd_tensors(base, batch, teacher, tau_t):
 
 def kd_loss(qa_n, cand, p_t, mask, tau_s):
     logits = torch.einsum("bd,bkd->bk", qa_n, cand) / tau_s
-    logits = torch.where(mask, logits, torch.tensor(float("-inf")))
+    logits = torch.where(mask, logits, logits.new_tensor(float("-inf")))
     log_ps = torch.log_softmax(logits, dim=1)
-    terms = torch.where(mask & (p_t > 0), p_t * (torch.log(p_t.clamp_min(1e-30)) - log_ps), torch.zeros(()))
+    terms = torch.where(mask & (p_t > 0), p_t * (torch.log(p_t.clamp_min(1e-30)) - log_ps), p_t.new_zeros(()))
     return terms.sum(1).mean()
 
 
@@ -190,29 +191,18 @@ def dev_eval(base, W, dev):
     return evals
 
 
-def save_ckpt(path, obj):
-    tmp = Path(str(path) + ".tmp")
-    torch.save(obj, tmp)
-    with open(tmp, "rb+") as f:
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
-def rng_state():
-    return {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
-
-
-def set_rng_state(s):
-    random.setstate(s["python"])
-    np.random.set_state(s["numpy"])
-    torch.set_rng_state(s["torch"])
-
-
 def train(a):
     cfg, cfg_sha = config_of(a)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     ckpt_path = out / "checkpoint.pt"
+    device = torch.device(a.device)
+    if device.type == "cuda":
+        # Deterministic cuBLAS needs this before the first CUDA call.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        if not torch.cuda.is_available():
+            raise SystemExit("--device cuda: CUDA is not available on this host")
+        torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_num_threads(a.threads)
     torch.use_deterministic_algorithms(True)
     random.seed(a.seed)
@@ -247,33 +237,42 @@ def train(a):
     if a.form == "procrustes":
         W = procrustes(base, train_q)
         ev = dev_eval(base, W, dev_q)
-        state = {"configSha256": cfg_sha, "config": cfg, "done": True, "bestW": W, "bestEpoch": 1,
+        state = {"configSha256": cfg_sha, "config": cfg, "device": a.device, "done": True, "bestW": W, "bestEpoch": 1,
                  "history": [{"epoch": 1, **M.metrics([r for *_, r in ev])}], "bestEvals": ev}
         save_ckpt(ckpt_path, state)
         return finish(a, base, train_q, dev_q, state, drop_train, drop_dev)
 
-    model = Adapter(d, a.form, a.rank)
+    # Initialised on the CPU generator, then moved: the initial W is the same on every device.
+    model = Adapter(d, a.form, a.rank).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.0)
     if ckpt_path.exists():
-        state = torch.load(ckpt_path, weights_only=False)
+        state = load_ckpt(ckpt_path)
         if state["configSha256"] != cfg_sha:
             raise SystemExit(f"{ckpt_path}: written for config {state['configSha256'][:12]}, this run is {cfg_sha[:12]}")
+        # A checkpoint without a device was written on the CPU.
+        ck_device = state.get("device", "cpu")
+        if ck_device != a.device and not a.allow_device_change:
+            raise SystemExit(f"{ckpt_path}: written on device {ck_device}, this run is {a.device} (--allow-device-change to resume anyway)")
+        state["device"] = a.device
         if state["done"]:
             return finish(a, base, train_q, dev_q, state, drop_train, drop_dev)
         model.load_state_dict(state["params"])
         opt.load_state_dict(state["opt"])
-        set_rng_state(state["rng"])
+        try:
+            set_rng_state(state["rng"], a.allow_device_change)
+        except ValueError as e:
+            raise SystemExit(f"{ckpt_path}: {e}")
         progress(f"{a.out}: resumed after epoch {state['epoch']}")
     else:
-        W0 = model.matrix().detach().numpy().copy()
+        W0 = model.matrix().detach().cpu().numpy().copy()
         ev = dev_eval(base, W0, dev_q)
         m0 = M.metrics([r for *_, r in ev])
-        state = {"configSha256": cfg_sha, "config": cfg, "done": False, "epoch": 0, "bad": 0,
+        state = {"configSha256": cfg_sha, "config": cfg, "device": a.device, "done": False, "epoch": 0, "bad": 0,
                  "best": m0["mrr"], "bestEpoch": 0, "bestW": W0, "bestEvals": ev,
                  "history": [{"epoch": 0, **m0}]}
         progress(f"{a.out}: epoch 0 dev MRR {m0['mrr']:.4f}")
 
-    Q = torch.from_numpy(base.qvec(train_q).astype(np.float32))
+    Q = torch.from_numpy(base.qvec(train_q).astype(np.float32)).to(device)
     for epoch in range(state["epoch"] + 1, a.epochs + 1):
         perm = np.random.default_rng([a.seed, epoch]).permutation(len(train_q))
         losses = []
@@ -282,10 +281,10 @@ def train(a):
             batch = [train_q[i] for i in bi]
             W = model.matrix()
             qa = torch.nn.functional.normalize(Q[bi] @ W.T, dim=1)
-            cn, pos, valid = batch_tensors(base, batch)
+            cn, pos, valid = (t.to(device) for t in batch_tensors(base, batch))
             loss = r1_loss(qa, cn, pos, valid, a.tau)
             if a.route == "r2":
-                cand, p_t, mask = kd_tensors(base, batch, teacher, a.tau_t)
+                cand, p_t, mask = (t.to(device) for t in kd_tensors(base, batch, teacher, a.tau_t))
                 loss = kd_loss(qa, cand, p_t, mask, a.tau_s) + a.alpha * loss
             if a.form == "full" and a.lam:
                 loss = loss + a.lam * ((W - model.eye) ** 2).sum()
@@ -293,7 +292,7 @@ def train(a):
             loss.backward()
             opt.step()
             losses.append(float(loss))
-        Wn = model.matrix().detach().numpy().copy()
+        Wn = model.matrix().detach().cpu().numpy().copy()
         ev = dev_eval(base, Wn, dev_q)
         m = M.metrics([r for *_, r in ev])
         state["history"].append({"epoch": epoch, "loss": float(np.mean(losses)), **m})
@@ -362,6 +361,10 @@ def parse(argv=None):
     ap.add_argument("--resamples", type=int, default=M.RESAMPLES)
     ap.add_argument("--no-train-metric", action="store_true", help="skip C6's train MRR")
     ap.add_argument("--stop-after-epochs", type=int, help="exit 75 after this epoch's checkpoint (resume test)")
+    ap.add_argument("--device", choices=["cpu", "cuda"], default="cpu",
+                    help="where the adapter trains; not part of the config hash")
+    ap.add_argument("--allow-device-change", action="store_true",
+                    help="resume a checkpoint written on another device")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     if a.route == "r2" and not a.teacher_dir:

@@ -515,3 +515,42 @@ role = "informational"
 reference = "gte-small-structured"
 adapter = "~/Projects/ClaudeProjects/g-mesh-data/gm436/adapters/gte-structured-distill-c2/W.f32"
 adapter_sha256 = "3756ae702b519db3bcccc250925abe67275924a2df84ac878fc658a95a3aa2fa"
+
+# --- GM-703: CodeRankEmbed on the shipped structured text (docs/design/GM-703-coderankembed.md)
+# No ONNX upstream: exported by eval/embedding/gm703/export_coderankembed.py from
+# the pinned revision into g-mesh-data/gm703/models (EXPORT.json beside model.onnx
+# records the sha256s). onnx_file names the export, so a re-export under another
+# file name changes the variant fingerprint; gm703/measure.sh also checks
+# model.onnx's sha256 against EXPORT.json before a run.
+# The fp32 row is the eval arm (a D9 quality candidate against
+# jina-v2-base-code-int8-structured). The int8 row is stopped: its export failed
+# the int8-vs-fp32 drift check Q-D (design note, section 11.1), so it is not run.
+[[variant]]
+name = "coderankembed-int8-structured"
+arm = "model"
+role = "informational"
+hf_repo = "nomic-ai/CodeRankEmbed"
+revision = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
+onnx_file = "gm703-export/model_int8.onnx"
+model_dir = "~/Projects/ClaudeProjects/g-mesh-data/gm703/models/coderankembed-int8"
+pooling = "cls"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+query_prefix = "Represent this query for searching relevant code: "
+text = "structured"
+
+[[variant]]
+name = "coderankembed-fp32-structured"
+arm = "model"
+role = "quality"
+hf_repo = "nomic-ai/CodeRankEmbed"
+revision = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
+onnx_file = "gm703-export/model_fp32.onnx"
+model_dir = "~/Projects/ClaudeProjects/g-mesh-data/gm703/models/coderankembed-fp32"
+pooling = "cls"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+query_prefix = "Represent this query for searching relevant code: "
+text = "structured"
