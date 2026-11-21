@@ -41,6 +41,7 @@ import gm699_separability as S  # noqa: E402
 import gm701_floor_or_blend as G  # noqa: E402
 import rerank_q5_diag as Q5  # noqa: E402
 import shipped_floor_rates as SFR  # noqa: E402
+import gm697_floor_refit as FR  # noqa: E402
 
 B, R = S.B, S.R
 LANGS = R.LANGS
@@ -88,7 +89,7 @@ def cols_for(kind, pop):
 
 
 # ---- rows --------------------------------------------------------------------------------------
-def features(cs, sc, flags, floors):
+def features(cs, sc, flags, floors, beta=S.BETA):
     """One row per query with a non-empty window: f1-f10, labels, population, side, languages."""
     rows, disagree = [], []
     for c in cs:
@@ -107,7 +108,7 @@ def features(cs, sc, flags, floors):
                 sys.exit(f"STOP: {q}: harness held_out {qq['held_out']} != sha256 side {side}")
             cos = np.array([x for _, x in lst[:n]], dtype=np.float64)
             logit = np.array([sc(c, q, nid) for nid, _ in lst[:n]], dtype=np.float64)
-            blend = logit + S.BETA * cos
+            blend = logit + beta * cos
             skip = bool(flags[(c.name, q)])
             s_ = -np.arange(n, dtype=np.float64) if skip else blend
             order = np.lexsort((np.arange(n), -s_))  # rerank order, ties by cosine position (R.reranked)
@@ -136,12 +137,12 @@ def matrix(rows, cols):
     return np.array([[r[k] for k in cols] for r in rows], dtype=np.float64).reshape(len(rows), len(cols))
 
 
-def arm_outs(cs, sc, flags, pop_of):
+def arm_outs(cs, sc, flags, pop_of, beta=S.BETA):
     """int8 outs (cosine order) and F4 outs (blend order, skip rule), as rerank_eval.outcome dicts.
     `mechanical`/`held_out` follow the population split (rust_is_prose) and the sha256 side."""
     int8 = [R.outcome(c, q, c.lists[B.ST][q], c.lists[B.ST][q][0][1] if c.lists[B.ST][q] else None)
             for c in cs for q in c.qids]
-    f4 = B.f4_skip(cs, S.K, S.BETA, sc, flags)
+    f4 = B.f4_skip(cs, S.K, beta, sc, flags)
     for outs in (int8, f4):
         for o in outs:
             pop = pop_of.get((o["corpus"], o["id"]))
@@ -495,7 +496,30 @@ def fit_population(rows, pop, resamples, shuffles, coef_boot, stops):
     return out, zmaps, dump, models
 
 
-def c0_d6_check(rows, int8_outs, model_nl):
+def load_floors(path, arm=None):
+    """Floors of the arm under test: a flat {language: floor} JSON, or a report_*.json (gm697_floor_refit's
+    --report format, D6 floors of `arms[arm]`; `arm` required). Must cover every language."""
+    d = json.loads(Path(path).read_text())
+    if "arms" in d:
+        if not arm:
+            sys.exit(f"STOP: {path} is a report_*.json; name the arm with --floors-arm")
+        got = FR.expected_from_report(path, arm)[0]
+    else:
+        got = d
+    got = {k: float(v) for k, v in got.items()}
+    if set(got) != set(LANGS):
+        sys.exit(f"STOP: floors {sorted(got)} != languages {sorted(LANGS)}")
+    return got
+
+
+def tune_beta_on_fit(cs, sc):
+    """FIT-only beta (gm463_bakeoff.tune_beta: best FIT NL r@10, then MRR, then the smaller beta, edge rule
+    doubling/halving). Held-out queries are never scored."""
+    fit_keys = [(c, q) for c in cs for q in c.qids if R.fit_nl(c.queries[q])]
+    return B.tune_beta(fit_keys, S.K, sc), len(fit_keys)
+
+
+def c0_d6_check(rows, int8_outs, model_nl, pinned=True):
     """Control 2b: the D6 rule on C0's z per query language, over rerank_eval.fit_floors' rows of the
     int8 outs; the implied cosine cut, rounded down to 2 dp, must equal R.fit_floors and the v2 refit."""
     by = {r["key"]: r for r in rows}
@@ -510,6 +534,8 @@ def c0_d6_check(rows, int8_outs, model_nl):
         i = int(np.argsort(z, kind="mergesort")[min(k, len(rs) - 1)])
         implied[l] = R.round_down_2(rs[i]["cos1"])
     ff = R.fit_floors(int8_outs)
+    if not pinned:  # another arm: the expectation is the arm's own R.fit_floors, not the base arm's constants
+        return dict(implied=implied, fit_floors=ff, v2_refit="skipped: base-arm constants", ok=implied == ff)
     return dict(implied=implied, fit_floors=ff, v2_refit=V2_D6_INT8,
                 ok=implied == ff and all(implied.get(l) == v for l, v in V2_D6_INT8.items()))
 
@@ -649,19 +675,40 @@ def main():
     ap.add_argument("--dump-fit", type=Path, help="write the FIT design matrices + fits as .npz (control 4)")
     ap.add_argument("--per-query-out", type=Path,
                     help="write per-query stack outcomes of every arm as JSONL (input of gm452_paired_bootstrap.py --stack)")
+    ap.add_argument("--floors-json", type=Path,
+                    help="floors of the arm: flat {lang: floor} JSON or a report_*.json (needs --floors-arm); "
+                         "default today's similarity.rs floors")
+    ap.add_argument("--floors-arm", help="arm key in the --floors-json report (gm697_floor_refit --report-arm)")
+    ap.add_argument("--beta", type=float, help=f"blend beta (default {S.BETA:g})")
+    ap.add_argument("--tune-beta-on-fit", action="store_true",
+                    help="pick beta on the FIT half only (gm463_bakeoff.tune_beta), print it; excludes --beta")
     ap.add_argument("--ignore-stops", action="store_true",
                     help="diagnostic only: build the tables despite a stop rule (still exits 2); not for the measure run")
     a = ap.parse_args()
 
     cs, sc, flags, sha = G.setup(a.work, a.cache_dir, a.st_runs)
-    floors = SFR.structured_floors()
-    rows, disagree = features(cs, sc, flags, floors)
+    if a.tune_beta_on_fit and a.beta is not None:
+        sys.exit("STOP: --beta and --tune-beta-on-fit are exclusive")
+    floors = load_floors(a.floors_json, a.floors_arm) if a.floors_json else SFR.structured_floors()
+    beta, tuned = S.BETA, None
+    if a.beta is not None:
+        beta = a.beta
+    elif a.tune_beta_on_fit:
+        (beta, fit_key, added), n_fit = tune_beta_on_fit(cs, sc)
+        tuned = {"beta": beta, "fit_r10": fit_key[0], "fit_mrr": fit_key[1], "grid_added": added, "fit_queries": n_fit}
+        print(f"FIT-tuned beta {beta:g} (FIT r@10 {fit_key[0]:.3f}, MRR {fit_key[1]:.3f}, {n_fit} FIT queries)", file=sys.stderr)
+    # The base-arm controls compare with constants of today's floors, beta and recall arm.
+    base_arm = a.floors_json is None and beta == S.BETA and a.st_runs is None
+    rows, disagree = features(cs, sc, flags, floors, beta)
     pop_of = {r["key"]: r["pop"] for r in rows}
-    int8, f4 = arm_outs(cs, sc, flags, pop_of)
+    int8, f4 = arm_outs(cs, sc, flags, pop_of, beta)
     stops = []
     res = {"sha256": sha, "seed": SEED, "resamples": a.resamples, "shuffles": a.shuffles, "floors": floors,
            "rows": len(rows), "prose_vs_mechanical_disagree": len(disagree), "disagree_ids": disagree[:20],
            "floor_unknown_rows": sum(not r["floor_known"] for r in rows)}
+    if not base_arm:
+        res["arm"] = {"floors_json": str(a.floors_json) if a.floors_json else None, "floors_arm": a.floors_arm,
+                      "beta": beta, "beta_tuned_on_fit": tuned, "st_runs": a.st_runs}
 
     zmaps, dumps, models = {}, {}, {}
     for pop in ("NL", "NAME"):
@@ -674,7 +721,12 @@ def main():
     c1["int8_nl_ho"] = {"got": int8_nl, "want": GM697_INT8_NL_HO}
     c1_ok = all(c1[p]["got"] == c1[p]["want"] for p in ("NL", "NAME")) and \
         all(tuple(int8_nl[k]) == v for k, v in GM697_INT8_NL_HO.items())
-    if not c1_ok:
+    if not base_arm:
+        note = "control 1 skipped: pinned to the base arm's GM-701/GM-697 numbers (not this arm's floors/beta/recall)"
+        print(note, file=sys.stderr)
+        c1 = {"skipped": note, "got": c1}
+        c1_ok = None
+    elif not c1_ok:
         stops.append("control 1: F4/int8 do not reproduce GM-701/GM-697")
 
     # arms as rerank_eval outcome lists
@@ -694,7 +746,10 @@ def main():
     res["stopped_arms"] = {p: res[p]["stopped_arms"] for p in ("NL", "NAME")}
 
     # control 2: C0 exact
-    c2b = c0_d6_check(rows, int8, models["NL"]["C0"])
+    c2b = c0_d6_check(rows, int8, models["NL"]["C0"], pinned=base_arm)
+    if not base_arm:
+        print("control 2b: v2 int8 refit constants skipped (base arm only); checked against this arm's own R.fit_floors",
+              file=sys.stderr)
     if not c2b["ok"]:
         stops.append("control 2b: D6 rule on C0's z does not give the v2 int8 refit floors")
     g_f4_f4 = Q5.fixed_floors_gates(f4, f4, floors, floors)
