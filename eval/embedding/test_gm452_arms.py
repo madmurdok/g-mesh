@@ -4,7 +4,8 @@ Covers gm697_floor_refit.py --report/--report-arm, shipped_floor_rates.py
 --after with --floors/--custom, --st-runs in gm701_floor_or_blend.py and
 gm461_learned_verdict.py, the paired per-language bootstrap
 gm452_paired_bootstrap.py, and that the default (no new flag) output equals
-the pre-change scripts (efbdf7ff~).
+the pre-change scripts (efbdf7ff~); GM-452/S7: gm461 --per-query-out, the bootstrap's
+stack mode (--base-stack/--stack/--base-arm/--stack-arm) and its NaN-resample count.
 
 Synthetic fixtures only: tiny run/eval dirs in a temp dir; g-mesh-data and the
 held-out eval data are never read. numpy must import; the regression group
@@ -416,6 +417,337 @@ class Bootstrap(TmpCase):
         self.assertIn("note: NL: ids differ between arms (base 16, candidate 14, paired 14); unpaired ids dropped",
                       stdout)
         self.assertIn("| NL | go | 2 |", stdout)
+
+
+# ---- 6. gm461 --per-query-out (GM-452/S7) ------------------------------------------------------
+PQ_FIELDS = {"arm", "id", "corpus", "language", "pop", "ho", "positive", "rank1", "below", "misled", "cw"}
+
+
+def oc(qid, lang, mech, ho, positive, rank, top, top_language="same", corpus="c"):
+    """A rerank_eval-style outcome dict as gm461's arms hold them."""
+    return dict(id=qid, corpus=corpus, language=lang, top_language=lang if top_language == "same" else top_language,
+                top=top, rank=rank, positive=positive, mechanical=mech, held_out=ho)
+
+
+class PerQueryOut(TmpCase):
+    FLOORS = {"go": 0.5, "python": 0.6}
+
+    def outs(self):
+        used = set()
+        nm_odd, nm_even = make_id("nm", True, used), make_id("nm", False, used)
+        return [
+            oc("n-misled", "go", False, True, True, 1, 0.4),      # rank-1 positive refused
+            oc("n-right", "go", False, True, True, 1, 0.9),       # rank-1 positive shown
+            oc("n-wrong", "python", False, False, True, 2, 0.7),  # wrong top shown (fit half)
+            oc("n-wrong-ref", "python", False, True, True, 3, 0.5),  # wrong top refused
+            oc("n-abs-shown", "go", False, True, False, None, 0.8),
+            oc("n-abs-ref", "go", False, True, False, None, 0.1),
+            oc("n-notop", "go", False, True, True, 1, None),       # empty window: no verdict
+            oc("n-nolang", "go", False, True, True, 1, 0.9, top_language=None),
+            oc("n-nofloor", "rust", False, True, True, 1, 0.9),   # no floor for rust: no verdict
+            # name rows: ho follows sha256(id) parity, not the outcome's held_out flag
+            oc(nm_odd, "go", True, False, True, 1, 0.9),
+            oc(nm_even, "go", True, True, True, 1, 0.9),
+        ], nm_odd, nm_even
+
+    def test_rows_fields_and_values(self):
+        outs, nm_odd, nm_even = self.outs()
+        rows = V.per_query_rows({"F4": (outs, self.FLOORS)})
+        for r in rows:
+            self.assertEqual(set(r), PQ_FIELDS)
+        got = {r["id"]: r for r in rows}
+        self.assertEqual(set(got), {"n-misled", "n-right", "n-wrong", "n-wrong-ref", "n-abs-shown", "n-abs-ref",
+                                    nm_odd, nm_even})
+        self.assertEqual(len(rows), 8)
+        want = {  # pop, ho, positive, rank1, below, misled, cw
+            "n-misled": ("NL", True, True, True, True, True, False),
+            "n-right": ("NL", True, True, True, False, False, False),
+            "n-wrong": ("NL", False, True, False, False, False, True),
+            "n-wrong-ref": ("NL", True, True, False, True, False, False),
+            "n-abs-shown": ("NL", True, False, False, False, False, True),
+            "n-abs-ref": ("NL", True, False, False, True, False, False),
+            nm_odd: ("NAME", True, True, True, False, False, False),
+            nm_even: ("NAME", False, True, True, False, False, False),
+        }
+        for qid, w in want.items():
+            r = got[qid]
+            self.assertEqual((r["pop"], r["ho"], r["positive"], r["rank1"], r["below"], r["misled"], r["cw"]), w, qid)
+            self.assertEqual((r["arm"], r["corpus"]), ("F4", "c"))
+        self.assertEqual(got["n-wrong"]["language"], "python")
+        json.dumps(rows)  # JSON-serialisable (plain bools, no numpy types)
+        self.assertTrue(all(type(r[k]) is bool for r in rows for k in ("ho", "positive", "rank1", "below", "misled", "cw")))
+
+    def test_one_row_per_arm_and_query(self):
+        outs, _, _ = self.outs()
+        clf = [dict(o, top_language="clf:NL", top=0.2 if o["id"] == "n-right" else 0.9) for o in outs]
+        rows = V.per_query_rows({"F4": (outs, self.FLOORS), "L-m": (clf, {"clf:NL": 0.5})})
+        self.assertEqual(sum(r["arm"] == "F4" for r in rows), 8)
+        self.assertEqual(sum(r["arm"] == "L-m" for r in rows), len(outs))  # one classifier key covers every row
+        self.assertEqual(len({(r["arm"], r["id"]) for r in rows}), len(rows))
+        lm = {r["id"]: r for r in rows if r["arm"] == "L-m"}
+        self.assertTrue(lm["n-right"]["below"] and lm["n-right"]["misled"])
+        self.assertFalse(lm["n-misled"]["below"])
+
+    # main(): everything before the per-query write is stubbed; control 2b (the next step) stops the run
+    def run_main(self, *extra):
+        outs, _, _ = self.outs()
+        outs = [o for o in outs if o["top"] is not None and o["top_language"] and o["language"] != "rust"]
+        nl = {(o["corpus"], o["id"]): 0.1 for o in outs if not o["mechanical"]}
+        nm = {(o["corpus"], o["id"]): 0.9 for o in outs if o["mechanical"]}
+        th = {"C0-m": 0.0, "L-m": 0.5, "L-d6": 0.5, "L-noCE": 0.5}
+
+        def fit(rows, pop, *a):
+            z = nl if pop == "NL" else nm
+            return ({"ho": {"F4": {"kept_k": 0, "caught_k": 0}}, "thresholds": th, "stopped_arms": []},
+                    {"full": z, "C0shift": z, "C0": z, "noCE": z}, None, {"C0": None})
+
+        with mock.patch.object(V.G, "setup", return_value=(None, None, None, "sha")), \
+                mock.patch.object(V.SFR, "structured_floors", return_value=dict(self.FLOORS)), \
+                mock.patch.object(V, "features", return_value=([], [])), \
+                mock.patch.object(V, "arm_outs", return_value=(outs, [dict(o) for o in outs])), \
+                mock.patch.object(V, "fit_population", side_effect=fit), \
+                mock.patch.object(V.R, "gm434", return_value=dict(V.GM697_INT8_NL_HO)), \
+                mock.patch.object(V, "c0_d6_check", side_effect=Stop), \
+                mock.patch.object(sys, "argv", [V.__file__, "--work", str(self.tmp), *map(str, extra)]):
+            with self.assertRaises(Stop):
+                V.main()
+        return outs
+
+    def test_main_flag_writes_jsonl(self):
+        pq = self.tmp / "pq" / "rows.jsonl"
+        pq.parent.mkdir()
+        outs = self.run_main("--per-query-out", pq)
+        rows = [json.loads(l) for l in pq.read_text().splitlines()]
+        arms = ("int8", "F4", "C0", "C0-m", "L-m", "L-d6", "L-noCE")
+        self.assertEqual(sorted({r["arm"] for r in rows}), sorted(arms))
+        self.assertEqual(len(rows), len(arms) * len(outs))
+        self.assertEqual(len({(r["arm"], r["id"]) for r in rows}), len(rows))
+        for r in rows:
+            self.assertEqual(set(r), PQ_FIELDS)
+        got = {(r["arm"], r["id"]): r for r in rows}
+        # L-m: NL z 0.1 < 0.5 -> refused; NAME z 0.9 -> shown. F4: cosine floors.
+        self.assertTrue(got[("L-m", "n-right")]["misled"])
+        self.assertFalse(got[("F4", "n-right")]["below"])
+        self.assertTrue(got[("F4", "n-misled")]["misled"])
+
+    def test_main_without_flag_writes_nothing(self):
+        self.run_main()
+        self.assertEqual(list(self.tmp.rglob("*")), [])
+
+
+# ---- 7. bootstrap stack mode (GM-452/S7) --------------------------------------------------------
+def srow(arm, qid, lang, positive, rank1, below, pop="NL", ho=True):
+    return dict(arm=arm, id=qid, corpus="c", language=lang, pop=pop, ho=ho, positive=positive, rank1=rank1,
+                below=below, misled=bool(positive and rank1 and below),
+                cw=bool((not below) and not (positive and rank1)))
+
+
+def write_jsonl(path, rows):
+    Path(path).write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return path
+
+
+def boot_script(*args):
+    return run_script(HERE / "gm452_paired_bootstrap.py", *args)
+
+
+class StackMode(TmpCase):
+    """Hand-computable fixture. NL held-out, F4 arm:
+    go: 2 wrong-top positives, shown in base and candidate (cw_pos 1 -> 1, delta 0, every draw);
+    python: 2 wrong-top positives, refused in base, shown in candidate (cw_pos 0 -> 1, delta +1, every draw).
+    Pooled with per-language strata: 2 go + 2 python per draw -> delta +0.5 exactly, CI [0.5, 0.5].
+    Decoys that must be ignored: arm X rows (all refused), NL fit-half rows, a NAME row, an unpaired id."""
+
+    def files(self, base_arm="F4", shuffle=True):
+        def f4(cand):
+            return [srow(base_arm if not cand else "F4", "g1", "go", True, False, False),
+                    srow(base_arm if not cand else "F4", "g2", "go", True, False, False),
+                    srow(base_arm if not cand else "F4", "p1", "python", True, False, not cand),
+                    srow(base_arm if not cand else "F4", "p2", "python", True, False, not cand)]
+        decoys = lambda arm: [srow("X", i, l, True, False, True) for i, l in
+                              (("g1", "go"), ("g2", "go"), ("p1", "python"), ("p2", "python"))] + \
+            [srow(arm, "fit1", "python", True, False, True, ho=False),
+             srow(arm, "nm1", "go", True, True, True, pop="NAME")]
+        base = f4(False) + decoys(base_arm) + ([srow("F4", "g1", "go", True, False, True)] if base_arm != "F4" else [])
+        cand = list(reversed(f4(True))) + decoys("F4") + [srow("F4", "only-cand", "go", True, False, False)]
+        if base_arm != "F4":  # base file's F4 rows contradict the selected arm
+            base = [r for r in base if not (r["arm"] == "F4" and r["id"] == "g1")] + \
+                [srow("F4", i, l, True, False, False) for i, l in (("p1", "python"), ("p2", "python"))]
+        return write_jsonl(self.tmp / "base.jsonl", base), write_jsonl(self.tmp / "cand.jsonl", cand)
+
+    def check(self, js, stdout):
+        nl = js["rows"]
+        self.assertEqual(nl["NL/pooled"]["n"], 4)
+        self.assertEqual(nl["NL/go"]["n"], 2)
+        self.assertEqual(nl["NL/python"]["n"], 2)
+        c = nl["NL/pooled"]["cw_pos"]
+        self.assertEqual((c["point"], c["lo"], c["hi"]), (0.5, 0.5, 0.5))
+        c = nl["NL/python"]["cw_pos"]
+        self.assertEqual((c["point"], c["lo"], c["hi"]), (1.0, 1.0, 1.0))
+        c = nl["NL/go"]["cw_pos"]
+        self.assertEqual((c["point"], c["lo"], c["hi"]), (0.0, 0.0, 0.0))
+        self.assertEqual(nl["NAME/pooled"]["n"], 1)
+        self.assertIn("note: NL: ids differ between arms (base 4, candidate 5, paired 4); unpaired ids dropped", stdout)
+        self.assertIn("| NL | pooled | 4 | ", stdout)
+        self.assertIn("+50.0 [+50.0, +50.0]", stdout)
+
+    def test_stack_hand_computed_and_deterministic(self):
+        b, c = self.files()
+        outs = []
+        for k in (1, 2):
+            out = self.tmp / f"o{k}.json"
+            code, stdout, err = boot_script("--base-stack", b, "--stack", c, "--resamples", "300", "--out", out)
+            self.assertEqual(code, 0, err)
+            outs.append(out.read_text())
+        self.assertEqual(outs[0], outs[1])
+        js = json.loads(outs[0])
+        self.assertEqual((js["seed"], js["mode"], js["base_arm"], js["stack_arm"]), (398, "stack", "F4", "F4"))
+        self.check(js, stdout)
+
+    def test_arm_selection(self):
+        b, c = self.files(base_arm="B")
+        out = self.tmp / "o.json"
+        code, stdout, err = boot_script("--base-stack", b, "--stack", c, "--base-arm", "B", "--stack-arm", "F4",
+                                        "--resamples", "100", "--out", out)
+        self.assertEqual(code, 0, err)
+        js = json.loads(out.read_text())
+        self.assertEqual((js["base_arm"], js["stack_arm"]), ("B", "F4"))
+        self.check(js, stdout)
+        # --stack-arm X: candidate X refuses everything -> python 0 -> 0, go 1 -> 0
+        code, stdout, err = boot_script("--base-stack", b, "--stack", c, "--base-arm", "B", "--stack-arm", "X",
+                                        "--resamples", "100", "--out", out)
+        self.assertEqual(code, 0, err)
+        c = json.loads(out.read_text())["rows"]["NL/pooled"]["cw_pos"]
+        self.assertEqual((c["point"], c["lo"], c["hi"]), (-0.5, -0.5, -0.5))
+
+    def test_stack_ci_matches_run_at_seed_398(self):
+        # non-degenerate data: the stack-mode interval is PB.run on the per-language strata at seed 398
+        rows_b, rows_c = [], []
+        pat_b = [(True, True, False), (True, False, False), (False, False, False), (True, True, True), (False, False, True)]
+        pat_c = [(True, True, True), (True, False, True), (False, False, False), (True, True, False), (False, False, False)]
+        for lang in ("go", "rust"):
+            for i in range(10):
+                pb, pc = pat_b[i % 5], pat_c[(i * 3) % 5]
+                rows_b.append(srow("F4", f"{lang}{i}", lang, *pb))
+                rows_c.append(srow("F4", f"{lang}{i}", lang, pb[0], pb[1], pc[2]))
+        b, c = write_jsonl(self.tmp / "b.jsonl", rows_b), write_jsonl(self.tmp / "c.jsonl", rows_c)
+        out = self.tmp / "o.json"
+        code, _, err = boot_script("--base-stack", b, "--stack", c, "--resamples", "400", "--out", out)
+        self.assertEqual(code, 0, err)
+        js = json.loads(out.read_text())
+        groups = []
+        for lang in ("go", "rust"):
+            sel = sorted(r["id"] for r in rows_b if r["language"] == lang)
+            vb = {r["id"]: PB.vector(r["positive"], r["rank1"], r["below"]) for r in rows_b}
+            vc = {r["id"]: PB.vector(r["positive"], r["rank1"], r["below"]) for r in rows_c}
+            groups.append((np.array([vb[i] for i in sel]), np.array([vc[i] for i in sel])))
+        p, lo, hi = boot(groups, 400)
+        for i, m in enumerate(PB.METRICS):
+            got = js["rows"]["NL/pooled"][m]
+            self.assertAlmostEqual(got["point"], float(p[i]), msg=m)
+            self.assertAlmostEqual(got["lo"], float(lo[i]), msg=m)
+            self.assertAlmostEqual(got["hi"], float(hi[i]), msg=m)
+        self.assertNotEqual(js["rows"]["NL/pooled"]["misled"]["lo"], js["rows"]["NL/pooled"]["misled"]["hi"])
+
+    def test_vector_and_stack_indicators(self):
+        np.testing.assert_array_equal(PB.vector(True, True, True), [1, 1, 0, 1, 0, 0])
+        np.testing.assert_array_equal(PB.vector(True, False, False), [0, 0, 1, 1, 0, 0])
+        np.testing.assert_array_equal(PB.vector(True, False, True), [0, 0, 0, 1, 0, 0])
+        np.testing.assert_array_equal(PB.vector(False, False, False), [0, 0, 0, 0, 1, 1])
+        np.testing.assert_array_equal(PB.vector(False, False, True), [0, 0, 0, 0, 0, 1])
+        b, _ = self.files()
+        got = PB.stack_indicators(b, "F4", "NL")
+        self.assertEqual(sorted(got), ["g1", "g2", "p1", "p2"])
+        self.assertEqual(got["p1"][0], "python")
+        np.testing.assert_array_equal(got["p1"][1], [0, 0, 0, 1, 0, 0])
+        self.assertEqual(sorted(PB.stack_indicators(b, "F4", "NAME")), ["nm1"])
+        self.assertEqual(sorted(PB.stack_indicators(b, "X", "NL")), ["g1", "g2", "p1", "p2"])
+        np.testing.assert_array_equal(PB.stack_indicators(b, "X", "NL")["g1"][1], [0, 0, 0, 1, 0, 0])
+
+    def test_mode_exclusivity(self):
+        b, c = self.files()
+        run, ev, _ = write_fixture(self.tmp / "fx", full_arm())
+        need_both = "error: stack mode needs both --base-stack and --stack"
+        exclude = "error: --base-stack/--stack exclude --base-run/--run"
+        embedder = "error: --base-run, --run and --eval-dir are required (or --base-stack and --stack)"
+        for args, msg in ((["--base-stack", b], need_both), (["--stack", c], need_both),
+                          (["--base-stack", b, "--stack", c, "--base-run", run], exclude),
+                          (["--base-stack", b, "--stack", c, "--run", run], exclude),
+                          ([], embedder), (["--base-run", run, "--run", run], embedder)):
+            with self.subTest(args=args):
+                code, _, err = boot_script(*args, "--resamples", "10")
+                self.assertEqual(code, 2, err)
+                self.assertIn(msg, err)
+
+
+# ---- 8. resamples with an empty denominator are counted (GM-452/S7) -----------------------------
+class NanResamples(TmpCase):
+    def test_run_counts_all_nan_metrics(self):
+        st = {}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            PB.run([(mat([ABS1, ABS0, ABS0]), mat([ABS1, ABS1, ABS0]))], np.random.default_rng(398), 250, st)
+        self.assertEqual(st["nan_resamples"], [250, 250, 0])
+
+    def test_run_counts_partial_nan_draws(self):
+        # 1 positive among 6 rows: a draw without it has no misled/cw_pos denominator.
+        POS = (1, 1, 0, 1, 0, 0)
+        B = mat([POS, ABS1, ABS0, ABS0, ABS1, ABS0])
+        R = 400
+        st = {}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            p, lo, hi = PB.run([(B, B.copy())], np.random.default_rng(398), R, st)
+        rng = np.random.default_rng(398)
+        want = sum(0 not in rng.integers(0, 6, 6) for _ in range(R))  # replay the draws
+        self.assertTrue(0 < want < R)
+        self.assertEqual(st["nan_resamples"], [want, want, 0])
+        self.assertEqual((lo[0], hi[0]), (0.0, 0.0))  # percentiles over the non-NaN draws
+
+    def test_run_without_stats_unchanged(self):
+        B = mat([ABS1, ABS0, ABS0, ABS1])
+        a = boot([(B, B.copy())], 100)
+        st = {}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            b = PB.run([(B, B.copy())], np.random.default_rng(398), 100, st)
+        for x, y in zip(a, b):
+            np.testing.assert_array_equal(x, y)
+
+    def assert_counts(self, js, err, R, lang_row):
+        self.assertEqual(js["rows"][lang_row]["nan_resamples"], [R, R, 0])
+        rows = js["rows"].values()
+        total = [sum(r["nan_resamples"][m] for r in rows) for m in range(3)]
+        self.assertEqual(js["nan_resamples_total"], total)
+        self.assertIn(f"nan resamples dropped by nanpercentile (misled, cw_pos, cw_abs; summed over rows): {total}", err)
+
+    def test_stack_mode_counts(self):
+        R = 60
+        rows = [srow("F4", "g1", "go", False, False, False), srow("F4", "g2", "go", False, False, True),
+                srow("F4", "p1", "python", True, True, False), srow("F4", "p2", "python", True, True, True)]
+        b = write_jsonl(self.tmp / "b.jsonl", rows)
+        out = self.tmp / "o.json"
+        code, stdout, err = boot_script("--base-stack", b, "--stack", b, "--resamples", R, "--out", out)
+        self.assertEqual(code, 0, err)
+        js = json.loads(out.read_text())
+        self.assertEqual(js["rows"]["NL/python"]["nan_resamples"], [0, 0, R])
+        self.assertEqual(js["rows"]["NL/pooled"]["nan_resamples"], [0, 0, 0])
+        self.assert_counts(js, err, R, "NL/go")
+        self.assertEqual(js["nan_resamples_total"], [R, R, R])
+        self.assertNotIn("nan resamples", stdout)
+
+    def test_embedder_mode_counts(self):
+        # go has no held-out NL positive: its NL row has no misled/cw_pos denominator in any draw
+        specs = [s for s in full_arm() if not (s["lang"] == "go" and not s["mech"] and s["ho"] and s["shape"] != "absent")]
+        run, ev, _ = write_fixture(self.tmp, specs)
+        R = 40
+        out = self.tmp / "o.json"
+        code, stdout, err = boot_script("--base-run", run, "--run", run, "--eval-dir", ev, "--resamples", R,
+                                        "--out", out)
+        self.assertEqual(code, 0, err)
+        js = json.loads(out.read_text())
+        self.assert_counts(js, err, R, "NL/go")
+        self.assertNotIn("nan resamples", stdout)
 
 
 # ---- 5. default output unchanged vs the pre-change scripts --------------------------------------
