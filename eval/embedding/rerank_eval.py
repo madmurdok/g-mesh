@@ -115,6 +115,30 @@ CE_BAKEOFF["ce-minilm-quint8-rust"] = CE_BAKEOFF["ce-minilm-quint8"]
 CE_DIR["ce-minilm-quint8-rust"] = CE_DIR["ce-minilm-quint8"]
 CE_FILES["ce-minilm-quint8-rust"] = CE_FILES["ce-minilm-quint8"]
 INT8_MODELS.add("ce-minilm-quint8-rust")
+# GM-741: the QAT-trained L6 (GM-734), quint8, from local files at <work>/models/<CE_DIR>; Python- and
+# Rust-scored arms as above. Not on Hugging Face, so not a bakeoff model.
+CE_DIR["ce-l6-qat-quint8"] = "g-mesh-reranker-l6-qat-quint8"
+CE_DIR["ce-l6-qat-quint8-rust"] = CE_DIR["ce-l6-qat-quint8"]
+INT8_MODELS.update({"ce-l6-qat-quint8", "ce-l6-qat-quint8-rust"})
+# The rerank variants g-mesh ships (core/src/embedding/rerank.rs RerankVariant) as the eval scripts'
+# --ce choice: Python arm, Rust-scored arm, pinned model.onnx sha256, blend beta (None: not fitted yet,
+# give one). "l6" is the default and gives the outputs of the scripts before the choice existed.
+SHIPPED_CE = {
+    "l6": {"py": "ce-minilm-quint8", "rust": "ce-minilm-quint8-rust",
+           "sha": "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9", "beta": 40.0},
+    "qat": {"py": "ce-l6-qat-quint8", "rust": "ce-l6-qat-quint8-rust",
+            "sha": "9eb66866978b8b7bf02e7f46cd6f005019151a1ebf03b65e0de4883ab44ea633", "beta": None},
+}
+DEFAULT_CE = "l6"
+
+
+def check_shipped_ce(work, ce):
+    """The sha256 of the --ce choice's model.onnx under work; exits with STOP when it is not the pin."""
+    want = SHIPPED_CE[ce]["sha"]
+    sha = sha256_file(ce_dir(work, SHIPPED_CE[ce]["py"]) / "model.onnx")
+    if sha != want:
+        sys.exit(f"STOP: model.onnx sha256 {sha} != shipped {want}")
+    return sha
 
 
 def load_ce_local(path):

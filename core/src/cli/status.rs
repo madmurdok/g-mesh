@@ -50,7 +50,7 @@ use anyhow::{Context, Result};
 use crate::control::lock::{self, DaemonLock};
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
-use crate::embedding::rerank::{OutcomeRecord, RerankModelState, RerankOutcome};
+use crate::embedding::rerank::{OutcomeRecord, RerankModelState, RerankOutcome, RerankVariant};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
 use crate::index_health::{index_status, language_retries, language_section, semantic_pass_lines};
@@ -244,8 +244,9 @@ pub enum RerankStatus {
     /// under the daemon's environment, which may differ from this shell's.
     Daemon(OutcomeRecord),
     /// No outcome from a live daemon (none running, or no `search_code` call
-    /// has resolved it yet): the model on disk under this shell's environment.
-    OnDisk { daemon_alive: bool, state: RerankModelState },
+    /// has resolved it yet): the selected variant's model on disk under this
+    /// shell's environment.
+    OnDisk { daemon_alive: bool, variant: RerankVariant, state: RerankModelState },
 }
 
 /// The live daemon's [`OutcomeRecord`] in `state_dir`, else the on-disk check.
@@ -259,10 +260,14 @@ fn rerank_status(core: CoreState, state_dir: &Path) -> RerankStatus {
         .filter(|record| Some(record.pid) == live_pid)
     {
         Some(record) => RerankStatus::Daemon(record),
-        None => RerankStatus::OnDisk {
-            daemon_alive: live_pid.is_some(),
-            state: RerankModelState::of(crate::config::embedding::rerank_settings()),
-        },
+        None => {
+            let settings = crate::config::embedding::rerank_settings();
+            RerankStatus::OnDisk {
+                daemon_alive: live_pid.is_some(),
+                variant: settings.variant,
+                state: RerankModelState::of(settings),
+            }
+        }
     }
 }
 
@@ -811,38 +816,62 @@ fn percent(done: u64, total: u64) -> f64 {
     done as f64 * 100.0 / total as f64
 }
 
+const RERANK_DISABLED: &str = "disabled ([rerank] enabled = false or G_MESH_RERANK=off)";
+
 fn describe_rerank(status: &RerankStatus) -> String {
-    const DISABLED: &str = "disabled ([rerank] enabled = false or G_MESH_RERANK=off)";
     match status {
-        RerankStatus::Daemon(record) => match record.outcome {
-            RerankOutcome::Loaded => "loaded".to_string(),
-            RerankOutcome::Off => DISABLED.to_string(),
-            RerankOutcome::Absent => {
-                "missing - search_code ranks by embedding similarity only; run `g-mesh model \
-                                      fetch`, then restart the daemon (`g-mesh stop`)"
-                    .to_string()
-            }
-            RerankOutcome::Failed => match &record.dir {
-                Some(dir) => format!(
-                    "failed to load (see the daemon log) - search_code ranks by embedding similarity only; \
-                     delete {}, run `g-mesh model fetch`, then restart the daemon (`g-mesh stop`)",
-                    dir.display()
+        RerankStatus::Daemon(record) => {
+            let said = describe_outcome(record);
+            match (record.outcome, record.variant) {
+                (RerankOutcome::Loaded, Some(variant)) if record.fallback => format!(
+                    "{said}: model {variant}, the fallback for the default {}, which is not fetched - \
+                     run `g-mesh model fetch`, then restart the daemon (`g-mesh stop`)",
+                    RerankVariant::DEFAULT
                 ),
-                None => {
-                    "failed to load (see the daemon log) - search_code ranks by embedding similarity only"
-                        .to_string()
+                (RerankOutcome::Loaded, Some(variant)) => format!("{said}: model {variant}"),
+                (RerankOutcome::Absent | RerankOutcome::Failed, Some(variant)) => {
+                    format!("{said}; model {variant}")
                 }
-            },
-        },
-        RerankStatus::OnDisk { daemon_alive, state } => {
+                _ => said,
+            }
+        }
+        RerankStatus::OnDisk { daemon_alive, variant, state } => {
             let lead = if *daemon_alive { "not loaded yet" } else { "no daemon running" };
             let on_disk = match state {
-                RerankModelState::Present => "present (file sizes only; the daemon checks sha256)",
-                RerankModelState::Missing => "missing - run `g-mesh model fetch`",
-                RerankModelState::Disabled => DISABLED,
+                RerankModelState::Present => {
+                    "present (file sizes only; the daemon checks sha256)".to_string()
+                }
+                RerankModelState::Fallback(fallback) => format!(
+                    "missing, {fallback} present - the daemon ranks with {fallback} until `g-mesh \
+                     model fetch` adds this model"
+                ),
+                RerankModelState::Missing => "missing - run `g-mesh model fetch`".to_string(),
+                RerankModelState::Disabled => RERANK_DISABLED.to_string(),
             };
-            format!("{lead}; on disk: {on_disk}")
+            format!("{lead}; on disk: {on_disk}; model {variant}")
         }
+    }
+}
+
+/// The daemon's outcome in words, without the variant.
+fn describe_outcome(record: &OutcomeRecord) -> String {
+    match record.outcome {
+        RerankOutcome::Loaded => "loaded".to_string(),
+        RerankOutcome::Off => RERANK_DISABLED.to_string(),
+        RerankOutcome::Absent => {
+            "missing - search_code ranks by embedding similarity only; run `g-mesh model \
+                                      fetch`, then restart the daemon (`g-mesh stop`)"
+                .to_string()
+        }
+        RerankOutcome::Failed => match &record.dir {
+            Some(dir) => format!(
+                "failed to load (see the daemon log) - search_code ranks by embedding similarity only; \
+                     delete {}, run `g-mesh model fetch`, then restart the daemon (`g-mesh stop`)",
+                dir.display()
+            ),
+            None => "failed to load (see the daemon log) - search_code ranks by embedding similarity only"
+                .to_string(),
+        },
     }
 }
 

@@ -308,7 +308,7 @@ fn stub_reranker(
 ) -> Reranker {
     let logit: Arc<dyn Fn(usize) -> f32 + Send + Sync> = Arc::new(logit);
     Reranker::with_parts(
-        move || RerankSettings { enabled, model_dir: Ok("/stub".into()) },
+        move || RerankSettings::l6(enabled, Ok("/stub".into())),
         move |_| Ok(Box::new(Stub(Arc::clone(&logit))) as Box<dyn Scorer>),
         lines.sink(),
     )
@@ -362,7 +362,7 @@ fn a_missing_model_keeps_todays_output_and_logs_once() {
     assert_matches_golden(&embedding);
     let logged = lines.0.lock().unwrap().clone();
     assert_eq!(logged.len(), 1, "{logged:?}");
-    assert!(logged[0].contains("rerank model ms-marco-MiniLM-L6-v2 is not available"), "{logged:?}");
+    assert!(logged[0].contains("rerank model l6 is not available"), "{logged:?}");
     assert!(logged[0].contains("g-mesh model fetch"), "{logged:?}");
 }
 
@@ -695,7 +695,7 @@ fn the_handler_scores_the_texts_the_reference_scored() {
         let scorer = capture.clone();
         let lines = Lines::default();
         let reranker = Reranker::with_parts(
-            || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+            || RerankSettings::l6(true, Ok("/stub".into())),
             move |_| Ok(Box::new(scorer.clone()) as Box<dyn Scorer>),
             lines.sink(),
         );
@@ -739,7 +739,7 @@ fn scored_texts(store: &Arc<IndexStore>, query: &str, project_root: Option<&Path
     let scorer = capture.clone();
     let lines = Lines::default();
     let reranker = Reranker::with_parts(
-        || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+        || RerankSettings::l6(true, Ok("/stub".into())),
         move |_| Ok(Box::new(scorer.clone()) as Box<dyn Scorer>),
         lines.sink(),
     );
@@ -863,7 +863,7 @@ async fn the_tool_reads_the_body_under_the_project_root() {
     let scorer = capture.clone();
     let lines = Lines::default();
     let reranker = Reranker::with_parts(
-        || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+        || RerankSettings::l6(true, Ok("/stub".into())),
         move |_| Ok(Box::new(scorer.clone()) as Box<dyn Scorer>),
         lines.sink(),
     );
@@ -946,9 +946,8 @@ fn mentions_the_rerank_model(page: &serde_json::Value) -> bool {
 /// A rerank switched on whose loader fails, with `model_dir` as given.
 fn failing_reranker(model_dir: Option<std::path::PathBuf>) -> Reranker {
     Reranker::with_parts(
-        move || RerankSettings {
-            enabled: true,
-            model_dir: model_dir.clone().ok_or_else(|| anyhow::anyhow!("no home directory")),
+        move || {
+            RerankSettings::l6(true, model_dir.clone().ok_or_else(|| anyhow::anyhow!("no home directory")))
         },
         |_| anyhow::bail!("the loader refused"),
         |_| {},
@@ -1165,7 +1164,7 @@ fn an_exact_name_first_row_skips_the_scorer_and_gives_the_plain_page() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = Arc::clone(&calls);
     let reranker = Reranker::with_parts(
-        || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+        || RerankSettings::l6(true, Ok("/stub".into())),
         move |_| Ok(Box::new(Counting(Arc::clone(&counted))) as Box<dyn Scorer>),
         |_| {},
     );

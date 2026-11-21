@@ -29,4 +29,4 @@ pub use model::{
     cosine_similarity, default_model_dir_from, EmbeddingModel, DEFAULT_MODEL_NAME, EMBEDDING_DIM,
 };
 pub use pipeline::{CacheSettings, EmbedStats, EmbeddingPipeline, EmbeddingSettings, ModelSettings};
-pub use rerank::{rerank_model_dir_from, RerankSettings, Reranker};
+pub use rerank::{rerank_model_dir_from, RerankSettings, RerankVariant, Reranker};

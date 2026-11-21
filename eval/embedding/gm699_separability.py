@@ -6,7 +6,9 @@ reranked top-1 row: cosine, CE logit (Rust-scored quint8, cache of ce-minilm-qui
 blend logit + 40 * cosine. Setup of the shipped path: ship text (E+P+B48), K=30, BETA 40, exact-name
 skip rule (rerank.rs `confident`), one pair per run. An absent query counts as "wrong".
 
-  python3 gm699_separability.py --work <v2 work> [--out results.json] [--resamples 2000]
+  python3 gm699_separability.py --work <v2 work> [--out results.json] [--resamples 2000] [--ce l6|qat]
+
+--ce picks the shipped cross-encoder (rerank_eval.SHIPPED_CE; default l6, the setup above).
 
 Reads the v2 work dir and its Rust logit cache; writes nothing there.
 """
@@ -170,20 +172,20 @@ def main():
     ap.add_argument("--shuffles", type=int, default=100)
     ap.add_argument("--shuffle-resamples", type=int, default=300)
     ap.add_argument("--out", type=Path)
+    ap.add_argument("--ce", choices=sorted(R.SHIPPED_CE), default=R.DEFAULT_CE)
     a = ap.parse_args()
-    sha = R.sha256_file(a.work / "models" / "ms-marco-MiniLM-L6-v2-quint8" / "model.onnx")
-    if sha != SHIPPED_SHA:
-        sys.exit(f"STOP: model.onnx sha256 {sha} != shipped {SHIPPED_SHA}")
+    py, rust = R.SHIPPED_CE[a.ce]["py"], R.SHIPPED_CE[a.ce]["rust"]
+    sha = R.check_shipped_ce(a.work, a.ce)
     ns = argparse.Namespace(work=a.work, eval_dir=HERE / "v2", st_runs=f"runs/{B.ST}", corpora=None)
     st_dir, corpora_dir = B.load_setup(ns)
     cs = B.load_corpora(a.work, ns.eval_dir, st_dir, corpora_dir, K)
-    B.build_model_texts(cs, a.work, PY, ["ship"])
-    B.use_texts(cs, PY)
+    B.build_model_texts(cs, a.work, py, ["ship"])
+    B.use_texts(cs, py)
     for c in cs:
-        c.atext_by[RUST] = c.atext_by[PY]
-    cache = B.open_cache(a.cache_dir or a.work / "rerank_cache_gm700_rust", cs, a.work, RUST, B.file_shas(a.work, PY))
+        c.atext_by[rust] = c.atext_by[py]
+    cache = B.open_cache(a.cache_dir or a.work / "rerank_cache_gm700_rust", cs, a.work, rust, B.file_shas(a.work, py))
     # every pair of the K window must be cached (sc raises KeyError otherwise)
-    sc = B.score_of_for(cache, RUST, "ship")
+    sc = B.score_of_for(cache, rust, "ship")
     flags = B.skip_flags(cs, True, None)
     shipped = R.shipped_floors(HERE.parents[1])
     res = {"sha256": sha, "cache_key": cache.key, "resamples": a.resamples, "seed": SEED,

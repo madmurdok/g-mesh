@@ -296,7 +296,11 @@ fn a_report_renders_every_field_it_was_asked_for() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -342,7 +346,11 @@ fn an_interrupted_workspace_reindex_is_named() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -382,7 +390,11 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -428,7 +440,11 @@ fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_gene
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     });
 
     assert!(
@@ -634,7 +650,11 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -681,7 +701,11 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     }
 }
 
@@ -897,7 +921,11 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -992,7 +1020,11 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -1208,7 +1240,11 @@ fn a_project_with_no_suspension_marker_reports_none() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     };
     let rendered = render(&report);
     assert!(!rendered.contains("semantic ("), "{rendered}");
@@ -1240,7 +1276,11 @@ fn report_with(index: IndexStatus) -> Report {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::Qat,
+            state: RerankModelState::Present,
+        },
     }
 }
 
@@ -1764,7 +1804,13 @@ fn rerank_report(rerank_model: RerankStatus) -> Report {
 }
 
 fn daemon_said(outcome: RerankOutcome, dir: Option<&str>) -> RerankStatus {
-    RerankStatus::Daemon(OutcomeRecord { pid: 4242, outcome, dir: dir.map(PathBuf::from) })
+    RerankStatus::Daemon(OutcomeRecord {
+        pid: 4242,
+        outcome,
+        dir: dir.map(PathBuf::from),
+        variant: None,
+        fallback: false,
+    })
 }
 
 /// The rendered `rerank model:` line's text.
@@ -1799,6 +1845,8 @@ fn the_live_daemons_own_outcome_is_reported() {
         pid: 4242,
         outcome: RerankOutcome::Absent,
         dir: Some(PathBuf::from("/models/rerank")),
+        variant: None,
+        fallback: false,
     };
     for core in [
         CoreState::Running { pid: 4242 },
@@ -1858,10 +1906,12 @@ fn each_daemon_outcome_has_its_own_wording() {
 /// The on-disk fallback is labelled as such, with whether a daemon runs.
 #[test]
 fn the_on_disk_fallback_is_labelled() {
-    let on_disk = |daemon_alive, state| rerank_line(RerankStatus::OnDisk { daemon_alive, state });
+    let on_disk = |daemon_alive, state| {
+        rerank_line(RerankStatus::OnDisk { daemon_alive, variant: RerankVariant::Qat, state })
+    };
     assert_eq!(
         on_disk(false, RerankModelState::Missing),
-        "no daemon running; on disk: missing - run `g-mesh model fetch`"
+        "no daemon running; on disk: missing - run `g-mesh model fetch`; model qat"
     );
     assert!(
         on_disk(true, RerankModelState::Present).starts_with("not loaded yet; on disk: present ("),
@@ -1894,7 +1944,10 @@ fn the_json_names_the_daemon_outcome_or_the_on_disk_state() {
         (RerankOutcome::Failed, "failed"),
         (RerankOutcome::Loaded, "loaded"),
     ] {
-        assert_eq!(json(daemon_said(outcome, None)), serde_json::json!({ "daemon": word, "onDisk": null }));
+        assert_eq!(
+            json(daemon_said(outcome, None)),
+            serde_json::json!({ "daemon": word, "onDisk": null, "variant": null, "fallback": false })
+        );
     }
     for (state, word) in [
         (RerankModelState::Present, "present"),
@@ -1903,8 +1956,8 @@ fn the_json_names_the_daemon_outcome_or_the_on_disk_state() {
     ] {
         for daemon_alive in [false, true] {
             assert_eq!(
-                json(RerankStatus::OnDisk { daemon_alive, state }),
-                serde_json::json!({ "daemon": null, "onDisk": word })
+                json(RerankStatus::OnDisk { daemon_alive, variant: RerankVariant::Qat, state }),
+                serde_json::json!({ "daemon": null, "onDisk": word, "variant": "qat", "fallback": false })
             );
         }
     }

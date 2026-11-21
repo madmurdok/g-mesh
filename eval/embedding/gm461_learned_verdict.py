@@ -682,13 +682,18 @@ def main():
     ap.add_argument("--beta", type=float, help=f"blend beta (default {S.BETA:g})")
     ap.add_argument("--tune-beta-on-fit", action="store_true",
                     help="pick beta on the FIT half only (gm463_bakeoff.tune_beta), print it; excludes --beta")
+    ap.add_argument("--ce", choices=sorted(R.SHIPPED_CE), default=R.DEFAULT_CE,
+                    help="shipped cross-encoder whose Rust-scored cache is read (default l6); one with no fitted "
+                         "beta needs --beta or --tune-beta-on-fit")
     ap.add_argument("--ignore-stops", action="store_true",
                     help="diagnostic only: build the tables despite a stop rule (still exits 2); not for the measure run")
     a = ap.parse_args()
 
-    cs, sc, flags, sha = G.setup(a.work, a.cache_dir, a.st_runs)
     if a.tune_beta_on_fit and a.beta is not None:
         sys.exit("STOP: --beta and --tune-beta-on-fit are exclusive")
+    if R.SHIPPED_CE[a.ce]["beta"] is None and a.beta is None and not a.tune_beta_on_fit:
+        sys.exit(f"STOP: --ce {a.ce} has no fitted beta; give --beta or --tune-beta-on-fit")
+    cs, sc, flags, sha = G.setup(a.work, a.cache_dir, a.st_runs, a.ce)
     floors = load_floors(a.floors_json, a.floors_arm) if a.floors_json else SFR.structured_floors()
     beta, tuned = S.BETA, None
     if a.beta is not None:
@@ -698,7 +703,7 @@ def main():
         tuned = {"beta": beta, "fit_r10": fit_key[0], "fit_mrr": fit_key[1], "grid_added": added, "fit_queries": n_fit}
         print(f"FIT-tuned beta {beta:g} (FIT r@10 {fit_key[0]:.3f}, MRR {fit_key[1]:.3f}, {n_fit} FIT queries)", file=sys.stderr)
     # The base-arm controls compare with constants of today's floors, beta and recall arm.
-    base_arm = a.floors_json is None and beta == S.BETA and a.st_runs is None
+    base_arm = a.floors_json is None and beta == S.BETA and a.st_runs is None and a.ce == R.DEFAULT_CE
     rows, disagree = features(cs, sc, flags, floors, beta)
     pop_of = {r["key"]: r["pop"] for r in rows}
     int8, f4 = arm_outs(cs, sc, flags, pop_of, beta)
@@ -709,6 +714,8 @@ def main():
     if not base_arm:
         res["arm"] = {"floors_json": str(a.floors_json) if a.floors_json else None, "floors_arm": a.floors_arm,
                       "beta": beta, "beta_tuned_on_fit": tuned, "st_runs": a.st_runs}
+        if a.ce != R.DEFAULT_CE:
+            res["arm"]["ce"] = a.ce
 
     zmaps, dumps, models = {}, {}, {}
     for pop in ("NL", "NAME"):

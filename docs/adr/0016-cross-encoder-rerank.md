@@ -1,7 +1,8 @@
 # 0016. search_code: a cross-encoder reorders the top 30, the verdict stays the embedding's
 
 ## Status
-Accepted
+Accepted. Superseded in part by [ADR 0044](0044-qat-reranker-variant.md):
+which weights rerank, and the blend weight per variant.
 
 ## Context
 GM-443 and GM-464 S1 measured an order-only rerank of the int8 embedding

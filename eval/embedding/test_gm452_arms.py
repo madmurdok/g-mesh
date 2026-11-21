@@ -298,8 +298,8 @@ class StRuns(TmpCase):
     def capture_setup(self, module, setup_owner, argv):
         got = {}
 
-        def rec(work, cache_dir, st_runs=None):
-            got.update(work=work, st_runs=st_runs)
+        def rec(work, cache_dir, st_runs=None, ce=None):
+            got.update(work=work, st_runs=st_runs, ce=ce)
             raise Stop
 
         with mock.patch.object(setup_owner, "setup", side_effect=rec), \

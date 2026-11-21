@@ -1,14 +1,15 @@
 //! The cross-encoder that reorders `search_code`'s top rows.
 //!
 //! `search_code` takes the embedding ranking's first [`WINDOW`] rows, scores
-//! each (query, symbol text) pair with `cross-encoder/ms-marco-MiniLM-L6-v2`,
-//! and orders the window by `logit + BETA * cosine`. Rows after the window
-//! keep the embedding order, and the score shown stays the cosine. A window
-//! whose first row's name is the query ([`confident`]) is not scored and
-//! keeps the embedding order. Design: ADR 0016
-//! (`docs/adr/0016-cross-encoder-rerank.md`); the int8 weights, one pair per
-//! run and the exact-name skip: ADR 0043
-//! (`docs/adr/0043-int8-rerank-one-pair-per-run.md`).
+//! each (query, symbol text) pair with the selected [`RerankVariant`]'s
+//! cross-encoder, and orders the window by `logit + beta * cosine`, `beta`
+//! being the variant's own. Rows after the window keep the embedding order,
+//! and the score shown stays the cosine. A window whose first row's name is
+//! the query ([`confident`]) is not scored and keeps the embedding order.
+//! Design: ADR 0016 (`docs/adr/0016-cross-encoder-rerank.md`); the int8
+//! weights, one pair per run and the exact-name skip: ADR 0043
+//! (`docs/adr/0043-int8-rerank-one-pair-per-run.md`); the variants, the
+//! default and its fallback: ADR 0044 (`docs/adr/0044-qat-reranker-variant.md`).
 //!
 //! Like the embedding model, the cross-encoder is fetched by `g-mesh model
 //! fetch` and loaded lazily, on the first call that reranks. A missing or
@@ -33,34 +34,161 @@ use tokenizers::TruncationParams;
 use crate::embedding::ce_text::split_words;
 use crate::embedding::model::{ONNX_FILE_NAME, TOKENIZER_FILE_NAME};
 
-/// The directory name under `~/.g-mesh/models/`, and the name the log uses.
-pub(crate) const RERANK_MODEL_NAME: &str = "ms-marco-MiniLM-L6-v2";
-pub(crate) const RERANK_MODEL_REPO: &str = "cross-encoder/ms-marco-MiniLM-L6-v2";
-/// The revision the blend's `BETA` was fitted against; the weights and
-/// tokenizer below are its files.
-pub(crate) const RERANK_MODEL_REVISION: &str = "233902d25c440f23af6f7d6e94d2946bac0bee0a";
-/// The official dynamic-int8 (unsigned, `quint8`, AVX2) export, written to
-/// [`ONNX_FILE_NAME`] in the model directory (ADR 0043).
-pub(crate) const RERANK_ONNX_REMOTE_PATH: &str = "onnx/model_quint8_avx2.onnx";
-pub(crate) const RERANK_ONNX_SIZE: u64 = 23_200_716;
-pub(crate) const RERANK_ONNX_SHA256: &str =
-    "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9";
-pub(crate) const RERANK_TOKENIZER_SIZE: u64 = 711_396;
-pub(crate) const RERANK_TOKENIZER_SHA256: &str =
-    "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
+/// Which cross-encoder reranks: `[rerank] model` in the global config or
+/// [`RERANK_MODEL_ENV`], `qat` by default (ADR 0044).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RerankVariant {
+    /// `cross-encoder/ms-marco-MiniLM-L6-v2` fine-tuned on code search
+    /// pairs with quantization-aware training (GM-734), quint8 export.
+    Qat,
+    /// `cross-encoder/ms-marco-MiniLM-L6-v2` itself, the official quint8
+    /// export (ADR 0043).
+    L6,
+}
+
+/// Everything pinned for one [`RerankVariant`].
+#[derive(Debug)]
+pub(crate) struct VariantSpec {
+    /// The value `[rerank] model` and [`RERANK_MODEL_ENV`] take.
+    pub(crate) name: &'static str,
+    /// The directory name under `~/.g-mesh/models/`, and the flat mirror's
+    /// prefix.
+    pub(crate) dir_name: &'static str,
+    pub(crate) repo: &'static str,
+    /// A commit hash, never a branch: the shas below are its files.
+    pub(crate) revision: &'static str,
+    /// Written to [`ONNX_FILE_NAME`] in the model directory.
+    pub(crate) onnx_remote_path: &'static str,
+    pub(crate) onnx_size: u64,
+    pub(crate) onnx_sha256: &'static str,
+    pub(crate) tokenizer_size: u64,
+    pub(crate) tokenizer_sha256: &'static str,
+    /// The cosine's weight in the blend `logit + beta * cosine`, fitted
+    /// against this variant's logits.
+    pub(crate) beta: f64,
+}
+
+/// Marks a `qat` pin that does not exist until the model is uploaded:
+/// [`VariantSpec::check_published`] refuses to download from it.
+pub(crate) const UNPUBLISHED: &str = "UNPUBLISHED";
+
+/// Marks a beta not fitted yet: [`RerankVariant::beta`] refuses it.
+pub(crate) const UNFITTED_BETA: f64 = f64::NAN;
+
+pub(crate) const QAT: VariantSpec = VariantSpec {
+    name: "qat",
+    dir_name: "g-mesh-reranker-l6-qat",
+    repo: "UNPUBLISHED-hf-org/g-mesh-reranker-l6-qat",
+    revision: UNPUBLISHED,
+    onnx_remote_path: "onnx/model_quint8.onnx",
+    onnx_size: 23_172_943,
+    onnx_sha256: "9eb66866978b8b7bf02e7f46cd6f005019151a1ebf03b65e0de4883ab44ea633",
+    tokenizer_size: 711_396,
+    tokenizer_sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    beta: UNFITTED_BETA,
+};
+
+pub(crate) const L6: VariantSpec = VariantSpec {
+    name: "l6",
+    dir_name: "ms-marco-MiniLM-L6-v2",
+    repo: "cross-encoder/ms-marco-MiniLM-L6-v2",
+    revision: "233902d25c440f23af6f7d6e94d2946bac0bee0a",
+    onnx_remote_path: "onnx/model_quint8_avx2.onnx",
+    onnx_size: 23_200_716,
+    onnx_sha256: "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9",
+    tokenizer_size: 711_396,
+    tokenizer_sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    beta: 40.0,
+};
+
+impl RerankVariant {
+    pub const DEFAULT: Self = Self::Qat;
+    pub const ALL: [Self; 2] = [Self::Qat, Self::L6];
+
+    pub(crate) const fn spec(self) -> &'static VariantSpec {
+        match self {
+            Self::Qat => &QAT,
+            Self::L6 => &L6,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        self.spec().name
+    }
+
+    /// The variant `value` names, ignoring case and surrounding blanks.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL.into_iter().find(|variant| variant.name().eq_ignore_ascii_case(value))
+    }
+
+    /// The variant a missing default falls back to (D3 of
+    /// `docs/design/GM-741-qat-reranker.md`); `None` for one that has none.
+    pub fn fallback(self) -> Option<Self> {
+        match self {
+            Self::Qat => Some(Self::L6),
+            Self::L6 => None,
+        }
+    }
+
+    /// The blend weight, refused while it is [`UNFITTED_BETA`].
+    pub fn beta(self) -> Result<f64> {
+        let beta = self.spec().beta;
+        if !beta.is_finite() {
+            bail!(
+                "the {} rerank model's blend weight is not fitted yet; set {} to measure it, or \
+                 {}=l6",
+                self.name(),
+                crate::knobs::RERANK_BETA.name,
+                RERANK_MODEL_ENV
+            );
+        }
+        Ok(beta)
+    }
+}
+
+impl std::fmt::Display for RerankVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl VariantSpec {
+    /// Refuses a variant whose repo or commit is still [`UNPUBLISHED`].
+    pub(crate) fn check_published(&self) -> Result<()> {
+        if self.revision.starts_with(UNPUBLISHED) || self.repo.starts_with(UNPUBLISHED) {
+            bail!(
+                "the {} rerank model is not published yet, so it cannot be downloaded; put its files \
+                 in a directory named by {} or set {}=l6",
+                self.name,
+                RERANK_MODEL_DIR_ENV,
+                RERANK_MODEL_ENV
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether `dir` holds both files at their pinned sizes; no sha256.
+    pub(crate) fn sizes_match(&self, dir: &Path) -> bool {
+        [(ONNX_FILE_NAME, self.onnx_size), (TOKENIZER_FILE_NAME, self.tokenizer_size)]
+            .iter()
+            .all(|(name, size)| std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.len() == *size))
+    }
+}
 
 /// Overrides the cross-encoder's directory. Separate from
 /// `G_MESH_MODEL_DIR`, which names the embedding model's own directory.
 pub const RERANK_MODEL_DIR_ENV: &str = crate::knobs::RERANK_MODEL_DIR.name;
+
+/// Selects the [`RerankVariant`], over `[rerank] model`.
+pub const RERANK_MODEL_ENV: &str = crate::knobs::RERANK_MODEL.name;
 
 /// `off` (any case) switches the rerank off, whatever the global config says.
 pub const RERANK_ENV: &str = crate::knobs::RERANK.name;
 
 /// How many of the embedding ranking's first rows are reordered.
 pub const WINDOW: usize = 30;
-
-/// The cosine's weight in the blend `logit + BETA * cosine`.
-pub const BETA: f64 = 40.0;
 
 /// Each (query, text) pair is truncated to this many tokens, longest side
 /// first.
@@ -90,31 +218,43 @@ pub(crate) trait Scorer: Send + Sync {
     fn count_tokens(&self, text: &str) -> usize;
 }
 
-/// The cross-encoder's directory: `dir_override` (`$G_MESH_RERANK_MODEL_DIR`,
-/// read by `config::embedding::rerank_model_dir`), else
-/// `~/.g-mesh/models/ms-marco-MiniLM-L6-v2`, beside the embedding model.
-pub fn rerank_model_dir_from(dir_override: Option<&Path>) -> Result<PathBuf> {
+/// `variant`'s directory: `dir_override` (`$G_MESH_RERANK_MODEL_DIR`, read
+/// by `config::embedding::rerank_model_dir`), else
+/// `~/.g-mesh/models/<variant's dir_name>`, beside the embedding model.
+pub fn rerank_model_dir_from(dir_override: Option<&Path>, variant: RerankVariant) -> Result<PathBuf> {
     if let Some(dir) = dir_override {
         return Ok(dir.to_path_buf());
     }
     let home = dirs::home_dir().context("could not resolve home directory")?;
-    Ok(home.join(".g-mesh").join("models").join(RERANK_MODEL_NAME))
+    Ok(home.join(".g-mesh").join("models").join(variant.spec().dir_name))
 }
 
-/// [`rerank_model_dir_from`] under the process's `$G_MESH_RERANK_MODEL_DIR`,
-/// for tests that need the real cross-encoder.
+/// The process's `$G_MESH_RERANK_MODEL`, else the default; the global config
+/// is not read. For tests that need the real cross-encoder.
 #[cfg(test)]
-pub(crate) fn env_rerank_model_dir() -> PathBuf {
-    let dir_override =
-        std::env::var_os(RERANK_MODEL_DIR_ENV).filter(|dir| !dir.is_empty()).map(PathBuf::from);
-    rerank_model_dir_from(dir_override.as_deref()).unwrap()
+pub(crate) fn env_rerank_variant() -> RerankVariant {
+    crate::knobs::lookup(RERANK_MODEL_ENV).filter(|value| !value.is_empty()).map_or(
+        RerankVariant::DEFAULT,
+        |value| {
+            RerankVariant::parse(&value)
+                .unwrap_or_else(|| panic!("{RERANK_MODEL_ENV}={value} names no variant"))
+        },
+    )
 }
 
-/// Whether `dir` holds the pinned weights and tokenizer, by sha256. The
-/// blend's `BETA` was fitted against these exact files.
-pub(crate) fn check_rerank_files(dir: &Path) -> Result<()> {
-    for (name, sha) in [(ONNX_FILE_NAME, RERANK_ONNX_SHA256), (TOKENIZER_FILE_NAME, RERANK_TOKENIZER_SHA256)]
-    {
+/// [`rerank_model_dir_from`] under the process's `$G_MESH_RERANK_MODEL_DIR`
+/// for `variant`, for tests that need the real cross-encoder.
+#[cfg(test)]
+pub(crate) fn env_rerank_model_dir(variant: RerankVariant) -> PathBuf {
+    let dir_override = crate::knobs::os_non_empty(&crate::knobs::RERANK_MODEL_DIR).map(PathBuf::from);
+    rerank_model_dir_from(dir_override.as_deref(), variant).unwrap()
+}
+
+/// Whether `dir` holds `variant`'s pinned weights and tokenizer, by sha256.
+/// The variant's beta was fitted against these exact files.
+pub(crate) fn check_rerank_files(dir: &Path, variant: RerankVariant) -> Result<()> {
+    let spec = variant.spec();
+    for (name, sha) in [(ONNX_FILE_NAME, spec.onnx_sha256), (TOKENIZER_FILE_NAME, spec.tokenizer_sha256)] {
         let path = dir.join(name);
         if !path.exists() {
             bail!("{} not found", path.display());
@@ -123,8 +263,8 @@ pub(crate) fn check_rerank_files(dir: &Path) -> Result<()> {
         if actual != sha {
             if name == ONNX_FILE_NAME {
                 bail!(
-                    "{} has sha256 {actual}, not the pinned {sha} (g-mesh switched the rerank to the \
-                     int8 model; this is likely the fp32 file it replaced).\n\
+                    "{} has sha256 {actual}, not the pinned {sha} of the {variant} rerank model (another \
+                     variant's or an older file).\n\
                      Replace it: g-mesh model fetch",
                     path.display()
                 );
@@ -149,15 +289,15 @@ fn file_sha256(path: &Path) -> Result<String> {
     Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// The window's new order, as indices into it: by `logit + BETA * cosine`,
+/// The window's new order, as indices into it: by `logit + beta * cosine`,
 /// descending, with ties in the window's own (embedding) order. `None` when
 /// a logit is not finite or the lengths differ.
-pub fn blended_order(logits: &[f32], cosines: &[f64]) -> Option<Vec<usize>> {
+pub fn blended_order(logits: &[f32], cosines: &[f64], beta: f64) -> Option<Vec<usize>> {
     if logits.len() != cosines.len() || logits.iter().any(|logit| !logit.is_finite()) {
         return None;
     }
     let blended: Vec<f64> =
-        logits.iter().zip(cosines).map(|(&logit, &cosine)| f64::from(logit) + BETA * cosine).collect();
+        logits.iter().zip(cosines).map(|(&logit, &cosine)| f64::from(logit) + beta * cosine).collect();
     if blended.iter().any(|s| !s.is_finite()) {
         return None;
     }
@@ -199,7 +339,7 @@ fn last_segment(qualified_name: &str) -> &str {
     &qualified_name[start..]
 }
 
-/// `cross-encoder/ms-marco-MiniLM-L6-v2` on onnxruntime.
+/// A [`RerankVariant`]'s cross-encoder on onnxruntime.
 pub struct CrossEncoder {
     session: Session,
     tokenizer: Tokenizer,
@@ -207,10 +347,10 @@ pub struct CrossEncoder {
 }
 
 impl CrossEncoder {
-    /// Loads the model in `dir` after checking its files against the pinned
-    /// shas ([`check_rerank_files`]).
-    pub fn load(dir: &Path) -> Result<Self> {
-        check_rerank_files(dir)?;
+    /// Loads `variant`'s model in `dir` after checking its files against
+    /// that variant's pinned shas ([`check_rerank_files`]).
+    pub fn load(dir: &Path, variant: RerankVariant) -> Result<Self> {
+        check_rerank_files(dir, variant)?;
         let tokenizer_path = dir.join(TOKENIZER_FILE_NAME);
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|err| anyhow!("failed to load tokenizer {}: {err}", tokenizer_path.display()))?;
@@ -316,15 +456,50 @@ impl Scorer for CrossEncoder {
     }
 }
 
-/// Whether the rerank is on, and where its model is.
+/// Whether the rerank is on, which variant, and where its model is.
 #[derive(Debug)]
 pub struct RerankSettings {
     pub enabled: bool,
+    pub variant: RerankVariant,
+    /// `variant`'s directory.
     pub model_dir: Result<PathBuf>,
+    /// The fallback variant's directory, set only when `variant` is the
+    /// default, chosen by no setting, and its directory is not overridden by
+    /// `$G_MESH_RERANK_MODEL_DIR`. An explicit choice never falls back.
+    pub fallback_dir: Option<PathBuf>,
+    /// `$G_MESH_RERANK_BETA`: replaces the loaded variant's beta.
+    pub beta_override: Option<f64>,
+}
+
+impl RerankSettings {
+    /// `l6` in `model_dir`, with no fallback and its own beta.
+    #[cfg(test)]
+    pub(crate) fn l6(enabled: bool, model_dir: Result<PathBuf>) -> Self {
+        Self { enabled, variant: RerankVariant::L6, model_dir, fallback_dir: None, beta_override: None }
+    }
+
+    /// The variant and directory to load: the selected ones, or the
+    /// fallback's when the selected directory lacks a file and the
+    /// fallback's has both at their pinned sizes. The flag is true for the
+    /// fallback.
+    fn resolve_fallback(self) -> (RerankVariant, Result<PathBuf>, bool, Option<f64>) {
+        if let (Ok(dir), Some(fallback_dir), Some(fallback)) =
+            (&self.model_dir, &self.fallback_dir, self.variant.fallback())
+        {
+            if any_file_absent(dir) && fallback.spec().sizes_match(fallback_dir) {
+                return (fallback, Ok(fallback_dir.clone()), true, self.beta_override);
+            }
+        }
+        (self.variant, self.model_dir, false, self.beta_override)
+    }
+}
+
+fn any_file_absent(dir: &Path) -> bool {
+    [ONNX_FILE_NAME, TOKENIZER_FILE_NAME].iter().any(|name| !dir.join(name).exists())
 }
 
 type SettingsSource = Box<dyn Fn() -> RerankSettings + Send + Sync>;
-type ScorerLoader = Box<dyn Fn(&Path) -> Result<Box<dyn Scorer>> + Send + Sync>;
+type ScorerLoader = Box<dyn Fn(&Path, RerankVariant) -> Result<Box<dyn Scorer>> + Send + Sync>;
 type Log = Box<dyn Fn(&str) + Send + Sync>;
 
 /// What the rerank model is on disk, as `g-mesh status` reports it.
@@ -332,6 +507,9 @@ type Log = Box<dyn Fn(&str) + Send + Sync>;
 pub enum RerankModelState {
     /// Both files present at their pinned sizes, and the rerank switched on.
     Present,
+    /// The selected default variant is missing, and the fallback variant is
+    /// present: the daemon loads the fallback.
+    Fallback(RerankVariant),
     /// Switched on, but a file is absent or the wrong size.
     Missing,
     /// Switched off by `[rerank] enabled = false` or [`RERANK_ENV`]`=off`,
@@ -347,15 +525,13 @@ impl RerankModelState {
         if !settings.enabled {
             return Self::Disabled;
         }
-        let complete = settings.model_dir.is_ok_and(|dir| {
-            [(ONNX_FILE_NAME, RERANK_ONNX_SIZE), (TOKENIZER_FILE_NAME, RERANK_TOKENIZER_SIZE)]
-                .iter()
-                .all(|(name, size)| std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.len() == *size))
-        });
-        if complete {
-            Self::Present
-        } else {
-            Self::Missing
+        let spec = settings.variant.spec();
+        if settings.model_dir.as_ref().is_ok_and(|dir| spec.sizes_match(dir)) {
+            return Self::Present;
+        }
+        match settings.resolve_fallback() {
+            (variant, _, true, _) => Self::Fallback(variant),
+            _ => Self::Missing,
         }
     }
 }
@@ -370,20 +546,28 @@ pub enum RerankOutcome {
     /// Switched on, but a model file is not in its directory.
     Absent,
     /// Switched on, the files are there, and loading them failed (a sha256
-    /// mismatch, a corrupt file, an ORT error), or the directory could not
-    /// be resolved.
+    /// mismatch, a corrupt file, an ORT error, a beta not fitted yet), or
+    /// the directory could not be resolved.
     Failed,
     Loaded,
 }
 
 /// What a daemon writes to its state directory once it resolves the rerank:
 /// read by `g-mesh status` only while the daemon with `pid` is the live one.
+/// `variant` and `fallback` default when absent, so an older daemon's
+/// record still reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutcomeRecord {
     pub pid: u32,
     pub outcome: RerankOutcome,
     /// The model directory the daemon resolved; `None` when it could not.
     pub dir: Option<PathBuf>,
+    /// The variant the daemon loaded or tried to; `None` when switched off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<RerankVariant>,
+    /// True when `variant` is the fallback for a missing default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback: bool,
 }
 
 impl OutcomeRecord {
@@ -398,7 +582,7 @@ enum Outcome {
     Off,
     Absent,
     Failed,
-    Loaded(Box<dyn Scorer>),
+    Loaded { scorer: Box<dyn Scorer>, beta: f64 },
 }
 
 impl Outcome {
@@ -407,7 +591,7 @@ impl Outcome {
             Self::Off => RerankOutcome::Off,
             Self::Absent => RerankOutcome::Absent,
             Self::Failed => RerankOutcome::Failed,
-            Self::Loaded(_) => RerankOutcome::Loaded,
+            Self::Loaded { .. } => RerankOutcome::Loaded,
         }
     }
 }
@@ -438,11 +622,16 @@ impl Reranker {
                 settings.lock().unwrap_or_else(PoisonError::into_inner).take().unwrap_or_else(|| {
                     RerankSettings {
                         enabled: false,
+                        variant: RerankVariant::DEFAULT,
                         model_dir: Err(anyhow!("the rerank settings were already taken")),
+                        fallback_dir: None,
+                        beta_override: None,
                     }
                 })
             }),
-            loader: Box::new(|dir| Ok(Box::new(CrossEncoder::load(dir)?) as Box<dyn Scorer>)),
+            loader: Box::new(|dir, variant| {
+                Ok(Box::new(CrossEncoder::load(dir, variant)?) as Box<dyn Scorer>)
+            }),
             outcome: OnceLock::new(),
             missing_hint_sent: AtomicBool::new(false),
             outcome_file: OnceLock::new(),
@@ -453,8 +642,14 @@ impl Reranker {
     /// Never reranks, and never reads a setting or a file.
     pub fn off() -> Self {
         Self {
-            settings: Box::new(|| RerankSettings { enabled: false, model_dir: Err(anyhow!("off")) }),
-            loader: Box::new(|_| bail!("off")),
+            settings: Box::new(|| RerankSettings {
+                enabled: false,
+                variant: RerankVariant::DEFAULT,
+                model_dir: Err(anyhow!("off")),
+                fallback_dir: None,
+                beta_override: None,
+            }),
+            loader: Box::new(|_, _| bail!("off")),
             outcome: OnceLock::from(Outcome::Off),
             missing_hint_sent: AtomicBool::new(false),
             outcome_file: OnceLock::new(),
@@ -469,6 +664,16 @@ impl Reranker {
         loader: impl Fn(&Path) -> Result<Box<dyn Scorer>> + Send + Sync + 'static,
         log: impl Fn(&str) + Send + Sync + 'static,
     ) -> Self {
+        Self::with_variant_loader(settings, move |dir, _| loader(dir), log)
+    }
+
+    /// [`Self::with_parts`] with a loader that sees the variant it loads.
+    #[cfg(test)]
+    pub(crate) fn with_variant_loader(
+        settings: impl Fn() -> RerankSettings + Send + Sync + 'static,
+        loader: impl Fn(&Path, RerankVariant) -> Result<Box<dyn Scorer>> + Send + Sync + 'static,
+        log: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
         Self {
             settings: Box::new(settings),
             loader: Box::new(loader),
@@ -479,13 +684,13 @@ impl Reranker {
         }
     }
 
-    /// The real model in `dir`, switched on, logging to `log`.
+    /// The real `l6` model in `dir`, switched on, logging to `log`.
     #[cfg(test)]
     pub(crate) fn real_at(dir: &Path, log: impl Fn(&str) + Send + Sync + 'static) -> Self {
         let dir = dir.to_path_buf();
-        Self::with_parts(
-            move || RerankSettings { enabled: true, model_dir: Ok(dir.clone()) },
-            |dir| Ok(Box::new(CrossEncoder::load(dir)?) as Box<dyn Scorer>),
+        Self::with_variant_loader(
+            move || RerankSettings::l6(true, Ok(dir.clone())),
+            |dir, variant| Ok(Box::new(CrossEncoder::load(dir, variant)?) as Box<dyn Scorer>),
             log,
         )
     }
@@ -495,7 +700,7 @@ impl Reranker {
     /// and every later call answers from the same outcome.
     pub(crate) fn scorer(&self) -> Option<&dyn Scorer> {
         match self.outcome() {
-            Outcome::Loaded(scorer) => Some(scorer.as_ref()),
+            Outcome::Loaded { scorer, .. } => Some(scorer.as_ref()),
             Outcome::Off | Outcome::Absent | Outcome::Failed => None,
         }
     }
@@ -520,31 +725,48 @@ impl Reranker {
     fn outcome(&self) -> &Outcome {
         self.outcome.get_or_init(|| {
             let settings = (self.settings)();
-            let dir = settings.model_dir.as_ref().ok().cloned();
-            let outcome = if !settings.enabled {
-                Outcome::Off
-            } else {
-                match settings.model_dir.and_then(|dir| (self.loader)(&dir)) {
-                    Ok(scorer) => Outcome::Loaded(scorer),
+            let selected = settings.variant;
+            let (outcome, variant, dir, fallback) = if settings.enabled {
+                let (variant, model_dir, fallback, beta_override) = settings.resolve_fallback();
+                let dir = model_dir.as_ref().ok().cloned();
+                if fallback {
+                    (self.log)(&format!(
+                        "{prefix}rerank model {selected} is not fetched - search_code ranks with {variant} \
+                         from {} until g-mesh model fetch adds it",
+                        dir.as_deref().unwrap_or(Path::new("?")).display(),
+                        prefix = crate::log::role_prefix()
+                    ));
+                }
+                let loaded = beta_override.map_or_else(|| variant.beta(), Ok).and_then(|beta| {
+                    model_dir.and_then(|dir| (self.loader)(&dir, variant)).map(|scorer| (scorer, beta))
+                });
+                let outcome = match loaded {
+                    Ok((scorer, beta)) => Outcome::Loaded { scorer, beta },
                     Err(err) => {
                         (self.log)(&format!(
-                            "{prefix}rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
+                            "{prefix}rerank model {variant} is not available ({err:#}) - \
                              search_code keeps the embedding order. Run g-mesh model fetch to enable it.",
                             prefix = crate::log::role_prefix()
                         ));
-                        let absent = dir.as_ref().is_some_and(|dir| {
-                            [ONNX_FILE_NAME, TOKENIZER_FILE_NAME].iter().any(|name| !dir.join(name).exists())
-                        });
-                        if absent {
+                        if dir.as_deref().is_some_and(any_file_absent) {
                             Outcome::Absent
                         } else {
                             Outcome::Failed
                         }
                     }
-                }
+                };
+                (outcome, Some(variant), dir, fallback)
+            } else {
+                (Outcome::Off, None, settings.model_dir.ok(), false)
             };
             if let Some(path) = self.outcome_file.get() {
-                let record = OutcomeRecord { pid: std::process::id(), outcome: outcome.kind(), dir };
+                let record = OutcomeRecord {
+                    pid: std::process::id(),
+                    outcome: outcome.kind(),
+                    dir,
+                    variant,
+                    fallback,
+                };
                 let written = serde_json::to_string(&record)
                     .map_err(anyhow::Error::from)
                     .and_then(|json| std::fs::write(path, json).map_err(anyhow::Error::from));
@@ -560,9 +782,10 @@ impl Reranker {
         })
     }
 
-    /// The window's reranked order ([`blended_order`]) under `scorer`, or
-    /// `None` when this call's scoring fails: logged once per failing call,
-    /// and the caller keeps the embedding order.
+    /// The window's reranked order ([`blended_order`] at the loaded
+    /// variant's beta) under `scorer`, or `None` when this call's scoring
+    /// fails: logged once per failing call, and the caller keeps the
+    /// embedding order.
     pub(crate) fn order(
         &self,
         scorer: &dyn Scorer,
@@ -570,6 +793,9 @@ impl Reranker {
         texts: &[String],
         cosines: &[f64],
     ) -> Option<Vec<usize>> {
+        let Outcome::Loaded { beta, .. } = self.outcome() else {
+            return None;
+        };
         let logits = match scorer.score(query, texts) {
             Ok(logits) => logits,
             Err(err) => {
@@ -581,7 +807,7 @@ impl Reranker {
                 return None;
             }
         };
-        let order = blended_order(&logits, cosines);
+        let order = blended_order(&logits, cosines, *beta);
         if order.is_none() {
             (self.log)(&format!(
                 "{prefix}the rerank produced {} logits for {} rows, or a non-finite one - this \
@@ -598,6 +824,10 @@ impl Reranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The variant `testdata/rerank_parity.json` was written from.
+    const FIXTURE_VARIANT: RerankVariant = RerankVariant::L6;
+    const L6_BETA: f64 = L6.beta;
 
     #[derive(serde::Deserialize)]
     struct Fixture {
@@ -669,7 +899,7 @@ mod tests {
     #[test]
     fn the_fixture_was_made_with_this_window_and_blend() {
         let fixture = fixture();
-        assert_eq!((fixture.k, fixture.beta), (WINDOW, BETA));
+        assert_eq!((fixture.k, fixture.beta), (WINDOW, FIXTURE_VARIANT.spec().beta));
         assert!(fixture.cases.len() >= 18);
     }
 
@@ -680,7 +910,7 @@ mod tests {
         for case in fixture().cases {
             let logits: Vec<f32> = case.rows.iter().map(|row| row.logit as f32).collect();
             let cosines: Vec<f64> = case.rows.iter().map(|row| row.cosine).collect();
-            let order = blended_order(&logits, &cosines).unwrap();
+            let order = blended_order(&logits, &cosines, L6_BETA).unwrap();
             assert_eq!(ids_in(&case, &order), case.order, "{}", case.query_id);
         }
     }
@@ -688,7 +918,8 @@ mod tests {
     #[test]
     fn ties_keep_the_embedding_order() {
         // 0 + 40 * 0.5 == 10 + 40 * 0.25 == 20 exactly.
-        let order = blended_order(&[0.0, 10.0, 0.0, 10.0, -1.0], &[0.5, 0.25, 0.5, 0.25, 0.75]).unwrap();
+        let order =
+            blended_order(&[0.0, 10.0, 0.0, 10.0, -1.0], &[0.5, 0.25, 0.5, 0.25, 0.75], L6_BETA).unwrap();
         assert_eq!(order, vec![4, 0, 1, 2, 3]);
     }
 
@@ -706,7 +937,7 @@ mod tests {
         // Three exact blend levels: 20, 30, 40 (logit 10k + 40 * 0.5).
         let logits: Vec<f32> = (0..WINDOW).map(|i| (i % 3) as f32 * 10.0).collect();
         let cosines = vec![0.5; WINDOW];
-        let order = blended_order(&logits, &cosines).unwrap();
+        let order = blended_order(&logits, &cosines, L6_BETA).unwrap();
         let expected: Vec<usize> =
             [2, 1, 0].iter().flat_map(|&level| (0..WINDOW).filter(move |i| i % 3 == level)).collect();
         assert_eq!(order, expected);
@@ -714,9 +945,9 @@ mod tests {
 
     #[test]
     fn a_non_finite_logit_or_a_length_mismatch_gives_no_order() {
-        assert_eq!(blended_order(&[f32::NAN, 1.0], &[0.5, 0.4]), None);
-        assert_eq!(blended_order(&[f32::INFINITY], &[0.5]), None);
-        assert_eq!(blended_order(&[1.0], &[0.5, 0.4]), None);
+        assert_eq!(blended_order(&[f32::NAN, 1.0], &[0.5, 0.4], L6_BETA), None);
+        assert_eq!(blended_order(&[f32::INFINITY], &[0.5], L6_BETA), None);
+        assert_eq!(blended_order(&[1.0], &[0.5, 0.4], L6_BETA), None);
     }
 
     #[test]
@@ -728,7 +959,7 @@ mod tests {
     #[test]
     fn a_directory_without_the_model_is_refused_with_the_missing_file_named() {
         let dir = tempfile::tempdir().unwrap();
-        let err = CrossEncoder::load(dir.path()).err().unwrap().to_string();
+        let err = CrossEncoder::load(dir.path(), RerankVariant::L6).err().unwrap().to_string();
         assert!(err.contains(ONNX_FILE_NAME), "{err}");
     }
 
@@ -737,7 +968,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(ONNX_FILE_NAME), "not the weights").unwrap();
         std::fs::write(dir.path().join(TOKENIZER_FILE_NAME), "{}").unwrap();
-        let err = check_rerank_files(dir.path()).unwrap_err().to_string();
+        let err = check_rerank_files(dir.path(), RerankVariant::L6).unwrap_err().to_string();
         assert!(err.contains("not the pinned"), "{err}");
     }
 
@@ -751,9 +982,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(ONNX_FILE_NAME), "the fp32 weights, say").unwrap();
         std::fs::write(dir.path().join(TOKENIZER_FILE_NAME), "{}").unwrap();
-        let err = check_rerank_files(dir.path()).unwrap_err().to_string();
+        let err = check_rerank_files(dir.path(), RerankVariant::L6).unwrap_err().to_string();
         assert!(err.contains("g-mesh model fetch"), "{err}");
-        let load = CrossEncoder::load(dir.path()).err().unwrap().to_string();
+        let load = CrossEncoder::load(dir.path(), RerankVariant::L6).err().unwrap().to_string();
         assert!(load.contains("g-mesh model fetch"), "{load}");
     }
 
@@ -831,9 +1062,8 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = std::sync::Arc::clone(&calls);
         let reranker = Reranker::with_parts(
-            move || RerankSettings {
-                enabled,
-                model_dir: model_dir.clone().ok_or_else(|| anyhow!("no home directory")),
+            move || {
+                RerankSettings::l6(enabled, model_dir.clone().ok_or_else(|| anyhow!("no home directory")))
             },
             move |_| {
                 counted.fetch_add(1, Ordering::SeqCst);
@@ -942,7 +1172,9 @@ mod tests {
             Some(OutcomeRecord {
                 pid: std::process::id(),
                 outcome: RerankOutcome::Absent,
-                dir: Some(empty.path().to_path_buf())
+                dir: Some(empty.path().to_path_buf()),
+                variant: Some(RerankVariant::L6),
+                fallback: false,
             })
         );
         std::fs::remove_file(&path).unwrap();
@@ -968,7 +1200,13 @@ mod tests {
         std::fs::write(&path, r#"{"pid":7,"outcome":"failed","dir":"/m"}"#).unwrap();
         assert_eq!(
             OutcomeRecord::read(&path),
-            Some(OutcomeRecord { pid: 7, outcome: RerankOutcome::Failed, dir: Some("/m".into()) })
+            Some(OutcomeRecord {
+                pid: 7,
+                outcome: RerankOutcome::Failed,
+                dir: Some("/m".into()),
+                variant: None,
+                fallback: false,
+            })
         );
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(OutcomeRecord::read(&path), None);
@@ -980,29 +1218,28 @@ mod tests {
     ///
     /// *Control:* drop the `enabled` check from `RerankModelState::of` ->
     /// the switched-off case with files reads `Present`. Set
-    /// `RERANK_ONNX_SIZE` back to the fp32 file's size -> the fp32-size
+    /// `L6.onnx_size` back to the fp32 file's size -> the fp32-size
     /// directory reads `Present`.
     #[test]
     fn the_on_disk_state_is_judged_by_the_switch_and_the_pinned_sizes() {
-        let settings = |enabled: bool, dir: Option<&Path>| RerankSettings {
-            enabled,
-            model_dir: dir.map(Path::to_path_buf).ok_or_else(|| anyhow!("no home directory")),
+        let settings = |enabled: bool, dir: Option<&Path>| {
+            RerankSettings::l6(
+                enabled,
+                dir.map(Path::to_path_buf).ok_or_else(|| anyhow!("no home directory")),
+            )
         };
         let pinned = tempfile::tempdir().unwrap();
-        File::create(pinned.path().join(ONNX_FILE_NAME)).unwrap().set_len(RERANK_ONNX_SIZE).unwrap();
-        File::create(pinned.path().join(TOKENIZER_FILE_NAME))
-            .unwrap()
-            .set_len(RERANK_TOKENIZER_SIZE)
-            .unwrap();
+        File::create(pinned.path().join(ONNX_FILE_NAME)).unwrap().set_len(L6.onnx_size).unwrap();
+        File::create(pinned.path().join(TOKENIZER_FILE_NAME)).unwrap().set_len(L6.tokenizer_size).unwrap();
         let wrong_size = dir_with_both_files();
         let empty = tempfile::tempdir().unwrap();
         // The size of the fp32 file the int8 model replaced (4.27.0's
-        // `RERANK_ONNX_SIZE`).
+        // `L6.onnx_size`).
         const FP32_ONNX_SIZE: u64 = 91_011_230;
-        assert_ne!(RERANK_ONNX_SIZE, FP32_ONNX_SIZE);
+        assert_ne!(L6.onnx_size, FP32_ONNX_SIZE);
         let fp32 = tempfile::tempdir().unwrap();
         File::create(fp32.path().join(ONNX_FILE_NAME)).unwrap().set_len(FP32_ONNX_SIZE).unwrap();
-        File::create(fp32.path().join(TOKENIZER_FILE_NAME)).unwrap().set_len(RERANK_TOKENIZER_SIZE).unwrap();
+        File::create(fp32.path().join(TOKENIZER_FILE_NAME)).unwrap().set_len(L6.tokenizer_size).unwrap();
 
         assert_eq!(RerankModelState::of(settings(true, Some(pinned.path()))), RerankModelState::Present);
         assert_eq!(RerankModelState::of(settings(false, Some(pinned.path()))), RerankModelState::Disabled);
@@ -1023,9 +1260,16 @@ mod tests {
     // pinned files.
     // -----------------------------------------------------------------------
 
+    /// The variant `$G_MESH_RERANK_MODEL` names (default `qat`) from its
+    /// directory.
     fn load_real() -> CrossEncoder {
-        let dir = env_rerank_model_dir();
-        CrossEncoder::load(&dir).unwrap_or_else(|err| panic!("could not load the cross-encoder: {err:#}"))
+        load_real_variant(env_rerank_variant())
+    }
+
+    fn load_real_variant(variant: RerankVariant) -> CrossEncoder {
+        let dir = env_rerank_model_dir(variant);
+        CrossEncoder::load(&dir, variant)
+            .unwrap_or_else(|err| panic!("could not load the {variant} cross-encoder: {err:#}"))
     }
 
     /// Parity with the Python reference: this crate's text for each row,
@@ -1040,7 +1284,7 @@ mod tests {
     #[ignore = "needs the real cross-encoder; see the comment above"]
     fn the_real_model_reproduces_the_reference_logits_and_order() {
         const LOGIT_TOLERANCE: f64 = 0.25;
-        let model = load_real();
+        let model = load_real_variant(FIXTURE_VARIANT);
         for case in fixture().cases {
             let texts: Vec<String> =
                 case.rows.iter().map(|row| row.ce_text(&|text| model.count_tokens(text))).collect();
@@ -1057,10 +1301,11 @@ mod tests {
                 );
             }
             let cosines: Vec<f64> = case.rows.iter().map(|row| row.cosine).collect();
-            let order = ids_in(&case, &blended_order(&logits, &cosines).unwrap());
+            let order =
+                ids_in(&case, &blended_order(&logits, &cosines, FIXTURE_VARIANT.spec().beta).unwrap());
             let blend = |id: &str| {
                 let row = case.rows.iter().find(|row| row.id == id).unwrap();
-                row.logit + BETA * row.cosine
+                row.logit + FIXTURE_VARIANT.spec().beta * row.cosine
             };
             let position = |id: &str| order.iter().position(|other| other == id).unwrap();
             for (i, higher) in case.order.iter().enumerate() {

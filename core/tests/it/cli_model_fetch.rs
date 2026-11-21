@@ -3,8 +3,8 @@
 //! which does not depend on the embedding model, is still fetched. Driven as
 //! a subprocess because the refusal is decided from the process's cwd.
 //!
-//! No network: the rerank files are placed at their pinned sizes first, and
-//! `fetch` keeps a file of its pinned size.
+//! No network: the `l6` rerank variant is selected, its files are placed at
+//! their pinned sizes first, and `fetch` keeps a file of its pinned size.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use std::process::{Command, Output};
 
 use g_mesh::config::{self, ProjectConfig};
 use g_mesh::embedding::model::MODEL_DIR_ENV;
-use g_mesh::embedding::rerank::RERANK_MODEL_DIR_ENV;
+use g_mesh::embedding::rerank::{RERANK_MODEL_DIR_ENV, RERANK_MODEL_ENV};
 use g_mesh::storage::connection::project_dir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
@@ -20,15 +20,17 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// The rerank module's source, for its pinned sizes (crate-private there).
 const RERANK_SOURCE: &str = include_str!("../../src/embedding/rerank.rs");
 
-/// The value of `pub(crate) const <name>: u64 = <value>;` in the rerank
-/// module.
-fn pinned_size(name: &str) -> u64 {
-    let prefix = format!("pub(crate) const {name}: u64 = ");
+/// The value of the `<field>: <value>,` line of the `L6` variant's
+/// `VariantSpec` in the rerank module.
+fn pinned_size(field: &str) -> u64 {
+    let prefix = format!("{field}: ");
     let line = RERANK_SOURCE
         .lines()
-        .find_map(|line| line.strip_prefix(&prefix))
-        .unwrap_or_else(|| panic!("no `{prefix}` in rerank.rs"));
-    line.trim_end_matches(';').replace('_', "").parse().unwrap_or_else(|_| panic!("not a size: {line}"))
+        .skip_while(|line| !line.starts_with("pub(crate) const L6: VariantSpec"))
+        .take_while(|line| *line != "};")
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no `{prefix}` in rerank.rs's L6"));
+    line.trim_end_matches(',').replace('_', "").parse().unwrap_or_else(|_| panic!("not a size: {line}"))
 }
 
 /// A project whose `[embedding] model` is not the default, so `model fetch`
@@ -56,6 +58,7 @@ impl ConfiguredProject {
             .current_dir(self.dir.path())
             .env(MODEL_DIR_ENV, embedding_dir)
             .env(RERANK_MODEL_DIR_ENV, rerank_dir)
+            .env(RERANK_MODEL_ENV, "l6")
             .output()
             .expect("failed to run `g-mesh model fetch`")
     }
@@ -90,10 +93,9 @@ fn a_refused_embedding_fetch_still_fetches_the_rerank_model() {
     let embedding_dir: PathBuf = models.path().join("some-other-model");
     let rerank_dir = models.path().join("rerank");
     std::fs::create_dir_all(&rerank_dir).expect("failed to create the rerank directory");
-    for (name, size) in [
-        ("model.onnx", pinned_size("RERANK_ONNX_SIZE")),
-        ("tokenizer.json", pinned_size("RERANK_TOKENIZER_SIZE")),
-    ] {
+    for (name, size) in
+        [("model.onnx", pinned_size("onnx_size")), ("tokenizer.json", pinned_size("tokenizer_size"))]
+    {
         File::create(rerank_dir.join(name)).unwrap().set_len(size).unwrap();
     }
 
@@ -103,7 +105,7 @@ fn a_refused_embedding_fetch_still_fetches_the_rerank_model() {
     assert!(!output.status.success(), "the embedding refusal still fails the command: {stdout}");
     assert!(stderr.contains(REFUSAL), "{stderr}");
     assert_eq!(stdout.matches("already present").count(), 2, "{stdout}");
-    assert!(stdout.contains(&format!("rerank model ready in {}", rerank_dir.display())), "{stdout}");
+    assert!(stdout.contains(&format!("rerank model l6 ready in {}", rerank_dir.display())), "{stdout}");
     assert!(!stdout.contains("downloading"), "{stdout}");
     assert!(!embedding_dir.exists(), "a refused fetch creates no embedding directory");
 }

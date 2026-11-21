@@ -499,7 +499,7 @@ fn status_without_a_daemon_reports_the_rerank_model_on_disk() {
     );
     assert_eq!(
         rerank_json(project.root(), &dir_env),
-        serde_json::json!({ "daemon": null, "onDisk": "missing" })
+        serde_json::json!({ "daemon": null, "onDisk": "missing", "variant": "qat", "fallback": false })
     );
 
     let off = [dir_env[0], (g_mesh::embedding::rerank::RERANK_ENV, Path::new("off"))];
@@ -509,7 +509,7 @@ fn status_without_a_daemon_reports_the_rerank_model_on_disk() {
     );
     assert_eq!(
         rerank_json(project.root(), &off),
-        serde_json::json!({ "daemon": null, "onDisk": "disabled" })
+        serde_json::json!({ "daemon": null, "onDisk": "disabled", "variant": "qat", "fallback": false })
     );
 
     let home = tempfile::tempdir().expect("failed to create a g-mesh home");
@@ -522,7 +522,7 @@ fn status_without_a_daemon_reports_the_rerank_model_on_disk() {
     );
     assert_eq!(
         rerank_json(project.root(), &configured),
-        serde_json::json!({ "daemon": null, "onDisk": "disabled" })
+        serde_json::json!({ "daemon": null, "onDisk": "disabled", "variant": "qat", "fallback": false })
     );
 }
 
@@ -584,7 +584,10 @@ fn status_reports_the_live_daemons_rerank_outcome_and_the_daemon_clears_it() {
         &status_text(project.root(), &[]),
         "rerank model:    missing - search_code ranks by embedding similarity only",
     );
-    assert_eq!(rerank_json(project.root(), &[]), serde_json::json!({ "daemon": "absent", "onDisk": null }));
+    assert_eq!(
+        rerank_json(project.root(), &[]),
+        serde_json::json!({ "daemon": "absent", "onDisk": null, "variant": null, "fallback": false })
+    );
 
     assert!(daemon_process.try_wait().unwrap().is_none(), "the daemon must still be running");
 }

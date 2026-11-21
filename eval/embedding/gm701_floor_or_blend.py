@@ -41,20 +41,20 @@ def name_held_out(qid):
     return hashlib.sha256(qid.encode()).digest()[0] % 2 == 1
 
 
-def setup(work, cache_dir, st_runs=None):
-    """st_runs: the recall arm's runs dir (absolute, or relative to work); default runs/<B.ST>."""
-    sha = R.sha256_file(work / "models" / "ms-marco-MiniLM-L6-v2-quint8" / "model.onnx")
-    if sha != S.SHIPPED_SHA:
-        sys.exit(f"STOP: model.onnx sha256 {sha} != shipped {S.SHIPPED_SHA}")
+def setup(work, cache_dir, st_runs=None, ce=R.DEFAULT_CE):
+    """st_runs: the recall arm's runs dir (absolute, or relative to work); default runs/<B.ST>.
+    ce: the shipped cross-encoder (rerank_eval.SHIPPED_CE) whose Rust-scored cache is read."""
+    py, rust = R.SHIPPED_CE[ce]["py"], R.SHIPPED_CE[ce]["rust"]
+    sha = R.check_shipped_ce(work, ce)
     ns = argparse.Namespace(work=work, eval_dir=HERE / "v2", st_runs=st_runs or f"runs/{B.ST}", corpora=None)
     st_dir, corpora_dir = B.load_setup(ns)
     cs = B.load_corpora(work, ns.eval_dir, st_dir, corpora_dir, S.K)
-    B.build_model_texts(cs, work, S.PY, ["ship"])
-    B.use_texts(cs, S.PY)
+    B.build_model_texts(cs, work, py, ["ship"])
+    B.use_texts(cs, py)
     for c in cs:
-        c.atext_by[S.RUST] = c.atext_by[S.PY]
-    cache = B.open_cache(cache_dir or work / "rerank_cache_gm700_rust", cs, work, S.RUST, B.file_shas(work, S.PY))
-    return cs, B.score_of_for(cache, S.RUST, "ship"), B.skip_flags(cs, True, None), sha
+        c.atext_by[rust] = c.atext_by[py]
+    cache = B.open_cache(cache_dir or work / "rerank_cache_gm700_rust", cs, work, rust, B.file_shas(work, py))
+    return cs, B.score_of_for(cache, rust, "ship"), B.skip_flags(cs, True, None), sha
 
 
 def collect(cs, sc, flags, floors):
