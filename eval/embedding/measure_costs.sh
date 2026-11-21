@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # GM-398 S14 (docs/results/gm-398-model-comparison.md): quality runs, query latency, timed passes (D11), report.
-# Env: VARIANTS (candidates), QCORPORA ("" = all), TCORPUS, ROUNDS, OUT, RUNS
+# Env: VARIANTS (candidates), QCORPORA ("" = all), TCORPUS, ROUNDS, OUT, RUNS,
+#   REF (the arm costs are relative to), EVAL_DIR (passed as --eval-dir),
+#   CONTROLS (broken arms given to the report), SKIP_QUALITY=1 (skip step 1, the
+#   quality runs come from elsewhere and must not be redone over shared runs)
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE/../.." || exit
-BIN=$PWD/target/release/g-mesh
-REF=jina-v2-base-code-fp32
+BIN=${GMESH_BIN:-$PWD/target/release/g-mesh}
+DEFAULT_REF=jina-v2-base-code-fp32
+REF=${REF:-$DEFAULT_REF}
+EVAL_DIR=${EVAL_DIR:-eval/embedding}
+CONTROLS=${CONTROLS:-"random shuffled words-shuffled bm25"}
+# The report scores against settings.reference unless REF names another arm.
+REF_ARGS=()
+[ "$REF" != "$DEFAULT_REF" ] && REF_ARGS=(--reference "$REF")
 VARIANTS=${VARIANTS:-"jina-v2-base-code-int8 bge-small-en-v1.5 gte-small snowflake-arctic-embed-s"}
 QCORPORA=${QCORPORA:-}
 TCORPUS=${TCORPUS:-g-mesh}
@@ -32,10 +41,11 @@ log "uptime $(uptime)"
 
 # 1. quality runs, one candidate at a time
 for v in ${QVARIANTS-$VARIANTS}; do
+  [ "${SKIP_QUALITY:-0}" = 1 ] && { log "quality runs skipped (SKIP_QUALITY=1)"; break; }
   wait_quiet
   log "quality $v: uptime $(uptime)"
   # shellcheck disable=SC2046 # corpus_args expands to multiple "--corpus X" flags, one per word
-  /usr/bin/time -p "$BIN" debug-embed-eval run --variant "$v" $(corpus_args) --out "$RUNS" \
+  /usr/bin/time -p "$BIN" debug-embed-eval run --eval-dir "$EVAL_DIR" --variant "$v" $(corpus_args) --out "$RUNS" \
     > "$OUT/quality-$v.out" 2> "$OUT/quality-$v.err"
   rc=$?
   log "quality $v rc=$rc $(grep -E '^(real|user|sys)' "$OUT/quality-$v.err" | tr '\n' ' ') after: $(uptime)"
@@ -48,7 +58,7 @@ for v in $REF $VARIANTS; do
   cp "$RUNS/$v/$TCORPUS/manifest.json" "$RUNS/$v/$TCORPUS/vectors.bin" "$d/"
   wait_quiet
   log "qlat $v: uptime $(uptime)"
-  G_MESH_EMBEDDING_CACHE=off "$BIN" debug-embed-eval run --variant "$v" --corpus "$TCORPUS" --out "$OUT/qlat" \
+  G_MESH_EMBEDDING_CACHE=off "$BIN" debug-embed-eval run --eval-dir "$EVAL_DIR" --variant "$v" --corpus "$TCORPUS" --out "$OUT/qlat" \
     > "$OUT/qlat-$v.out" 2>&1
   log "qlat $v rc=$? after: $(uptime)"
 done
@@ -61,7 +71,7 @@ for r in $(seq 1 "$ROUNDS"); do
       before=$(uptime)
       f=$OUT/timed/r$r/$v.time
       mkdir -p "$(dirname "$f")"
-      G_MESH_EMBEDDING_CACHE=off /usr/bin/time -lp "$BIN" debug-embed-eval run --variant "$v" \
+      G_MESH_EMBEDDING_CACHE=off /usr/bin/time -lp "$BIN" debug-embed-eval run --eval-dir "$EVAL_DIR" --variant "$v" \
         --corpus "$TCORPUS" --embed-only --force --out "$OUT/timed/r$r" > "$f.out" 2> "$f"
       rc=$?
       after=$(uptime); la=$(load1)
@@ -81,10 +91,11 @@ done
 # shellcheck disable=SC2086 # $VARIANTS is a space-separated list; each name must be its own arg
 python3 "$HERE/measure_summary.py" costs "$OUT" "$REF" $VARIANTS > "$OUT/costs.toml"
 log "costs written"
-ARMS="$RUNS/$REF $RUNS/random $RUNS/shuffled $RUNS/words-shuffled $RUNS/bm25"
+ARMS="$RUNS/$REF"
+for c in $CONTROLS; do ARMS="$ARMS $RUNS/$c"; done
 for v in $VARIANTS; do ARMS="$ARMS $RUNS/$v"; done
 # shellcheck disable=SC2086 # $ARMS is a space-separated list of paths; each must be its own arg
-"$BIN" debug-embed-eval report $ARMS --costs "$OUT/costs.toml" --json "$OUT/report.json" > "$OUT/report.txt" 2>&1
+"$BIN" debug-embed-eval report --eval-dir "$EVAL_DIR" ${REF_ARGS[@]+"${REF_ARGS[@]}"} $ARMS --costs "$OUT/costs.toml" --json "$OUT/report.json" > "$OUT/report.txt" 2>&1
 log "report rc=$?"
 # shellcheck disable=SC2086 # $VARIANTS is a space-separated list; each name must be its own arg
 python3 "$HERE/measure_summary.py" table "$OUT" "$REF" $VARIANTS > "$OUT/summary.md" 2>&1

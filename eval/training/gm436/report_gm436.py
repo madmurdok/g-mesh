@@ -68,11 +68,13 @@ def main():
     ap.add_argument("--arm", action="append", required=True)
     ap.add_argument("--ws-pair", action="append", default=[])
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--reference", help="score against this run instead of the eval dir's settings.reference")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
 
     report_json = a.out / "report.json"
-    run([a.bin, "debug-embed-eval", "report", "--eval-dir", a.eval_dir, "--json", report_json]
+    reference = ["--reference", a.reference] if a.reference else []
+    run([a.bin, "debug-embed-eval", "report", "--eval-dir", a.eval_dir, "--json", report_json] + reference
         + [a.runs / arm for arm in a.arm])
     report = json.loads(report_json.read_text())
 

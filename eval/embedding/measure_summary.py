@@ -6,10 +6,25 @@ WT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 TCORPUS = os.environ.get("TCORPUS", "g-mesh")
 
 
+def variant_model_dir(v):
+    """The `model_dir` a variants.toml block sets for variant `v`, or None."""
+    path = os.path.join(WT, "eval/embedding/variants.toml")
+    if not os.path.exists(path):
+        return None
+    for block in open(path).read().split("[[variant]]")[1:]:
+        if re.search(rf'^name = "{re.escape(v)}"$', block, re.M):
+            m = re.search(r'^model_dir = "([^"]+)"$', block, re.M)
+            if not m:
+                return None
+            d = os.path.expanduser(m.group(1))
+            return d if os.path.isabs(d) else os.path.join(WT, "eval/embedding", d)
+    return None
+
+
 def model_dir(v, ref):
     if v == ref:
         return os.path.expanduser("~/.g-mesh/models/jina-embeddings-v2-base-code")
-    return os.path.join(WT, "eval/embedding/work/models", v)
+    return variant_model_dir(v) or os.path.join(WT, "eval/embedding/work/models", v)
 
 
 def model_bytes(v, ref):
