@@ -277,3 +277,9 @@ grep and line ranges.
   stack, NL confident-wrong positives paired upper bound < 0 pooled and point
   <= 0 in every language; absent pooled upper bound <= +5 pts; name misled
   <= 3% per language at J's floors.
+
+## 11. Owner decisions (2026-11-21)
+
+- D1: "Домерить (4 шага, ~1–2 ч CPU) (Recommended)" (option B).
+- D2: "Переподобрать при равных ложных тревогах (Recommended)" (D6 refit for the model verdict; the GM-697 name-fit floors are reported too).
+- D3: "Принять как предложено (Recommended)": the go rule in section 10 is pre-registered before S4.
