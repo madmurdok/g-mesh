@@ -162,3 +162,14 @@ script changes and their byte-identical check:
 `/private/tmp/claude-502/gm452s2/summary.md`. Both are scratch and may be gone.
 Wall times (loaded machine): s3 base 183 s real / 46 user, s3 J 126 s / 35,
 each bootstrap ~65 s / 18, s5 5.6 s / 1.4.
+
+## Owner decision (2026-11-21)
+
+"Оставить эмбеддер + задача на дообучение (Recommended)": GM-452 closes as
+no-go; today's embedder stays. A backlog task covers option 3 (retrain J with
+absent-aware negatives).
+
+Correction to the orchestrator's first reading: the +29.9 pts CW absent is an
+operating-point difference (today's shipped floors at ~21.7% false alarm vs
+J's D6 floors at ~5%), not J being worse at "nothing here" at equal false
+alarm (+0.6 [-8.3, +9.5]).
