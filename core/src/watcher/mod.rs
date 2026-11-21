@@ -5,6 +5,7 @@ pub mod ignore_layers;
 pub mod rescan;
 pub mod starvation;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
@@ -42,6 +43,9 @@ pub struct ProjectWatcher {
     // it stops the poll loop.
     _poll_fallback: Option<PollWatcher>,
     events: Receiver<WatchSignal>,
+    // A signal [`Self::has_pending_signal`] took off `events`; `next_change`
+    // returns it before receiving another, so the order is kept.
+    peeked: Cell<Option<WatchSignal>>,
     // A sender into `events`, so a test can inject a Rescan or a path
     // without the OS event service ([`Self::inject_rescan`],
     // [`Self::inject_path`]).
@@ -191,6 +195,7 @@ impl ProjectWatcher {
             _watcher: watcher,
             _poll_fallback: poll_fallback,
             events: rx,
+            peeked: Cell::new(None),
             #[cfg(test)]
             test_events: tx,
             root: root.to_path_buf(),
@@ -308,11 +313,16 @@ impl ProjectWatcher {
     pub fn next_change(&self, timeout: Duration) -> Option<Change> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            let signal = self.events.recv_timeout(remaining);
+            let signal = match self.peeked.take() {
+                Some(signal) => Ok(signal),
+                None => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return None;
+                    }
+                    self.events.recv_timeout(remaining)
+                }
+            };
             if signal.is_ok() {
                 self.signal_seen.store(true, Ordering::Relaxed);
             }
@@ -341,6 +351,23 @@ impl ProjectWatcher {
                 Err(RecvTimeoutError::Timeout) => return None,
                 Err(RecvTimeoutError::Disconnected) => return None,
             }
+        }
+    }
+
+    /// Whether a signal is queued that [`Self::next_change`] has not received
+    /// yet. Records nothing for [`Self::take_signal_seen`]: the signal counts
+    /// when `next_change` returns it.
+    pub fn has_pending_signal(&self) -> bool {
+        if let Some(signal) = self.peeked.take() {
+            self.peeked.set(Some(signal));
+            return true;
+        }
+        match self.events.try_recv() {
+            Ok(signal) => {
+                self.peeked.set(Some(signal));
+                true
+            }
+            Err(_) => false,
         }
     }
 

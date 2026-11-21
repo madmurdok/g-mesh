@@ -195,8 +195,23 @@ pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
 }
 
 /// Above this many files one language would gain from a `.gitignore` change,
-/// [`PluginRegistry::gitignore_changed`] does not reindex it (GM-508, Q2).
+/// [`PluginRegistry::gitignore_changed`] does not reindex it (GM-508, Q2), and
+/// a [`PluginRegistry::starvation_sweep`] does not index them.
 pub(crate) const GITIGNORE_REINDEX_GUARD: usize = 10_000;
+
+/// Whether `added` new `language` files are more than
+/// [`GITIGNORE_REINDEX_GUARD`]; if so, logs that `cause` indexed none of them
+/// and asks for `g-mesh reindex`.
+fn over_reindex_guard(cause: &str, language: &str, added: usize) -> bool {
+    if added <= GITIGNORE_REINDEX_GUARD {
+        return false;
+    }
+    crate::log_role!(
+        "{cause} would add {added} {language} files to the index - more than \
+         {GITIGNORE_REINDEX_GUARD}, so nothing was reindexed; run `g-mesh reindex` to index them"
+    );
+    true
+}
 
 /// The directories holding `gitignores` and `links` (project-relative, `""`
 /// for the root), deduplicated; just the root when one of them is in the
@@ -1175,12 +1190,7 @@ impl PluginRegistry {
             if added == 0 && removed == 0 {
                 continue;
             }
-            if added > GITIGNORE_REINDEX_GUARD {
-                crate::log_role!(
-                    "{trigger} changed would add {added} {language} files to the index - \
-                     more than {GITIGNORE_REINDEX_GUARD}, so nothing was reindexed; run `g-mesh reindex` \
-                     to index them"
-                );
+            if over_reindex_guard(&format!("{trigger} changed"), &language, added) {
                 continue;
             }
             crate::log_role!(
@@ -1266,8 +1276,10 @@ impl PluginRegistry {
     /// [`rescan_subtrees`](Self::rescan_subtrees) of the whole project with
     /// [`ReconcileScope::Starved`]: run on the watcher's consumer thread when
     /// its starvation watchdog finds the event stream silent while the
-    /// project may change. Returns how many things it changed: files
-    /// deleted, created or reindexed, plus the `.gitignore` files and links
+    /// project may change. Created files of a language that would gain more
+    /// than [`GITIGNORE_REINDEX_GUARD`] are left out. Returns how many things
+    /// it changed: files deleted or reindexed (a created file only once it is
+    /// indexed), plus the `.gitignore` files and links
     /// it passed on.
     pub(crate) fn starvation_sweep(
         &self,
@@ -1307,15 +1319,15 @@ impl PluginRegistry {
     /// language's own `exclude_dirs` is never statted beyond the walk and
     /// never hashed. The live side is every `indexed_files` baseline and
     /// `File` node. Routed in the watcher's batch order (ADR 0023):
-    /// - live, absent on disk: a deletion, through
+    /// - live, absent on disk (or failing its stat): a deletion, through
     ///   [`route_settled_path`](Self::route_settled_path).
     /// - walked, not live: a creation, announced with the others
     ///   ([`announce_created`](Self::announce_created)), then reindexed.
     /// - walked and live: statted against the baselines read once up front;
     ///   a file whose mtime matches its baseline is fresh and skipped, as
     ///   [`ensure_fresh`](Self::ensure_fresh)'s stat fast path would skip it.
-    ///   Any other (no baseline, another mtime, a failed stat) goes to
-    ///   `ensure_fresh`, whose hash refreshes only the mtime of a touched
+    ///   Any other (no baseline, another mtime; a failed stat when seeded)
+    ///   goes to `ensure_fresh`, whose hash refreshes only the mtime of a touched
     ///   file, and which records the new baseline after a reindex, so the
     ///   next start finds it fresh. No store lock is held across a stat.
     ///
@@ -1404,8 +1416,34 @@ impl PluginRegistry {
         let unwalked_live: Vec<String> =
             live.iter().filter(|file_path| !walked_set.contains(file_path)).cloned().collect();
         drop(walked_set);
-        let (known, created): (Vec<String>, Vec<String>) =
+        let (known, mut created): (Vec<String>, Vec<String>) =
             walked.into_iter().partition(|file_path| live.contains(file_path));
+        if scope == ReconcileScope::Starved {
+            // A sweep sees the files a `.gitignore` un-ignored as created, so
+            // the gate's guard holds here too.
+            let mut per_language: BTreeMap<&str, usize> = BTreeMap::new();
+            for file_path in &created {
+                if let Some(language) = self.language_for(file_path) {
+                    *per_language.entry(language).or_default() += 1;
+                }
+            }
+            let over: HashSet<String> = per_language
+                .into_iter()
+                .filter(|(language, added)| {
+                    over_reindex_guard(
+                        "a sweep after the watcher's event stream went silent",
+                        language,
+                        *added,
+                    )
+                })
+                .map(|(language, _)| language.to_string())
+                .collect();
+            if !over.is_empty() {
+                created.retain(|file_path| {
+                    self.language_for(file_path).is_none_or(|language| !over.contains(language))
+                });
+            }
+        }
         // The stat pass, outside any lock: which walked live files may have
         // changed, and which are gone since the walk.
         let mut stale_known = Vec::new();
@@ -1420,7 +1458,8 @@ impl PluginRegistry {
                         stale_known.push(file_path);
                     }
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound && !seeded => vanished.push(file_path),
+                // Any failed stat (EACCES too) is a deletion.
+                Err(_) if !seeded => vanished.push(file_path),
                 // `ensure_fresh` stats it again and logs why it fails.
                 Err(_) => stale_known.push(file_path),
             }
@@ -1483,7 +1522,9 @@ impl PluginRegistry {
                 crate::log_role!("could not record {language}'s reparsed files as semantic-pending: {err:#}");
             }
         }
-        let changed = deleted.len() + unwalked.len() + created.len() + reindexed;
+        // `reindexed` already counts the created files that became live; a
+        // created file that did not (a failed language) changed nothing.
+        let changed = deleted.len() + unwalked.len() + reindexed;
         if scope == ReconcileScope::Starved && changed == 0 {
             return (reparsed, 0);
         }

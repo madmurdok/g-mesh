@@ -351,6 +351,11 @@ fn watch_for_starvation(
         return;
     };
     let now = (watchdog.clock)();
+    // Signals still queued after a long iteration are a stream that delivers:
+    // no sweep while it does.
+    if watcher.has_pending_signal() {
+        watchdog.state.observe_at(now, true);
+    }
     let heard = watchdog.canary.as_ref().is_some_and(|canary| canary.take_heard());
     let action = watchdog.state.decide_at(now, heard);
     if let Some(end) = watchdog.state.take_episode_end() {
