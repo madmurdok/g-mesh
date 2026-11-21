@@ -358,7 +358,12 @@ mod tests {
     #[test]
     fn the_coderankembed_rows_are_the_exported_encoder() {
         let file = VariantsFile::parse(VARIANTS).unwrap();
-        let spec = EncoderSpec { pooling: Pooling::Cls, dimension: 768, max_sequence_length: 1024, token_type_ids: false };
+        let spec = EncoderSpec {
+            pooling: Pooling::Cls,
+            dimension: 768,
+            max_sequence_length: 1024,
+            token_type_ids: false,
+        };
         for (name, role) in [
             ("coderankembed-fp32-structured", Role::Quality),
             ("coderankembed-int8-structured", Role::Informational),
