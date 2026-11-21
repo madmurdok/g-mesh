@@ -554,3 +554,58 @@ max_tokens = 1024
 token_type_ids = false
 query_prefix = "Represent this query for searching relevant code: "
 text = "structured"
+
+# --- GM-736: CodeRankEmbed int8 with per-channel smoothing (docs/design/GM-736-cre-int8.md)
+# Exported by eval/embedding/gm736/recipe.py --export into g-mesh-data/gm736/models;
+# EXPORT.json beside model.onnx records alpha, the weight form, the calibration
+# and smoothing sha256s and model.onnx's sha256 (gm703/measure.sh checks it
+# before a run). sq = QInt8 7-bit weights (the shipped recipe); squ8 = QUInt8
+# symmetric 8-bit weights.
+[[variant]]
+name = "coderankembed-int8sq-structured"
+arm = "model"
+role = "quality"
+hf_repo = "nomic-ai/CodeRankEmbed"
+revision = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
+onnx_file = "gm736-export/model_int8_sq_s7.onnx"
+model_dir = "~/Projects/ClaudeProjects/g-mesh-data/gm736/models/coderankembed-int8-sq-s7"
+pooling = "cls"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+query_prefix = "Represent this query for searching relevant code: "
+text = "structured"
+
+[[variant]]
+name = "coderankembed-int8squ8-structured"
+arm = "model"
+role = "quality"
+hf_repo = "nomic-ai/CodeRankEmbed"
+revision = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
+onnx_file = "gm736-export/model_int8_sq_u8.onnx"
+model_dir = "~/Projects/ClaudeProjects/g-mesh-data/gm736/models/coderankembed-int8-sq-u8"
+pooling = "cls"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+query_prefix = "Represent this query for searching relevant code: "
+text = "structured"
+
+# gm730 pins: model.onnx=6c9f475d629fe14e69418d3e2338959c4ad80b8ed4261c5e432241a49db1c757 tokenizer.json=b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5
+[[variant]]
+name = "gm730-jina-full-int8-structured"
+arm = "model"
+role = "quality"
+model_dir = "~/Projects/ClaudeProjects/g-mesh-data/gm730/models/gm730-jina-full-int8-structured@6c9f475d629fe14e"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+text = "structured"
+
+[[variant]]
+name = "gm730-jina-full-int8-structured-words-shuffled"
+arm = "words-shuffled"
+role = "informational"
+reference = "gm730-jina-full-int8-structured"
+text = "structured"

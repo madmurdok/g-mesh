@@ -40,6 +40,8 @@ OUTPUT_NAME = "last_hidden_state"
 HIDDEN = 768
 # The shipped jina int8 file's recipe (section 3.4).
 QUANTIZE_ARGS = {"weight_type": "QInt8", "per_channel": True, "reduce_range": True}
+# ORT's zero point for symmetric QUInt8 weights (WeightSymmetric), every channel.
+U8_ZERO_POINT = 128
 DEFAULT_OUT = Path.home() / "Projects/ClaudeProjects/g-mesh-data/gm703/models"
 
 
@@ -158,7 +160,8 @@ def export_onnx(model, path, opset=OPSET, dynamic=True, prebuild=True):
         raise RuntimeError(f"output trailing dimension {last}, expected {width}")
 
 
-def quantize_int8(fp32_path, int8_path):
+def quantize_int8(fp32_path, int8_path, nodes_to_exclude=()):
+    """The shipped recipe; `nodes_to_exclude` (node names) stay fp32."""
     from onnxruntime.quantization import QuantType, quantize_dynamic
 
     quantize_dynamic(
@@ -167,12 +170,20 @@ def quantize_int8(fp32_path, int8_path):
         weight_type=getattr(QuantType, QUANTIZE_ARGS["weight_type"]),
         per_channel=QUANTIZE_ARGS["per_channel"],
         reduce_range=QUANTIZE_ARGS["reduce_range"],
+        nodes_to_exclude=list(nodes_to_exclude) or None,
     )
 
 
-def int8_fingerprint(path, hidden=HIDDEN):
+def int8_fingerprint(path, hidden=HIDDEN, allowed_fp32=0, weights="s7"):
     """Q-F (section 3.4): the shipped jina recipe's marks. Returns a dict with
-    `ok` and the counts behind it."""
+    `ok` and the counts behind it.
+
+    weights="s7": signed 8-bit tables holding 7-bit values (reduce_range).
+    weights="u8": unsigned 8-bit tables whose zero points all equal U8_ZERO_POINT,
+    and no signed 8-bit table (the AVX2 U8S8 kernel saturates on signed 8-bit weights).
+    `allowed_fp32` is the number of big MatMuls deliberately left fp32."""
+    if weights not in ("s7", "u8"):
+        raise ValueError(f"weights {weights!r}: s7 or u8")
     import numpy as np
     import onnx
     from onnx import numpy_helper
@@ -182,6 +193,8 @@ def int8_fingerprint(path, hidden=HIDDEN):
     inits = {t.name: t for t in graph.initializer}
     ops = [n.op_type for n in graph.node]
     int8_min, int8_max, per_channel_zp, int8_weights = 0, 0, 0, 0
+    uint8_weights, uint8_min, uint8_max, uint8_per_channel_zp = 0, 255, 0, 0
+    uint8_zero_points = set()
     for t in graph.initializer:
         if t.data_type == onnx.TensorProto.INT8:
             a = numpy_helper.to_array(t)
@@ -191,6 +204,16 @@ def int8_fingerprint(path, hidden=HIDDEN):
                 int8_max = max(int8_max, int(a.max()))
             elif a.ndim == 1 and a.shape[0] > 1:
                 per_channel_zp += 1
+        elif t.data_type == onnx.TensorProto.UINT8:
+            a = numpy_helper.to_array(t)
+            if a.ndim == 2:
+                uint8_weights += 1
+                uint8_min = min(uint8_min, int(a.min()))
+                uint8_max = max(uint8_max, int(a.max()))
+            elif t.name.endswith("_zero_point"):
+                uint8_zero_points.update(int(v) for v in a.reshape(-1))
+                if a.ndim == 1 and a.shape[0] > 1:
+                    uint8_per_channel_zp += 1
     # An embedding table is quantized when its Gather reads an 8-bit table
     # (a DequantizeLinear follows the Gather).
     gather_quantized = 0
@@ -216,17 +239,30 @@ def int8_fingerprint(path, hidden=HIDDEN):
         "per_channel_zero_points": per_channel_zp,
         "gather_quantized": gather_quantized,
         "fp32_matmul_on_big_weights": fp32_matmul,
+        "allowed_fp32": allowed_fp32,
+        "weights": weights,
         "opset": [{"domain": o.domain, "version": o.version} for o in proto.opset_import],
     }
-    result["ok"] = bool(
-        result["matmul_integer"] > 0
-        and int8_weights > 0
-        and -64 <= int8_min
-        and int8_max <= 64
-        and per_channel_zp >= int8_weights
-        and gather_quantized >= 1
-        and fp32_matmul == 0
-    )
+    common = result["matmul_integer"] > 0 and gather_quantized >= 1 and fp32_matmul == allowed_fp32
+    if weights == "s7":
+        result["ok"] = bool(
+            common and int8_weights > 0 and -64 <= int8_min and int8_max <= 64 and per_channel_zp >= int8_weights
+        )
+    else:
+        result.update(
+            uint8_weights=uint8_weights,
+            uint8_min=uint8_min,
+            uint8_max=uint8_max,
+            uint8_per_channel_zero_points=uint8_per_channel_zp,
+            uint8_zero_point_values=sorted(uint8_zero_points),
+        )
+        result["ok"] = bool(
+            common
+            and int8_weights == 0
+            and uint8_weights > 0
+            and uint8_per_channel_zp >= uint8_weights - gather_quantized
+            and uint8_zero_points == {U8_ZERO_POINT}
+        )
     return result
 
 
