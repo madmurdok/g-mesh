@@ -82,10 +82,31 @@ class Verify(Case):
         self.register()
         self.assertTrue(R.verify(["nope"], variants=self.variants))
 
-    def test_a_duplicate_arm_is_refused(self):
+    def test_registering_the_same_arm_again_is_a_no_op(self):
         self.register()
-        with self.assertRaises(SystemExit):
+        before = self.variants.read_text()
+        self.register()
+        self.assertEqual(self.variants.read_text(), before)
+        self.assertEqual(before.count(f'name = "{ARM}"'), 1)
+        self.assertEqual(R.verify(variants=self.variants), [])
+
+    def test_a_different_row_under_an_existing_name_is_refused(self):
+        self.register()
+        before = self.variants.read_text()
+        (self.src / "model.onnx").write_bytes(b"other onnx bytes")
+        with self.assertRaises(SystemExit) as cm:
             self.register()
+        self.assertIn("different variant", str(cm.exception))
+        self.assertEqual(self.variants.read_text(), before)
+
+    def test_a_symlinked_variants_file_stays_a_symlink(self):
+        real = self.root / "real-variants.toml"
+        self.variants.rename(real)
+        self.variants.symlink_to(real)
+        self.register()
+        self.assertTrue(self.variants.is_symlink())
+        self.assertIn(f'name = "{ARM}"', real.read_text())
+        self.assertEqual(R.verify(variants=self.variants), [])
 
 
 class CheckRun(Case):
