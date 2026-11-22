@@ -275,7 +275,7 @@ the Rust cache gave mean |d| 0.0052, max 0.198, for today's L6.
    15 name per language, held-out and FIT mixed as drawn), about 3,600 pairs.
 4. Compare per pair and per window.
 
-**Tolerance (all must hold):**
+**Tolerance (all must hold; S1, superseded for the gate by 4.1):**
 - mean |d| <= 0.01 logits, and mean |d| <= 0.005 x the new model's logit
   standard deviation over the sample (scale-free: the new logits are
   narrower, so an absolute bound alone is looser than it was for today's L6);
@@ -289,6 +289,143 @@ from the new model (`gm464_rerank_fixture.py` with the new model and beta), so
 the `#[ignore]` test keeps guarding the shipped variant; `LOGIT_TOLERANCE` is
 re-derived as 4 x the observed max |d|, capped at 0.25 (must-confirm: the new
 logit scale may make 0.25 too loose to catch a wrong model).
+
+### 4.1 Re-derived parity bound (owner 2026-11-22)
+
+GM-741/S13. The first parity run (S8, `docs/results/gm-741-qat-reranker.md`
+section 1, commit `f8e20a38`) failed two of the five bounds above. Owner
+decision, verbatim: "Перевывести границу и взять новую выборку
+(Recommended)". This subsection replaces the **Tolerance** list above for the
+gate; the method steps 1-4 and the fixture paragraph stay. It is committed
+before any new parity run. The S8 numbers are quoted below only to explain
+what went wrong; no bound below takes a value from them, and the S8 sample is
+never re-judged under these bounds.
+
+**What the gate is for.** The stack numbers of section 6 are computed from the
+Rust logits (method step 2), so the go rule already measures what the shipped
+kernel does, near-tie orderings included. Parity guards something else: that
+the Rust kernel path (`ort` 2.0.0-rc.9, `rerank.rs`) runs the new model as
+the reference does (Python onnxruntime 1.19.2, `rerank_eval`), so that a
+wrong file, a wrong input, a wrong output read or a numeric defect cannot
+hide behind a good stack number. Both models are the same architecture and
+the same quint8 format on the same two runtimes, so the reference for "how
+far apart may the two runtimes be" is today's shipped L6 on the same pairs.
+
+#### 4.1.1 Why the S8 bounds were mis-specified
+
+1. **The sd-relative mean bound assumed kernel noise scales with the logit
+   sd.** It does not. Rust-vs-ORT differences come from the integer GEMMs,
+   requantization and fused activations inside the encoder (different ORT
+   builds and optimizer passes); the logit sd is the spread of the final
+   head's output across pairs, most of it between queries. Nothing makes the
+   first proportional to the second. The coefficient 0.005 was not derived
+   either: it was picked so the bound would be tighter than the absolute one.
+   With the new model's narrow scale (sd 0.70) it asked for a mean |d| of
+   0.0035, about two thirds of the 0.0052 today's L6 shows on the same two
+   runtimes (GM-452 caveat b). The bar was stricter than what the shipped
+   model clears, for a reason unrelated to correctness.
+2. **The pooled logit sd is also the wrong yardstick for ranking.** Rows
+   change places when an error exceeds the gap between neighbouring blend
+   scores (`logit + beta * cosine`) within one window; the pooled sd mixes in
+   the between-query offsets that never affect a window's order.
+3. **"No window's top-3 set differs" bounds the sample's near-ties, not the
+   kernel.** Two runtimes that are not bit-identical swap rows 3 and 4
+   whenever the reference gap between them is smaller than the two rows'
+   errors. How many windows of a sample hold such a pair is a property of the
+   model's score spacing and of the draw; a correct kernel fails the bound
+   with a probability that grows with the sample. Today's L6 was never held to
+   it (GM-452 compared pairs, not window sets).
+
+#### 4.1.2 The bounds (all must hold, on the fresh sample of 4.1.3)
+
+Notation: `d = rust - python` per pair; `s = logit + beta * cosine` the blend
+score, at beta 5.0 for `qat` (fitted in S8, not refitted) and 40.0 for `l6`.
+**Reference arm:** today's L6 (`ce-minilm-quint8` Python vs
+`ce-minilm-quint8-rust`), measured the same way on the same windows and the
+same pairs, in the same run.
+
+| id | bound | principle | why it protects the shown ranking |
+|---|---|---|---|
+| P1 | mean \|d\| of `qat` <= mean \|d\| of `l6` (point estimates, same pairs; plus the absolute ceiling mean \|d\| <= 0.01 kept) | No worse than shipped: the kernel path may not add more average error to the new model than it adds to today's | The average perturbation every window sees is no larger than the one users already get today |
+| P2 | max \|d\| <= 0.20 (kept) | GM-452's max for today's L6 | No single row can jump far enough to cross a clear gap |
+| P3 | blend top-1 identical in >= n - 1 windows (kept; 119 of 120) | The first row is what the user reads; one disagreement in 120 is the S1 allowance, unchanged | Bounds the row the F4 page shows first |
+| P4 | **tie-aware top-3**: zero windows with a *non-tie* top-3 difference (definition below) | A swap is a defect signal only when the reference gap it crosses is larger than the error today's kernel already makes | Rows 1-3 never change across a gap the shipped product resolves today |
+
+**P4 definition.** Margin `m = 2 x p99(|d|)` of the **`l6` reference arm** on
+the same pairs (computed in the same run). For a window, let `A` be the
+Python top-3 set and `R` the Rust top-3 set by `s` (stable sort, as in
+`gm741_parity.py`). If `A != R`, the window is a non-tie difference when some
+`x` in `A \ R` and `y` in `R \ A` have a Python gap `s_py(x) - s_py(y) > m`;
+otherwise every swap is a tie and the window counts as agreeing.
+
+Why this margin and not another:
+- Two rows' reference scores can cross only if their gap is smaller than
+  `|d_x| + |d_y|`. With both errors inside today's p99, that is `2 x p99`. A
+  crossing over a larger gap needs an error beyond today's typical kernel
+  error: a defect, or noise the new model amplifies. Both are what the gate
+  must catch.
+- The margin comes from the **reference** arm, not the candidate, so a
+  defective candidate cannot widen its own tolerance.
+- p99 rather than max: the max of 3,600 pairs is one outlier (GM-452: 0.198),
+  and `2 x max` approaches `2 x` the P2 ceiling, where any swap would be
+  forgiven and P4 would measure nothing.
+- Rows within `m` of each other are already ordered arbitrarily by today's
+  kernel; which of them shows third is not a regression, and its effect on
+  quality is already inside the section 6 numbers, which were scored on the
+  Rust logits.
+
+**Units caveat (stated, not hidden).** `d` is in logits for both arms, which
+is the right unit for kernel error (P1, P2, P4's margin). In blend units the
+new model's spacing is narrower (beta 5 vs 40), so the same absolute error
+reorders near-ties more often than it does for today's L6. That effect is a
+property of the model, not of the kernel; the stack eval already contains it,
+and P4 still fails any crossing wider than today's error.
+
+**Reported, not gated** (both arms): raw top-3 set agreement, the `l6`
+arm's tie-aware top-3 and top-1 at beta 40, top-10 set agreement, mean signed
+d, p99 |d|, the logit sd, and the Python gap of every top-3 swap.
+
+#### 4.1.3 Fresh-sample protocol
+
+- **Windows:** 120, as in S8: 15 NL + 15 name per language (go, python,
+  rust, typescript), from the v2 K = 30 window set, held-out and FIT mixed as
+  drawn.
+- **Disjoint from S8:** the S8 windows are exactly `draw()` with seed 741 in
+  `gm741_parity.py` (reproducible from code, no scratch file needed). Each
+  cell's pool is the cell minus those 15; the new draw is
+  `random.Random(74113).sample(pool, 15)` per cell, cells in sorted order.
+  Seed 74113 = GM-741, slice 13; fixed here. A cell with fewer than 15
+  windows left is a STOP, not a smaller cell.
+- **Pairs:** every pair of each window, ship text, the same tokenizer and
+  window construction as S8 (`gm700_rust_pairs.setup`), about 3,600 pairs.
+- **Python:** onnxruntime via `rerank_eval.CrossEncoder`, one pair per run,
+  for both `qat` and `l6`.
+- **Rust:** the logits already dumped for every pair: `qat` from the S8 full
+  dump (`ce-l6-qat-quint8-rust` in `rerank_cache_gm741_qat`), `l6` from
+  `ce-minilm-quint8-rust` in `rerank_cache_gm700_rust`. Logits are
+  deterministic; no new Rust run is needed. A fresh-window pair missing from
+  either Rust cache is a STOP.
+- **Order:** draw, then write the window list and its sha256 to the result
+  before scoring; then score both arms; then evaluate P1-P4 once.
+- **Code** (measure slice): `gm741_parity.py` gains `--seed` and
+  `--exclude-seed`, a `--ce` choice for the arm, reads the Rust logits from
+  the cache, computes P4 with `m` from the `l6` arm, and exits 1 when any of
+  P1-P4 fails. The old `mean <= 0.005 x sd` and `top3_all_same` checks are
+  removed, not left as reported failures.
+
+#### 4.1.4 On a fail
+
+Any of P1-P4 failing on the fresh sample stops the gate for good: the measure
+slice records the numbers and stops; section 7 is not run. There is no
+further re-derivation, no third sample, no larger sample, and no exception
+for a "near miss". GM-741 then does not ship the QAT model as the default in
+4.36.0; the owner chooses between leaving it out of the release and opening an
+investigation of the Rust kernel path for this model (a diagnosis task, not a
+bound change). A missing reference arm (a Rust or Python `l6` logit that
+cannot be produced) is a STOP, not a fallback to GM-452's 0.0052.
+
+On a pass, the S8 stack numbers (section 6, all from the same Rust dump)
+stand without a re-run, and the measure slice continues with section 7.
 
 ## 5. Downstream calibration
 
