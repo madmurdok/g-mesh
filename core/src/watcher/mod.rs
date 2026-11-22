@@ -395,6 +395,14 @@ impl ProjectWatcher {
     pub(crate) fn inject_path(&self, path: impl Into<PathBuf>) {
         let _ = self.test_events.send(WatchSignal::Path(path.into()));
     }
+
+    /// Test-only seam: a sender into this watcher's channel, for a test that
+    /// must queue a signal from inside an iteration of the consumer (from its
+    /// injected clock), after `next_change` has returned.
+    #[cfg(test)]
+    pub(crate) fn test_sender(&self) -> Sender<WatchSignal> {
+        self.test_events.clone()
+    }
 }
 
 /// What the OS callbacks put on the watcher's channel.
@@ -1292,5 +1300,136 @@ mod tests {
         let source = root.join("src/lib.rs");
         assert_eq!(delivered(&watcher, &source), Some(source.clone()));
         assert!(watcher.take_signal_seen(), "a routed path is a signal received");
+    }
+
+    // --- GM-727: the starvation watchdog's canary and pending signals ---
+    // B-numbers name the behaviours in docs/design/GM-727-starvation-watchdog.md §7.
+
+    /// What the OS callback does with `event` under a canary at `dir`: the
+    /// signals it queues, and whether it marked the canary heard.
+    fn routed_with_canary(event: notify::Event, root: &Path, dir: &Path) -> (Vec<WatchSignal>, bool) {
+        let heard = AtomicBool::new(false);
+        let (tx, rx) = channel();
+        forward_or_hear(event, root, Some((dir, &heard)), &tx);
+        drop(tx);
+        (rx.iter().collect(), heard.load(Ordering::Relaxed))
+    }
+
+    /// B7 (unit half): a canary event marks the canary heard and queues
+    /// nothing; an event mixing canary and project paths queues only the
+    /// project's; an event without canary paths is forwarded untouched and
+    /// leaves the canary unheard.
+    ///
+    /// Control: in `forward_or_hear`, set `heard` but forward the event
+    /// unfiltered - the canary path is queued.
+    #[test]
+    fn a_canary_path_is_heard_and_never_queued() {
+        let root = Path::new("/project");
+        let dir = Path::new("/state/watch-canary");
+
+        let canary_only = notify::Event::new(notify::EventKind::Any).add_path(dir.join("probe"));
+        assert_eq!(routed_with_canary(canary_only, root, dir), (vec![], true));
+
+        let mixed =
+            notify::Event::new(notify::EventKind::Any).add_path(dir.join("probe")).add_path(root.join("a"));
+        assert_eq!(routed_with_canary(mixed, root, dir), (vec![WatchSignal::Path(root.join("a"))], true));
+
+        let project_only = notify::Event::new(notify::EventKind::Any).add_path(root.join("b"));
+        assert_eq!(
+            routed_with_canary(project_only, root, dir),
+            (vec![WatchSignal::Path(root.join("b"))], false)
+        );
+
+        let (tx, rx) = channel();
+        forward_or_hear(
+            notify::Event::new(notify::EventKind::Any).add_path(dir.join("probe")),
+            root,
+            None,
+            &tx,
+        );
+        drop(tx);
+        assert_eq!(rx.iter().count(), 1, "without a canary every path is forwarded");
+    }
+
+    /// `has_pending_signal` sees a queued signal without consuming it or
+    /// recording it as seen: `next_change` then returns the queued signals
+    /// in their order and only that records them.
+    ///
+    /// Control: in `has_pending_signal`, drop the received signal instead of
+    /// keeping it in `peeked` - the first path is lost.
+    #[test]
+    fn a_pending_signal_is_seen_without_being_consumed_or_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let watcher = injected_only(&root);
+        assert!(!watcher.has_pending_signal(), "nothing is queued");
+
+        let (first, second) = (root.join("src/a.rs"), root.join("src/b.rs"));
+        watcher.inject_path(&first);
+        watcher.inject_path(&second);
+        assert!(watcher.has_pending_signal());
+        assert!(watcher.has_pending_signal(), "asking again consumes nothing");
+        assert!(!watcher.take_signal_seen(), "a pending signal is not recorded as seen");
+
+        assert_eq!(watcher.next_change(INJECTED_TIMEOUT), Some(Change::Path(first)));
+        assert!(watcher.take_signal_seen());
+        assert_eq!(watcher.next_change(INJECTED_TIMEOUT), Some(Change::Path(second)));
+        assert!(!watcher.has_pending_signal());
+        assert_eq!(watcher.next_change(INJECTED_TIMEOUT), None);
+    }
+
+    /// B7: a probe written into a real canary directory is heard through the
+    /// OS event stream, is never returned by `next_change` and is not
+    /// recorded as a signal.
+    ///
+    /// Control: in `forward_or_hear`, set `heard` but forward the event
+    /// unfiltered - `next_change` returns the probe's path.
+    #[test]
+    fn a_real_canary_probe_is_heard_and_never_delivered_as_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join("watch-canary");
+        let watcher = ProjectWatcher::with_canary(&root, &dir).unwrap();
+        let canary = watcher.canary().expect("a canary outside the root is set up");
+        drain_startup_noise(&watcher);
+        watcher.take_signal_seen();
+        canary.take_heard();
+
+        canary.probe().unwrap();
+        let deadline = std::time::Instant::now() + SYNC_TIMEOUT;
+        let mut changes = Vec::new();
+        let mut heard = false;
+        while !heard && std::time::Instant::now() < deadline {
+            if let Some(change) = watcher.next_change(Duration::from_millis(100)) {
+                changes.push(change);
+            }
+            heard = canary.take_heard();
+        }
+        assert!(heard, "the probe must be heard within {SYNC_TIMEOUT:?}");
+        // Drain whatever the probe's write still has queued.
+        while let Some(change) = watcher.next_change(NO_EVENT_TIMEOUT) {
+            changes.push(change);
+        }
+        let canonical_dir = dir.canonicalize().unwrap();
+        assert!(
+            changes.iter().all(|change| !change.clone().into_path().starts_with(&canonical_dir)),
+            "a canary path reached next_change: {changes:?}"
+        );
+        // Late setup noise (a duplicate sentinel) is a real signal; with none,
+        // nothing may have been recorded.
+        if changes.is_empty() {
+            assert!(!watcher.take_signal_seen(), "a canary event is not a signal");
+        }
+    }
+
+    /// A canary directory under the project root would be reported by the
+    /// root's own watch as project changes: the watcher runs without one.
+    #[test]
+    fn a_canary_directory_under_the_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let watcher = ProjectWatcher::with_canary(&root, root.join("watch-canary")).unwrap();
+        assert!(watcher.canary().is_none());
     }
 }

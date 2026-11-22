@@ -1686,3 +1686,137 @@ fn a_change_under_a_link_into_an_excluded_dir_is_not_routed() {
     registry.file_changed(&conn, "src/y.alpha-src".to_string());
     assert_eq!(test_plugin::spawns(&dir).len(), 1, "an ordinary file still routes");
 }
+
+// --- GM-727: what a starvation sweep reconciles ---
+// B-numbers name the behaviours in docs/design/GM-727-starvation-watchdog.md §7.
+
+/// Records `file_path` (on disk under `root`) as indexed at its mtime: fresh.
+fn record_fresh(root: &Path, conn: &IndexStore, file_path: &str) {
+    let mtime = crate::fsutil::mtime_millis(&fs::metadata(root.join(file_path)).unwrap()).unwrap();
+    conn.with(|c| crate::storage::write::upsert_indexed_file(c, file_path, mtime, "indexed")).unwrap();
+}
+
+fn has_baseline(conn: &IndexStore, file_path: &str) -> bool {
+    conn.with(|c| staleness::has_indexed_baseline(c, file_path)).unwrap()
+}
+
+/// A sweep of `project`'s registry with no `.gitignore` newer than the
+/// watermark; returns what it reports as changed.
+fn sweep(registry: &PluginRegistry, conn: &IndexStore, project: &Path) -> usize {
+    let watcher = crate::watcher::ProjectWatcher::injected_only(project);
+    registry.starvation_sweep(conn, &watcher, i64::MAX)
+}
+
+/// B6: the sweep's mtime pre-filter leaves a file whose mtime matches its
+/// baseline alone and still reindexes a live file with no baseline (a
+/// `File` node only).
+///
+/// Control: in `reconcile_counted`'s stat pass, count a file with no
+/// recorded mtime as fresh - the file with no baseline is not reindexed.
+#[test]
+fn a_sweep_skips_files_whose_mtime_matches_and_reindexes_one_with_no_baseline() {
+    let (project, _plugins, dirs, registry) = registry_over(&["alpha"]);
+    let conn = index_walked_at(WALKED_AT);
+    write_file(project.path(), "fresh.alpha-src", "v0");
+    record_fresh(project.path(), &conn, "fresh.alpha-src");
+    write_file(project.path(), "nobase.alpha-src", "v0");
+    insert_file_nodes(&conn, &[("alpha", "nobase.alpha-src")]);
+
+    let changed = sweep(&registry, &conn, project.path());
+
+    assert_eq!(test_plugin::file_changed_requests(&dirs[0]), vec!["nobase.alpha-src".to_string()]);
+    assert!(has_baseline(&conn, "nobase.alpha-src"), "the reindex records its baseline");
+    assert_eq!(changed, 1);
+}
+
+/// The over-reindex guard holds for a sweep: a language that would gain
+/// more than `GITIGNORE_REINDEX_GUARD` created files indexes none of them,
+/// and another language's created file is still indexed and counted.
+///
+/// Control: drop the `ReconcileScope::Starved` guard block in
+/// `reconcile_counted` - alpha's plugin is spawned.
+#[test]
+fn a_sweep_that_would_create_more_than_the_guard_indexes_none_of_that_language() {
+    let (project, _plugins, dirs, registry) = registry_over(&["alpha", "beta"]);
+    let (alpha, beta) = (&dirs[0], &dirs[1]);
+    let generated = project.path().join("generated");
+    fs::create_dir_all(&generated).unwrap();
+    for index in 0..=GITIGNORE_REINDEX_GUARD {
+        fs::File::create(generated.join(format!("f{index}.alpha-src"))).unwrap();
+    }
+    write_file(project.path(), "generated/one.beta-src", "");
+    let conn = index_walked_at(WALKED_AT);
+
+    let changed = sweep(&registry, &conn, project.path());
+
+    assert!(test_plugin::spawns(alpha).is_empty(), "alpha would gain more than the guard: nothing indexed");
+    assert!(!has_baseline(&conn, "generated/f0.alpha-src"));
+    assert_eq!(test_plugin::file_changed_requests(beta), vec!["generated/one.beta-src".to_string()]);
+    assert_eq!(changed, 1, "only beta's created file is counted");
+}
+
+/// A sweep counts only what it applied: a created file of a failed
+/// language, which never becomes live, changes nothing; once the language
+/// is healthy the same file counts.
+///
+/// Control: count every created file in `changed` (`+ created.len()`) - the
+/// first sweep reports 1.
+#[test]
+fn a_sweep_counts_a_created_file_only_once_it_is_indexed() {
+    let (project, _plugins, _dirs, registry) = registry_over(&["alpha"]);
+    let conn = index_walked_at(WALKED_AT);
+    write_file(project.path(), "new.alpha-src", "v0");
+
+    registry.set_failed_languages(["alpha".to_string()]);
+    assert_eq!(sweep(&registry, &conn, project.path()), 0, "a failed language's file is not indexed");
+    assert!(!has_baseline(&conn, "new.alpha-src"));
+
+    registry.set_failed_languages(Vec::<String>::new());
+    assert_eq!(sweep(&registry, &conn, project.path()), 1);
+    assert!(has_baseline(&conn, "new.alpha-src"));
+}
+
+/// Restores a directory's mode when dropped, so the tempdir can be removed.
+#[cfg(unix)]
+struct ModeGuard(PathBuf, u32);
+
+#[cfg(unix)]
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+    }
+}
+
+/// In a plain (non-seeded) sweep, a walked live file whose stat fails with
+/// an error other than NotFound (EACCES: its directory is readable but not
+/// searchable, so the walk lists it) is a deletion, routed through
+/// `route_settled_path` and counted.
+///
+/// Control: in `reconcile_counted`'s stat pass, count only a NotFound stat
+/// as a deletion - the file goes to `ensure_fresh`, whose stat fails: nothing
+/// is routed and nothing counted.
+#[cfg(unix)]
+#[test]
+fn a_sweep_routes_a_live_file_whose_stat_fails_with_eacces_as_a_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+    let (project, _plugins, dirs, registry) = registry_over(&["alpha"]);
+    let conn = index_walked_at(WALKED_AT);
+    write_file(project.path(), "locked/a.alpha-src", "v0");
+    record_fresh(project.path(), &conn, "locked/a.alpha-src");
+    let locked = project.path().join("locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o444)).unwrap();
+    let _restore = ModeGuard(locked.clone(), 0o755);
+    let err = fs::metadata(locked.join("a.alpha-src")).expect_err("the stat must fail (not run as root)");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(fs::read_dir(&locked).is_ok(), "the directory still lists its files");
+
+    let changed = sweep(&registry, &conn, project.path());
+
+    assert_eq!(
+        test_plugin::file_changed_requests(&dirs[0]),
+        vec!["locked/a.alpha-src".to_string()],
+        "a failed stat is a deletion, routed to the plugin"
+    );
+    assert_eq!(changed, 1);
+}
