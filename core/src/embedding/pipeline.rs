@@ -1452,7 +1452,7 @@ mod tests {
             let pipeline = EmbeddingPipeline::load(EmbeddingSettings {
                 model: model_at("a-custom-model", &model_dir),
                 cache: wants_cache.then(|| settings.clone()),
-                rerank: RerankSettings { enabled: false, model_dir: Ok(dir.path().join("rerank")) },
+                rerank: RerankSettings::l6(false, Ok(dir.path().join("rerank"))),
             });
             pipeline.compute(&diff_of(1), &mut EmbedStats::default());
             assert_eq!(settings.path.exists(), wants_cache, "cache file with settings.cache = {wants_cache}");

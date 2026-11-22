@@ -274,14 +274,16 @@ pub enum PluginsCommand {
 /// them* - see [`crate::cli::model`] for how that stays true.
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
-    /// Download the embedding model's weights (~154 MiB) and the search
-    /// rerank model's (~87 MiB) into the directories their loaders read.
+    /// Download the embedding model's weights (~154 MiB) and the selected
+    /// search rerank model's (~23 MiB) into the directories their loaders
+    /// read.
     Fetch {
         /// Where to put the embedding weights. Defaults to
         /// `$G_MESH_MODEL_DIR`, else `~/.g-mesh/models/<model>` - the same
         /// resolution the loader uses, so the two cannot disagree. The rerank
-        /// model goes to `$G_MESH_RERANK_MODEL_DIR`, else
-        /// `~/.g-mesh/models/ms-marco-MiniLM-L6-v2`.
+        /// model (`[rerank] model` or `$G_MESH_RERANK_MODEL`, default `l6`)
+        /// goes to `$G_MESH_RERANK_MODEL_DIR`, else
+        /// `~/.g-mesh/models/<its directory>`.
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Skip the rerank model; `search_code` then keeps the embedding

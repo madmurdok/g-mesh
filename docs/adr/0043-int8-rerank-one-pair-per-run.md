@@ -9,6 +9,8 @@ Design note: [`GM-700-rerank-speedup.md`](../design/GM-700-rerank-speedup.md).
 Results: [`gm-700-offline.md`](../results/gm-700-offline.md),
 [`gm-700-int8-parity.md`](../results/gm-700-int8-parity.md),
 [`gm-700-rust-quality.md`](../results/gm-700-rust-quality.md).
+Superseded in part by [ADR 0044](0044-qat-reranker-variant.md) (the
+weights are one of two variants, each with its own beta).
 Amends [ADR 0016](0016-cross-encoder-rerank.md) (the weights, the batching)
 and keeps [ADR 0042](0042-enriched-reranker-text.md)'s text and blend weight.
 

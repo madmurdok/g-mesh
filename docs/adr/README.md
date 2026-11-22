@@ -114,3 +114,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0041 | [`g-mesh deps` reads the index directly after a daemon readiness wait](0041-deps-cli-reads-the-index-after-a-daemon-readiness-wait.md) | Accepted |
 | 0042 | [The cross-encoder reads an enriched text: enclosing, path words and a 48-token body](0042-enriched-reranker-text.md) | Accepted |
 | 0043 | [The rerank runs the int8 cross-encoder one pair per run, and skips an exact-name window](0043-int8-rerank-one-pair-per-run.md) | Accepted |
+| 0044 | [The rerank model is a selectable variant](0044-qat-reranker-variant.md) | Proposed |

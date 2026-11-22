@@ -21,6 +21,10 @@ logits (no model needed), and its #[ignore]d parity test builds the texts
 with the real tokenizer, scores them with the real model and compares logits
 and order.
 
+--ce picks the shipped cross-encoder (rerank_eval.SHIPPED_CE; default l6, the
+weights above) and --beta the blend's beta (default the choice's fitted one; a
+choice with none needs it). The model.onnx sha256 must be the choice's pin.
+
 The fixture must tell its controls apart, so this script refuses to write it
 unless the order differs from F4 under beta = 80 and under the structured
 text alone (the text before GM-698) on at least one query each.
@@ -44,8 +48,6 @@ import gm698_ce_text_fixture as F  # noqa: E402
 from gm464_ce_structured import ST, add_structured  # noqa: E402
 
 K = 30
-BETA = 40.0
-CE = "ce-minilm-quint8"  # rerank_eval scores it one pair per run (core's CHUNK = 1)
 NL_PER_CORPUS = 2
 NAME_PER_CORPUS = 1
 
@@ -76,11 +78,19 @@ def main():
     ap.add_argument("--eval-dir", type=Path, default=HERE / "v2", help="holds queries/ (default eval/embedding/v2)")
     ap.add_argument("--st-runs", type=Path, help="int8-structured runs root (default <work>/runs-gm465/<ST>)")
     ap.add_argument("--out", type=Path, default=HERE.parents[1] / "core/src/embedding/testdata/rerank_parity.json")
+    ap.add_argument("--ce", choices=sorted(R.SHIPPED_CE), default=R.DEFAULT_CE)
+    ap.add_argument("--beta", type=float, help="blend beta (default the --ce choice's fitted beta)")
     a = ap.parse_args()
+    # rerank_eval scores the shipped quint8 arms one pair per run (core's CHUNK = 1)
+    ce_arm = R.SHIPPED_CE[a.ce]["py"]
+    beta = a.beta if a.beta is not None else R.SHIPPED_CE[a.ce]["beta"]
+    if beta is None:
+        sys.exit(f"STOP: --ce {a.ce} has no fitted beta; give --beta")
+    R.check_shipped_ce(a.work, a.ce)
 
     corpora = [p.name for p in sorted((a.work / "runs" / R.REF).iterdir()) if (p / "rankings.jsonl").exists()]
     corpora_dir = a.corpora or a.work / "corpora"
-    ce = R.CrossEncoder(a.work, CE)
+    ce = R.CrossEncoder(a.work, ce_arm)
     assert ce.chunk == 1, ce.chunk
     minilm = F.minilm_counter(a.work)
     toks = (F.words, minilm)
@@ -117,9 +127,9 @@ def main():
                     assert F.build(r, merged, tok) == r[key], (q, r["id"], key, "the merged file changes the text")
             logits = [float(x) for x in ce.score(query, [r["text"] for r in rows])]
             base_logits = [float(x) for x in ce.score(query, [c.stext[n] for n in ids])]
-            order = f4_order(logits, cosines, BETA)
+            order = f4_order(logits, cosines, beta)
             differs_beta += order != f4_order(logits, cosines, 80.0)
-            differs_base += order != f4_order(base_logits, cosines, BETA)
+            differs_base += order != f4_order(base_logits, cosines, beta)
             for r, lg in zip(rows, logits):
                 r["logit"] = lg
             cases.append({
@@ -140,7 +150,7 @@ def main():
         "about": "GM-464 rerank parity fixture, written by eval/embedding/gm464_rerank_fixture.py",
         "model": {"files": ce.files, "maxTokens": R.MAX_TOKENS},
         "k": K,
-        "beta": BETA,
+        "beta": beta,
         "bodyBudget": F.BODY_BUDGET,
         "cases": cases,
     }

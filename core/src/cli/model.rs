@@ -64,15 +64,12 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::cli::ModelCommand;
-use crate::config::embedding::{rerank_model_dir, resolve_model_dir};
+use crate::config::embedding::{rerank_model_settings, resolve_model_dir};
 use crate::config::EmbeddingConfig;
 use crate::embedding::model::{
     DEFAULT_ONNX_REMOTE_PATH, DEFAULT_ONNX_SHA256, DEFAULT_ONNX_SIZE, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
-use crate::embedding::rerank::{
-    RERANK_MODEL_REPO, RERANK_MODEL_REVISION, RERANK_ONNX_REMOTE_PATH, RERANK_ONNX_SHA256, RERANK_ONNX_SIZE,
-    RERANK_TOKENIZER_SHA256, RERANK_TOKENIZER_SIZE,
-};
+use crate::embedding::rerank::{RerankVariant, VariantSpec, L6, QAT, RERANK_MODEL_DIR_ENV};
 
 /// The Hugging Face repository the default model comes from.
 pub(crate) const MODEL_REPO: &str = "jinaai/jina-embeddings-v2-base-code";
@@ -100,8 +97,9 @@ enum Source {
     Upstream,
     /// Any host serving the embedding model's two files side by side under
     /// one prefix - a corporate mirror, a GitHub release's assets (which are
-    /// flat under their tag), or a directory served for a test - and the
-    /// rerank model's two under `<prefix>/ms-marco-MiniLM-L6-v2/`.
+    /// flat under their tag), or a directory served for a test - and each
+    /// rerank variant's two under `<prefix>/<variant's dir_name>/`, e.g.
+    /// `<prefix>/g-mesh-reranker-l6-qat/model.onnx`.
     Flat(String),
 }
 
@@ -205,40 +203,86 @@ const FILES: [RemoteFile; 2] = [
     },
 ];
 
-/// The rerank model's two files (`embedding::rerank`), the official
-/// dynamic-int8 export at its pinned revision, in the same download order as
-/// [`FILES`].
-const RERANK_FILES: [RemoteFile; 2] = [
-    RemoteFile {
-        repo: RERANK_MODEL_REPO,
-        revision: RERANK_MODEL_REVISION,
-        flat_prefix: "ms-marco-MiniLM-L6-v2/",
-        remote_path: RERANK_ONNX_REMOTE_PATH,
-        local_name: ONNX_FILE_NAME,
-        size: RERANK_ONNX_SIZE,
-        sha256: RERANK_ONNX_SHA256,
-    },
-    RemoteFile {
-        repo: RERANK_MODEL_REPO,
-        revision: RERANK_MODEL_REVISION,
-        flat_prefix: "ms-marco-MiniLM-L6-v2/",
-        remote_path: "tokenizer.json",
-        local_name: TOKENIZER_FILE_NAME,
-        size: RERANK_TOKENIZER_SIZE,
-        sha256: RERANK_TOKENIZER_SHA256,
-    },
-];
+/// A rerank variant's two files (`embedding::rerank`) at its pinned
+/// revision, in the same download order as [`FILES`]. `flat_prefix` is the
+/// variant's `dir_name` and a slash.
+const fn rerank_files_of(spec: &'static VariantSpec, flat_prefix: &'static str) -> [RemoteFile; 2] {
+    [
+        RemoteFile {
+            repo: spec.repo,
+            revision: spec.revision,
+            flat_prefix,
+            remote_path: spec.onnx_remote_path,
+            local_name: ONNX_FILE_NAME,
+            size: spec.onnx_size,
+            sha256: spec.onnx_sha256,
+        },
+        RemoteFile {
+            repo: spec.repo,
+            revision: spec.revision,
+            flat_prefix,
+            remote_path: "tokenizer.json",
+            local_name: TOKENIZER_FILE_NAME,
+            size: spec.tokenizer_size,
+            sha256: spec.tokenizer_sha256,
+        },
+    ]
+}
+
+const QAT_FILES: [RemoteFile; 2] = rerank_files_of(&QAT, "g-mesh-reranker-l6-qat/");
+const L6_FILES: [RemoteFile; 2] = rerank_files_of(&L6, "ms-marco-MiniLM-L6-v2/");
+
+fn rerank_files(variant: RerankVariant) -> &'static [RemoteFile; 2] {
+    match variant {
+        RerankVariant::Qat => &QAT_FILES,
+        RerankVariant::L6 => &L6_FILES,
+    }
+}
+
+/// The rerank variant `model` works on, its directory, the fallback
+/// variant's directory when a missing default falls back to it, and the
+/// unpublished variant asked for when `variant` stands in for it.
+struct RerankTarget {
+    variant: RerankVariant,
+    dir: PathBuf,
+    fallback_dir: Option<PathBuf>,
+    unpublished: Option<RerankVariant>,
+}
+
+impl RerankTarget {
+    fn from_settings() -> Result<Self> {
+        let settings = rerank_model_settings();
+        Ok(Self {
+            variant: settings.variant,
+            dir: settings.model_dir?,
+            fallback_dir: settings.fallback_dir,
+            unpublished: settings.unpublished,
+        })
+    }
+
+    /// One line when `variant` stands in for an unpublished variant.
+    fn note_unpublished(&self, out: &mut impl Write) -> Result<()> {
+        if let Some(asked) = self.unpublished {
+            writeln!(
+                out,
+                "rerank model {asked} is not published yet - using {}, at its own beta",
+                self.variant
+            )?;
+        }
+        Ok(())
+    }
+}
 
 /// Runs `g-mesh model <subcommand>`.
 pub fn run(command: &ModelCommand) -> Result<()> {
     let stdout = std::io::stdout();
     match command {
         ModelCommand::Fetch { dir, no_rerank } => {
-            let rerank_dir = if *no_rerank { None } else { Some(rerank_model_dir()?) };
-            fetch(dir.as_deref(), rerank_dir.as_deref(), &mut stdout.lock())
+            let rerank = if *no_rerank { None } else { Some(RerankTarget::from_settings()?) };
+            fetch(dir.as_deref(), rerank.as_ref(), &mut stdout.lock())
         }
         ModelCommand::Status { dir } => {
-            status(dir.as_deref(), Some(&rerank_model_dir()?), &mut stdout.lock())
+            status(dir.as_deref(), Some(&RerankTarget::from_settings()?), &mut stdout.lock())
         }
     }
 }
@@ -370,17 +414,22 @@ fn model_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf> 
 /// 641,517,466 bytes) must not pass for the pinned one. The replacement is downloaded and verified beside it and renamed
 /// over it only once verified, so a failed fetch leaves the old file intact.
 ///
-/// `rerank_dir` is where the rerank model goes (`$G_MESH_RERANK_MODEL_DIR`,
-/// else `~/.g-mesh/models/ms-marco-MiniLM-L6-v2`), or `None` to skip it
-/// (`--no-rerank`). The rerank model does not depend on the embedding model,
-/// so a refused embedding fetch still fetches it, then fails with the refusal.
-fn fetch(explicit: Option<&Path>, rerank_dir: Option<&Path>, out: &mut impl Write) -> Result<()> {
+/// `rerank` is the selected rerank variant and where it goes
+/// (`$G_MESH_RERANK_MODEL_DIR`, else `~/.g-mesh/models/<variant's
+/// dir_name>`), or `None` to skip it (`--no-rerank`). Only the selected
+/// variant is fetched; another variant's directory is not touched. The rerank
+/// model does not depend on the embedding model, so a refused embedding
+/// fetch still fetches it, then fails with the refusal.
+fn fetch(explicit: Option<&Path>, rerank: Option<&RerankTarget>, out: &mut impl Write) -> Result<()> {
     let model = resolved_model();
+    if let Some(rerank) = rerank {
+        rerank.note_unpublished(out)?;
+    }
     // Before the embedding directory is created, so a refused fetch leaves
     // nothing behind there.
     if let Some(refusal) = fetch_refusal(explicit, &model, &model_dir(None, &model)?) {
-        if let Some(rerank_dir) = rerank_dir {
-            fetch_rerank(&http_agent(), rerank_dir, &sources(), out)?;
+        if let Some(rerank) = rerank {
+            fetch_rerank(&http_agent(), rerank.variant, &rerank.dir, &sources(), out)?;
             writeln!(out)?;
         }
         bail!("{refusal}");
@@ -394,25 +443,46 @@ fn fetch(explicit: Option<&Path>, rerank_dir: Option<&Path>, out: &mut impl Writ
     fetch_files(&agent, &dir, &FILES, &sources, out)?;
     writeln!(out, "\nmodel ready in {}", dir.display())?;
 
-    if let Some(rerank_dir) = rerank_dir {
+    if let Some(rerank) = rerank {
         writeln!(out)?;
-        fetch_rerank(&agent, rerank_dir, &sources, out)?;
+        fetch_rerank(&agent, rerank.variant, &rerank.dir, &sources, out)?;
     }
     Ok(())
 }
 
+/// Fetches `variant` into `rerank_dir`; refused, before anything is created,
+/// while the variant is unpublished or while `rerank_dir` holds another
+/// variant's model.
 fn fetch_rerank(
     agent: &ureq::Agent,
+    variant: RerankVariant,
     rerank_dir: &Path,
     sources: &[Source],
     out: &mut impl Write,
 ) -> Result<()> {
+    variant.spec().check_published()?;
+    if let Some(other) = other_variant_in(rerank_dir, variant) {
+        bail!(
+            "{} holds rerank model {other}, not {variant}; `g-mesh model fetch` does not replace it \
+             ({other} may not be downloadable). Point {RERANK_MODEL_DIR_ENV} at another directory, or unset it.",
+            rerank_dir.display()
+        );
+    }
     fs::create_dir_all(rerank_dir)
         .with_context(|| format!("failed to create model directory {}", rerank_dir.display()))?;
-    writeln!(out, "rerank model directory: {}", rerank_dir.display())?;
-    fetch_files(agent, rerank_dir, &RERANK_FILES, sources, out)?;
-    writeln!(out, "\nrerank model ready in {}", rerank_dir.display())?;
+    writeln!(out, "rerank model {variant} directory: {}", rerank_dir.display())?;
+    fetch_files(agent, rerank_dir, rerank_files(variant), sources, out)?;
+    writeln!(out, "\nrerank model {variant} ready in {}", rerank_dir.display())?;
     Ok(())
+}
+
+/// The variant other than `variant` whose `model.onnx` is in `dir` at its
+/// pinned size. The variants' `model.onnx` sizes differ (their tokenizers do
+/// not), so the size tells them apart; replacing that file would lose a
+/// model that may not be downloadable (an unpublished `qat`).
+fn other_variant_in(dir: &Path, variant: RerankVariant) -> Option<RerankVariant> {
+    let size = fs::metadata(dir.join(ONNX_FILE_NAME)).ok()?.len();
+    RerankVariant::ALL.into_iter().find(|other| *other != variant && other.spec().onnx_size == size)
 }
 
 /// Downloads each of `files` into `dir` unless it is already there at its
@@ -492,8 +562,9 @@ fn prepare_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf
 /// (a file restored from a truncated backup, say), and [`fetch`] verifies the
 /// digest at the only moment the bytes are actually in hand.
 ///
-/// `rerank_dir`, when given, is reported the same way for the rerank model.
-fn status(explicit: Option<&Path>, rerank_dir: Option<&Path>, out: &mut impl Write) -> Result<()> {
+/// `rerank`, when given, is reported the same way for the selected rerank
+/// variant, with the fallback the daemon uses while it is missing.
+fn status(explicit: Option<&Path>, rerank: Option<&RerankTarget>, out: &mut impl Write) -> Result<()> {
     let model = resolved_model();
     let dir = model_dir(explicit, &model)?;
     writeln!(out, "model:     {} (from {})", model.name, model.source.describe())?;
@@ -519,16 +590,36 @@ fn status(explicit: Option<&Path>, rerank_dir: Option<&Path>, out: &mut impl Wri
         writeln!(out, "\nrun `g-mesh model fetch` to download it.")?;
     }
 
-    if let Some(rerank_dir) = rerank_dir {
-        writeln!(out, "\nrerank model: {RERANK_MODEL_REPO}")?;
-        writeln!(out, "revision:  {RERANK_MODEL_REVISION}")?;
-        writeln!(out, "directory: {}", rerank_dir.display())?;
-        if report_files(rerank_dir, &RERANK_FILES, out)? {
+    if let Some(rerank) = rerank {
+        let spec = rerank.variant.spec();
+        writeln!(out, "\nrerank model: {} ({})", rerank.variant, spec.repo)?;
+        rerank.note_unpublished(out)?;
+        writeln!(out, "revision:  {}", spec.revision)?;
+        writeln!(out, "directory: {}", rerank.dir.display())?;
+        let fallback = rerank
+            .variant
+            .fallback()
+            .zip(rerank.fallback_dir.as_deref())
+            .filter(|(fallback, dir)| fallback.spec().sizes_match(dir));
+        if report_files(&rerank.dir, rerank_files(rerank.variant), out)? {
             writeln!(out, "\nsearch_code can rerank with this model (unless switched off: [rerank] enabled, G_MESH_RERANK=off).")?;
-        } else {
+        } else if let Some((fallback, dir)) = fallback {
+            writeln!(
+                out,
+                "\nsearch_code reranks with {fallback} from {} until this model is fetched; run `g-mesh \
+                 model fetch` to download it.",
+                dir.display()
+            )?;
+        } else if rerank.variant.published() {
             writeln!(
                 out,
                 "\nsearch_code keeps the embedding order; run `g-mesh model fetch` to download it."
+            )?;
+        } else {
+            writeln!(
+                out,
+                "\nsearch_code keeps the embedding order; this model is not published yet, so `g-mesh \
+                 model fetch` cannot download it: put its files in {RERANK_MODEL_DIR_ENV}."
             )?;
         }
     }
@@ -851,6 +942,16 @@ mod tests {
     /// fallback at all.
     const TEST_DIGEST: &str = "602a7f1475de6cea8eeee903327a0e3d402620c8f277f075d4fcdc9f068fc6a9";
 
+    /// `l6` in `dir`, with no fallback.
+    fn l6_target(dir: &Path) -> RerankTarget {
+        RerankTarget {
+            variant: RerankVariant::L6,
+            dir: dir.to_path_buf(),
+            fallback_dir: None,
+            unpublished: None,
+        }
+    }
+
     fn test_file() -> RemoteFile {
         RemoteFile {
             repo: MODEL_REPO,
@@ -1093,34 +1194,37 @@ mod tests {
         for file in &FILES {
             File::create(dir.path().join(file.local_name)).unwrap().set_len(file.size).unwrap();
         }
-        for file in &RERANK_FILES {
+        for file in &L6_FILES {
             File::create(rerank.path().join(file.local_name)).unwrap().set_len(file.size).unwrap();
         }
 
         let mut out = Vec::new();
-        fetch(Some(dir.path()), Some(rerank.path()), &mut out).unwrap();
+        fetch(Some(dir.path()), Some(&l6_target(rerank.path())), &mut out).unwrap();
         let output = String::from_utf8(out).unwrap();
 
         assert_eq!(output.matches("already present").count(), 4, "{output}");
-        assert!(output.contains(&format!("rerank model ready in {}", rerank.path().display())), "{output}");
+        assert!(
+            output.contains(&format!("rerank model l6 ready in {}", rerank.path().display())),
+            "{output}"
+        );
         assert!(!output.contains("downloading"), "{output}");
     }
 
     /// The fp32 file the int8 model replaced is not the pinned one, and
     /// `fetch` downloads over it.
     ///
-    /// *Controls:* `RERANK_ONNX_SIZE` back to the fp32 size -> `on_disk`
+    /// *Controls:* `L6.onnx_size` back to the fp32 size -> `on_disk`
     /// reads it `Pinned`; make `fetch_files` skip any file that exists ->
     /// the stale bytes stay.
     #[test]
     fn a_stale_fp32_rerank_file_is_replaced_by_fetch() {
         const FP32_ONNX_SIZE: u64 = 91_011_230;
         let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join(RERANK_FILES[0].local_name);
+        let dest = dir.path().join(L6_FILES[0].local_name);
         File::create(&dest).unwrap().set_len(FP32_ONNX_SIZE).unwrap();
-        assert_eq!(on_disk(&dest, &RERANK_FILES[0]), OnDisk::Other(FP32_ONNX_SIZE));
+        assert_eq!(on_disk(&dest, &L6_FILES[0]), OnDisk::Other(FP32_ONNX_SIZE));
 
-        let file = RemoteFile { local_name: RERANK_FILES[0].local_name, ..test_file() };
+        let file = RemoteFile { local_name: L6_FILES[0].local_name, ..test_file() };
         let agent = ureq::AgentBuilder::new().build();
         let mut out = Vec::new();
         fetch_files(&agent, dir.path(), &[file], &[Source::Flat(serve_once(TEST_BODY))], &mut out).unwrap();
@@ -1134,10 +1238,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rerank = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
-        status(Some(dir.path()), Some(rerank.path()), &mut out).unwrap();
+        status(Some(dir.path()), Some(&l6_target(rerank.path())), &mut out).unwrap();
         let output = String::from_utf8(out).unwrap();
 
-        assert!(output.contains(RERANK_MODEL_REPO), "{output}");
+        assert!(output.contains(L6.repo), "{output}");
         assert!(output.contains(&rerank.path().display().to_string()), "{output}");
         assert!(output.contains("search_code keeps the embedding order"), "{output}");
     }
@@ -1147,7 +1251,7 @@ mod tests {
     /// mirror keeps it apart from the embedding model's same-named files.
     #[test]
     fn the_pinned_rerank_model_is_the_quint8_export() {
-        let [onnx, tokenizer] = &RERANK_FILES;
+        let [onnx, tokenizer] = &L6_FILES;
         assert_eq!(
             (onnx.repo, onnx.revision),
             ("cross-encoder/ms-marco-MiniLM-L6-v2", "233902d25c440f23af6f7d6e94d2946bac0bee0a")
@@ -1159,7 +1263,7 @@ mod tests {
         assert_eq!(onnx.sha256, "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9");
         assert_eq!((tokenizer.local_name, tokenizer.size), (TOKENIZER_FILE_NAME, 711_396));
         assert_eq!(tokenizer.sha256, "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66");
-        assert_eq!(onnx.flat_prefix, format!("{}/", crate::embedding::rerank::RERANK_MODEL_NAME));
+        assert_eq!(onnx.flat_prefix, format!("{}/", L6.dir_name));
         assert_eq!(
             Source::Flat("https://mirror.test/g".to_string()).url(onnx),
             "https://mirror.test/g/ms-marco-MiniLM-L6-v2/model.onnx"

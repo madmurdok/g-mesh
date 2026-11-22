@@ -25,6 +25,11 @@ Modes:
                             each under /usr/bin/time -p, then the summary table
   gm464_latency.py arm NAME one arm (internal; prints a JSON line)
 
+GM-741/S14 arms: old (G_MESH_RERANK_MODEL=l6, BIN_OLD, default BIN_NEW) and, with
+`run --qat-dir DIR --qat-beta B`, new = QAT (G_MESH_RERANK_MODEL=qat,
+G_MESH_RERANK_MODEL_DIR=DIR, G_MESH_RERANK_BETA=B). Without the flags `new` is the
+GM-700 arm. Daemon RSS (ps) is recorded after warm-up and after each pass.
+
 GM-698/S16 arms: base, enr (BIN_BASE, BIN_ENR); `off` then uses BIN_T4.
 
 Env: OUT (results dir), H (isolated G_MESH_HOME; short path - the daemon
@@ -52,6 +57,8 @@ BINS = {
     "t1": Path(os.environ.get("BIN_T1", "/private/tmp/claude-502/gm464s8/t1")),
     # GM-698/S16: base = release-4.26.0 binary, enr = the enriched-text branch binary (both rerank on)
     "new": Path(os.environ.get("BIN_NEW", "/private/tmp/claude-502/gm464s8/t4")),  # GM-700/S26: branch tip
+    # GM-741/S14: old = today's L6 reranker, same binary as new (BIN_OLD defaults to BIN_NEW)
+    "old": Path(os.environ.get("BIN_OLD", os.environ.get("BIN_NEW", "/private/tmp/claude-502/gm464s8/t4"))),
     "base": Path(os.environ.get("BIN_BASE", "/private/tmp/claude-502/gm698s16/base")),
     "enr": Path(os.environ.get("BIN_ENR", "/private/tmp/claude-502/gm698s16/enr")),
 }
@@ -193,9 +200,23 @@ def env_for(arm):
     env["G_MESH_RERANK_MODEL_DIR"] = os.environ.get("RDIR_" + arm.upper(), RERANK_DIR)
     env["G_MESH_PLUGIN_ROOTS_OVERRIDE"] = str(ROOT / "plugins")
     env.pop("G_MESH_RERANK", None)
+    if arm == "old":  # GM-741/S14: today's L6 reranker
+        env["G_MESH_RERANK_MODEL"] = "l6"
+    qat_dir = os.environ.get("QAT_DIR")
+    if arm == "new" and qat_dir:  # GM-741/S14: the QAT reranker (flags --qat-dir / --qat-beta)
+        env["G_MESH_RERANK_MODEL"] = "qat"
+        env["G_MESH_RERANK_MODEL_DIR"] = qat_dir
+        if os.environ.get("QAT_BETA"):
+            env["G_MESH_RERANK_BETA"] = os.environ["QAT_BETA"]
     if arm == "off":  # off runs the BIN_T4 binary (the caller points it at the new build)
         env["G_MESH_RERANK"] = "off"
     return env
+
+
+def rss_kb(pid):
+    """Resident set size of pid in KiB (`ps -o rss=`), None when gone."""
+    out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return int(out) if out else None
 
 
 def stop_daemon(binary, env):
@@ -231,6 +252,8 @@ def gate():
         spent = waited + (time.time() - start)
         if spent >= GATE_CAP:
             status = "closed (cap reached, measured anyway)"
+            if os.environ.get("GATE_STRICT") == "1":  # GM-741/S15: never measure past the cap
+                raise RuntimeError(f"load gate never opened within {GATE_CAP}s (load1 {load1():.1f})")
             break
         progress(f"gate-wait load<{GATE_LOAD} held {held}s waited {spent:.0f}/{GATE_CAP}s", 0, 1)
         time.sleep(5)
@@ -305,6 +328,7 @@ def run_arm(arm, label):
         rec["outcome_file"] = [(d / "rerank.outcome").read_text().strip()
                                for d in state_dirs() if (d / "rerank.outcome").exists()]
         cpu0, w0 = cpu_seconds(dpid), time.time()
+        rss = [rss_kb(dpid)]  # GM-741/S14: after warm-up, then after each timed pass
         samples = []
         total = PASSES * len(qs)
         last = time.time()
@@ -319,10 +343,13 @@ def run_arm(arm, label):
                     rate = (time.time() - w0) / done
                     progress(f"{label} timed", done, total, rate * (total - done))
                     last = time.time()
+            rss.append(rss_kb(dpid))
         wall = time.time() - w0
         cpu1 = cpu_seconds(dpid)
         rec["samples_ms"] = samples
         rec["reordered_pages"] = reordered
+        rec["rss_kb"] = rss
+        rec["rss_max_kb"] = max((x for x in rss if x is not None), default=None)
         rec["timed_wall_s"] = round(wall, 2)
         rec["daemon_cpu_s"] = round(cpu1 - cpu0, 2) if cpu0 is not None and cpu1 is not None else None
         rec["load_end"] = round(load1(), 2)
@@ -388,6 +415,11 @@ def write_summary(recs):
         rows.append(f"| {r['label']} | {len(s)} | {pct(s, .5):.0f} | {pct(s, .95):.0f} | {r['first_ms']:.0f} | "
                     f"{r['reordered_pages']}/{len(s)} | {cw} | {r['gate']} | {r['load_start']}/{r['load_end']} | "
                     f"{r['therm_start']}/{r['therm_end']} | {tps} |")
+    if any("rss_max_kb" in r for r in recs):
+        rows += ["", "daemon RSS (KiB; after warm-up, then after each pass; max):"]
+        for r in recs:
+            if "rss_kb" in r:
+                rows.append(f"- {r['label']}: {r['rss_kb']} max {r['rss_max_kb']}")
     rows += ["", "| arm (pooled) | n | p50 ms | p95 ms |", "|---|---|---|---|"]
     for arm, s in pooled.items():
         rows.append(f"| {arm} | {len(s)} | {pct(s, .5):.0f} | {pct(s, .95):.0f} |")
@@ -404,6 +436,13 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "arm":
         print(json.dumps(run_arm(sys.argv[2], sys.argv[3])))
     elif len(sys.argv) >= 2 and sys.argv[1] == "run":
+        a = sys.argv[2:]  # GM-741/S14: --qat-dir DIR --qat-beta B (inherited by the arm processes)
+        while a:
+            if a[0] in ("--qat-dir", "--qat-beta") and len(a) >= 2:
+                os.environ["QAT_" + a[0][6:].upper()] = a[1]
+                a = a[2:]
+            else:
+                sys.exit(__doc__)
         main_run()
     else:
         sys.exit(__doc__)

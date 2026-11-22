@@ -56,18 +56,32 @@ pub fn to_json(report: &Report) -> Value {
 }
 
 /// `daemon` is the live daemon's outcome (`off`, `absent`, `failed`,
-/// `loaded`), `onDisk` this shell's check (`present`, `missing`,
-/// `disabled`); exactly one is non-null.
+/// `loaded`), `onDisk` this shell's check (`present`, `fallback`, `missing`,
+/// `disabled`); exactly one is non-null. `variant` is the daemon's variant
+/// (null when its record names none) or the selected one; `fallback` is true
+/// when the default variant is missing and its fallback is used;
+/// `unpublished` names the unpublished variant asked for, for which
+/// `variant` stands in (else null).
 fn rerank_model(status: &RerankStatus) -> Value {
     match status {
-        RerankStatus::Daemon(record) => json!({ "daemon": record.outcome, "onDisk": null }),
-        RerankStatus::OnDisk { state, .. } => json!({
+        RerankStatus::Daemon(record) => json!({
+            "daemon": record.outcome,
+            "onDisk": null,
+            "variant": record.variant,
+            "fallback": record.fallback,
+            "unpublished": record.unpublished,
+        }),
+        RerankStatus::OnDisk { variant, unpublished, state, .. } => json!({
             "daemon": null,
             "onDisk": match state {
                 RerankModelState::Present => "present",
+                RerankModelState::Fallback(_) => "fallback",
                 RerankModelState::Missing => "missing",
                 RerankModelState::Disabled => "disabled",
             },
+            "variant": variant,
+            "fallback": matches!(state, RerankModelState::Fallback(_)),
+            "unpublished": unpublished,
         }),
     }
 }

@@ -296,7 +296,12 @@ fn a_report_renders_every_field_it_was_asked_for() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -342,7 +347,12 @@ fn an_interrupted_workspace_reindex_is_named() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -382,7 +392,12 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -428,7 +443,12 @@ fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_gene
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     });
 
     assert!(
@@ -634,7 +654,12 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -681,7 +706,12 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     }
 }
 
@@ -897,7 +927,12 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -992,7 +1027,12 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     };
 
     let rendered = render(&report);
@@ -1208,7 +1248,12 @@ fn a_project_with_no_suspension_marker_reports_none() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     };
     let rendered = render(&report);
     assert!(!rendered.contains("semantic ("), "{rendered}");
@@ -1240,7 +1285,12 @@ fn report_with(index: IndexStatus) -> Report {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
+        rerank_model: RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state: RerankModelState::Present,
+        },
     }
 }
 
@@ -1764,7 +1814,14 @@ fn rerank_report(rerank_model: RerankStatus) -> Report {
 }
 
 fn daemon_said(outcome: RerankOutcome, dir: Option<&str>) -> RerankStatus {
-    RerankStatus::Daemon(OutcomeRecord { pid: 4242, outcome, dir: dir.map(PathBuf::from) })
+    RerankStatus::Daemon(OutcomeRecord {
+        pid: 4242,
+        outcome,
+        dir: dir.map(PathBuf::from),
+        variant: None,
+        fallback: false,
+        unpublished: None,
+    })
 }
 
 /// The rendered `rerank model:` line's text.
@@ -1799,6 +1856,9 @@ fn the_live_daemons_own_outcome_is_reported() {
         pid: 4242,
         outcome: RerankOutcome::Absent,
         dir: Some(PathBuf::from("/models/rerank")),
+        variant: None,
+        fallback: false,
+        unpublished: None,
     };
     for core in [
         CoreState::Running { pid: 4242 },
@@ -1858,10 +1918,17 @@ fn each_daemon_outcome_has_its_own_wording() {
 /// The on-disk fallback is labelled as such, with whether a daemon runs.
 #[test]
 fn the_on_disk_fallback_is_labelled() {
-    let on_disk = |daemon_alive, state| rerank_line(RerankStatus::OnDisk { daemon_alive, state });
+    let on_disk = |daemon_alive, state| {
+        rerank_line(RerankStatus::OnDisk {
+            daemon_alive,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state,
+        })
+    };
     assert_eq!(
         on_disk(false, RerankModelState::Missing),
-        "no daemon running; on disk: missing - run `g-mesh model fetch`"
+        "no daemon running; on disk: missing - run `g-mesh model fetch`; model l6"
     );
     assert!(
         on_disk(true, RerankModelState::Present).starts_with("not loaded yet; on disk: present ("),
@@ -1894,7 +1961,10 @@ fn the_json_names_the_daemon_outcome_or_the_on_disk_state() {
         (RerankOutcome::Failed, "failed"),
         (RerankOutcome::Loaded, "loaded"),
     ] {
-        assert_eq!(json(daemon_said(outcome, None)), serde_json::json!({ "daemon": word, "onDisk": null }));
+        assert_eq!(
+            json(daemon_said(outcome, None)),
+            serde_json::json!({ "daemon": word, "onDisk": null, "variant": null, "fallback": false, "unpublished": null })
+        );
     }
     for (state, word) in [
         (RerankModelState::Present, "present"),
@@ -1903,11 +1973,142 @@ fn the_json_names_the_daemon_outcome_or_the_on_disk_state() {
     ] {
         for daemon_alive in [false, true] {
             assert_eq!(
-                json(RerankStatus::OnDisk { daemon_alive, state }),
-                serde_json::json!({ "daemon": null, "onDisk": word })
+                json(RerankStatus::OnDisk {
+                    daemon_alive,
+                    variant: RerankVariant::L6,
+                    unpublished: None,
+                    state
+                }),
+                serde_json::json!({ "daemon": null, "onDisk": word, "variant": "l6", "fallback": false, "unpublished": null })
             );
         }
     }
+}
+
+// --- the rerank line for an unpublished variant -----------------------------
+
+const STAND_IN_NOTE: &str =
+    "(qat is not published yet, so l6 stands in at its own beta; G_MESH_RERANK_BETA applies to qat only)";
+const QAT_WORDS: &str =
+    "qat (not published yet; loaded only with G_MESH_RERANK_MODEL_DIR and G_MESH_RERANK_BETA set)";
+
+fn daemon_record(
+    outcome: RerankOutcome,
+    dir: Option<&str>,
+    variant: RerankVariant,
+    unpublished: Option<RerankVariant>,
+) -> RerankStatus {
+    RerankStatus::Daemon(OutcomeRecord {
+        pid: 4242,
+        outcome,
+        dir: dir.map(PathBuf::from),
+        variant: Some(variant),
+        fallback: false,
+        unpublished,
+    })
+}
+
+/// `l6` standing in for `qat`: the daemon's line and the on-disk line both
+/// say so, and that the beta knob is `qat`'s only.
+///
+/// *Control:* make `with_unpublished_note` return `line` unchanged -> no
+/// note.
+#[test]
+fn the_rerank_line_says_when_l6_stands_in_for_an_unpublished_qat() {
+    assert_eq!(
+        rerank_line(daemon_record(
+            RerankOutcome::Loaded,
+            Some("/m"),
+            RerankVariant::L6,
+            Some(RerankVariant::Qat)
+        )),
+        format!("loaded: model l6 {STAND_IN_NOTE}")
+    );
+    let on_disk = rerank_line(RerankStatus::OnDisk {
+        daemon_alive: false,
+        variant: RerankVariant::L6,
+        unpublished: Some(RerankVariant::Qat),
+        state: RerankModelState::Present,
+    });
+    assert!(on_disk.starts_with("no daemon running; on disk: present"), "{on_disk}");
+    assert!(on_disk.ends_with(&format!("model l6 {STAND_IN_NOTE}")), "{on_disk}");
+    assert_eq!(
+        rerank_line(daemon_record(RerankOutcome::Loaded, Some("/m"), RerankVariant::L6, None)),
+        "loaded: model l6"
+    );
+}
+
+/// `qat` itself loaded (the measurement setup) is named as unpublished,
+/// with the two settings that load it.
+#[test]
+fn a_loaded_qat_is_named_as_the_measurement_setup() {
+    assert_eq!(
+        rerank_line(daemon_record(RerankOutcome::Loaded, Some("/m"), RerankVariant::Qat, None)),
+        format!("loaded: model {QAT_WORDS}")
+    );
+}
+
+/// For an unpublished variant that is missing or failed, the line never
+/// sends the reader to `g-mesh model fetch` or to delete its directory: it
+/// says the fetch cannot add it and where its files go. A published one
+/// keeps that advice.
+///
+/// *Control:* drop `if !unpublished` from the `Failed` arm of
+/// `describe_outcome` -> the `qat` line says to delete `/m`.
+#[test]
+fn an_unpublished_variant_is_never_sent_to_model_fetch() {
+    let lines = [
+        rerank_line(daemon_record(RerankOutcome::Absent, Some("/m"), RerankVariant::Qat, None)),
+        rerank_line(daemon_record(RerankOutcome::Failed, Some("/m"), RerankVariant::Qat, None)),
+        rerank_line(RerankStatus::OnDisk {
+            daemon_alive: true,
+            variant: RerankVariant::Qat,
+            unpublished: None,
+            state: RerankModelState::Missing,
+        }),
+    ];
+    for line in &lines {
+        assert!(!line.contains("run `g-mesh model fetch`"), "{line}");
+        assert!(!line.contains("delete"), "{line}");
+        assert!(line.contains(QAT_WORDS), "{line}");
+    }
+    for line in [&lines[0], &lines[2]] {
+        assert!(
+            line.contains(
+                "`g-mesh model fetch` cannot add a model that is not published; put its files in \
+                 G_MESH_RERANK_MODEL_DIR"
+            ),
+            "{line}"
+        );
+    }
+
+    let l6_failed = rerank_line(daemon_record(RerankOutcome::Failed, Some("/m"), RerankVariant::L6, None));
+    assert!(l6_failed.contains("delete /m, run `g-mesh model fetch`"), "{l6_failed}");
+    let l6_absent = rerank_line(daemon_record(RerankOutcome::Absent, Some("/m"), RerankVariant::L6, None));
+    assert!(l6_absent.contains("run `g-mesh model fetch`"), "{l6_absent}");
+}
+
+/// `rerankModel.unpublished` names the variant `l6` stands in for, in both
+/// arms.
+///
+/// *Control:* emit `null` for `unpublished` in the on-disk arm of
+/// `json::rerank_model` -> that arm reads null.
+#[test]
+fn the_json_names_the_unpublished_variant_in_both_arms() {
+    let json = |status| json::to_json(&rerank_report(status))["rerankModel"].clone();
+    assert_eq!(
+        json(daemon_record(RerankOutcome::Loaded, Some("/m"), RerankVariant::L6, Some(RerankVariant::Qat))),
+        serde_json::json!({ "daemon": "loaded", "onDisk": null, "variant": "l6", "fallback": false, "unpublished": "qat" })
+    );
+    assert_eq!(
+        json(RerankStatus::OnDisk {
+            daemon_alive: false,
+            variant: RerankVariant::L6,
+            unpublished: Some(RerankVariant::Qat),
+            state: RerankModelState::Missing,
+        }),
+        serde_json::json!({ "daemon": null, "onDisk": "missing", "variant": "l6", "fallback": false, "unpublished": "qat" })
+    );
 }
 
 // ---------------------------------------------------------------------

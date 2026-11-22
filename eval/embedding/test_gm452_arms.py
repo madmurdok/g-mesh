@@ -298,8 +298,8 @@ class StRuns(TmpCase):
     def capture_setup(self, module, setup_owner, argv):
         got = {}
 
-        def rec(work, cache_dir, st_runs=None):
-            got.update(work=work, st_runs=st_runs)
+        def rec(work, cache_dir, st_runs=None, ce=None):
+            got.update(work=work, st_runs=st_runs, ce=ce)
             raise Stop
 
         with mock.patch.object(setup_owner, "setup", side_effect=rec), \
@@ -1058,6 +1058,39 @@ class DefaultUnchanged(TmpCase):
                       ["--floors", "shipped-int8"], ["--custom", "go=0.5,python=0.6,rust=0.5,typescript=0.5"]):
             with self.subTest(extra=extra):
                 self.both("shipped_floor_rates.py", "--run", self.run_dir, "--eval-dir", self.ev, *extra)
+
+
+class ShippedCe(unittest.TestCase):
+    """GM-741: the eval scripts' --ce choice defaults to l6, and each choice's pins are the Rust
+    variant's (core/src/embedding/rerank.rs), so the default reproduces the outputs before the choice."""
+
+    RUST = (REPO / "core/src/embedding/rerank.rs").read_text()
+
+    def rust_spec(self, const):
+        import re
+        block = self.RUST.split(f"pub(crate) const {const}: VariantSpec = VariantSpec {{", 1)[1].split("\n};", 1)[0]
+        sha = re.search(r'onnx_sha256: "([0-9a-f]{64})"', block).group(1)
+        beta = re.search(r"beta: ([^,]+),", block).group(1).strip()
+        return sha, (None if beta == "UNFITTED_BETA" else float(beta))
+
+    def test_the_default_is_l6_at_its_rust_pins(self):
+        import rerank_eval as R
+        self.assertEqual(R.DEFAULT_CE, "l6")
+        self.assertEqual(sorted(R.SHIPPED_CE), ["l6", "qat"])
+        self.assertEqual(R.SHIPPED_CE["l6"]["py"], "ce-minilm-quint8")
+        self.assertEqual(R.SHIPPED_CE["l6"]["beta"], 40.0)
+        for name, const in (("l6", "L6"), ("qat", "QAT")):
+            sha, beta = self.rust_spec(const)
+            self.assertEqual((R.SHIPPED_CE[name]["sha"], R.SHIPPED_CE[name]["beta"]), (sha, beta), name)
+
+    def test_every_ce_flag_defaults_to_the_default_choice(self):
+        flags = []
+        for script in sorted(HERE.glob("gm*.py")):
+            for line in script.read_text().splitlines():
+                if 'add_argument("--ce"' in line:
+                    flags.append(script.name)
+                    self.assertIn("default=R.DEFAULT_CE", line, script.name)
+        self.assertGreaterEqual(len(set(flags)), 4, flags)
 
 
 if __name__ == "__main__":

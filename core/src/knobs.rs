@@ -55,6 +55,8 @@ pub const MODEL_DIR: Knob =
 pub const RERANK_MODEL_DIR: Knob =
     knob("G_MESH_RERANK_MODEL_DIR", Kind::User, "cross-encoder directory; empty is unset");
 pub const RERANK: Knob = knob("G_MESH_RERANK", Kind::User, "`off` switches the search rerank off");
+pub const RERANK_MODEL: Knob =
+    knob("G_MESH_RERANK_MODEL", Kind::User, "`l6` or `qat`; the rerank model, over `[rerank] model`");
 pub const EMBEDDING_CACHE: Knob =
     knob("G_MESH_EMBEDDING_CACHE", Kind::User, "`off` switches the embedding cache off");
 pub const SEED: Knob = knob("G_MESH_SEED", Kind::User, "`0` or `1` overrides the seeding default");
@@ -68,6 +70,11 @@ pub const DOWNLOAD_BASE: Knob =
 pub const REPO: Knob =
     knob("G_MESH_REPO", Kind::User, "GitHub `owner/name` the release is downloaded from; empty is unset");
 
+pub const RERANK_BETA: Knob = knob(
+    "G_MESH_RERANK_BETA",
+    Kind::Tuning,
+    "the rerank blend's cosine weight, over the rerank model's own; a finite number >= 0",
+);
 pub const EMBED_INTRA_THREADS: Knob =
     knob("G_MESH_EMBED_INTRA_THREADS", Kind::Tuning, "intra-op threads of the embedding session");
 pub const EMBED_INTER_THREADS: Knob =
@@ -178,11 +185,13 @@ pub const ALL: &[Knob] = &[
     MODEL_DIR,
     RERANK_MODEL_DIR,
     RERANK,
+    RERANK_MODEL,
     EMBEDDING_CACHE,
     SEED,
     MODEL_BASE_URL,
     DOWNLOAD_BASE,
     REPO,
+    RERANK_BETA,
     EMBED_INTRA_THREADS,
     EMBED_INTER_THREADS,
     EMBED_OPT_LEVEL,

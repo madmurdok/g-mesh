@@ -149,18 +149,23 @@ pub struct GlobalConfig {
 }
 
 /// `[rerank]`: whether `search_code` reorders its top rows with the
-/// cross-encoder (`embedding::rerank`). The environment variable
-/// `G_MESH_RERANK=off` overrides `enabled`. Read once per daemon or CLI run,
-/// at its start ([`embedding::embedding_settings`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+/// cross-encoder (`embedding::rerank`), and which one. The environment
+/// variables `G_MESH_RERANK=off` and `G_MESH_RERANK_MODEL` override `enabled`
+/// and `model`. Read once per daemon or CLI run, at its start
+/// ([`embedding::embedding_settings`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RerankConfig {
     pub enabled: bool,
+    /// `qat` or `l6` (`embedding::rerank::RerankVariant`); unset is the
+    /// default variant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Default for RerankConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: true, model: None }
     }
 }
 
@@ -321,7 +326,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "[rerank]\nenabled = false\n").unwrap();
         let config: GlobalConfig = read_toml_or_default(&path).unwrap();
-        assert_eq!(config.rerank, RerankConfig { enabled: false });
+        assert_eq!(config.rerank, RerankConfig { enabled: false, model: None });
         assert_eq!(config.embedding_cache, EmbeddingCacheConfig::default());
     }
 
@@ -386,7 +391,7 @@ mod tests {
         let config = GlobalConfig {
             cleanup: CleanupConfig { enabled: false, idle_threshold_days: 30 },
             embedding_cache: EmbeddingCacheConfig { enabled: false, max_size_mb: 64 },
-            rerank: RerankConfig { enabled: false },
+            rerank: RerankConfig { enabled: false, model: Some("l6".to_string()) },
         };
         write_toml(&path, &config).unwrap();
 

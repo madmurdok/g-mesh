@@ -7,6 +7,9 @@ the Rust CrossEncoder produced for them as the score cache of ce-minilm-quint8-r
 
 Pairs are the K=30 window of every query (scope all) with the model's own ship texts, the set
 gm463_bakeoff.py quality scores for ce-minilm-quint8.
+
+--ce picks the shipped cross-encoder (rerank_eval.SHIPPED_CE; default l6, the arms above; qat writes
+the cache of ce-l6-qat-quint8-rust). The agreement stats cover the pairs whose Python logit is cached.
 """
 import argparse
 import json
@@ -29,12 +32,18 @@ class NoCache:
         return False
 
 
+def arms(a):
+    """(Python arm, Rust arm) of the --ce choice."""
+    return R.SHIPPED_CE[a.ce]["py"], R.SHIPPED_CE[a.ce]["rust"]
+
+
 def setup(a):
+    py, _ = arms(a)
     ns = argparse.Namespace(work=a.work, eval_dir=HERE / "v2", st_runs=f"runs/{B.ST}", corpora=None)
     st_dir, corpora_dir = B.load_setup(ns)
     cs = B.load_corpora(a.work, ns.eval_dir, st_dir, corpora_dir, K)
-    B.build_model_texts(cs, a.work, PY, ["ship"])
-    need = B.model_need(cs, NoCache(), PY, "ship", K, "all")
+    B.build_model_texts(cs, a.work, py, ["ship"])
+    need = B.model_need(cs, NoCache(), py, "ship", K, "all")
     return cs, need
 
 
@@ -59,16 +68,19 @@ def import_(a):
     logits = [json.loads(l)["logit"] for l in (a.dir / "logits.jsonl").read_text().splitlines()]
     if len(logits) != len(keys):
         sys.exit(f"STOP: {len(logits)} logits for {len(keys)} pairs")
-    files = B.file_shas(a.work, PY)
-    py = B.open_cache(a.cache_dir, cs, a.work, PY, files)
-    rs = B.open_cache(a.cache_dir, cs, a.work, RUST, files)
+    py_arm, rust_arm = arms(a)
+    files = B.file_shas(a.work, py_arm)
+    py = B.open_cache(a.cache_dir, cs, a.work, py_arm, files)
+    rs = B.open_cache(a.cache_dir, cs, a.work, rust_arm, files)
     for (cn, q, h), v in zip(keys, logits):
         if not np.isfinite(v):
             sys.exit(f"STOP: non-finite logit for {cn} {q}")
         rs.put(cn, q, [h], [v])
     d, per_q = [], {}
     for (cn, q, h), v in zip(keys, logits):
-        p = py.d[cn][q][h]
+        p = py.d[cn].get(q, {}).get(h)
+        if p is None:
+            continue
         d.append(abs(v - p))
         per_q.setdefault((cn, q), []).append((v, p))
     agree = []
@@ -96,10 +108,12 @@ def main():
     d = sub.add_parser("dump")
     d.add_argument("--work", type=Path, required=True)
     d.add_argument("--out", type=Path, required=True)
+    d.add_argument("--ce", choices=sorted(R.SHIPPED_CE), default=R.DEFAULT_CE)
     i = sub.add_parser("import")
     i.add_argument("--work", type=Path, required=True)
     i.add_argument("--dir", type=Path, required=True)
     i.add_argument("--cache-dir", type=Path, required=True)
+    i.add_argument("--ce", choices=sorted(R.SHIPPED_CE), default=R.DEFAULT_CE)
     a = ap.parse_args()
     {"dump": dump, "import": import_}[a.mode](a)
 

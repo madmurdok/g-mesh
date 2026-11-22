@@ -20,6 +20,7 @@ mod cli_deps;
 mod cli_init;
 mod cli_log_role;
 mod cli_model_fetch;
+mod cli_model_rerank_variant;
 mod cli_reindex;
 mod cli_status;
 mod cli_stop;
