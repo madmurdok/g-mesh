@@ -44,7 +44,7 @@ use crate::test_plugin;
 use crate::watcher::debounce::Debouncer;
 use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
 use crate::watcher::rescan::RescanScheduler;
-use crate::watcher::ProjectWatcher;
+use crate::watcher::{ProjectWatcher, WatchSignal};
 
 /// Forces the exact shape of task 165's race deterministically, instead
 /// of relying on a real `kill -9`'s unpredictable teardown delay the way
@@ -1434,4 +1434,337 @@ fn the_quiet_counts_from_the_consumer_start() {
         assert!(std::time::Instant::now() < deadline, "the consumer never started the clock");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+// --- GM-727: the starvation watchdog sweeps the disk when the stream is silent ---
+// B-numbers name the behaviours in docs/design/GM-727-starvation-watchdog.md §7.
+//
+// These tests drive `watch_and_route_once` over a watcher that receives
+// nothing from the OS (`ProjectWatcher::injected_only`), with a fake canary
+// and a clock the test advances between iterations: starvation is an input,
+// not something the OS is pushed into.
+
+/// A clock that stands still until the test advances it.
+#[derive(Clone)]
+struct FakeClock {
+    base: std::time::Instant,
+    elapsed_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl FakeClock {
+    fn new() -> Self {
+        Self { base: std::time::Instant::now(), elapsed_ms: Arc::default() }
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.base + Duration::from_millis(self.elapsed_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn advance(&self, by: Duration) {
+        self.elapsed_ms.fetch_add(by.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A canary that is heard after every probe (`heard`) or never; it counts
+/// the probes written.
+#[derive(Clone, Default)]
+struct FakeCanary {
+    heard: bool,
+    probes: Arc<std::sync::atomic::AtomicUsize>,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::watcher::starvation::Canary for FakeCanary {
+    fn probe(&self) -> std::io::Result<()> {
+        self.probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.heard {
+            self.pending.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn take_heard(&self) -> bool {
+        self.pending.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl FakeCanary {
+    fn probes(&self) -> usize {
+        self.probes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// One python project, its walked index and a silent watcher, consumed by
+/// `watch_and_route_once` with the canary-gated watchdog on a fake clock.
+struct Starving {
+    _project: tempfile::TempDir,
+    _plugins: tempfile::TempDir,
+    plugin_dir: PathBuf,
+    registry: PluginRegistry,
+    root: PathBuf,
+    conn: IndexStore,
+    watcher: ProjectWatcher,
+    debouncer: Debouncer,
+    rescans: Rescans,
+    clock: FakeClock,
+    canary: FakeCanary,
+}
+
+impl Starving {
+    /// `files` indexed and fresh; the canary heard after each probe or never.
+    /// While `inject` is set, every read of the watchdog's clock queues an
+    /// ignored path on the watcher's channel: a signal that arrives inside
+    /// an iteration, after `next_change` returned.
+    fn new(files: &[&str], heard: bool, inject: Option<Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        let (project, plugins, dirs, registry) = registry_over(&["python"]);
+        let root = project.path().canonicalize().unwrap();
+        let conn = walked_index(project.path());
+        for file_path in files {
+            indexed_file(&root, &conn, file_path);
+        }
+        let watcher = ProjectWatcher::injected_only(&root);
+        let clock = FakeClock::new();
+        let canary = FakeCanary { heard, ..FakeCanary::default() };
+        let read_clock: super::watch_loop::Clock = {
+            let clock = clock.clone();
+            let tx = watcher.test_sender();
+            let ignored = root.join(".git/objects/ab/cdef");
+            Box::new(move || {
+                if inject.as_ref().is_some_and(|inject| inject.load(std::sync::atomic::Ordering::Relaxed)) {
+                    let _ = tx.send(crate::watcher::WatchSignal::Path(ignored.clone()));
+                }
+                clock.now()
+            })
+        };
+        let rescans = Rescans::with_watchdog_clock(
+            crate::watcher::starvation::StarvationWatchdog::new(),
+            Some(Box::new(canary.clone())),
+            read_clock,
+        );
+        Self {
+            _project: project,
+            _plugins: plugins,
+            plugin_dir: dirs[0].clone(),
+            registry,
+            root,
+            conn,
+            watcher,
+            // No path event ever settles: only a sweep can reach the index.
+            debouncer: Debouncer::new(SWALLOWING_WINDOW),
+            rescans,
+            clock,
+            canary,
+        }
+    }
+
+    /// Advances the clock by `secs`, then runs one iteration.
+    fn step(&mut self, secs: u64) {
+        self.clock.advance(Duration::from_secs(secs));
+        watch_and_route_once(
+            &self.watcher,
+            &mut self.debouncer,
+            &mut self.rescans,
+            &self.root,
+            &self.conn,
+            &self.registry,
+        );
+    }
+
+    /// One iteration at the current time, then `count` more `secs` apart.
+    fn run(&mut self, count: usize, secs: u64) {
+        self.step(0);
+        for _ in 0..count {
+            self.step(secs);
+        }
+    }
+
+    fn requested(&self, file_path: &str) -> bool {
+        requested(&self.plugin_dir, file_path)
+    }
+
+    fn requests(&self) -> Vec<String> {
+        test_plugin::file_changed_requests(&self.plugin_dir)
+    }
+
+    fn has_baseline(&self, file_path: &str) -> bool {
+        self.conn.with(|c| crate::ingest::staleness::has_indexed_baseline(c, file_path)).unwrap()
+    }
+
+    fn ignored_path(&self) -> PathBuf {
+        let ignored = self.root.join(".git/objects/ab/cdef");
+        assert!(self.watcher.is_ignored(&ignored), "the fixture path must be ignored");
+        ignored
+    }
+}
+
+/// B1: the stream starved (no signal, the canary never heard) for 20 s: an
+/// edit made with no event reaching the daemon is reindexed by a sweep, and
+/// only that file reaches the plugin.
+///
+/// Control: drop the `watch_for_starvation` call in `watch_and_route_once` -
+/// the edit is never reindexed.
+#[test]
+fn a_starved_stream_is_swept_and_only_the_edited_file_is_reindexed() {
+    let mut starving = Starving::new(&["a.python-src", "untouched.python-src"], false, None);
+    edit(&starving.root, "a.python-src");
+
+    starving.run(20, 1);
+
+    assert_eq!(starving.requests(), vec!["a.python-src".to_string()], "only the edited file is reparsed");
+    assert!(!is_stale(&starving.conn, &starving.root, "a.python-src"), "the index holds the file as on disk");
+    assert!(starving.canary.probes() >= 1, "the sweep came after an unheard probe");
+}
+
+/// B2: a quiet but healthy stream (the canary heard after every probe) is
+/// never swept, however long it stays quiet: an edit made with no event is
+/// not reindexed. A probe was written.
+///
+/// Control: in `decide_at`, ignore `canary_heard` - the probe goes overdue
+/// and a sweep reindexes the edit.
+#[test]
+fn a_quiet_stream_that_hears_its_canary_is_never_swept() {
+    let mut starving = Starving::new(&["a.python-src"], true, None);
+    edit(&starving.root, "a.python-src");
+
+    starving.run(30, 2);
+
+    assert!(starving.canary.probes() >= 1, "a probe was written once the stream was quiet");
+    assert!(starving.requests().is_empty(), "no sweep: {:?}", starving.requests());
+    assert!(is_stale(&starving.conn, &starving.root, "a.python-src"));
+}
+
+/// B3, the guarantee: while the stream delivers signals (an ignored path
+/// every 2 s) nothing is probed or swept, though the canary is never heard,
+/// for 60 s.
+///
+/// Control: drop the `quiet < quiet_before_probe` return in `decide_at` -
+/// probes are written while signals arrive.
+#[test]
+fn no_probe_and_no_sweep_while_the_stream_delivers_signals() {
+    let mut starving = Starving::new(&["a.python-src"], false, None);
+    edit(&starving.root, "a.python-src");
+    let ignored = starving.ignored_path();
+
+    starving.step(0);
+    for _ in 0..30 {
+        starving.watcher.inject_path(&ignored);
+        starving.step(2);
+    }
+
+    assert_eq!(starving.canary.probes(), 0, "no probe while signals arrive");
+    assert!(starving.requests().is_empty(), "no sweep while signals arrive: {:?}", starving.requests());
+    assert!(is_stale(&starving.conn, &starving.root, "a.python-src"));
+}
+
+/// No sweep while a signal is queued: one that arrives inside the
+/// iteration in which a sweep is due (after `next_change` returned) counts
+/// as a delivering stream. Once the stream is quiet again, the sweep comes.
+///
+/// Control: drop the `has_pending_signal` check in `watch_for_starvation` -
+/// the iteration at 10 s sweeps and reindexes the edit.
+#[test]
+fn no_sweep_while_a_signal_waits_in_the_channel() {
+    let inject = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut starving = Starving::new(&["a.python-src"], false, Some(Arc::clone(&inject)));
+    edit(&starving.root, "a.python-src");
+
+    starving.step(0);
+    starving.step(5);
+    assert_eq!(starving.canary.probes(), 1, "the probe whose deadline is 10 s");
+    inject.store(true, std::sync::atomic::Ordering::Relaxed);
+    starving.step(5);
+    inject.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(starving.requests().is_empty(), "a sweep with a signal queued: {:?}", starving.requests());
+
+    starving.run(20, 1);
+    assert!(starving.requested("a.python-src"), "the sweep comes once the stream is quiet again");
+}
+
+/// B5: a file deleted and one created while the stream starves are retired
+/// and indexed by a sweep; an untouched file is not reparsed.
+///
+/// Control: skip the walk's `created` files for `ReconcileScope::Starved`
+/// in `reconcile_counted` - the created file is never indexed.
+#[test]
+fn a_file_created_and_one_deleted_while_starved_are_reconciled_by_a_sweep() {
+    let mut starving = Starving::new(&["gone.python-src", "kept.python-src"], false, None);
+    fs::remove_file(starving.root.join("gone.python-src")).unwrap();
+    fs::write(starving.root.join("new.python-src"), "v0").unwrap();
+
+    starving.run(20, 1);
+
+    assert!(starving.requested("gone.python-src"), "the deletion is routed: {:?}", starving.requests());
+    assert!(starving.requested("new.python-src"), "the creation is routed: {:?}", starving.requests());
+    assert!(!starving.requested("kept.python-src"), "an untouched file is not reparsed");
+    assert!(!starving.has_baseline("gone.python-src"), "the deleted file is retired from the index");
+    assert!(starving.has_baseline("new.python-src"), "the created file is indexed");
+}
+
+/// A real canary probe, heard through the OS event stream, never reaches the
+/// consumer as a signal: no signal the watcher receives names a canary path,
+/// so the watcher clock (the MCP calls' quiet hint) is stamped only by
+/// something else, and nothing is routed.
+///
+/// The OS may still deliver a late root or sentinel event (FSEvents replays
+/// setup noise; GM-727/S11 saw the clock stamped once in a one-process run
+/// under load). That is a real signal and rightly stamps the clock, so the
+/// test drains with a sentinel, then asserts on what each received signal
+/// names: the clock may be stamped only when a non-canary signal arrived.
+///
+/// Control: in `forward_or_hear`, set `heard` but forward the event
+/// unfiltered - the probe's path is among the signals received.
+#[test]
+fn a_real_canary_probe_never_stamps_the_watcher_clock() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let canary_dir = state.path().join("watch-canary");
+    let watcher = ProjectWatcher::with_canary(&root, &canary_dir).unwrap();
+    let canary_dir = canary_dir.canonicalize().unwrap();
+    let canary = watcher.canary().expect("a canary outside the root is set up");
+    // The OS delivers in order: once the sentinel surfaces, the setup noise
+    // queued before it has been received.
+    let sentinel = root.join(".watcher-sync-canary-clock");
+    fs::write(&sentinel, b"").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while watcher.next_change(Duration::from_millis(200)).map(|change| change.into_path())
+        != Some(sentinel.clone())
+    {
+        assert!(std::time::Instant::now() < deadline, "the sync sentinel never surfaced");
+    }
+    watcher.take_signal_seen();
+    watcher.take_seen_signals();
+    canary.take_heard();
+    let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+
+    canary.probe().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut heard = false;
+    while !heard && std::time::Instant::now() < deadline {
+        watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
+        heard = canary.take_heard();
+    }
+    assert!(heard, "the probe must be heard");
+    // What the probe's write still has queued.
+    for _ in 0..3 {
+        watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
+    }
+
+    let seen = watcher.take_seen_signals();
+    let canary_signals: Vec<_> = seen
+        .iter()
+        .filter(|signal| match signal {
+            WatchSignal::Path(path) | WatchSignal::Rescan(path) => path.starts_with(&canary_dir),
+        })
+        .collect();
+    assert!(canary_signals.is_empty(), "a canary event reached the consumer as a signal: {seen:?}");
+    if seen.is_empty() {
+        assert_eq!(
+            registry.watcher_clock().quiet_for_at(std::time::Instant::now()),
+            None,
+            "with no signal received, nothing may stamp the watcher clock"
+        );
+    }
+    assert!(test_plugin::file_changed_requests(&dirs[0]).is_empty(), "nothing is routed");
 }

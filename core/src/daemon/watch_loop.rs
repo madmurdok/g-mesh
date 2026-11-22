@@ -15,6 +15,7 @@ use crate::watcher::batch::{classify_settled, order_for_routing};
 use crate::watcher::debounce::Debouncer;
 use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
 use crate::watcher::rescan::RescanScheduler;
+use crate::watcher::starvation::{Action, Canary, StarvationWatchdog};
 use crate::watcher::{Change, ProjectWatcher};
 
 /// The watcher's debounce window and its loop's poll bound: a path is reparsed
@@ -27,6 +28,11 @@ pub(crate) const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 /// within about a second, so an agent querying right after its own edit sees
 /// no hint unless the stream has stalled.
 pub(crate) const WATCHER_QUIET_HINT_AFTER: Duration = Duration::from_secs(5);
+
+/// The watcher canary's directory, under the project's state dir (never
+/// under the project root): see [`ProjectWatcher::with_canary`]. It goes with
+/// the state dir when that is purged.
+pub(crate) const WATCH_CANARY_DIR: &str = "watch-canary";
 
 /// When the watcher's consumer last saw the watcher receive any signal (a
 /// path, ignored ones included, or a Rescan), or started listening. One per daemon, written by
@@ -100,7 +106,10 @@ pub(crate) fn spawn_watch_consumer(
     thread::spawn(move || {
         // Taken before the start's own `.gitignore` recheck and reconcile,
         // which count as the first run for a later Rescan's recheck.
-        let mut rescans = Rescans::new();
+        let mut rescans = match watcher.canary() {
+            Some(canary) => Rescans::with_watchdog(StarvationWatchdog::new(), Some(canary)),
+            None => Rescans::with_watchdog(StarvationWatchdog::without_canary(), None),
+        };
         // On this thread, before the first batch, as an in-session edit would
         // be; events meanwhile queue in the watcher's channel.
         match start {
@@ -152,25 +161,59 @@ pub(crate) fn spawn_watch_consumer(
 }
 
 /// The watcher loop's dropped-event state (GM-616), beside its
-/// [`Debouncer`]: the scheduler holding the subtrees to reconcile, and the
-/// `.gitignore` watermark.
+/// [`Debouncer`]: the scheduler holding the subtrees to reconcile, the
+/// `.gitignore` watermark, and the starvation watchdog when there is one.
 pub(crate) struct Rescans {
     pub(crate) scheduler: RescanScheduler,
     /// Unix seconds when the previous reconcile started (at first, the
     /// consumer's start): a `.gitignore` with a newer mtime goes through
-    /// [`PluginRegistry::gitignore_changed`] at the next Rescan run.
+    /// [`PluginRegistry::gitignore_changed`] at the next Rescan run or
+    /// starvation sweep.
     pub(crate) gitignores_since: i64,
+    pub(crate) watchdog: Option<Watchdog>,
+}
+
+/// The clock a [`Watchdog`] reads; a test passes one it advances itself.
+pub(crate) type Clock = Box<dyn Fn() -> Instant + Send>;
+
+/// The starvation watchdog's state, its canary (`None` for the backoff
+/// watchdog), and the clock its decisions read.
+pub(crate) struct Watchdog {
+    pub(crate) state: StarvationWatchdog,
+    pub(crate) canary: Option<Box<dyn Canary + Send>>,
+    pub(crate) clock: Clock,
+    probe_error_logged: bool,
 }
 
 impl Rescans {
-    /// The daemon's timings, the watermark at now.
+    /// The daemon's timings, the watermark at now, no watchdog.
     pub(crate) fn new() -> Self {
         Self::with_scheduler(RescanScheduler::new())
     }
 
-    /// `scheduler`, the watermark at now.
+    /// `scheduler`, the watermark at now, no watchdog.
     pub(crate) fn with_scheduler(scheduler: RescanScheduler) -> Self {
-        Self { scheduler, gitignores_since: gitignore_watermark() }
+        Self { scheduler, gitignores_since: gitignore_watermark(), watchdog: None }
+    }
+
+    /// The daemon's Rescan timings, plus `watchdog` probing `canary` on the
+    /// real clock.
+    pub(crate) fn with_watchdog(
+        watchdog: StarvationWatchdog,
+        canary: Option<Box<dyn Canary + Send>>,
+    ) -> Self {
+        Self::with_watchdog_clock(watchdog, canary, Box::new(Instant::now))
+    }
+
+    /// [`with_watchdog`](Self::with_watchdog) on `clock`.
+    pub(crate) fn with_watchdog_clock(
+        watchdog: StarvationWatchdog,
+        canary: Option<Box<dyn Canary + Send>>,
+        clock: Clock,
+    ) -> Self {
+        let mut rescans = Self::new();
+        rescans.watchdog = Some(Watchdog { state: watchdog, canary, clock, probe_error_logged: false });
+        rescans
     }
 }
 
@@ -221,8 +264,12 @@ pub(crate) fn watch_and_route_once(
     registry: &PluginRegistry,
 ) {
     let change = watcher.next_change(DEBOUNCE_WINDOW);
-    if watcher.take_signal_seen() {
+    let signal_seen = watcher.take_signal_seen();
+    if signal_seen {
         registry.watcher_clock().heard();
+    }
+    if let Some(watchdog) = &mut rescans.watchdog {
+        watchdog.state.observe_at((watchdog.clock)(), signal_seen);
     }
     match change {
         Some(Change::Path(path)) => {
@@ -286,6 +333,82 @@ pub(crate) fn watch_and_route_once(
         let gitignores_since = std::mem::replace(&mut rescans.gitignores_since, gitignore_watermark());
         registry.rescan_subtrees(conn, &subtrees, watcher, gitignores_since);
         rescans.scheduler.ran(started.elapsed());
+    }
+    watch_for_starvation(watcher, rescans, conn, registry);
+}
+
+/// The starvation watchdog's turn in [`watch_and_route_once`], after the
+/// batch and any Rescan run, on the same thread: writes a canary probe or
+/// runs [`PluginRegistry::starvation_sweep`] when the watchdog says so, and
+/// logs an episode's start and end.
+fn watch_for_starvation(
+    watcher: &ProjectWatcher,
+    rescans: &mut Rescans,
+    conn: &IndexStore,
+    registry: &PluginRegistry,
+) {
+    let Some(watchdog) = rescans.watchdog.as_mut() else {
+        return;
+    };
+    let now = (watchdog.clock)();
+    // Signals still queued after a long iteration are a stream that delivers:
+    // no sweep while it does.
+    if watcher.has_pending_signal() {
+        watchdog.state.observe_at(now, true);
+    }
+    let heard = watchdog.canary.as_ref().is_some_and(|canary| canary.take_heard());
+    let action = watchdog.state.decide_at(now, heard);
+    if let Some(end) = watchdog.state.take_episode_end() {
+        crate::log_role!(
+            "watcher delivers again after {} s: {} sweeps, {} files reindexed",
+            end.silent_for.as_secs(),
+            end.sweeps,
+            end.changed
+        );
+    }
+    match action {
+        Action::Idle => {}
+        Action::Probe => watchdog.probe(),
+        Action::Sweep => {
+            let first = watchdog.state.first_sweep_of_episode();
+            if first && watchdog.state.uses_canary() {
+                crate::log_role!(
+                    "watcher starved: no event for {} s and the canary is overdue - sweeping every {} s",
+                    now.saturating_duration_since(watchdog.state.silent_since().unwrap_or(now)).as_secs(),
+                    crate::watcher::starvation::STARVED_SWEEP_EVERY.as_secs()
+                );
+            } else if first {
+                crate::log_role!(
+                    "watcher silent: no event for {} s and no canary - sweeping, backing off while \
+                     nothing changes",
+                    now.saturating_duration_since(watchdog.state.silent_since().unwrap_or(now)).as_secs()
+                );
+            }
+            let gitignores_since = std::mem::replace(&mut rescans.gitignores_since, gitignore_watermark());
+            let changed = registry.starvation_sweep(conn, watcher, gitignores_since);
+            let ended = (watchdog.clock)();
+            watchdog.state.swept_at(ended, ended.saturating_duration_since(now), changed);
+            if watchdog.canary.is_some() {
+                watchdog.probe();
+            }
+        }
+    }
+}
+
+impl Watchdog {
+    /// Writes a probe the state has recorded as written; a failure is
+    /// logged once and leaves nothing outstanding.
+    fn probe(&mut self) {
+        let Some(canary) = &self.canary else {
+            self.state.probe_failed();
+            return;
+        };
+        if let Err(err) = canary.probe() {
+            self.state.probe_failed();
+            if !std::mem::replace(&mut self.probe_error_logged, true) {
+                crate::log_role!("could not write the watcher canary probe: {err}");
+            }
+        }
     }
 }
 

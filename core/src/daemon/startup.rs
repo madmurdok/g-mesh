@@ -17,7 +17,7 @@ use crate::daemon::build_stamp;
 use crate::daemon::lifecycle::{self, CoreActivity, IdleTimeouts};
 use crate::daemon::registry::{self, PluginRegistry};
 use crate::daemon::seed;
-use crate::daemon::watch_loop::{spawn_watch_consumer, ConsumerStart};
+use crate::daemon::watch_loop::{spawn_watch_consumer, ConsumerStart, WATCH_CANARY_DIR};
 use crate::daemon::workspace_reindex;
 use crate::daemon::{acquire_singleton_lock, serve_forever, write_pid_file};
 use crate::embedding::EmbeddingPipeline;
@@ -420,11 +420,14 @@ pub(super) fn start_watcher_and_activation(
     };
     let pending_watcher = match watcher {
         WatcherPlan::StartedByActivation => None,
-        WatcherPlan::ParkedForActivation => {
-            Some(ProjectWatcher::new(root).context("failed to start the file watcher")?)
-        }
+        WatcherPlan::ParkedForActivation => Some(
+            ProjectWatcher::with_canary(root, services.registry.state_dir().join(WATCH_CANARY_DIR))
+                .context("failed to start the file watcher")?,
+        ),
         WatcherPlan::ConsumerNow => {
-            let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
+            let watcher =
+                ProjectWatcher::with_canary(root, services.registry.state_dir().join(WATCH_CANARY_DIR))
+                    .context("failed to start the file watcher")?;
             let start = match seed_gate.take() {
                 Some(gate) => ConsumerStart::Seeded(gate),
                 None => ConsumerStart::Reconcile,
