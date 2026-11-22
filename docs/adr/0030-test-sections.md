@@ -46,7 +46,8 @@ section has one CI step.
   each section once (ignored tests included) and
   `scripts/test-sections-check.py` fails on a test in no section, in two
   sections, or matched by a section but absent from the suite. CI's linux row
-  and `cut-release.sh` run it.
+  runs it ("Test sections cover the whole suite"); `cut-release.sh` requires
+  that step to have succeeded in the release tip's full run (GM-729).
 - **A CI step check.** `check` first runs `check-ci`: each section in
   `SECTIONS` has exactly one `tests: <section>` step in `ci.yml` that runs it
   and selects it by name, and no step runs an unlisted section. Adding a
@@ -87,7 +88,8 @@ Accepted 2026-10-09 (owner decisions Q1 and Q2 in the design note, section 10).
 - **A plugin change runs that plugin's section and all six core sections**
   (Q1), never the other plugins' sections. Core tests spawn and read every
   plugin, so narrowing core further would trade safety for little time.
-- **Pushes to `release-*` are selected like any other push** (Q2). `main`, a
+- **Pushes to `release-*` are selected like any other push** (Q2). `main`
+  (unless it reuses a same-tree green run, see the GM-729 amendment), a
   `workflow_call` (the tag's release gate) and a `workflow_dispatch` always
   run full. A push whose earlier tip is unknown (new branch, force-push) runs
   full.
@@ -104,3 +106,29 @@ release-branch tip needs a full ci.yml run, which a push that touched only
 selected paths does not give, so a release may need one `workflow_dispatch`.
 The selection never changes the build (`--workspace` every time), so CI saves
 section time, not build time.
+
+## Amendment: the release flow reuses the release tip's full run (GM-729, 2026-11-22)
+
+- **`cut-release.sh` no longer runs `test-sections.sh check` locally.** The
+  check built every test binary (12+ minutes on 4.33.0) and repeated the
+  Linux row's "Test sections cover the whole suite" step of the full run the
+  gate already requires. The gate now also requires that step to have
+  *succeeded* in that run (a run where it was skipped, failed or absent is
+  refused, naming the step), so the check is still a release precondition.
+  Rejected: running it locally only when no green run exists (the gate
+  refuses then anyway) or behind a flag (a step to forget).
+- **A push to `main` reuses a green full run of the same tree.** After the
+  release merge, `main`'s tree equals the release tip's, which already passed
+  a full run, so the push started a second one. The `select` job now asks
+  `scripts/ci-green-for-commit.sh` (release.yml's `ci-gate` question, same
+  tree rule) and, when it answers `green=true`, sets `mode=none` and
+  `reused=true`: the `test`, `installer`, `go-plugin-without-toolchain`,
+  `shellcheck` and `lint` jobs are skipped and the run summary names the run
+  relied on. Lints are skipped too: their tools are pinned and the workflow is
+  part of the tree, so a same-tree green run already passed them. Any lookup
+  error, or a push to `main` with no such run, stays `full`;
+  `workflow_dispatch` and `workflow_call` stay `full`.
+- **`select` holds `actions: read`,** so release.yml's `tests` job, which
+  calls ci.yml, grants `actions: read` too (a called job cannot request more
+  than its caller job grants). Every other ci.yml job stays at the workflow
+  floor `contents: read`.

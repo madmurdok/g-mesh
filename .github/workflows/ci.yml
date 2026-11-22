@@ -119,16 +119,30 @@ jobs:
   # Invariants:
   # - `mode` is `full`, `partial` or `none`. Anything this step cannot diff
   #   (a new branch, a base lost to a force-push, an unknown event) is `full`.
-  # - `main`, a workflow_call and a workflow_dispatch are always `full`.
-  # - A partial or empty run says so in the run summary; the `full-suite` job
-  #   below is the machine-readable "this run was full" signal.
+  # - A workflow_call and a workflow_dispatch are always `full`.
+  # - A push to `main` is `full` unless `scripts/ci-green-for-commit.sh` finds
+  #   a green full ci.yml run on the pushed commit or a parent with the same
+  #   tree (the release tip a release merge brings in). Then `reused` is
+  #   `true`, `mode` is `none`, and every job that is a function of the tree
+  #   (tests, installer, conformance, lints: all tools pinned, this file part
+  #   of the tree) is skipped. Any lookup failure is `full`.
+  # - A partial, empty or reused run says so in the run summary; the
+  #   `full-suite` job below is the machine-readable "this run was full"
+  #   signal.
+  #
+  # The only job that holds `actions: read` (to list ci.yml runs and jobs), so
+  # release.yml's `tests` job, which calls this workflow, grants it too.
   select:
     name: Select the test sections
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       mode: ${{ steps.select.outputs.mode }}
       sections: ${{ steps.select.outputs.sections }}
+      reused: ${{ steps.select.outputs.reused }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -141,16 +155,25 @@ jobs:
           FULL_SUITE: ${{ inputs.full_suite }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           BEFORE: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           base=""
           reason=""
+          reused=false
           if [ "$FULL_SUITE" = true ]; then
             reason="called by another workflow"
           elif [ "$EVENT" = pull_request ]; then
             base="$PR_BASE"
           elif [ "$EVENT" = push ] && [ "$REF" = refs/heads/main ]; then
             reason="push to main"
+            # Only an exact `green=true` line reuses a run.
+            gate="$(bash scripts/ci-green-for-commit.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA")" || gate="green=false"
+            if printf '%s\n' "$gate" | grep -qx 'green=true'; then
+              reused=true
+              reused_run="$(printf '%s\n' "$gate" | sed -n 's/^run=//p')"
+              reused_sha="$(printf '%s\n' "$gate" | sed -n 's/^sha=//p')"
+            fi
           elif [ "$EVENT" = push ]; then
             if [ -z "$BEFORE" ] || [ -z "${BEFORE//0/}" ]; then
               reason="new branch: no earlier push to diff against"
@@ -166,7 +189,9 @@ jobs:
           fi
 
           answer=full
-          if [ -n "$base" ]; then
+          if [ "$reused" = true ]; then
+            answer=none
+          elif [ -n "$base" ]; then
             answer="$(scripts/test-select.sh --base "$base")"
             reason="changes since ${base:0:7}"
           fi
@@ -177,11 +202,23 @@ jobs:
           none) mode=none; sections="" ;;
           *) mode=partial; sections="$answer" ;;
           esac
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
-          echo "sections=$sections" >> "$GITHUB_OUTPUT"
-          echo "mode: $mode ($reason); sections: ${sections:-none}"
+          {
+            echo "mode=$mode"
+            echo "sections=$sections"
+            echo "reused=$reused"
+          } >> "$GITHUB_OUTPUT"
+          echo "mode: $mode ($reason); sections: ${sections:-none}; reused: $reused"
 
-          if [ "$mode" != full ]; then
+          if [ "$reused" = true ]; then
+            run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$reused_run"
+            {
+              echo "## Tests skipped: this tree already passed a full run"
+              echo
+              echo "ci.yml run [$reused_run]($run_url) passed a full run on \`$reused_sha\`, which has the same tree as \`$GITHUB_SHA\`. No test, installer, conformance or lint job runs here."
+              echo
+              echo "A full run anyway: \`workflow_dispatch\` this workflow on \`main\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$mode" != full ]; then
             skipped=""
             for s in $all; do
               case " $sections " in *" $s "*) ;; *) skipped="$skipped $s" ;; esac
@@ -213,6 +250,8 @@ jobs:
 
   shellcheck:
     name: shellcheck
+    needs: select
+    if: needs.select.outputs.reused != 'true'
     runs-on: ubuntu-22.04
     env:
       SHELLCHECK_VERSION: v0.11.0
@@ -261,6 +300,8 @@ jobs:
   # script runs under dash on Ubuntu and under macOS's sh and BSD tools.
   installer:
     name: install.sh PATH tests (${{ matrix.os }})
+    needs: select
+    if: needs.select.outputs.reused != 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -1050,6 +1091,8 @@ jobs:
 
   go-plugin-without-toolchain:
     name: Go plugin conformance (no toolchain on PATH)
+    needs: select
+    if: needs.select.outputs.reused != 'true'
     runs-on: ubuntu-22.04
     env:
       RUST_VERSION: "1.97.1"
@@ -1263,6 +1306,8 @@ jobs:
 
   lint:
     name: cargo clippy
+    needs: select
+    if: needs.select.outputs.reused != 'true'
     runs-on: ubuntu-22.04
     env:
       RUST_VERSION: "1.97.1"

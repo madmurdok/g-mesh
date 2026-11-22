@@ -279,9 +279,16 @@ jobs:
   # commit is never published untested. When it can, this job is skipped and
   # `build` starts at once. ci.yml's per-row limits (GM-612) live in its own
   # matrix, so this call inherits them.
+  #
+  # `actions: read` is the ceiling for the called workflow: only ci.yml's
+  # `select` job requests it, and a called job cannot request more than this
+  # job grants. ci.yml's own floor keeps every other job at `contents: read`.
   tests:
     needs: ci-gate
     if: needs.ci-gate.outputs.green != 'true'
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/ci.yml
 
   build:

@@ -947,9 +947,19 @@ exec jq -r "$4" "{fixtures}/$file"
         git_out(&self.dir.path().join("repo"), &["tag", "-l"])
     }
 
-    /// The jobs of run `id`, as (name, conclusion).
+    /// The jobs of run `id`, as (name, conclusion). A job named `tests`
+    /// carries ci.yml's partition-check step with the job's conclusion.
     fn jobs(&self, id: u64, jobs: &[(&str, &str)]) {
-        let jobs: Vec<_> = jobs.iter().map(|(n, c)| json!({ "name": n, "conclusion": c })).collect();
+        let jobs: Vec<_> = jobs
+            .iter()
+            .map(|(n, c)| {
+                if *n == "tests" {
+                    json!({ "name": n, "conclusion": c, "steps": [{ "name": SECTIONS_STEP, "conclusion": c }] })
+                } else {
+                    json!({ "name": n, "conclusion": c })
+                }
+            })
+            .collect();
         fs::write(
             self.dir.path().join(format!("fixtures/jobs-{id}.json")),
             json!({ "jobs": jobs }).to_string(),
@@ -987,6 +997,7 @@ exec jq -r "$4" "{fixtures}/$file"
 }
 
 const FULL_JOB: &str = "Full test suite ran";
+const SECTIONS_STEP: &str = "Test sections cover the whole suite";
 
 #[test]
 fn a_tip_with_a_green_full_suite_job_passes_the_gate() {
@@ -1241,6 +1252,155 @@ fn three_failed_queries_in_a_row_are_refused_and_one_is_retried() {
     assert!(output.status.success(), "{}", describe(&output));
     assert_eq!(release.runs_queries(), 2);
     assert_eq!(release.tags(), format!("v{VERSION}"));
+}
+
+impl Release {
+    /// Run `id` with a successful full-suite job and test jobs whose
+    /// partition-check steps ended as `steps` (one job per entry; `None`: the
+    /// job has no such step, "none": a null conclusion).
+    fn sections_jobs(&self, id: u64, steps: &[Option<&str>]) {
+        let mut jobs: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let name = format!("tests (row {i})");
+                match step {
+                    None => json!({ "name": name, "conclusion": "success", "steps": [{ "name": "Build", "conclusion": "success" }] }),
+                    Some(c) => {
+                        let c = if *c == "none" { json!(null) } else { json!(c) };
+                        json!({ "name": name, "conclusion": "success", "steps": [{ "name": SECTIONS_STEP, "conclusion": c }] })
+                    }
+                }
+            })
+            .collect();
+        jobs.push(json!({ "name": FULL_JOB, "conclusion": "success" }));
+        fs::write(
+            self.dir.path().join(format!("fixtures/jobs-{id}.json")),
+            json!({ "jobs": jobs }).to_string(),
+        )
+        .unwrap();
+    }
+}
+
+/// The gate reads the partition-check step by its display name; renaming the
+/// step in ci.yml without the script would refuse every release as `missing`.
+#[test]
+fn the_gates_sections_step_name_is_the_partition_check_steps_name_in_ci_yml() {
+    let script = fs::read_to_string(repo_root().join("scripts/cut-release.sh")).unwrap();
+    let in_script = script
+        .lines()
+        .find_map(|l| l.strip_prefix("CI_SECTIONS_STEP="))
+        .expect("CI_SECTIONS_STEP= line in cut-release.sh")
+        .trim_matches('"');
+    assert_eq!(in_script, SECTIONS_STEP);
+    let ci = fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    let test_job: String = ci
+        .lines()
+        .skip_while(|l| *l != "  test:")
+        .take_while(|l| *l == "  test:" || l.starts_with("    ") || l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let step = test_job
+        .split("\n      - name: ")
+        .skip(1)
+        .find(|s| s.lines().next().unwrap().trim().trim_matches('"').trim_matches('\'') == in_script)
+        .unwrap_or_else(|| panic!("ci.yml's test job has no step named {in_script:?}"));
+    assert!(
+        step.contains("run: scripts/test-sections.sh check"),
+        "the step {in_script:?} does not run the check:\n{step}"
+    );
+}
+
+/// A green full run whose partition-check step did not succeed on any row.
+fn assert_refused_as_unchecked(release: &Release, output: &Output, id: u64, conclusions: &str) {
+    assert_died_untagged(release, output, &format!("its step '{SECTIONS_STEP}' did not succeed"));
+    let stderr = stderr_of(output);
+    assert!(
+        stderr.contains(&format!("run {id}: '{SECTIONS_STEP}' {conclusions} https://github.com/")),
+        "{}",
+        describe(output)
+    );
+    assert!(
+        stderr.contains(&format!("gh workflow run ci.yml --ref release-{VERSION}")),
+        "{}",
+        describe(output)
+    );
+}
+
+#[test]
+fn a_full_run_whose_sections_step_was_skipped_is_refused_by_name() {
+    let release = Release::new();
+    release.runs(&[(181, "success")]);
+    release.sections_jobs(181, &[Some("skipped"), Some("skipped")]);
+    assert_refused_as_unchecked(&release, &release.check(), 181, "skipped");
+}
+
+#[test]
+fn a_full_run_whose_sections_step_failed_is_refused_naming_every_conclusion() {
+    let release = Release::new();
+    release.runs(&[(182, "success")]);
+    release.sections_jobs(182, &[Some("failure"), Some("skipped"), Some("none")]);
+    assert_refused_as_unchecked(&release, &release.check(), 182, "failure,none,skipped");
+}
+
+#[test]
+fn a_full_run_without_the_sections_step_is_refused_as_missing() {
+    let release = Release::new();
+    release.runs(&[(183, "success")]);
+    release.sections_jobs(183, &[None, None]);
+    assert_refused_as_unchecked(&release, &release.check(), 183, "missing");
+}
+
+/// The step runs on the Linux row only; the other rows skip it.
+#[test]
+fn a_sections_step_that_succeeded_on_one_row_and_was_skipped_on_the_others_passes() {
+    let release = Release::new();
+    release.runs(&[(184, "success")]);
+    release.sections_jobs(184, &[Some("skipped"), Some("success"), Some("skipped")]);
+    let output = release.check();
+    assert!(output.status.success(), "{}", describe(&output));
+    assert_eq!(release.tags(), format!("v{VERSION}"));
+}
+
+#[test]
+fn a_qualifying_run_wins_over_a_run_whose_sections_step_was_skipped() {
+    let release = Release::new();
+    release.runs(&[(191, "success"), (192, "success")]);
+    release.sections_jobs(191, &[Some("skipped")]);
+    release.sections_jobs(192, &[Some("success")]);
+    let output = release.check();
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("passed a full ci.yml run (192)"), "{}", describe(&output));
+    assert_eq!(release.tags(), format!("v{VERSION}"));
+}
+
+#[test]
+fn a_running_run_is_waited_for_before_an_unchecked_run_is_refused() {
+    let release = Release::new();
+    release.runs_at(1, &[(201, "completed", "success", 1), (202, "in_progress", "none", 1)]);
+    release.runs_at(2, &[(201, "completed", "success", 1), (202, "completed", "success", 1)]);
+    release.sections_jobs(201, &[Some("skipped")]);
+    release.sections_jobs(202, &[Some("success")]);
+    let output = release.check();
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("waiting for ci.yml run 202"), "{}", describe(&output));
+    assert_eq!(release.runs_queries(), 2);
+    assert_eq!(release.tags(), format!("v{VERSION}"));
+}
+
+#[test]
+fn an_unparseable_jobs_answer_is_retried_and_refused_never_green() {
+    let release = Release::new();
+    release.runs(&[(211, "success")]);
+    fs::write(release.dir.path().join("fixtures/jobs-211.json"), "not json").unwrap();
+    let output = release.check();
+    assert_died_untagged(&release, &output, "could not query the jobs of ci.yml run 211 after 3 attempts");
+    assert_eq!(
+        release.calls().lines().filter(|l| l.contains("/actions/runs/211/jobs")).count(),
+        3,
+        "{}",
+        release.calls()
+    );
 }
 
 /// The steps that carry what the old local run covered run on the Linux row of
