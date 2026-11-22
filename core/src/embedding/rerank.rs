@@ -35,7 +35,7 @@ use crate::embedding::ce_text::split_words;
 use crate::embedding::model::{ONNX_FILE_NAME, TOKENIZER_FILE_NAME};
 
 /// Which cross-encoder reranks: `[rerank] model` in the global config or
-/// [`RERANK_MODEL_ENV`], `qat` by default (ADR 0044).
+/// [`RERANK_MODEL_ENV`], `l6` by default (ADR 0044).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RerankVariant {
@@ -103,8 +103,8 @@ pub(crate) const L6: VariantSpec = VariantSpec {
 };
 
 impl RerankVariant {
-    pub const DEFAULT: Self = Self::Qat;
-    pub const ALL: [Self; 2] = [Self::Qat, Self::L6];
+    pub const DEFAULT: Self = Self::L6;
+    pub const ALL: [Self; 2] = [Self::L6, Self::Qat];
 
     pub(crate) const fn spec(self) -> &'static VariantSpec {
         match self {
@@ -123,13 +123,22 @@ impl RerankVariant {
         Self::ALL.into_iter().find(|variant| variant.name().eq_ignore_ascii_case(value))
     }
 
-    /// The variant a missing default falls back to (D3 of
-    /// `docs/design/GM-741-qat-reranker.md`); `None` for one that has none.
+    /// The variant that stands in for this one when it is not published, or
+    /// when it is the default and not fetched (ADR 0044); `None` for one
+    /// that has none.
     pub fn fallback(self) -> Option<Self> {
         match self {
             Self::Qat => Some(Self::L6),
             Self::L6 => None,
         }
+    }
+
+    /// Whether the variant's pins are real: its repo and commit are not
+    /// [`UNPUBLISHED`] and its beta is not [`UNFITTED_BETA`]. An unpublished
+    /// variant is loaded only from [`RERANK_MODEL_DIR_ENV`] with
+    /// `G_MESH_RERANK_BETA` set; otherwise its [`Self::fallback`] stands in.
+    pub fn published(self) -> bool {
+        self.spec().check_published().is_ok() && self.spec().beta.is_finite()
     }
 
     /// The blend weight, refused while it is [`UNFITTED_BETA`].
@@ -465,29 +474,42 @@ pub struct RerankSettings {
     pub model_dir: Result<PathBuf>,
     /// The fallback variant's directory, set only when `variant` is the
     /// default, chosen by no setting, and its directory is not overridden by
-    /// `$G_MESH_RERANK_MODEL_DIR`. An explicit choice never falls back.
+    /// `$G_MESH_RERANK_MODEL_DIR`. An explicit published choice never falls
+    /// back.
     pub fallback_dir: Option<PathBuf>,
-    /// `$G_MESH_RERANK_BETA`: replaces the loaded variant's beta.
+    /// `$G_MESH_RERANK_BETA`: replaces `variant`'s beta, and only while
+    /// `variant` itself is loaded; a fallback or a stand-in for an
+    /// unpublished variant ranks at its own beta.
     pub beta_override: Option<f64>,
+    /// The variant a setting asked for that is not published
+    /// ([`RerankVariant::published`]); `variant` is its stand-in.
+    pub unpublished: Option<RerankVariant>,
 }
 
 impl RerankSettings {
     /// `l6` in `model_dir`, with no fallback and its own beta.
     #[cfg(test)]
     pub(crate) fn l6(enabled: bool, model_dir: Result<PathBuf>) -> Self {
-        Self { enabled, variant: RerankVariant::L6, model_dir, fallback_dir: None, beta_override: None }
+        Self {
+            enabled,
+            variant: RerankVariant::L6,
+            model_dir,
+            fallback_dir: None,
+            beta_override: None,
+            unpublished: None,
+        }
     }
 
     /// The variant and directory to load: the selected ones, or the
     /// fallback's when the selected directory lacks a file and the
     /// fallback's has both at their pinned sizes. The flag is true for the
-    /// fallback.
+    /// fallback, which drops the beta override.
     fn resolve_fallback(self) -> (RerankVariant, Result<PathBuf>, bool, Option<f64>) {
         if let (Ok(dir), Some(fallback_dir), Some(fallback)) =
             (&self.model_dir, &self.fallback_dir, self.variant.fallback())
         {
             if any_file_absent(dir) && fallback.spec().sizes_match(fallback_dir) {
-                return (fallback, Ok(fallback_dir.clone()), true, self.beta_override);
+                return (fallback, Ok(fallback_dir.clone()), true, None);
             }
         }
         (self.variant, self.model_dir, false, self.beta_override)
@@ -568,6 +590,10 @@ pub struct OutcomeRecord {
     /// True when `variant` is the fallback for a missing default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fallback: bool,
+    /// The unpublished variant a setting asked for; `variant` is its
+    /// stand-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpublished: Option<RerankVariant>,
 }
 
 impl OutcomeRecord {
@@ -626,6 +652,7 @@ impl Reranker {
                         model_dir: Err(anyhow!("the rerank settings were already taken")),
                         fallback_dir: None,
                         beta_override: None,
+                        unpublished: None,
                     }
                 })
             }),
@@ -648,6 +675,7 @@ impl Reranker {
                 model_dir: Err(anyhow!("off")),
                 fallback_dir: None,
                 beta_override: None,
+                unpublished: None,
             }),
             loader: Box::new(|_, _| bail!("off")),
             outcome: OnceLock::from(Outcome::Off),
@@ -726,14 +754,21 @@ impl Reranker {
         self.outcome.get_or_init(|| {
             let settings = (self.settings)();
             let selected = settings.variant;
+            let unpublished = settings.unpublished;
             let (outcome, variant, dir, fallback) = if settings.enabled {
                 let (variant, model_dir, fallback, beta_override) = settings.resolve_fallback();
                 let dir = model_dir.as_ref().ok().cloned();
-                if fallback {
+                let shown_dir = dir.as_deref().unwrap_or(Path::new("?")).display();
+                if let Some(asked) = unpublished {
+                    (self.log)(&format!(
+                        "{prefix}rerank model {asked} is not published yet - search_code ranks with \
+                         {variant} from {shown_dir} at {variant}'s own beta",
+                        prefix = crate::log::role_prefix()
+                    ));
+                } else if fallback {
                     (self.log)(&format!(
                         "{prefix}rerank model {selected} is not fetched - search_code ranks with {variant} \
-                         from {} until g-mesh model fetch adds it",
-                        dir.as_deref().unwrap_or(Path::new("?")).display(),
+                         from {shown_dir} at {variant}'s own beta until g-mesh model fetch adds it",
                         prefix = crate::log::role_prefix()
                     ));
                 }
@@ -743,9 +778,14 @@ impl Reranker {
                 let outcome = match loaded {
                     Ok((scorer, beta)) => Outcome::Loaded { scorer, beta },
                     Err(err) => {
+                        let advice = if variant.published() {
+                            "Run g-mesh model fetch to enable it."
+                        } else {
+                            "It is not published yet, so g-mesh model fetch cannot add it."
+                        };
                         (self.log)(&format!(
                             "{prefix}rerank model {variant} is not available ({err:#}) - \
-                             search_code keeps the embedding order. Run g-mesh model fetch to enable it.",
+                             search_code keeps the embedding order. {advice}",
                             prefix = crate::log::role_prefix()
                         ));
                         if dir.as_deref().is_some_and(any_file_absent) {
@@ -766,6 +806,7 @@ impl Reranker {
                     dir,
                     variant,
                     fallback,
+                    unpublished: variant.and(unpublished),
                 };
                 let written = serde_json::to_string(&record)
                     .map_err(anyhow::Error::from)
@@ -1175,6 +1216,7 @@ mod tests {
                 dir: Some(empty.path().to_path_buf()),
                 variant: Some(RerankVariant::L6),
                 fallback: false,
+                unpublished: None,
             })
         );
         std::fs::remove_file(&path).unwrap();
@@ -1206,6 +1248,7 @@ mod tests {
                 dir: Some("/m".into()),
                 variant: None,
                 fallback: false,
+                unpublished: None,
             })
         );
         std::fs::write(&path, "not json").unwrap();
@@ -1260,7 +1303,7 @@ mod tests {
     // pinned files.
     // -----------------------------------------------------------------------
 
-    /// The variant `$G_MESH_RERANK_MODEL` names (default `qat`) from its
+    /// The variant `$G_MESH_RERANK_MODEL` names (default `l6`) from its
     /// directory.
     fn load_real() -> CrossEncoder {
         load_real_variant(env_rerank_variant())

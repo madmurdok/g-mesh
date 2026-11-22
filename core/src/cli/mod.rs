@@ -281,7 +281,7 @@ pub enum ModelCommand {
         /// Where to put the embedding weights. Defaults to
         /// `$G_MESH_MODEL_DIR`, else `~/.g-mesh/models/<model>` - the same
         /// resolution the loader uses, so the two cannot disagree. The rerank
-        /// model (`[rerank] model` or `$G_MESH_RERANK_MODEL`, default `qat`)
+        /// model (`[rerank] model` or `$G_MESH_RERANK_MODEL`, default `l6`)
         /// goes to `$G_MESH_RERANK_MODEL_DIR`, else
         /// `~/.g-mesh/models/<its directory>`.
         #[arg(long)]

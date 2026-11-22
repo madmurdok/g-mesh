@@ -233,26 +233,26 @@ from nowhere else in the codebase). Using the binary built in step 1
 ```bash
 g-mesh model fetch
 # -> ~/.g-mesh/models/jina-embeddings-v2-base-code/{model.onnx,tokenizer.json}
-# -> ~/.g-mesh/models/g-mesh-reranker-l6-qat/{model.onnx,tokenizer.json}  (the rerank model)
+# -> ~/.g-mesh/models/ms-marco-MiniLM-L6-v2/{model.onnx,tokenizer.json}   (the rerank model)
 
 g-mesh model status   # where the weights are expected, and whether they're there
 ```
 
 `model fetch` also downloads the cross-encoder `search_code` reranks with
 (see "Tools exposed"), the selected *variant* ([ADR 0044](docs/adr/0044-qat-reranker-variant.md)):
-`qat` (the default), `cross-encoder/ms-marco-MiniLM-L6-v2` trained further on
-code search pairs, from g-mesh's own Hugging Face repo, into
-`~/.g-mesh/models/g-mesh-reranker-l6-qat`; or `l6`, the original model at
-revision `233902d25c440f23af6f7d6e94d2946bac0bee0a`, its dynamic-int8 export
-(`onnx/model_quint8_avx2.onnx`), into `~/.g-mesh/models/ms-marco-MiniLM-L6-v2`.
-Each is 23 MB, saved as `model.onnx`, checked against a pinned SHA-256 like the
-embedding model, and again by the daemon when it loads it. Select the variant
-with `[rerank] model = "l6"` in `~/.g-mesh/config.toml` or
-`G_MESH_RERANK_MODEL=l6` (the environment wins); fetching one never touches
-the other's directory, so switching back needs no download. While the default
-`qat` is not fetched and `l6` is, the daemon ranks with `l6`, says so once in
-its log, and `g-mesh status` shows it. `--no-rerank` skips the rerank model;
-`G_MESH_RERANK_MODEL_DIR` puts the selected variant elsewhere
+`l6` (the default), `cross-encoder/ms-marco-MiniLM-L6-v2` at revision
+`233902d25c440f23af6f7d6e94d2946bac0bee0a`, its dynamic-int8 export
+(`onnx/model_quint8_avx2.onnx`, 23 MB, saved as `model.onnx`; an older fp32
+`model.onnx` is replaced), into `~/.g-mesh/models/ms-marco-MiniLM-L6-v2`,
+checked against a pinned SHA-256 like the embedding model, and again by the
+daemon when it loads it. The other variant, `qat` (the same model trained
+further on code search pairs), is not published yet: selecting it with
+`[rerank] model = "qat"` in `~/.g-mesh/config.toml` or
+`G_MESH_RERANK_MODEL=qat` keeps ranking with `l6` at `l6`'s own blend weight,
+and the daemon log and `g-mesh status` say so. `G_MESH_RERANK_BETA` replaces
+the blend weight of the variant actually loaded, never of a stand-in.
+`--no-rerank` skips the rerank model; `G_MESH_RERANK_MODEL_DIR` puts the
+selected variant elsewhere
 (`G_MESH_MODEL_DIR` names the embedding model's own directory, so it cannot
 also hold this one). Without it
 `search_code` keeps the embedding order, says so once in the daemon log, and
@@ -261,9 +261,10 @@ adds a `hint` to one first page per daemon; `g-mesh status` shows it as
 sha256 mismatch) shows as `failed to load`: `model fetch` keeps a file of the
 pinned size, so delete the rerank directory first, then fetch. `model fetch`
 fetches the rerank model even when it refuses to fetch a non-default
-embedding model. **After upgrading, run `g-mesh model fetch` again** (then
-restart the daemon with `g-mesh stop`): it adds the new rerank model, and an
-upgrade does not fetch it for you.
+embedding model. **If you fetched models before 3.18.0, run `g-mesh
+model fetch` again after upgrading** (then restart the daemon with `g-mesh
+stop`): releases before it did not download the rerank model, and an upgrade
+does not fetch it for you.
 
 **If you are comparing two indexes, point `G_MESH_MODEL_DIR` at an empty
 directory in both arms.** Embedding generation, not indexing, dominates a

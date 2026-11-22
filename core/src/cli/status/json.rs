@@ -59,7 +59,9 @@ pub fn to_json(report: &Report) -> Value {
 /// `loaded`), `onDisk` this shell's check (`present`, `fallback`, `missing`,
 /// `disabled`); exactly one is non-null. `variant` is the daemon's variant
 /// (null when its record names none) or the selected one; `fallback` is true
-/// when the default variant is missing and its fallback is used.
+/// when the default variant is missing and its fallback is used;
+/// `unpublished` names the unpublished variant asked for, for which
+/// `variant` stands in (else null).
 fn rerank_model(status: &RerankStatus) -> Value {
     match status {
         RerankStatus::Daemon(record) => json!({
@@ -67,8 +69,9 @@ fn rerank_model(status: &RerankStatus) -> Value {
             "onDisk": null,
             "variant": record.variant,
             "fallback": record.fallback,
+            "unpublished": record.unpublished,
         }),
-        RerankStatus::OnDisk { variant, state, .. } => json!({
+        RerankStatus::OnDisk { variant, unpublished, state, .. } => json!({
             "daemon": null,
             "onDisk": match state {
                 RerankModelState::Present => "present",
@@ -78,6 +81,7 @@ fn rerank_model(status: &RerankStatus) -> Value {
             },
             "variant": variant,
             "fallback": matches!(state, RerankModelState::Fallback(_)),
+            "unpublished": unpublished,
         }),
     }
 }

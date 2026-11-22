@@ -298,7 +298,8 @@ fn a_report_renders_every_field_it_was_asked_for() {
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     };
@@ -348,7 +349,8 @@ fn an_interrupted_workspace_reindex_is_named() {
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     };
@@ -392,7 +394,8 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     };
@@ -442,7 +445,8 @@ fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_gene
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     });
@@ -652,7 +656,8 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     };
@@ -703,7 +708,8 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     }
@@ -923,7 +929,8 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     };
@@ -1022,7 +1029,8 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     };
@@ -1242,7 +1250,8 @@ fn a_project_with_no_suspension_marker_reports_none() {
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     };
@@ -1278,7 +1287,8 @@ fn report_with(index: IndexStatus) -> Report {
         languages: no_languages(),
         rerank_model: RerankStatus::OnDisk {
             daemon_alive: false,
-            variant: RerankVariant::Qat,
+            variant: RerankVariant::L6,
+            unpublished: None,
             state: RerankModelState::Present,
         },
     }
@@ -1810,6 +1820,7 @@ fn daemon_said(outcome: RerankOutcome, dir: Option<&str>) -> RerankStatus {
         dir: dir.map(PathBuf::from),
         variant: None,
         fallback: false,
+        unpublished: None,
     })
 }
 
@@ -1847,6 +1858,7 @@ fn the_live_daemons_own_outcome_is_reported() {
         dir: Some(PathBuf::from("/models/rerank")),
         variant: None,
         fallback: false,
+        unpublished: None,
     };
     for core in [
         CoreState::Running { pid: 4242 },
@@ -1907,11 +1919,16 @@ fn each_daemon_outcome_has_its_own_wording() {
 #[test]
 fn the_on_disk_fallback_is_labelled() {
     let on_disk = |daemon_alive, state| {
-        rerank_line(RerankStatus::OnDisk { daemon_alive, variant: RerankVariant::Qat, state })
+        rerank_line(RerankStatus::OnDisk {
+            daemon_alive,
+            variant: RerankVariant::L6,
+            unpublished: None,
+            state,
+        })
     };
     assert_eq!(
         on_disk(false, RerankModelState::Missing),
-        "no daemon running; on disk: missing - run `g-mesh model fetch`; model qat"
+        "no daemon running; on disk: missing - run `g-mesh model fetch`; model l6"
     );
     assert!(
         on_disk(true, RerankModelState::Present).starts_with("not loaded yet; on disk: present ("),
@@ -1946,7 +1963,7 @@ fn the_json_names_the_daemon_outcome_or_the_on_disk_state() {
     ] {
         assert_eq!(
             json(daemon_said(outcome, None)),
-            serde_json::json!({ "daemon": word, "onDisk": null, "variant": null, "fallback": false })
+            serde_json::json!({ "daemon": word, "onDisk": null, "variant": null, "fallback": false, "unpublished": null })
         );
     }
     for (state, word) in [
@@ -1956,8 +1973,13 @@ fn the_json_names_the_daemon_outcome_or_the_on_disk_state() {
     ] {
         for daemon_alive in [false, true] {
             assert_eq!(
-                json(RerankStatus::OnDisk { daemon_alive, variant: RerankVariant::Qat, state }),
-                serde_json::json!({ "daemon": null, "onDisk": word, "variant": "qat", "fallback": false })
+                json(RerankStatus::OnDisk {
+                    daemon_alive,
+                    variant: RerankVariant::L6,
+                    unpublished: None,
+                    state
+                }),
+                serde_json::json!({ "daemon": null, "onDisk": word, "variant": "l6", "fallback": false, "unpublished": null })
             );
         }
     }

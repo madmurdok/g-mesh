@@ -71,9 +71,34 @@ pub fn rerank_model_settings() -> RerankSettings {
 /// [`RerankSettings`] for the variant [`select_variant`] picks from the
 /// environment and `file`.
 fn rerank_settings_for(enabled: bool, file: Option<&GlobalConfig>) -> RerankSettings {
-    let (variant, explicit) = select_variant(env_lookup, file, |line| crate::log_line!("{line}"));
-    let dir_override = rerank_dir_override();
-    let fallback_dir = if explicit || dir_override.is_some() {
+    let (selected, explicit) = select_variant(env_lookup, file, |line| crate::log_line!("{line}"));
+    settle_rerank(
+        enabled,
+        selected,
+        explicit,
+        rerank_dir_override().as_deref(),
+        rerank_beta_override(|line| crate::log_line!("{line}")),
+    )
+}
+
+/// The settings for `selected`. An unpublished variant
+/// ([`RerankVariant::published`]) is kept only when both `dir_override`
+/// and `beta_override` are set; otherwise its fallback stands in, in the
+/// overridden directory if any, at its own beta (ADR 0044).
+/// `beta_override` applies only to the variant kept.
+pub(crate) fn settle_rerank(
+    enabled: bool,
+    selected: RerankVariant,
+    explicit: bool,
+    dir_override: Option<&Path>,
+    beta_override: Option<f64>,
+) -> RerankSettings {
+    let measuring = dir_override.is_some() && beta_override.is_some();
+    let (variant, unpublished, beta_override) = match selected.fallback() {
+        Some(stand_in) if !selected.published() && !measuring => (stand_in, Some(selected), None),
+        _ => (selected, None, beta_override),
+    };
+    let fallback_dir = if explicit || dir_override.is_some() || unpublished.is_some() {
         None
     } else {
         variant.fallback().and_then(|fallback| rerank_model_dir_from(None, fallback).ok())
@@ -81,9 +106,10 @@ fn rerank_settings_for(enabled: bool, file: Option<&GlobalConfig>) -> RerankSett
     RerankSettings {
         enabled,
         variant,
-        model_dir: rerank_model_dir_from(dir_override.as_deref(), variant),
+        model_dir: rerank_model_dir_from(dir_override, variant),
         fallback_dir,
-        beta_override: rerank_beta_override(|line| crate::log_line!("{line}")),
+        beta_override,
+        unpublished,
     }
 }
 

@@ -50,7 +50,9 @@ use anyhow::{Context, Result};
 use crate::control::lock::{self, DaemonLock};
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
-use crate::embedding::rerank::{OutcomeRecord, RerankModelState, RerankOutcome, RerankVariant};
+use crate::embedding::rerank::{
+    OutcomeRecord, RerankModelState, RerankOutcome, RerankVariant, RERANK_MODEL_DIR_ENV,
+};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
 use crate::index_health::{index_status, language_retries, language_section, semantic_pass_lines};
@@ -245,8 +247,14 @@ pub enum RerankStatus {
     Daemon(OutcomeRecord),
     /// No outcome from a live daemon (none running, or no `search_code` call
     /// has resolved it yet): the selected variant's model on disk under this
-    /// shell's environment.
-    OnDisk { daemon_alive: bool, variant: RerankVariant, state: RerankModelState },
+    /// shell's environment. `unpublished` is the unpublished variant a
+    /// setting asked for, `variant` its stand-in.
+    OnDisk {
+        daemon_alive: bool,
+        variant: RerankVariant,
+        unpublished: Option<RerankVariant>,
+        state: RerankModelState,
+    },
 }
 
 /// The live daemon's [`OutcomeRecord`] in `state_dir`, else the on-disk check.
@@ -265,6 +273,7 @@ fn rerank_status(core: CoreState, state_dir: &Path) -> RerankStatus {
             RerankStatus::OnDisk {
                 daemon_alive: live_pid.is_some(),
                 variant: settings.variant,
+                unpublished: settings.unpublished,
                 state: RerankModelState::of(settings),
             }
         }
@@ -822,20 +831,21 @@ fn describe_rerank(status: &RerankStatus) -> String {
     match status {
         RerankStatus::Daemon(record) => {
             let said = describe_outcome(record);
-            match (record.outcome, record.variant) {
+            let line = match (record.outcome, record.variant) {
                 (RerankOutcome::Loaded, Some(variant)) if record.fallback => format!(
                     "{said}: model {variant}, the fallback for the default {}, which is not fetched - \
                      run `g-mesh model fetch`, then restart the daemon (`g-mesh stop`)",
                     RerankVariant::DEFAULT
                 ),
-                (RerankOutcome::Loaded, Some(variant)) => format!("{said}: model {variant}"),
+                (RerankOutcome::Loaded, Some(variant)) => format!("{said}: model {}", variant_words(variant)),
                 (RerankOutcome::Absent | RerankOutcome::Failed, Some(variant)) => {
-                    format!("{said}; model {variant}")
+                    format!("{said}; model {}", variant_words(variant))
                 }
                 _ => said,
-            }
+            };
+            with_unpublished_note(line, record.unpublished, record.variant)
         }
-        RerankStatus::OnDisk { daemon_alive, variant, state } => {
+        RerankStatus::OnDisk { daemon_alive, variant, unpublished, state } => {
             let lead = if *daemon_alive { "not loaded yet" } else { "no daemon running" };
             let on_disk = match state {
                 RerankModelState::Present => {
@@ -845,31 +855,74 @@ fn describe_rerank(status: &RerankStatus) -> String {
                     "missing, {fallback} present - the daemon ranks with {fallback} until `g-mesh \
                      model fetch` adds this model"
                 ),
+                RerankModelState::Missing if !variant.published() => {
+                    format!("missing - {}", unpublished_advice())
+                }
                 RerankModelState::Missing => "missing - run `g-mesh model fetch`".to_string(),
                 RerankModelState::Disabled => RERANK_DISABLED.to_string(),
             };
-            format!("{lead}; on disk: {on_disk}; model {variant}")
+            let line = format!("{lead}; on disk: {on_disk}; model {}", variant_words(*variant));
+            with_unpublished_note(line, *unpublished, Some(*variant))
         }
+    }
+}
+
+/// `variant`'s name, marked when it is not published: it is then loaded only
+/// as a measurement setup.
+fn variant_words(variant: RerankVariant) -> String {
+    if variant.published() {
+        variant.to_string()
+    } else {
+        format!(
+            "{variant} (not published yet; loaded only with {} and {} set)",
+            RERANK_MODEL_DIR_ENV,
+            crate::knobs::RERANK_BETA.name
+        )
+    }
+}
+
+fn unpublished_advice() -> String {
+    format!("`g-mesh model fetch` cannot add a model that is not published; put its files in {RERANK_MODEL_DIR_ENV}")
+}
+
+/// `line`, followed by why `stand_in` is used when the asked-for variant is
+/// not published.
+fn with_unpublished_note(
+    line: String,
+    unpublished: Option<RerankVariant>,
+    stand_in: Option<RerankVariant>,
+) -> String {
+    match (unpublished, stand_in) {
+        (Some(asked), Some(stand_in)) => format!(
+            "{line} ({asked} is not published yet, so {stand_in} stands in at its own beta; {} applies \
+             to {asked} only)",
+            crate::knobs::RERANK_BETA.name
+        ),
+        _ => line,
     }
 }
 
 /// The daemon's outcome in words, without the variant.
 fn describe_outcome(record: &OutcomeRecord) -> String {
+    let unpublished = record.variant.is_some_and(|variant| !variant.published());
     match record.outcome {
         RerankOutcome::Loaded => "loaded".to_string(),
         RerankOutcome::Off => RERANK_DISABLED.to_string(),
+        RerankOutcome::Absent if unpublished => {
+            format!("missing - search_code ranks by embedding similarity only; {}", unpublished_advice())
+        }
         RerankOutcome::Absent => {
             "missing - search_code ranks by embedding similarity only; run `g-mesh model \
                                       fetch`, then restart the daemon (`g-mesh stop`)"
                 .to_string()
         }
         RerankOutcome::Failed => match &record.dir {
-            Some(dir) => format!(
+            Some(dir) if !unpublished => format!(
                 "failed to load (see the daemon log) - search_code ranks by embedding similarity only; \
                      delete {}, run `g-mesh model fetch`, then restart the daemon (`g-mesh stop`)",
                 dir.display()
             ),
-            None => "failed to load (see the daemon log) - search_code ranks by embedding similarity only"
+            _ => "failed to load (see the daemon log) - search_code ranks by embedding similarity only"
                 .to_string(),
         },
     }

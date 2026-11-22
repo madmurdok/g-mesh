@@ -1,4 +1,4 @@
-# 0044. The rerank model is a selectable variant; the QAT-trained L6 is the default
+# 0044. The rerank model is a selectable variant
 
 ## Status
 Proposed (GM-741; owner decisions D1-D4, D6 of the design note, all as
@@ -24,29 +24,40 @@ regression needs a way back that does not need a rebuild or a download.
   `qat` is the QAT-trained model from g-mesh's own Hugging Face repo; `l6`
   is today's model at beta 40, unchanged.
 - **Selection.** `G_MESH_RERANK_MODEL`, else `[rerank] model` in the global
-  config, else `qat`. A value naming no variant logs one line and gives the
+  config, else `l6` while `qat` is unpublished (the default becomes `qat`
+  once it is published). A value naming no variant logs one line and gives the
   default.
 - **Directories.** Each variant has its own directory under
   `~/.g-mesh/models/` (`g-mesh-reranker-l6-qat`, `ms-marco-MiniLM-L6-v2`), so
   `model fetch` of one never overwrites the other and rollback to `l6` needs
   no download. `G_MESH_RERANK_MODEL_DIR` overrides the selected variant's
   directory. A flat mirror serves `<base>/<directory>/model.onnx`.
-- **Fallback.** When the default `qat` is selected by no setting, its
+- **Fallback.** When a published default `qat` is selected by no setting, its
   directory is not overridden and lacks a file, and `l6`'s directory holds
   both files at their pinned sizes, the daemon loads `l6`, logs it once, and
   `g-mesh status` says so. An explicit choice never falls back.
 - **Blend weight.** Each variant carries its own beta, fitted on eval v2 FIT
   against its own logits. The similarity floors and the verdict read the
   embedding cosine only and do not change. `G_MESH_RERANK_BETA` overrides the
-  loaded variant's beta for measurement.
+  beta of the selected variant only while that variant itself is loaded; a
+  fallback or a stand-in always ranks at its own beta.
 - **Unpublished pins.** Until the upload, `qat`'s repo and commit are
   `UNPUBLISHED` placeholders and `model fetch` refuses to download it; its
   beta is `UNFITTED_BETA` (NaN), and the daemon refuses to rerank with it
   unless `G_MESH_RERANK_BETA` is set.
+- **Unpublished variant stands in (deviates from D3).** While `qat` is
+  unpublished (`RerankVariant::published`), selecting it, explicitly or as
+  the default, loads its fallback `l6` instead: from `l6`'s directory (or
+  `G_MESH_RERANK_MODEL_DIR`), at `l6`'s own beta, with one daemon log line
+  and a `g-mesh status` / `model` note that `qat` is not published yet.
+  `model fetch` then fetches `l6`. `qat` itself loads only with both
+  `G_MESH_RERANK_MODEL_DIR` and `G_MESH_RERANK_BETA` set, for measurement.
+  Publishing is the pin change plus flipping `RerankVariant::DEFAULT`; the
+  stand-in rule then goes dormant.
 
 ## Consequences
 - Two pinned models to maintain until `l6` is retired by a later task.
-- Every existing user runs `l6` after the upgrade until they run `g-mesh
-  model fetch`; the installer says to run it.
+- Until `qat` is published, every user runs `l6` exactly as before, and the
+  installer's fetch advice is unchanged.
 - The eval scripts take `--ce l6|qat` (`rerank_eval.SHIPPED_CE`); `l6` is
   the default and reproduces their earlier outputs.

@@ -69,7 +69,7 @@ use crate::config::EmbeddingConfig;
 use crate::embedding::model::{
     DEFAULT_ONNX_REMOTE_PATH, DEFAULT_ONNX_SHA256, DEFAULT_ONNX_SIZE, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
-use crate::embedding::rerank::{RerankVariant, VariantSpec, L6, QAT};
+use crate::embedding::rerank::{RerankVariant, VariantSpec, L6, QAT, RERANK_MODEL_DIR_ENV};
 
 /// The Hugging Face repository the default model comes from.
 pub(crate) const MODEL_REPO: &str = "jinaai/jina-embeddings-v2-base-code";
@@ -239,18 +239,37 @@ fn rerank_files(variant: RerankVariant) -> &'static [RemoteFile; 2] {
     }
 }
 
-/// The rerank variant `model` works on, its directory, and the fallback
-/// variant's directory when a missing default falls back to it.
+/// The rerank variant `model` works on, its directory, the fallback
+/// variant's directory when a missing default falls back to it, and the
+/// unpublished variant asked for when `variant` stands in for it.
 struct RerankTarget {
     variant: RerankVariant,
     dir: PathBuf,
     fallback_dir: Option<PathBuf>,
+    unpublished: Option<RerankVariant>,
 }
 
 impl RerankTarget {
     fn from_settings() -> Result<Self> {
         let settings = rerank_model_settings();
-        Ok(Self { variant: settings.variant, dir: settings.model_dir?, fallback_dir: settings.fallback_dir })
+        Ok(Self {
+            variant: settings.variant,
+            dir: settings.model_dir?,
+            fallback_dir: settings.fallback_dir,
+            unpublished: settings.unpublished,
+        })
+    }
+
+    /// One line when `variant` stands in for an unpublished variant.
+    fn note_unpublished(&self, out: &mut impl Write) -> Result<()> {
+        if let Some(asked) = self.unpublished {
+            writeln!(
+                out,
+                "rerank model {asked} is not published yet - using {}, at its own beta",
+                self.variant
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -403,6 +422,9 @@ fn model_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf> 
 /// fetch still fetches it, then fails with the refusal.
 fn fetch(explicit: Option<&Path>, rerank: Option<&RerankTarget>, out: &mut impl Write) -> Result<()> {
     let model = resolved_model();
+    if let Some(rerank) = rerank {
+        rerank.note_unpublished(out)?;
+    }
     // Before the embedding directory is created, so a refused fetch leaves
     // nothing behind there.
     if let Some(refusal) = fetch_refusal(explicit, &model, &model_dir(None, &model)?) {
@@ -554,6 +576,7 @@ fn status(explicit: Option<&Path>, rerank: Option<&RerankTarget>, out: &mut impl
     if let Some(rerank) = rerank {
         let spec = rerank.variant.spec();
         writeln!(out, "\nrerank model: {} ({})", rerank.variant, spec.repo)?;
+        rerank.note_unpublished(out)?;
         writeln!(out, "revision:  {}", spec.revision)?;
         writeln!(out, "directory: {}", rerank.dir.display())?;
         let fallback = rerank
@@ -570,10 +593,16 @@ fn status(explicit: Option<&Path>, rerank: Option<&RerankTarget>, out: &mut impl
                  model fetch` to download it.",
                 dir.display()
             )?;
-        } else {
+        } else if rerank.variant.published() {
             writeln!(
                 out,
                 "\nsearch_code keeps the embedding order; run `g-mesh model fetch` to download it."
+            )?;
+        } else {
+            writeln!(
+                out,
+                "\nsearch_code keeps the embedding order; this model is not published yet, so `g-mesh \
+                 model fetch` cannot download it: put its files in {RERANK_MODEL_DIR_ENV}."
             )?;
         }
     }
@@ -898,7 +927,12 @@ mod tests {
 
     /// `l6` in `dir`, with no fallback.
     fn l6_target(dir: &Path) -> RerankTarget {
-        RerankTarget { variant: RerankVariant::L6, dir: dir.to_path_buf(), fallback_dir: None }
+        RerankTarget {
+            variant: RerankVariant::L6,
+            dir: dir.to_path_buf(),
+            fallback_dir: None,
+            unpublished: None,
+        }
     }
 
     fn test_file() -> RemoteFile {
