@@ -451,7 +451,8 @@ fn fetch(explicit: Option<&Path>, rerank: Option<&RerankTarget>, out: &mut impl 
 }
 
 /// Fetches `variant` into `rerank_dir`; refused, before anything is created,
-/// while the variant is unpublished.
+/// while the variant is unpublished or while `rerank_dir` holds another
+/// variant's model.
 fn fetch_rerank(
     agent: &ureq::Agent,
     variant: RerankVariant,
@@ -460,12 +461,28 @@ fn fetch_rerank(
     out: &mut impl Write,
 ) -> Result<()> {
     variant.spec().check_published()?;
+    if let Some(other) = other_variant_in(rerank_dir, variant) {
+        bail!(
+            "{} holds rerank model {other}, not {variant}; `g-mesh model fetch` does not replace it \
+             ({other} may not be downloadable). Point {RERANK_MODEL_DIR_ENV} at another directory, or unset it.",
+            rerank_dir.display()
+        );
+    }
     fs::create_dir_all(rerank_dir)
         .with_context(|| format!("failed to create model directory {}", rerank_dir.display()))?;
     writeln!(out, "rerank model {variant} directory: {}", rerank_dir.display())?;
     fetch_files(agent, rerank_dir, rerank_files(variant), sources, out)?;
     writeln!(out, "\nrerank model {variant} ready in {}", rerank_dir.display())?;
     Ok(())
+}
+
+/// The variant other than `variant` whose `model.onnx` is in `dir` at its
+/// pinned size. The variants' `model.onnx` sizes differ (their tokenizers do
+/// not), so the size tells them apart; replacing that file would lose a
+/// model that may not be downloadable (an unpublished `qat`).
+fn other_variant_in(dir: &Path, variant: RerankVariant) -> Option<RerankVariant> {
+    let size = fs::metadata(dir.join(ONNX_FILE_NAME)).ok()?.len();
+    RerankVariant::ALL.into_iter().find(|other| *other != variant && other.spec().onnx_size == size)
 }
 
 /// Downloads each of `files` into `dir` unless it is already there at its

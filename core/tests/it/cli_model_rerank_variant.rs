@@ -31,15 +31,21 @@ fn size(text: &str) -> u64 {
         .unwrap_or_else(|_| panic!("not a size: {text}"))
 }
 
-/// `field`'s value in the `L6` `VariantSpec` of the rerank module.
-fn l6_size(field: &str) -> u64 {
+/// `field`'s value in the `spec` (`L6`, `QAT`) `VariantSpec` of the rerank
+/// module.
+fn spec_size(spec: &str, field: &str) -> u64 {
     let prefix = format!("{field}: ");
+    let header = format!("pub(crate) const {spec}: VariantSpec");
     RERANK_SOURCE
         .lines()
-        .skip_while(|line| !line.starts_with("pub(crate) const L6: VariantSpec"))
+        .skip_while(|line| !line.starts_with(&header))
         .take_while(|line| *line != "};")
         .find_map(|line| line.trim().strip_prefix(&prefix).map(size))
-        .unwrap_or_else(|| panic!("no `{prefix}` in rerank.rs's L6"))
+        .unwrap_or_else(|| panic!("no `{prefix}` in rerank.rs's {spec}"))
+}
+
+fn l6_size(field: &str) -> u64 {
+    spec_size("L6", field)
 }
 
 /// The embedding model's (`model.onnx`, `tokenizer.json`) pinned sizes.
@@ -92,6 +98,20 @@ impl Home {
 
     fn place_l6(&self, dir: &Path) {
         place(dir, [("model.onnx", l6_size("onnx_size")), ("tokenizer.json", l6_size("tokenizer_size"))]);
+    }
+
+    /// `qat`'s files in a directory of their own, as the measurement setup
+    /// keeps them (its only copy while it is unpublished).
+    fn place_qat(&self) -> PathBuf {
+        let dir = self.home.path().join("qat");
+        place(
+            &dir,
+            [
+                ("model.onnx", spec_size("QAT", "onnx_size")),
+                ("tokenizer.json", spec_size("QAT", "tokenizer_size")),
+            ],
+        );
+        dir
     }
 
     fn write_global_config(&self, toml: &str) {
@@ -225,4 +245,61 @@ fn status_of_the_measurement_setup_does_not_send_the_reader_to_fetch() {
     assert!(!stdout.contains(STAND_IN_NOTE), "{stdout}");
     assert!(stdout.contains("not published yet, so `g-mesh model fetch` cannot download it"), "{stdout}");
     assert!(!stdout.contains("run `g-mesh model fetch`"), "{stdout}");
+}
+
+fn onnx_len(dir: &Path) -> u64 {
+    std::fs::metadata(dir.join("model.onnx")).unwrap().len()
+}
+
+/// `qat` asked for with `G_MESH_RERANK_MODEL_DIR` holding its files but no
+/// beta: `l6` stands in from its own directory; that directory is neither
+/// fetched into nor reported, and `qat`'s `model.onnx` stays.
+///
+/// *Control:* pass `dir_override` to the stand-in in `settle_rerank` ->
+/// fetch and status name the `qat` directory.
+#[test]
+fn the_stand_in_never_touches_a_directory_set_for_qat() {
+    let home = Home::new();
+    let l6_dir = home.rerank_dir(L6_DIR_NAME);
+    home.place_l6(&l6_dir);
+    let qat_dir = home.place_qat();
+    let env = [(RERANK_MODEL_ENV, Path::new("qat")), (RERANK_MODEL_DIR_ENV, qat_dir.as_path())];
+
+    let fetch = stdout_of(&home.model(&["fetch"], &env));
+    assert!(fetch.contains(&format!("rerank model l6 ready in {}", l6_dir.display())), "{fetch}");
+    assert!(!fetch.contains(&qat_dir.display().to_string()), "{fetch}");
+    assert_eq!(onnx_len(&qat_dir), spec_size("QAT", "onnx_size"));
+
+    let status = stdout_of(&home.model(&["status"], &env));
+    assert!(status.contains(&format!("directory: {}", l6_dir.display())), "{status}");
+    assert!(!status.contains(&qat_dir.display().to_string()), "{status}");
+    assert!(status.contains("search_code can rerank with this model"), "{status}");
+}
+
+/// `l6` selected with `G_MESH_RERANK_MODEL_DIR` holding `qat`'s files:
+/// `model fetch` refuses before replacing anything and says why.
+///
+/// *Control:* drop the `other_variant_in` check in `fetch_rerank` -> the
+/// fetch starts replacing `qat`'s `model.onnx` (and fails on the dead
+/// mirror without the refusal).
+#[test]
+fn fetch_never_replaces_another_variants_model() {
+    let home = Home::new();
+    let qat_dir = home.place_qat();
+    for variant in [None, Some("l6")] {
+        let mut env = vec![(RERANK_MODEL_DIR_ENV, qat_dir.as_path())];
+        if let Some(variant) = variant {
+            env.push((RERANK_MODEL_ENV, Path::new(variant)));
+        }
+        let output = home.model(&["fetch"], &env);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{variant:?}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains(&format!("{} holds rerank model qat, not l6", qat_dir.display())),
+            "{variant:?}: {stderr}"
+        );
+        assert!(!stdout.contains("replacing") && !stdout.contains("downloading model.onnx"), "{stdout}");
+        assert_eq!(onnx_len(&qat_dir), spec_size("QAT", "onnx_size"));
+    }
 }

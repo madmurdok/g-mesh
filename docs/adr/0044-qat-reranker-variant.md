@@ -47,10 +47,13 @@ regression needs a way back that does not need a rebuild or a download.
   unless `G_MESH_RERANK_BETA` is set.
 - **Unpublished variant stands in (deviates from D3).** While `qat` is
   unpublished (`RerankVariant::published`), selecting it, explicitly or as
-  the default, loads its fallback `l6` instead: from `l6`'s directory (or
-  `G_MESH_RERANK_MODEL_DIR`), at `l6`'s own beta, with one daemon log line
-  and a `g-mesh status` / `model` note that `qat` is not published yet.
-  `model fetch` then fetches `l6`. `qat` itself loads only with both
+  the default, loads its fallback `l6` instead: from `l6`'s own default
+  directory, at `l6`'s own beta, with one daemon log line and a
+  `g-mesh status` / `model` note that `qat` is not published yet.
+  `model fetch` then fetches `l6`. `G_MESH_RERANK_MODEL_DIR` applies only to
+  the variant selected and loaded (it may hold `qat`'s only copy), so the
+  stand-in never reads, fetches into or advises about it, and `model fetch`
+  refuses a directory holding another variant's `model.onnx`. `qat` itself loads only with both
   `G_MESH_RERANK_MODEL_DIR` and `G_MESH_RERANK_BETA` set, for measurement.
   Publishing is the pin change plus flipping `RerankVariant::DEFAULT`; the
   stand-in rule then goes dormant.

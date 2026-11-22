@@ -83,9 +83,11 @@ fn rerank_settings_for(enabled: bool, file: Option<&GlobalConfig>) -> RerankSett
 
 /// The settings for `selected`. An unpublished variant
 /// ([`RerankVariant::published`]) is kept only when both `dir_override`
-/// and `beta_override` are set; otherwise its fallback stands in, in the
-/// overridden directory if any, at its own beta (ADR 0044).
-/// `beta_override` applies only to the variant kept.
+/// and `beta_override` are set; otherwise its fallback stands in, from its
+/// own default directory, at its own beta (ADR 0044). `dir_override` and
+/// `beta_override` apply only to the variant selected and kept: a
+/// directory set for the unpublished variant may hold its only copy, which
+/// the stand-in must neither load nor advise fetching over.
 pub(crate) fn settle_rerank(
     enabled: bool,
     selected: RerankVariant,
@@ -103,6 +105,7 @@ pub(crate) fn settle_rerank(
     } else {
         variant.fallback().and_then(|fallback| rerank_model_dir_from(None, fallback).ok())
     };
+    let dir_override = if unpublished.is_some() { None } else { dir_override };
     RerankSettings {
         enabled,
         variant,
@@ -487,9 +490,12 @@ mod tests {
     }
 
     /// `qat` is not published: asked for, explicitly or not, with no
-    /// directory or no beta set, `l6` stands in - in `l6`'s directory or the
-    /// one set, at `l6`'s own beta (a beta set for `qat` is dropped), with
-    /// no fallback.
+    /// directory or no beta set, `l6` stands in - always in `l6`'s own
+    /// directory (a directory set for `qat` may hold its only copy), at
+    /// `l6`'s own beta (a beta set for `qat` is dropped), with no fallback.
+    ///
+    /// *Control (directory):* pass `dir_override` to the stand-in in
+    /// `settle_rerank` -> the directory-only row loads `l6` from it.
     ///
     /// *Control:* drop the `!selected.published()` arm of `settle_rerank`
     /// -> `qat` is kept.
@@ -504,7 +510,8 @@ mod tests {
 
             let dir_only = settle_rerank(true, QAT, explicit, Some(elsewhere), None);
             assert_eq!(parts(&dir_only), (true, L6, None, None, Some(QAT)));
-            assert_eq!(dir_only.model_dir.unwrap(), elsewhere);
+            assert_eq!(dir_only.model_dir.unwrap(), default_dir("ms-marco-MiniLM-L6-v2"));
+            assert_ne!(default_dir("ms-marco-MiniLM-L6-v2"), elsewhere);
 
             let beta_only = settle_rerank(true, QAT, explicit, None, Some(7.5));
             assert_eq!(parts(&beta_only), (true, L6, None, None, Some(QAT)), "the beta is qat's, dropped");
