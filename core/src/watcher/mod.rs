@@ -59,6 +59,10 @@ pub struct ProjectWatcher {
     // Set by `next_change` on every signal it receives, ignored paths
     // included, before any filtering; cleared by [`Self::take_signal_seen`].
     signal_seen: AtomicBool,
+    // Every signal `next_change` received, in order, for tests that must
+    // name what stamped a signal record ([`Self::take_seen_signals`]).
+    #[cfg(test)]
+    seen_signals: std::sync::Mutex<Vec<WatchSignal>>,
     // The canary directory (canonical) and the flag the OS callback sets when
     // an event under it arrives; `None` when the watcher has no canary.
     // Canary events never reach `events` or `signal_seen`.
@@ -201,6 +205,8 @@ impl ProjectWatcher {
             root: root.to_path_buf(),
             ignores,
             signal_seen: AtomicBool::new(false),
+            #[cfg(test)]
+            seen_signals: std::sync::Mutex::new(Vec::new()),
             canary,
         })
     }
@@ -326,6 +332,13 @@ impl ProjectWatcher {
             if signal.is_ok() {
                 self.signal_seen.store(true, Ordering::Relaxed);
             }
+            #[cfg(test)]
+            if let Ok(signal) = &signal {
+                self.seen_signals
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(signal.clone());
+            }
             match signal {
                 Ok(WatchSignal::Path(path)) => {
                     let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -376,6 +389,14 @@ impl ProjectWatcher {
     /// the record.
     pub fn take_signal_seen(&self) -> bool {
         self.signal_seen.swap(false, Ordering::Relaxed)
+    }
+
+    /// Every signal [`Self::next_change`] received since the last call, in
+    /// order; clears the list. What a [`Self::take_signal_seen`] record was
+    /// made of, for a test that must tell its causes apart.
+    #[cfg(test)]
+    pub(crate) fn take_seen_signals(&self) -> Vec<WatchSignal> {
+        std::mem::take(&mut *self.seen_signals.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// Test-only seam: queues a Rescan of `path` exactly as the OS callback

@@ -44,7 +44,7 @@ use crate::test_plugin;
 use crate::watcher::debounce::Debouncer;
 use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
 use crate::watcher::rescan::RescanScheduler;
-use crate::watcher::ProjectWatcher;
+use crate::watcher::{ProjectWatcher, WatchSignal};
 
 /// Forces the exact shape of task 165's race deterministically, instead
 /// of relying on a real `kill -9`'s unpredictable teardown delay the way
@@ -1701,21 +1701,40 @@ fn a_file_created_and_one_deleted_while_starved_are_reconciled_by_a_sweep() {
 }
 
 /// A real canary probe, heard through the OS event stream, never reaches the
-/// consumer as a signal: the watcher clock (the MCP calls' quiet hint) is not
-/// stamped by it, and nothing is routed.
+/// consumer as a signal: no signal the watcher receives names a canary path,
+/// so the watcher clock (the MCP calls' quiet hint) is stamped only by
+/// something else, and nothing is routed.
+///
+/// The OS may still deliver a late root or sentinel event (FSEvents replays
+/// setup noise; GM-727/S11 saw the clock stamped once in a one-process run
+/// under load). That is a real signal and rightly stamps the clock, so the
+/// test drains with a sentinel, then asserts on what each received signal
+/// names: the clock may be stamped only when a non-canary signal arrived.
 ///
 /// Control: in `forward_or_hear`, set `heard` but forward the event
-/// unfiltered - the probe stamps the clock.
+/// unfiltered - the probe's path is among the signals received.
 #[test]
 fn a_real_canary_probe_never_stamps_the_watcher_clock() {
     let (project, _plugins, dirs, registry) = registry_over(&["python"]);
     let conn = test_plugin::empty_index();
     let root = project.path().canonicalize().unwrap();
     let state = tempfile::tempdir().unwrap();
-    let watcher = ProjectWatcher::with_canary(&root, state.path().join("watch-canary")).unwrap();
+    let canary_dir = state.path().join("watch-canary");
+    let watcher = ProjectWatcher::with_canary(&root, &canary_dir).unwrap();
+    let canary_dir = canary_dir.canonicalize().unwrap();
     let canary = watcher.canary().expect("a canary outside the root is set up");
-    while watcher.next_change(Duration::from_secs(1)).is_some() {}
+    // The OS delivers in order: once the sentinel surfaces, the setup noise
+    // queued before it has been received.
+    let sentinel = root.join(".watcher-sync-canary-clock");
+    fs::write(&sentinel, b"").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while watcher.next_change(Duration::from_millis(200)).map(|change| change.into_path())
+        != Some(sentinel.clone())
+    {
+        assert!(std::time::Instant::now() < deadline, "the sync sentinel never surfaced");
+    }
     watcher.take_signal_seen();
+    watcher.take_seen_signals();
     canary.take_heard();
     let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
 
@@ -1732,10 +1751,20 @@ fn a_real_canary_probe_never_stamps_the_watcher_clock() {
         watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
     }
 
-    assert_eq!(
-        registry.watcher_clock().quiet_for_at(std::time::Instant::now()),
-        None,
-        "a canary event must not stamp the watcher clock"
-    );
+    let seen = watcher.take_seen_signals();
+    let canary_signals: Vec<_> = seen
+        .iter()
+        .filter(|signal| match signal {
+            WatchSignal::Path(path) | WatchSignal::Rescan(path) => path.starts_with(&canary_dir),
+        })
+        .collect();
+    assert!(canary_signals.is_empty(), "a canary event reached the consumer as a signal: {seen:?}");
+    if seen.is_empty() {
+        assert_eq!(
+            registry.watcher_clock().quiet_for_at(std::time::Instant::now()),
+            None,
+            "with no signal received, nothing may stamp the watcher clock"
+        );
+    }
     assert!(test_plugin::file_changed_requests(&dirs[0]).is_empty(), "nothing is routed");
 }
