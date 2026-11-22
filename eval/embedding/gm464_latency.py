@@ -252,6 +252,8 @@ def gate():
         spent = waited + (time.time() - start)
         if spent >= GATE_CAP:
             status = "closed (cap reached, measured anyway)"
+            if os.environ.get("GATE_STRICT") == "1":  # GM-741/S15: never measure past the cap
+                raise RuntimeError(f"load gate never opened within {GATE_CAP}s (load1 {load1():.1f})")
             break
         progress(f"gate-wait load<{GATE_LOAD} held {held}s waited {spent:.0f}/{GATE_CAP}s", 0, 1)
         time.sleep(5)

@@ -12,6 +12,11 @@
       held-out positives: queries whose F4 top row differs between today's stack and the candidate, MRR and
       r@10 of the shown order within the K=30 window (rank of the first expected row; none = 0).
 
+  fresh   --work W --beta B --out F
+      design 4.1: 120 fresh windows (seed 74113, excluding the seed-741 draw), Python one pair per run for qat and l6,
+      Rust logits from the caches; P1-P4 vs the l6 reference arm; exit 1 when any fails.
+
+SUPERSEDED for the gate by design 4.1 (the tolerance below is the S8 one; `compare` only):
 Tolerance (design section 4): mean |d| <= 0.01 and <= 0.005 x the sample's Python logit sd; max |d| <= 0.20;
 blend top-1 identical in >= 119 of 120 windows; no window's top-3 set differs. Exit 1 when a bound fails.
 """
@@ -33,16 +38,16 @@ import rerank_eval as R  # noqa: E402
 SEED, PER_CELL = 741, 15
 
 
-def draw(cs, need, per_cell):
+def draw(cs, need, per_cell, seed=SEED, exclude=()):
     byname = {c.name: c for c in cs}
     cells = {}
     for (cn, q) in sorted(need):
         qq = byname[cn].queries[q]
         cells.setdefault(("name" if qq["mechanical"] else "nl", qq["language"]), []).append((cn, q))
-    rng = random.Random(SEED)
+    rng = random.Random(seed)
     out = []
     for cell in sorted(cells):
-        c = cells[cell]
+        c = [x for x in cells[cell] if x not in exclude]
         if len(c) < per_cell:
             sys.exit(f"STOP: cell {cell} has {len(c)} windows < {per_cell}")
         out += [(cell, w) for w in rng.sample(c, per_cell)]
@@ -114,6 +119,78 @@ def compare(a):
     sys.exit(0 if rep["pass"] else 1)
 
 
+def fresh(a):
+    """Design 4.1: fresh-window parity of qat vs the l6 reference arm; P1-P4; exit 1 when any fails."""
+    import hashlib
+    nss = {ce: argparse.Namespace(work=a.work, ce=ce) for ce in ("qat", "l6")}
+    setups = {ce: P.setup(ns) for ce, ns in nss.items()}
+    cs, need = setups["qat"]
+    if set(setups["l6"][1]) != set(need) or any(setups["l6"][1][k] != need[k] for k in need):
+        sys.exit("STOP: qat and l6 pair sets differ")
+    byname = {c.name: c for c in cs}
+    old = {w for _, w in draw(cs, need, PER_CELL, SEED)}
+    wins = draw(cs, need, PER_CELL, 74113, old)
+    assert not (old & {w for _, w in wins})
+    lst = json.dumps([[list(c), list(w)] for c, w in wins])
+    sha = hashlib.sha256(lst.encode()).hexdigest()
+    print(f"windows {len(wins)} sha256 {sha}", flush=True)
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    (a.out.parent / "windows.json").write_text(lst)
+    cfg = {"qat": ("ce-l6-qat-quint8", "ce-l6-qat-quint8-rust", a.work / "rerank_cache_gm741_qat", a.beta),
+           "l6": ("ce-minilm-quint8", "ce-minilm-quint8-rust", a.work / "rerank_cache_gm700_rust", 40.0)}
+    res = {}
+    for ce, (pyarm, rsarm, cdir, beta) in cfg.items():
+        rs = B.open_cache(cdir, cs, a.work, rsarm, B.file_shas(a.work, pyarm))
+        enc = R.CrossEncoder(a.work, R.SHIPPED_CE[ce]["py"])
+        W = []
+        for (pop, lang), (cn, q) in wins:
+            c = byname[cn]
+            m = need[(cn, q)]
+            hs = list(m)
+            pv = np.array(enc.score(c.queries[q]["text"], [m[h] for h in hs]), dtype=np.float64)
+            rv = [rs.d[cn].get(q, {}).get(h) for h in hs]
+            if None in rv:
+                sys.exit(f"STOP: Rust {ce} logit missing for {cn}|{q}")
+            cos = {}
+            for nid, x in c.lists[B.ST][q][:P.K]:
+                cos.setdefault(E.tsha(c.atext["ship"][nid]), float(x))
+            W.append((pv, np.array(rv, dtype=np.float64), np.array([cos[h] for h in hs]), beta))
+        res[ce] = W
+        print(f"scored {ce}: {sum(len(w[0]) for w in W)} pairs", flush=True)
+    stats = {}
+    for ce, W in res.items():
+        d = np.concatenate([w[1] - w[0] for w in W])
+        stats[ce] = {"d": d, "ad": np.abs(d), "sd": float(np.concatenate([w[0] for w in W]).std())}
+    m = 2 * float(np.quantile(stats["l6"]["ad"], 0.99))
+    rep = {"windows_sha256": sha, "windows": len(wins), "beta_qat": a.beta, "margin_m": m}
+    for ce, W in res.items():
+        t1 = t3 = nt = 0
+        gaps = []
+        for pv, rv, cos, beta in W:
+            bp, br = pv + beta * cos, rv + beta * cos
+            op, orr = np.argsort(-bp, kind="stable"), np.argsort(-br, kind="stable")
+            t1 += int(op[0] == orr[0])
+            A, Rr = set(op[:3].tolist()), set(orr[:3].tolist())
+            t3 += int(A == Rr)
+            if A != Rr:
+                g = max(bp[x] - bp[y] for x in A - Rr for y in Rr - A)
+                gaps.append(round(float(g), 4))
+                nt += int(g > m)
+        ad = stats[ce]["ad"]
+        rep[ce] = {"pairs": int(len(ad)), "mean_abs_d": float(ad.mean()), "max_abs_d": float(ad.max()),
+                   "p99_abs_d": float(np.quantile(ad, 0.99)), "mean_signed_d": float(stats[ce]["d"].mean()),
+                   "logit_sd": stats[ce]["sd"], "top1_same": t1, "top3_raw_same": t3,
+                   "top3_swap_gaps": gaps, "p4_nontie": nt}
+    q, l = rep["qat"], rep["l6"]
+    n = len(wins)
+    rep["checks"] = {"P1": q["mean_abs_d"] <= l["mean_abs_d"] and q["mean_abs_d"] <= 0.01,
+                     "P2": q["max_abs_d"] <= 0.20, "P3": q["top1_same"] >= n - 1, "P4": q["p4_nontie"] == 0}
+    rep["pass"] = all(rep["checks"].values())
+    a.out.write_text(json.dumps(rep, indent=1))
+    print(json.dumps(rep, indent=1))
+    sys.exit(0 if rep["pass"] else 1)
+
+
 def f4_order(c, q, sc, flags, beta):
     """Row order of the shown page: cosine order when the exact-name skip fires, else logit + beta * cosine."""
     import gm699_separability as S  # noqa: E402
@@ -177,6 +254,10 @@ def main():
     c.add_argument("--sample", type=Path, required=True)
     c.add_argument("--beta", type=float, required=True)
     c.add_argument("--out", type=Path, required=True)
+    f = sub.add_parser("fresh")
+    f.add_argument("--work", type=Path, required=True)
+    f.add_argument("--beta", type=float, required=True)
+    f.add_argument("--out", type=Path, required=True)
     t = sub.add_parser("top")
     t.add_argument("--work", type=Path, required=True)
     t.add_argument("--cache-base", type=Path, required=True)
@@ -184,7 +265,7 @@ def main():
     t.add_argument("--beta", type=float, required=True)
     t.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
-    {"sample": sample, "compare": compare, "top": top}[a.mode](a)
+    {"sample": sample, "compare": compare, "top": top, "fresh": fresh}[a.mode](a)
 
 
 if __name__ == "__main__":
