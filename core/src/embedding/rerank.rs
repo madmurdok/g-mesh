@@ -138,6 +138,10 @@ impl RerankVariant {
     /// variant is loaded only from [`RERANK_MODEL_DIR_ENV`] with
     /// `G_MESH_RERANK_BETA` set; otherwise its [`Self::fallback`] stands in.
     pub fn published(self) -> bool {
+        #[cfg(test)]
+        if PRETEND_PUBLISHED.with(std::cell::Cell::get) {
+            return true;
+        }
         self.spec().check_published().is_ok() && self.spec().beta.is_finite()
     }
 
@@ -155,6 +159,29 @@ impl RerankVariant {
         }
         Ok(beta)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by [`pretend_published`]: every variant reads as published on
+    /// this thread.
+    static PRETEND_PUBLISHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `body` with every variant reading as published on this thread, as
+/// publishing `qat` will leave it, so the published path is tested before
+/// the pins change.
+#[cfg(test)]
+pub(crate) fn pretend_published<R>(body: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PRETEND_PUBLISHED.with(|flag| flag.set(false));
+        }
+    }
+    PRETEND_PUBLISHED.with(|flag| flag.set(true));
+    let _reset = Reset;
+    body()
 }
 
 impl std::fmt::Display for RerankVariant {
@@ -861,6 +888,9 @@ impl Reranker {
         order
     }
 }
+
+#[cfg(test)]
+mod variant_tests;
 
 #[cfg(test)]
 mod tests {
