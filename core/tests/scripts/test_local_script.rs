@@ -883,10 +883,7 @@ fn a_cut_release_runs_the_ci_gate_then_tags_and_runs_no_suite_or_check() {
     let root = fake_root(false);
     let (output, record) = run_cut_release(root.path(), &["9.9.9", "--ci-timeout", "7"], 0);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    assert!(
-        !record.iter().any(|l| l.starts_with("cargo") || l.starts_with("test-sections")),
-        "{record:?}"
-    );
+    assert!(!record.iter().any(|l| l.starts_with("cargo") || l.starts_with("test-sections")), "{record:?}");
     let pos = |needle: &str| {
         record.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle}: {record:?}"))
     };

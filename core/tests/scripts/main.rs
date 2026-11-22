@@ -20,6 +20,7 @@
 //! compiles to no tests at all.
 #![cfg(unix)]
 
+mod ci_green_for_commit_script;
 mod ci_junit_summary_script;
 mod cut_release_plugin_versions;
 mod install_script_text;
