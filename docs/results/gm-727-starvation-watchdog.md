@@ -164,3 +164,10 @@ probes heard" is not measured.
 in the daemon log: control 1, 1, 1; churn arms 1-2 per file (8 of 9 files
 2, expected 2 = sweep plus late event; 1 where no late event arrived). Never
 above 2.
+
+## Owner decision
+
+2026-11-22, on criterion 1 at 50k files: "Принять ~35 с при 50k (Recommended)".
+N stays 15 s and the 3x gap stays; the bound under heavy churn is about
+N + 3·sweep (37.5 s at a 7.5 s sweep), and the gap keeps the sweeps at about
+a quarter of one core during a build.
