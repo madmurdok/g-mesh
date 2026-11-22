@@ -399,7 +399,9 @@ d, p99 |d|, the logit sd, and the Python gap of every top-3 swap.
 - **Pairs:** every pair of each window, ship text, the same tokenizer and
   window construction as S8 (`gm700_rust_pairs.setup`), about 3,600 pairs.
 - **Python:** onnxruntime via `rerank_eval.CrossEncoder`, one pair per run,
-  for both `qat` and `l6`.
+  for both `qat` and `l6`, scored in this run (the `ce-minilm-quint8` Python
+  logits already in `rerank_cache_gm700_rust` are not reused, so both arms
+  share one runtime and one setting).
 - **Rust:** the logits already dumped for every pair: `qat` from the S8 full
   dump (`ce-l6-qat-quint8-rust` in `rerank_cache_gm741_qat`), `l6` from
   `ce-minilm-quint8-rust` in `rerank_cache_gm700_rust`. Logits are
@@ -412,6 +414,17 @@ d, p99 |d|, the logit sd, and the Python gap of every top-3 swap.
   the cache, computes P4 with `m` from the `l6` arm, and exits 1 when any of
   P1-P4 fails. The old `mean <= 0.005 x sd` and `top3_all_same` checks are
   removed, not left as reported failures.
+
+**Computability probe (after the bounds above were committed in `56a2ca19`;
+S8 windows only; changes no definition).** `draw(seed 741)` reproduces the
+S8 window list exactly. Pools left per cell after excluding it: 285 to 585
+windows, so 15 per cell is drawable. On the S8 pairs both Rust caches and both
+Python logits exist for all 3,600 pairs, and P1-P4 compute. Today's L6 there:
+mean |d| 0.0044, p99 0.075 (`m` = 0.15), max 0.195, top-1 120/120, raw top-3
+119/120 (one swap, Python gap 0.0054): **today's L6 would fail the S1 rule
+"no window's top-3 set differs" itself**, which supports 4.1.1 point 3. These
+figures are not a pass for `qat`: the S8 sample is spent and is not judged.
+Script: scratch `s13/probe.py`.
 
 #### 4.1.4 On a fail
 
