@@ -11,7 +11,9 @@
 # The cost pass runs whatever S6 says.
 #
 # Environment: GM703_DATA, EVAL_DATA, GMESH_BIN, OUT (default $GM703_DATA/measure), PY,
-# ARM (coderankembed-fp32-structured or coderankembed-int8-structured),
+# ARM (coderankembed-fp32-structured, coderankembed-int8-structured, or a GM-736
+# smoothed int8 arm: coderankembed-int8sq-structured or coderankembed-int8squ8-structured),
+# ARM_MODEL (the GM-736 arms' model dir; default under $GM736_DATA/models),
 # P3_RUNS and P3_CORPORA (step 5's runs; default the step-4 runs, all corpora),
 # DRY=1 (log each step's command instead of running it).
 
@@ -66,12 +68,28 @@ INT8=coderankembed-int8-structured
 FP32=coderankembed-fp32-structured
 JINA=jina-v2-base-code-int8-structured
 V2_CORPORA="excalidraw g-mesh gin py-requests ripgrep task-tracker-mcp"
+SQ_S7=coderankembed-int8sq-structured
+SQ_U8=coderankembed-int8squ8-structured
+GM736_MODELS="${GM736_DATA:-$HOME/Projects/ClaudeProjects/g-mesh-data/gm736}/models"
 ARM="${ARM:-$FP32}"
 case "$ARM" in
-    "$FP32") ARM_MODEL="$MODELS/coderankembed-fp32" ;;
-    "$INT8") ARM_MODEL="$MODELS/coderankembed-int8" ;;
-    *) echo "ARM must be $FP32 or $INT8, not $ARM" >&2; exit 2 ;;
+    "$FP32") ARM_MODEL="$MODELS/coderankembed-fp32"; ARM_INT8=0 ;;
+    "$INT8") ARM_MODEL="$MODELS/coderankembed-int8"; ARM_INT8=1 ;;
+    "$SQ_S7") ARM_MODEL="${ARM_MODEL:-$GM736_MODELS/coderankembed-int8-sq-s7}"; ARM_INT8=1 ;;
+    "$SQ_U8") ARM_MODEL="${ARM_MODEL:-$GM736_MODELS/coderankembed-int8-sq-u8}"; ARM_INT8=1 ;;
+    *) echo "ARM must be $FP32, $INT8, $SQ_S7 or $SQ_U8, not $ARM" >&2; exit 2 ;;
 esac
+# variants.toml fixes the GM-736 arms' model_dir, and the Rust run loads that one; an ARM_MODEL
+# or GM736_DATA pointing elsewhere would make the check and the run read different files.
+case "$ARM" in
+    "$SQ_S7") FIXED_DIR="$HOME/Projects/ClaudeProjects/g-mesh-data/gm736/models/coderankembed-int8-sq-s7" ;;
+    "$SQ_U8") FIXED_DIR="$HOME/Projects/ClaudeProjects/g-mesh-data/gm736/models/coderankembed-int8-sq-u8" ;;
+    *) FIXED_DIR="$ARM_MODEL" ;;
+esac
+if [ "$ARM_MODEL" != "$FIXED_DIR" ]; then
+    echo "ARM_MODEL $ARM_MODEL differs from variants.toml's model_dir $FIXED_DIR for $ARM; unset ARM_MODEL/GM736_DATA" >&2
+    exit 2
+fi
 P3_RUNS="${P3_RUNS:-$RUNS}"
 P3_CORPORA="${P3_CORPORA:-$V2_CORPORA}"
 DRY="${DRY:-0}"
@@ -140,7 +158,7 @@ fi
 if step 5; then
     # P3 on the arm's own runs; gated (S4) for fp32, reported for int8.
     min_cos=0.99999
-    [ "$ARM" = "$INT8" ] && min_cos=0
+    [ "$ARM_INT8" = 1 ] && min_cos=0
     for c in $P3_CORPORA; do
         rc=0
         timed "s5-p3-$c" "$PY" -I "$HERE/parity.py" --rust-queries "$P3_RUNS/$ARM/$c" \

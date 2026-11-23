@@ -123,12 +123,21 @@ def words_shuffled_row(name):
 
 def append(variants, text, new_rows):
     """Append rows; refuses a name that already exists and checks the file still parses."""
-    have = {r["name"] for r in rows(text)}
-    for r in rows("\n".join(new_rows)):
+    have = {r["name"]: r for r in rows(text)}
+    fresh = []
+    for block in new_rows:
+        r = rows(block)[0]
         if r["name"] in have:
-            raise SystemExit(f"{variants} already has a variant {r['name']}; rows are appended, never edited")
+            if have[r["name"]] != r:
+                raise SystemExit(f"{variants} already has a different variant {r['name']}; rows are appended, never edited")
+            continue  # identical row already registered: a re-run is a no-op
         if r.get("role") == "control":
             raise SystemExit(f"{r['name']}: GM-730 arms are never role = control")
+        fresh.append(block)
+    new_rows = fresh
+    if not new_rows:
+        return
+    variants = Path(variants).resolve()  # write through a symlink (v2/variants.toml), do not replace it
     out = text.rstrip("\n") + "\n" + "".join("\n" + r for r in new_rows)
     rows(out)
     tmp = Path(str(variants) + ".tmp")

@@ -243,7 +243,7 @@ def tokenizer_ids(tok, text, max_tokens):
     return ids
 
 
-def check_qd(int8, fp32_vecs, ids_list, sample, jina_fp32_dir, jina_int8_dir):
+def check_qd(int8, fp32_vecs, ids_list, sample, jina_fp32_dir, jina_int8_dir, min_median=QD_MIN_MEDIAN):
     int8_vecs = cls_vectors(int8, ids_list)
     cre = [float(np.dot(a, b)) for a, b in zip(int8_vecs, fp32_vecs)]
     jtok = tokenizer(Path(jina_fp32_dir) / "tokenizer.json")
@@ -252,8 +252,8 @@ def check_qd(int8, fp32_vecs, ids_list, sample, jina_fp32_dir, jina_int8_dir):
     ji = mean_vectors(session(Path(jina_int8_dir) / "model.onnx"), jids)
     jina = [float(np.dot(a, b)) for a, b in zip(ji, jf)]
     cs, js = summary(cre), summary(jina)
-    ok = cs["median"] >= QD_MIN_MEDIAN and cs["p1"] >= js["p1"] - QD_MAX_P1_GAP
-    return {"ok": ok, "coderankembed": cs, "jina": js}
+    ok = cs["median"] >= min_median and cs["p1"] >= js["p1"] - QD_MAX_P1_GAP
+    return {"ok": ok, "min_median": min_median, "coderankembed": cs, "jina": js}
 
 
 def run_checks(out_dir, models, jina_fp32, jina_int8):

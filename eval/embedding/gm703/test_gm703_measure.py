@@ -21,6 +21,8 @@ MEASURE = HERE / "measure.sh"
 COSTS = REPO / "eval" / "embedding" / "measure_costs.sh"
 FP32 = "coderankembed-fp32-structured"
 INT8 = "coderankembed-int8-structured"
+SQ_S7 = "coderankembed-int8sq-structured"
+SQ_U8 = "coderankembed-int8squ8-structured"
 
 
 def stub(path, body):
@@ -137,6 +139,59 @@ class Arms(Sandbox):
         r = self.run_measure("--from", "2", "--until", "2", ARM=INT8, PY_RC="2")
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn("STOP S1", self.summary())
+
+
+class SmoothedArms(Sandbox):
+    """GM-736: the smoothed int8 arms run from variants.toml's fixed model_dir."""
+
+    def fixed_dir(self, arm):
+        form = "s7" if arm == SQ_S7 else "u8"
+        return self.tmp / "Projects/ClaudeProjects/g-mesh-data/gm736/models" / f"coderankembed-int8-sq-{form}"
+
+    def export(self, arm, recorded=None):
+        d = self.fixed_dir(arm)
+        d.mkdir(parents=True)
+        (d / "model.onnx").write_bytes(b"sq onnx")
+        sha = recorded or hashlib.sha256(b"sq onnx").hexdigest()
+        (d / "EXPORT.json").write_text('{"model_onnx_sha256": "%s"}\n' % sha)
+        return d
+
+    def test_both_smoothed_arms_are_accepted(self):
+        for arm in (SQ_S7, SQ_U8):
+            r = self.run_measure("--from", "9", "--until", "9", ARM=arm, DRY="1")
+            self.assertEqual(r.returncode, 0, (arm, r.stderr))
+
+    def test_step_4_checks_the_arms_export_and_runs_it(self):
+        for arm in (SQ_S7, SQ_U8):
+            self.export(arm)
+            r = self.run_measure("--from", "4", "--until", "4", ARM=arm, DRY="1")
+            self.assertEqual(r.returncode, 0, (arm, r.stderr))
+            self.assertIn(f"--variant {arm}", self.summary())
+
+    def test_step_4_refuses_a_stale_export(self):
+        self.export(SQ_U8, recorded="0" * 64)
+        r = self.run_measure("--from", "4", "--until", "4", ARM=SQ_U8, DRY="1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("debug-embed-eval run", self.summary())
+
+    def test_step_5_reports_and_does_not_gate_the_smoothed_arms(self):
+        for arm in (SQ_S7, SQ_U8):
+            r = self.run_measure("--from", "5", "--until", "5", ARM=arm, DRY="1", P3_CORPORA="gin")
+            self.assertEqual(r.returncode, 0, (arm, r.stderr))
+            line = [x for x in self.summary().splitlines() if "--rust-queries" in x and arm in x][-1]
+            self.assertIn("--min-cosine 0", line)
+            self.assertIn(f"--model-dir {self.fixed_dir(arm)}", line)
+
+    def test_a_model_dir_other_than_variants_toml_is_refused(self):
+        for env in ({"ARM_MODEL": str(self.tmp / "elsewhere")}, {"GM736_DATA": str(self.tmp / "other")}):
+            r = self.run_measure("--from", "9", "--until", "9", ARM=SQ_S7, DRY="1", **env)
+            self.assertEqual(r.returncode, 2, (env, r.stderr))
+            self.assertIn("variants.toml", r.stderr)
+            self.assertFalse(self.marker.exists())
+
+    def test_the_fixed_dir_given_explicitly_is_accepted(self):
+        r = self.run_measure("--from", "9", "--until", "9", ARM=SQ_U8, DRY="1", ARM_MODEL=str(self.fixed_dir(SQ_U8)))
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class DryRun(Sandbox):
