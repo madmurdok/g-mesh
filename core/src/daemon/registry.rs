@@ -195,23 +195,10 @@ pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
 }
 
 /// Above this many files one language would gain from a `.gitignore` change,
-/// [`PluginRegistry::gitignore_changed`] does not reindex it (GM-508, Q2), and
-/// a [`PluginRegistry::starvation_sweep`] does not index them.
+/// [`PluginRegistry::gitignore_changed`] does not reindex it and records the
+/// files as deferred; no [`ReconcileMode::Plain`] reconcile (daemon start,
+/// dropped-event rescan, starvation sweep) indexes a deferred file.
 pub(crate) const GITIGNORE_REINDEX_GUARD: usize = 10_000;
-
-/// Whether `added` new `language` files are more than
-/// [`GITIGNORE_REINDEX_GUARD`]; if so, logs that `cause` indexed none of them
-/// and asks for `g-mesh reindex`.
-fn over_reindex_guard(cause: &str, language: &str, added: usize) -> bool {
-    if added <= GITIGNORE_REINDEX_GUARD {
-        return false;
-    }
-    crate::log_role!(
-        "{cause} would add {added} {language} files to the index - more than \
-         {GITIGNORE_REINDEX_GUARD}, so nothing was reindexed; run `g-mesh reindex` to index them"
-    );
-    true
-}
 
 /// The directories holding `gitignores` and `links` (project-relative, `""`
 /// for the root), deduplicated; just the root when one of them is in the
@@ -510,6 +497,17 @@ pub struct PluginRegistry {
     failed_languages: Mutex<HashSet<String>>,
     /// When the watcher's consumer last took an event; read by the MCP host.
     watcher_clock: WatcherClock,
+    /// language -> the files a `.gitignore` change would have added to it,
+    /// left out by [`GITIGNORE_REINDEX_GUARD`]. Filled and trimmed by
+    /// [`gitignore_changed`](Self::gitignore_changed); a language's set is
+    /// cleared by its whole-language reindex
+    /// ([`clear_deferred_unignores`](Self::clear_deferred_unignores)), and a
+    /// file leaves it when its own change is routed
+    /// ([`file_changed`](Self::file_changed)). In memory only: a restart
+    /// rebuilds it from [`recheck_gitignores_since_index`](Self::recheck_gitignores_since_index),
+    /// which runs before the start's reconcile. Held for a lookup or an update
+    /// and nothing else.
+    deferred_unignores: Mutex<BTreeMap<String, HashSet<String>>>,
 }
 
 impl PluginRegistry {
@@ -564,7 +562,19 @@ impl PluginRegistry {
             unroutable: Mutex::new(HashSet::new()),
             failed_languages: Mutex::new(HashSet::new()),
             watcher_clock: WatcherClock::new(),
+            deferred_unignores: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Forgets `language`'s deferred un-ignored files: its whole-language
+    /// reindex just walked it under the current `.gitignore` rules.
+    pub(crate) fn clear_deferred_unignores(&self, language: &str) {
+        self.deferred_unignores.lock().unwrap().remove(language);
+    }
+
+    /// Whether `file_path` is a deferred un-ignored file of any language.
+    fn is_deferred_unignore(deferred: &BTreeMap<String, HashSet<String>>, file_path: &str) -> bool {
+        deferred.values().any(|files| files.contains(file_path))
     }
 
     /// When the watcher's consumer last took an event off the watcher.
@@ -1070,6 +1080,9 @@ impl PluginRegistry {
         if self.is_failed_language(&language) {
             return;
         }
+        if let Some(deferred) = self.deferred_unignores.lock().unwrap().get_mut(&language) {
+            deferred.remove(&file_path);
+        }
 
         match self.get_or_spawn(&language) {
             Ok(supervisor) => {
@@ -1153,8 +1166,12 @@ impl PluginRegistry {
     /// ([`reindex_workspace`](Self::reindex_workspace), never asking for a
     /// resolution delta, since a `.gitignore` changes which files are indexed;
     /// the first of `gitignores`, else of `links`, as the trigger), unless it would gain more than
-    /// [`GITIGNORE_REINDEX_GUARD`] files: then one log line asks for
-    /// `g-mesh reindex`. No difference, no reindex.
+    /// [`GITIGNORE_REINDEX_GUARD`] files: then those files become the
+    /// language's deferred un-ignores under these directories, and one log
+    /// line asks for `g-mesh reindex`, unless every one of them was already
+    /// deferred. A compared language that does not trip the guard has its
+    /// deferred files under these directories forgotten. No difference, no
+    /// reindex.
     pub(crate) fn gitignore_changed(&self, conn: &IndexStore, gitignores: &[String], links: &[String]) {
         let Some(trigger) = gitignores.first().or(links.first()) else { return };
         let subtrees = gitignore_subtrees(gitignores, links);
@@ -1179,18 +1196,26 @@ impl PluginRegistry {
         let languages: std::collections::BTreeSet<String> =
             walked.keys().chain(live.keys()).cloned().collect();
         let none = HashSet::new();
+        let deferred_languages: Vec<String> =
+            self.deferred_unignores.lock().unwrap().keys().cloned().collect();
+        let languages: std::collections::BTreeSet<String> =
+            languages.into_iter().chain(deferred_languages).collect();
         for language in languages {
             if !self.has_manifest(&language) || self.is_failed_language(&language) {
                 continue;
             }
             let now = walked.get(&language).unwrap_or(&none);
             let indexed = live.get(&language).unwrap_or(&none);
-            let added = now.difference(indexed).count();
+            let added_files: HashSet<String> = now.difference(indexed).cloned().collect();
+            let added = added_files.len();
             let removed = indexed.difference(now).count();
-            if added == 0 && removed == 0 {
-                continue;
+            if self.defer_unignores(&language, &subtrees, added_files) {
+                crate::log_role!(
+                    "{trigger} changed would add {added} {language} files to the index - more than \
+                     {GITIGNORE_REINDEX_GUARD}, so nothing was reindexed; run `g-mesh reindex` to index them"
+                );
             }
-            if over_reindex_guard(&format!("{trigger} changed"), &language, added) {
+            if added > GITIGNORE_REINDEX_GUARD || (added == 0 && removed == 0) {
                 continue;
             }
             crate::log_role!(
@@ -1201,6 +1226,30 @@ impl PluginRegistry {
             // `.gitignore` change added or removed.
             self.reindex_workspace(conn, &language, trigger, false);
         }
+    }
+
+    /// Replaces `language`'s deferred un-ignores under `subtrees` with
+    /// `added` when there are more than [`GITIGNORE_REINDEX_GUARD`] of them,
+    /// else with none. Returns whether `added` holds a file that was not
+    /// deferred before, i.e. whether the guard has something new to report.
+    fn defer_unignores(&self, language: &str, subtrees: &[String], added: HashSet<String>) -> bool {
+        let mut deferred = self.deferred_unignores.lock().unwrap();
+        let over = added.len() > GITIGNORE_REINDEX_GUARD;
+        let Some(files) = deferred.get_mut(language) else {
+            if over {
+                deferred.insert(language.to_string(), added);
+            }
+            return over;
+        };
+        let new = over && !added.iter().all(|file_path| files.contains(file_path));
+        files.retain(|file_path| !crate::project_walk::under_any(file_path, subtrees));
+        if over {
+            files.extend(added);
+        }
+        if files.is_empty() {
+            deferred.remove(language);
+        }
+        new
     }
 
     /// GM-508, owner's Q3: at daemon start on an indexed project, the
@@ -1276,8 +1325,8 @@ impl PluginRegistry {
     /// [`rescan_subtrees`](Self::rescan_subtrees) of the whole project with
     /// [`ReconcileScope::Starved`]: run on the watcher's consumer thread when
     /// its starvation watchdog finds the event stream silent while the
-    /// project may change. Created files of a language that would gain more
-    /// than [`GITIGNORE_REINDEX_GUARD`] are left out. Returns how many things
+    /// project may change. Deferred un-ignored files ([`GITIGNORE_REINDEX_GUARD`])
+    /// are left out, as in every plain reconcile. Returns how many things
     /// it changed: files deleted or reindexed (a created file only once it is
     /// indexed), plus the `.gitignore` files and links
     /// it passed on.
@@ -1331,7 +1380,8 @@ impl PluginRegistry {
     ///   file, and which records the new baseline after a reindex, so the
     ///   next start finds it fresh. No store lock is held across a stat.
     ///
-    /// Creations go through `ensure_fresh` too, for that baseline. A file
+    /// Creations go through `ensure_fresh` too, for that baseline; in `Plain`
+    /// mode a file deferred by the [`GITIGNORE_REINDEX_GUARD`] is not one. A file
     /// still on disk but no longer walked (a `.gitignore` edit) is left to
     /// [`recheck_gitignores_since_index`](Self::recheck_gitignores_since_index).
     /// Errors are logged per file; nothing here propagates.
@@ -1418,30 +1468,12 @@ impl PluginRegistry {
         drop(walked_set);
         let (known, mut created): (Vec<String>, Vec<String>) =
             walked.into_iter().partition(|file_path| live.contains(file_path));
-        if scope == ReconcileScope::Starved {
-            // A sweep sees the files a `.gitignore` un-ignored as created, so
-            // the gate's guard holds here too.
-            let mut per_language: BTreeMap<&str, usize> = BTreeMap::new();
-            for file_path in &created {
-                if let Some(language) = self.language_for(file_path) {
-                    *per_language.entry(language).or_default() += 1;
-                }
-            }
-            let over: HashSet<String> = per_language
-                .into_iter()
-                .filter(|(language, added)| {
-                    over_reindex_guard(
-                        "a sweep after the watcher's event stream went silent",
-                        language,
-                        *added,
-                    )
-                })
-                .map(|(language, _)| language.to_string())
-                .collect();
-            if !over.is_empty() {
-                created.retain(|file_path| {
-                    self.language_for(file_path).is_none_or(|language| !over.contains(language))
-                });
+        if !seeded {
+            // A plain walk sees the files an over-guard `.gitignore` change
+            // un-ignored as created; the guard keeps them out of the index.
+            let deferred = self.deferred_unignores.lock().unwrap();
+            if !deferred.is_empty() {
+                created.retain(|file_path| !Self::is_deferred_unignore(&deferred, file_path));
             }
         }
         // The stat pass, outside any lock: which walked live files may have

@@ -229,6 +229,7 @@ pub(crate) fn run_with(
             .map(|rebuilt| rebuilt.embed_stats)
             .with_context(|| format!("failed to reindex {language} after {changed_file} changed"))
     })?;
+    registry.clear_deferred_unignores(language);
     // Outside the locked phase: it may trim the embedding cache.
     registry.embedding().finish_unit(
         &format!("workspace-reindex {language}"),
