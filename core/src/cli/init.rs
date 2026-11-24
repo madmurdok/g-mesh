@@ -258,6 +258,7 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         let summary = bulk_index::run(&canonical_root, &conn, &discovered)
             .context("failed to build the project's initial index")?;
         conn.with(schema::record_bulk_index).context("failed to record that the project was indexed")?;
+        conn.with(schema::record_gitignore_baseline).context("failed to record the .gitignore baseline")?;
         // The walk is only the structural half of a complete index, and the
         // record just written is what stops any later daemon start from
         // finishing the rest - see `daemon::semantic` and

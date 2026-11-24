@@ -123,6 +123,7 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let summary = bulk_index::run(&canonical_root, &conn, &discovered)
         .context("failed to rebuild the project's index")?;
     conn.with(schema::record_bulk_index).context("failed to record that the project was fully reindexed")?;
+    conn.with(schema::record_gitignore_baseline).context("failed to record the .gitignore baseline")?;
 
     let state_dir = crate::paths::state_dir::project_dir(project_root)
         .context("failed to resolve the project's state directory")?;
