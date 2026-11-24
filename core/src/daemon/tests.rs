@@ -1306,6 +1306,73 @@ fn a_gitignore_written_in_the_watermark_second_is_rechecked_by_a_rescan() {
     assert!(!file_node("generated/x.python-src"), "the newly ignored file has left the index");
 }
 
+/// After a `.gitignore` edit un-ignores more files than the guard, Rescans
+/// index none of them: the Rescan whose watermark predates the edit runs the
+/// gate, which defers them, and its reconcile skips them; a later Rescan
+/// whose watermark is past the edit (no gate) skips them too, and still
+/// indexes a file created after the edit.
+///
+/// Control: filter the deferred files only in a `Starved` reconcile - the
+/// first Rescan indexes them; or filter every created file of a language
+/// with deferred files - `src/new.python-src` is never indexed.
+#[test]
+fn rescans_after_an_over_guard_unignore_index_none_of_the_unignored_files() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let plugin_dir = &dirs[0];
+    let root = project.path().canonicalize().unwrap();
+    let conn = walked_index(project.path());
+    indexed_file(&root, &conn, "src/a.python-src");
+    let generated = root.join("generated");
+    fs::create_dir_all(&generated).unwrap();
+    for index in 0..=registry::GITIGNORE_REINDEX_GUARD {
+        fs::File::create(generated.join(format!("f{index}.python-src"))).unwrap();
+    }
+    fs::write(root.join(GITIGNORE_FILE_NAME), "").unwrap();
+    let edited = fs::metadata(root.join(GITIGNORE_FILE_NAME))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let watcher = ProjectWatcher::new(&root).unwrap();
+    let mut debouncer = Debouncer::new(SWALLOWING_WINDOW);
+    let mut rescans = immediate_rescans();
+    // The previous reconcile started before the un-ignore: this Rescan runs
+    // the gate. The edited file marks the Rescan's reconcile as done.
+    rescans.gitignores_since = edited - 1;
+    edit(&root, "src/a.python-src");
+    watcher.inject_rescan(&root);
+    let reconciled = pump_until(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry, || {
+        requested(plugin_dir, "src/a.python-src")
+    });
+    assert!(reconciled, "the rescan must reindex the edited file");
+    assert_eq!(
+        test_plugin::file_changed_requests(plugin_dir),
+        vec!["src/a.python-src".to_string()],
+        "no un-ignored file is indexed by the rescan that ran the gate"
+    );
+
+    // Past the edit: this Rescan does not run the gate.
+    rescans.gitignores_since = edited;
+    fs::write(root.join("src/new.python-src"), "v0").unwrap();
+    watcher.inject_rescan(&root);
+    let reconciled = pump_until(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry, || {
+        requested(plugin_dir, "src/new.python-src")
+    });
+    assert!(reconciled, "a file created after the un-ignore is indexed");
+    assert_eq!(
+        test_plugin::file_changed_requests(plugin_dir),
+        vec!["src/a.python-src".to_string(), "src/new.python-src".to_string()],
+        "no un-ignored file is indexed by a later rescan either"
+    );
+    let baseline = |file_path: &str| {
+        conn.with(|c| crate::ingest::staleness::has_indexed_baseline(c, file_path)).unwrap()
+    };
+    assert!(!baseline("generated/f0.python-src"));
+}
+
 // --- GM-725: the watcher clock behind a by-name answer's quiet note ---
 
 /// A fresh clock reports no quiet, however late it is asked: no consumer

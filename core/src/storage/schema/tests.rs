@@ -1667,3 +1667,51 @@ fn a_schema_16_index_is_reset_and_has_the_also_scopes_table() {
     assert_eq!(rows, 0, "the reset drops the old rows and recreates the table");
     assert!(!ensure_current(&conn, GENERATION).unwrap(), "the reset index is current");
 }
+
+fn gitignore_baseline_rows(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM gitignore_baseline", [], |row| row.get(0)).unwrap()
+}
+
+/// The `.gitignore` baseline moves only when a full walk records it: none is
+/// written while `bulkIndexedAt` is unset, an index without the row adopts
+/// `bulkIndexedAt` once at its first read, and a later `bulkIndexedAt` (a
+/// per-language swap) leaves it until the next full walk records it.
+///
+/// Control: adopt with `INSERT OR REPLACE` in `gitignore_baseline_unix` - the
+/// read after the swap returns the swap's time.
+#[test]
+fn the_gitignore_baseline_is_adopted_once_and_moved_only_by_a_full_walk() {
+    const WALKED: i64 = 1_767_225_600; // 2026-01-01 00:00:00 UTC
+    const SWAPPED: i64 = WALKED + 86_400;
+    let conn = setup();
+    ensure_current(&conn, GENERATION).unwrap();
+
+    record_gitignore_baseline(&conn).unwrap();
+    assert_eq!(gitignore_baseline_rows(&conn), 0, "no baseline before a walk completed");
+    assert_eq!(gitignore_baseline_unix(&conn).unwrap(), None);
+
+    conn.execute("UPDATE meta SET bulkIndexedAt = '2026-01-01 00:00:00' WHERE id = 1", []).unwrap();
+    assert_eq!(gitignore_baseline_unix(&conn).unwrap(), Some(WALKED), "adopted from bulkIndexedAt");
+
+    conn.execute("UPDATE meta SET bulkIndexedAt = '2026-01-02 00:00:00' WHERE id = 1", []).unwrap();
+    assert_eq!(gitignore_baseline_unix(&conn).unwrap(), Some(WALKED), "a swap does not move it");
+
+    record_gitignore_baseline(&conn).unwrap();
+    assert_eq!(gitignore_baseline_unix(&conn).unwrap(), Some(SWAPPED), "a full walk does");
+}
+
+/// A version-mismatch wipe drops the `.gitignore` baseline with the rest of
+/// the index: the reset index has none until its walk.
+#[test]
+fn a_version_mismatch_wipe_drops_the_gitignore_baseline() {
+    let conn = setup();
+    ensure_current(&conn, GENERATION).unwrap();
+    conn.execute("UPDATE meta SET bulkIndexedAt = '2026-01-01 00:00:00' WHERE id = 1", []).unwrap();
+    record_gitignore_baseline(&conn).unwrap();
+    assert_eq!(gitignore_baseline_rows(&conn), 1);
+
+    conn.execute("UPDATE meta SET schema_version = '0' WHERE id = 1", []).unwrap();
+    assert!(ensure_current(&conn, GENERATION).unwrap());
+
+    assert_eq!(gitignore_baseline_rows(&conn), 0);
+}

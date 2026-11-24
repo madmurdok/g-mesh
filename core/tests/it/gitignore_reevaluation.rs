@@ -377,3 +377,86 @@ async fn un_ignoring_more_files_than_the_guard_logs_once_and_reindexes_nothing()
 
     client.cancel().await.expect("failed to shut the client down");
 }
+
+/// The guard keeps holding after its line: the gate running again over the
+/// same un-ignored files (another write to `.gitignore` with the same rules)
+/// logs nothing more, and a daemon restart, whose start reconciles every
+/// file not indexed, indexes none of them either; the restart's own
+/// `.gitignore` recheck logs the line once more.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unignore_over_the_guard_stays_unindexed_across_a_repeated_gate_and_a_restart() {
+    const OVER_THE_GUARD: usize = 10_001;
+    let harness = Harness::new();
+    harness.write(".gitignore", "generated/\n");
+    let generated = harness.root().join("generated");
+    fs::create_dir_all(&generated).unwrap();
+    for index in 0..OVER_THE_GUARD {
+        fs::File::create(generated.join(format!("f{index}.ts"))).unwrap();
+    }
+    harness.write("src/a.ts", "export const a = 1;\n");
+    let client = harness.connect().await;
+
+    let guard_lines = |log: &str| {
+        log.lines().filter(|line| line.contains("g-mesh reindex") && line.contains(".gitignore")).count()
+    };
+    harness.write(".gitignore", "");
+    let deadline = Instant::now() + CHANGE_DEADLINE;
+    while guard_lines(&harness.log_text()) == 0 {
+        assert!(Instant::now() < deadline, "no guard line was logged; daemon log:\n{}", harness.log_text());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    harness.probe("probe-first.ts").await;
+
+    // The same rules again: the gate compares and finds the same files.
+    harness.write(".gitignore", "# nothing ignored\n");
+    harness.probe("probe-repeat.ts").await;
+    let log = harness.log_text();
+    assert_eq!(guard_lines(&log), 1, "a repeated gate logs nothing more: {log}");
+    assert!(Index::open(harness.root()).unwrap().files_under("generated").is_empty());
+
+    client.cancel().await.expect("failed to shut the client down");
+    let output = std::process::Command::new(BIN).arg("stop").current_dir(harness.root()).output().unwrap();
+    assert!(output.status.success(), "`g-mesh stop` failed: {}", String::from_utf8_lossy(&output.stderr));
+    // mtimes are compared with the baseline in whole seconds, strictly: an
+    // edit in the walk's own last second would read as walked.
+    let gitignore = harness.root().join(".gitignore");
+    let baseline: i64 = {
+        let index = Index::open(harness.root()).unwrap();
+        index
+            .0
+            .query_row(
+                "SELECT CAST(strftime('%s', walkedAt) AS INTEGER) FROM gitignore_baseline",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the cold-start walk recorded a .gitignore baseline")
+    };
+    let edited = fs::metadata(&gitignore).unwrap().modified().unwrap();
+    let after_baseline = std::time::UNIX_EPOCH + Duration::from_secs(baseline as u64 + 1);
+    if edited < after_baseline {
+        fs::File::options().write(true).open(&gitignore).unwrap().set_modified(after_baseline).unwrap();
+    }
+
+    // The probe waits for the restart's recheck: a file written before the
+    // recheck walks the root is one of the files its gate defers. The start's
+    // reconcile runs before the watcher routes anything, so the probe is
+    // indexed only after it.
+    let client = harness.connect().await;
+    let deadline = Instant::now() + CHANGE_DEADLINE;
+    while guard_lines(&harness.log_text()) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the restart logged no guard line; daemon log:\n{}",
+            harness.log_text()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    harness.probe("probe-restart.ts").await;
+    let log = harness.log_text();
+    assert_eq!(guard_lines(&log), 2, "the restart's recheck logs the line once: {log}");
+    let index = Index::open(harness.root()).unwrap();
+    assert!(index.files_under("generated").is_empty(), "nothing under generated/ was indexed: {log}");
+    assert!(index.files_under("").contains(&"probe-repeat.ts".to_string()));
+
+    client.cancel().await.expect("failed to shut the client down");
+}
