@@ -55,7 +55,7 @@ const MAX_PEAK_GROWTH_BYTES: u64 = 1 << 30;
 #[test]
 #[ignore = "needs the real model weights; see this file's module doc comment"]
 fn an_over_long_input_does_not_raise_peak_memory_by_gigabytes() {
-    let dir = g_mesh::config::embedding::model_dir(DEFAULT_MODEL_NAME).unwrap();
+    let dir = g_mesh::embedding::settings::model_dir(DEFAULT_MODEL_NAME).unwrap();
     let model = EmbeddingModel::load(&dir)
         .unwrap_or_else(|err| panic!("could not load the real model from {}: {err:#}", dir.display()));
 

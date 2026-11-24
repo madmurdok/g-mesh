@@ -662,3 +662,147 @@ mod bound_page {
         assert!(page.all_unresolved);
     }
 }
+
+/// The response bound over pages `graph::pagination` serves from a store.
+mod over_graph_pages {
+    use rusqlite::{params, Connection};
+    use serde::Serialize;
+
+    use crate::graph::pagination::{
+        paginate_edges, Distinctness, EdgeRow, Page, ScoredEdge, FILE_KIND, MAX_PAGE_SIZE,
+    };
+    use crate::graph::Direction;
+    use crate::mcp::response_bound::{bound_page_within, tally_edge_files_bounded};
+    use crate::storage::schema;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn
+    }
+
+    fn make_ranked_node(conn: &Connection, id: &str, kind: &str, file_path: &str, start_line: i64) {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES (?1, ?2, ?1, ?1, ?3, ?4, 0, ?4, 0, 'rust')",
+            params![id, kind, file_path, start_line],
+        )
+        .unwrap();
+    }
+
+    fn make_edge(conn: &Connection, id: &str, from: &str, to: &str, resolved: bool) {
+        conn.execute(
+            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved) VALUES (?1, ?2, ?3, 'CALLS', 'syntactic', 'tree-sitter', ?4)",
+            params![id, from, to, resolved],
+        )
+        .unwrap();
+    }
+
+    /// Every rank key varies somewhere in the fixture, and within one file
+    /// the edge ids run against the line order, so a cursor that dropped any
+    /// key would skip or repeat a row.
+    fn mixed_fixture() -> Connection {
+        let conn = setup();
+        make_ranked_node(&conn, "root", "Function", "src/a/root.rs", 0);
+        for (edge, file, line, resolved) in [
+            ("e9", "src/a/x.rs", 2, true),
+            ("e1", "src/a/x.rs", 5, true),
+            ("e8", "src/a/root.rs", 7, true),
+            ("e2", "src/a/root.rs", 3, false),
+            ("e7", "lib/m.rs", 1, true),
+            ("e3", "lib/m.rs", 1, true),
+            ("e6", "src/ab/y.rs", 4, false),
+            ("e4", "src/a/sub/z.rs", 4, true),
+        ] {
+            let node = format!("n_{edge}");
+            make_ranked_node(&conn, &node, "Function", file, line);
+            make_edge(&conn, edge, "root", &node, resolved);
+        }
+        make_ranked_node(&conn, "importer", FILE_KIND, "src/a/w.rs", 0);
+        make_edge(&conn, "e5", "root", "importer", true);
+        conn
+    }
+
+    fn ranked_page(
+        conn: &Connection,
+        anchor_file: &str,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> Page<ScoredEdge> {
+        paginate_edges(
+            conn,
+            "root",
+            Direction::Outgoing,
+            &[],
+            &[],
+            anchor_file,
+            Distinctness::Edges,
+            page_size,
+            cursor,
+        )
+        .unwrap()
+    }
+
+    #[derive(Serialize)]
+    struct Item {
+        id: String,
+        blob: String,
+    }
+
+    /// A page cut for bytes rather than rows hands back a cursor built from
+    /// the last kept row's whole rank, so the next SQL page starts exactly
+    /// after it.
+    #[test]
+    fn a_page_cut_for_bytes_resumes_exactly_after_its_last_kept_row() {
+        let conn = mixed_fixture();
+        let page = ranked_page(&conn, "src/a/root.rs", MAX_PAGE_SIZE, None);
+        let whole: Vec<String> = page.results.iter().map(|row| row.edge.id.clone()).collect();
+        let rows: Vec<EdgeRow<Item>> = page
+            .results
+            .into_iter()
+            .map(|row| EdgeRow {
+                item: Item { id: row.edge.id.clone(), blob: "x".repeat(100) },
+                rank: row.rank,
+            })
+            .collect();
+        let budget =
+            serde_json::to_vec(&rows.iter().take(3).map(|row| &row.item).collect::<Vec<_>>()).unwrap().len();
+
+        let cut = bound_page_within(rows, false, None, budget);
+        assert_eq!(cut.results.len(), 3, "precondition: the budget keeps three rows");
+        assert!(cut.has_more);
+
+        let mut served: Vec<String> = cut.results.into_iter().map(|item| item.id).collect();
+        let rest = ranked_page(&conn, "src/a/root.rs", MAX_PAGE_SIZE, cut.next_cursor.as_deref());
+        served.extend(rest.results.into_iter().map(|row| row.edge.id));
+
+        assert_eq!(served, whole);
+    }
+
+    /// A collapsed `CALLS` edge (no `toDeclaration`) beside a bound one from
+    /// the same caller onto the same callee is tallied once by the bounded
+    /// file tally too, through the bound edge.
+    #[test]
+    fn a_collapsed_call_beside_its_bound_sibling_is_tallied_once_within_the_bound() {
+        const CALLER: &str = "useString";
+        const CALLEE: &str = "parse";
+        let conn = setup();
+        make_ranked_node(&conn, CALLER, "Function", "use.ts", 0);
+        make_ranked_node(&conn, CALLEE, "Function", "lib.ts", 0);
+        make_ranked_node(&conn, "other", "Function", "other.ts", 0);
+        for (id, source, to_declaration) in [("collapsed", "syntactic", None), ("bound", "semantic", Some(0))]
+        {
+            conn.execute(
+                "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved, toDeclaration)
+                 VALUES (?1, ?2, ?3, 'CALLS', ?4, 'test', 1, ?5)",
+                params![id, CALLER, CALLEE, source, to_declaration],
+            )
+            .unwrap();
+        }
+
+        let (files, truncated) =
+            tally_edge_files_bounded(&conn, CALLEE, Direction::Incoming, &["CALLS"], &[]).unwrap();
+        assert_eq!(files.iter().map(|file| file.refs).sum::<i64>(), 1);
+        assert!(!truncated);
+    }
+}

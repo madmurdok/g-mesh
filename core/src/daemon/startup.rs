@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use crate::daemon::activation;
 use crate::daemon::build_stamp;
 use crate::daemon::lifecycle::{self, CoreActivity, IdleTimeouts};
-use crate::daemon::registry::{self, PluginRegistry};
+use crate::daemon::registry::PluginRegistry;
 use crate::daemon::seed;
 use crate::daemon::watch_loop::{spawn_watch_consumer, ConsumerStart, WATCH_CANARY_DIR};
 use crate::daemon::workspace_reindex;
@@ -25,7 +25,7 @@ use crate::gc::last_used;
 use crate::indexing_status::{ColdCause, IndexingStatus};
 use crate::ipc;
 use crate::paths::state_dir::StateDir;
-use crate::plugin_manifest::DiscoveredPlugins;
+use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -188,7 +188,9 @@ pub(super) fn open_index(root: &Path, dir: &StateDir) -> Result<OpenedIndex> {
     workspace_reindex::remove_stale_staging(dir.path());
     seed::remove_stale_seed_tmp(dir.path());
     // Before `connection::open`, which would create an empty `index.db`.
-    if let Some(origin) = seed::seed_if_eligible(root, dir.path(), &registry::indexer_version(&discovered)) {
+    if let Some(origin) =
+        seed::seed_if_eligible(root, dir.path(), &plugin_manifest::fingerprint::indexer_version(&discovered))
+    {
         crate::log_role!("index seeded from {} in {} ms", origin.source_root.display(), origin.copy_ms);
     }
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
@@ -197,8 +199,9 @@ pub(super) fn open_index(root: &Path, dir: &StateDir) -> Result<OpenedIndex> {
     let had_generation = schema::stored_generation(&conn).is_some();
     // The generation names every discovered plugin's build and core's
     // pipeline, so an index built by a since-rebuilt plugin is thrown away.
-    let reinitialized = schema::ensure_current(&conn, &registry::indexer_version(&discovered))
-        .context("failed to check the index's schema and indexer versions")?;
+    let reinitialized =
+        schema::ensure_current(&conn, &plugin_manifest::fingerprint::indexer_version(&discovered))
+            .context("failed to check the index's schema and indexer versions")?;
     if reinitialized {
         crate::log_role!("index (re)initialized - a full reindex is needed");
     }
@@ -334,7 +337,7 @@ pub(super) fn start_services(
     // Not loaded here, not even in the background (a startup thread broke the
     // restart budgets): the first `apply` pays for it on its own thread. A
     // missing model does not stop the daemon, which never fetches one.
-    let embedding = Arc::new(EmbeddingPipeline::load(crate::config::embedding::embedding_settings(
+    let embedding = Arc::new(EmbeddingPipeline::load(crate::embedding::settings::embedding_settings(
         &project_config.embedding,
     )));
     let _ = fs::remove_file(dir.rerank_outcome_file());

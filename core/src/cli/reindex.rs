@@ -51,7 +51,7 @@ use anyhow::{bail, Context, Result};
 use crate::control::stop;
 use crate::daemon;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::{registry, semantic};
+use crate::daemon::semantic;
 use crate::embedding::{backfill, EmbeddingPipeline};
 use crate::indexing_status::IndexingStatus;
 use crate::plugin_manifest;
@@ -96,13 +96,13 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     // discovery's result directly rather than a `PluginRegistry`. Resolved
     // before the reset rather than beside the walk, because the generation
     // this index is re-stamped with is derived from it
-    // (`daemon::registry::indexer_version`): stamping anything else here would
+    // (`plugin_manifest::fingerprint::indexer_version`): stamping anything else here would
     // have the next daemon start wipe the index this command just rebuilt.
     let discovered = plugin_manifest::discover(&plugin_manifest::default_roots())
         .context("failed to discover language plugins")?;
 
     let conn = connection::open(project_root).context("failed to open the project's SQLite index")?;
-    schema::reset(&conn, &registry::indexer_version(&discovered))
+    schema::reset(&conn, &plugin_manifest::fingerprint::indexer_version(&discovered))
         .context("failed to reset the project's index")?;
 
     let canonical_root = project_root
@@ -116,7 +116,7 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let project_config = crate::config::read_project_config(project_root)
         .context("failed to read the project's config.toml")?;
     let embedding_pipeline =
-        EmbeddingPipeline::load(crate::config::embedding::embedding_settings(&project_config.embedding));
+        EmbeddingPipeline::load(crate::embedding::settings::embedding_settings(&project_config.embedding));
     // The walk is structural-only, matching `daemon::run`'s own cold
     // start; the pipeline above is used by the semantic pass and the
     // backfill pass below.

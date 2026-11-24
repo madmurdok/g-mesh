@@ -9,6 +9,8 @@
 //! An absent `[plugin.capabilities]` or `[plugin.workspace]` takes the
 //! conservative default: a manifest that says nothing can do the least.
 
+pub mod fingerprint;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

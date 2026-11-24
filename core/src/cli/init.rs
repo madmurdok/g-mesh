@@ -103,7 +103,7 @@ use crate::cli::agent_instructions::{self, AgentsMdWrite};
 use crate::cli::{reindex, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::{registry, semantic};
+use crate::daemon::semantic;
 use crate::embedding::{backfill, EmbeddingPipeline};
 use crate::indexing_status::IndexingStatus;
 use crate::plugin_manifest;
@@ -176,7 +176,7 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
 
     // Discovered up front rather than inside the walk below, because the
     // generation this index is stamped with is derived from it (see
-    // `daemon::registry::indexer_version`) - and stamping it with anything
+    // `plugin_manifest::fingerprint::indexer_version`) - and stamping it with anything
     // other than what `daemon::run` would compute means the very next daemon
     // start throws away the index this command just paid to build. Same
     // discovery `daemon::run`'s own cold start uses; the walk below takes this
@@ -185,7 +185,7 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         .context("failed to discover language plugins")?;
 
     let conn = connection::open(project_root).context("failed to open the project's SQLite index")?;
-    schema::ensure_current(&conn, &registry::indexer_version(&discovered))
+    schema::ensure_current(&conn, &plugin_manifest::fingerprint::indexer_version(&discovered))
         .context("failed to check the index's schema and indexer versions")?;
     let already_indexed = schema::bulk_index_completed(&conn)
         .context("failed to check whether the project has already been indexed")?;
@@ -215,8 +215,9 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
             );
             let project_config = config::read_project_config(project_root)
                 .context("failed to read the project's config.toml")?;
-            let embedding_pipeline =
-                EmbeddingPipeline::load(config::embedding::embedding_settings(&project_config.embedding));
+            let embedding_pipeline = EmbeddingPipeline::load(crate::embedding::settings::embedding_settings(
+                &project_config.embedding,
+            ));
             // Per language now: `run_once` asks every currently-owed
             // language and records `language_state.semanticPassAt` (and the
             // roll-up) itself - see that function's own doc comment.
@@ -247,8 +248,9 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         // configured, exactly like `daemon::run`'s own cold start.
         let project_config =
             config::read_project_config(project_root).context("failed to read the project's config.toml")?;
-        let embedding_pipeline =
-            EmbeddingPipeline::load(config::embedding::embedding_settings(&project_config.embedding));
+        let embedding_pipeline = EmbeddingPipeline::load(crate::embedding::settings::embedding_settings(
+            &project_config.embedding,
+        ));
         // Discovery's result, resolved above, handed straight in - see
         // `daemon::bulk_index::run`'s doc comment for why it takes that
         // directly rather than a `PluginRegistry`. The walk is

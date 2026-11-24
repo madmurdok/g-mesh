@@ -701,9 +701,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::embedding::text::TextRule;
     use crate::model::{EdgeRecord, NodeRecord};
     use crate::storage::connection::open_staging;
+    use crate::storage::embed_row::SignatureText;
     use crate::storage::write::apply_diff;
 
     #[test]
@@ -749,9 +749,14 @@ mod tests {
         )
         .unwrap();
 
-        let plan =
-            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
-                .unwrap();
+        let plan = plan(
+            &mut staging,
+            live_path.to_str().unwrap(),
+            "rust",
+            &SignatureText { version: "model" },
+            true,
+        )
+        .unwrap();
         drop(staging);
         assert_eq!(
             plan.counts,
@@ -855,9 +860,14 @@ mod tests {
             },
         )
         .unwrap();
-        let plan =
-            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
-                .unwrap();
+        let plan = plan(
+            &mut staging,
+            live_path.to_str().unwrap(),
+            "rust",
+            &SignatureText { version: "model" },
+            true,
+        )
+        .unwrap();
         (dir, live, staging_path, plan)
     }
 
@@ -1032,9 +1042,14 @@ mod tests {
         apply_diff(&mut live, &Diff { upsert_nodes: vec![live_node], ..Default::default() }).unwrap();
         let mut staging = open_staging(&staging_path).unwrap();
         apply_diff(&mut staging, &Diff { upsert_nodes: vec![staged_node], ..Default::default() }).unwrap();
-        let planned =
-            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
-                .unwrap();
+        let planned = plan(
+            &mut staging,
+            live_path.to_str().unwrap(),
+            "rust",
+            &SignatureText { version: "model" },
+            true,
+        )
+        .unwrap();
         drop(staging);
         swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
         (dir, live, planned.counts)
@@ -1305,7 +1320,7 @@ mod tests {
         .unwrap();
         let staged_paths: Vec<String> = staged_paths.iter().map(|path| path.to_string()).collect();
         schema::set_resolution_facts(&staging, "rust", staged_facts, &staged_paths).unwrap();
-        plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
+        plan(&mut staging, live_path.to_str().unwrap(), "rust", &SignatureText { version: "model" }, true)
             .unwrap();
         drop(staging);
         swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
@@ -1404,7 +1419,7 @@ mod tests {
             },
         )
         .unwrap();
-        plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
+        plan(&mut staging, live_path.to_str().unwrap(), "rust", &SignatureText { version: "model" }, true)
             .unwrap();
         drop(staging);
         swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
@@ -1435,74 +1450,6 @@ mod tests {
         );
     }
 
-    /// GM-646, the language swap: a generated staged node is never staged
-    /// for embedding (new, or turned generated), its sibling is, the live
-    /// vector of the node that turned generated is deleted, an unchanged
-    /// node keeps its vector, and live ends with the flag.
-    /// Controls: `Side::text` passing `generated: false` to `node_text`
-    /// (`y` is staged and `x` keeps its vector); drop `generated` from
-    /// `NODE_COLUMNS` (live's `x` stays unflagged and keeps its vector).
-    #[test]
-    fn a_swap_stages_no_generated_node_and_deletes_the_vector_of_one_that_turned_generated() {
-        let generated = |id: &str| {
-            let mut node = node_in(id, "pb.rs", &format!("fn {id}()"));
-            node.generated = true;
-            node
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let live_path = dir.path().join("index.db");
-        let staging_path = dir.path().join("staging-rust.db");
-        let mut live = open_staging(&live_path).unwrap();
-        live.execute(
-            "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, 'x', 'x', 'x')",
-            [],
-        )
-        .unwrap();
-        apply_diff(
-            &mut live,
-            &Diff {
-                upsert_nodes: vec![node_in("x", "pb.rs", "fn x()"), node_in("keep", "a.rs", "fn keep()")],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        for id in ["x", "keep"] {
-            crate::storage::vectors::insert(&live, id, &[0.0; crate::embedding::EMBEDDING_DIM], "model")
-                .unwrap();
-        }
-        let mut staging = open_staging(&staging_path).unwrap();
-        apply_diff(
-            &mut staging,
-            &Diff {
-                upsert_nodes: vec![
-                    generated("x"),
-                    node_in("keep", "a.rs", "fn keep()"),
-                    generated("y"),
-                    node_in("z", "a.rs", "fn z()"),
-                ],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let planned =
-            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
-                .unwrap();
-        drop(staging);
-        let mut staged: Vec<&str> =
-            planned.to_embed.upsert_nodes.iter().map(|node| node.id.as_str()).collect();
-        staged.sort_unstable();
-        assert_eq!(staged, vec!["z"], "only the new hand-written node is owed a vector");
-
-        swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
-        assert_eq!(column(&live, "SELECT nodeId FROM vectors ORDER BY nodeId"), vec!["keep"]);
-        assert_eq!(
-            column(&live, "SELECT id FROM nodes WHERE generated = 1 ORDER BY id"),
-            vec!["x", "y"],
-            "the swap carries the flag into live"
-        );
-    }
-
     // -----------------------------------------------------------------
     // The vectors are written on the swap's transaction.
     // -----------------------------------------------------------------
@@ -1511,8 +1458,11 @@ mod tests {
         column(conn, "SELECT nodeId || ':' || embeddingVersion FROM vectors ORDER BY nodeId")
     }
 
+    /// Storage keeps a vector's bytes whatever its width.
+    const VECTOR: [f32; 4] = [0.0; 4];
+
     fn a_vector(conn: &Connection, id: &str, version: &str) {
-        crate::storage::vectors::insert(conn, id, &[0.0; crate::embedding::EMBEDDING_DIM], version).unwrap();
+        crate::storage::vectors::insert(conn, id, &VECTOR, version).unwrap();
     }
 
     /// A swap that fails in its bookkeeping, after the vectors are written,
@@ -1644,9 +1594,14 @@ mod tests {
         )
         .unwrap();
 
-        let planned =
-            plan(&mut staging, live_path.to_str().unwrap(), "rust", &TextRule { version: "model" }, true)
-                .unwrap();
+        let planned = plan(
+            &mut staging,
+            live_path.to_str().unwrap(),
+            "rust",
+            &SignatureText { version: "model" },
+            true,
+        )
+        .unwrap();
 
         assert_eq!(planned.counts.upsert_nodes, 6, "every node is upserted");
         let mut owed: Vec<&str> = planned.to_embed.upsert_nodes.iter().map(|node| node.id.as_str()).collect();

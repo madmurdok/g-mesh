@@ -53,7 +53,8 @@ impl Fixture {
     /// computed against.
     fn index(&self) -> Connection {
         let conn = Connection::open(self.db_path()).unwrap();
-        schema::ensure_current(&conn, &crate::daemon::registry::fixture_indexer_version()).unwrap();
+        schema::ensure_current(&conn, &crate::plugin_manifest::fingerprint::fixture_indexer_version())
+            .unwrap();
         conn
     }
 

@@ -1027,7 +1027,7 @@ fn immediate_rescans() -> Rescans {
 fn walked_index(project: &Path) -> IndexStore {
     let conn = crate::storage::connection::open(project).unwrap();
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-    schema::ensure_current(&conn, &registry::fixture_indexer_version()).unwrap();
+    schema::ensure_current(&conn, &crate::plugin_manifest::fingerprint::fixture_indexer_version()).unwrap();
     let updated = conn.execute("UPDATE meta SET bulkIndexedAt = CURRENT_TIMESTAMP WHERE id = 1", []).unwrap();
     assert_eq!(updated, 1, "the fixture index must have its meta row");
     IndexStore::new(conn)

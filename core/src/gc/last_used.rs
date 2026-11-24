@@ -76,7 +76,8 @@ mod tests {
         let written = {
             let conn = Connection::open(dir.path().join("index.db")).unwrap();
             conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-            schema::ensure_current(&conn, &crate::daemon::registry::fixture_indexer_version()).unwrap();
+            schema::ensure_current(&conn, &crate::plugin_manifest::fingerprint::fixture_indexer_version())
+                .unwrap();
             touch(&conn).unwrap();
             stamp(&conn)
         }; // connection closed here - nothing is holding the index open

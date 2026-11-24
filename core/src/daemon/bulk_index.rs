@@ -378,14 +378,14 @@ fn walk_one_language_in(
     // this is the one place that knows which language just finished;
     // `schema::record_bulk_index` is the project-wide roll-up its caller
     // writes once, after every language. The one write site of
-    // `pluginFingerprint`, the digest `daemon::registry::indexer_version`
+    // `pluginFingerprint`, the digest `plugin_manifest::fingerprint::indexer_version`
     // computes per plugin.
     store
         .step(|conn| {
             schema::record_language_bulk_indexed(
                 conn,
                 &manifest.language,
-                Some(&plugin::fingerprint(manifest)),
+                Some(&crate::plugin_manifest::fingerprint::fingerprint(manifest)),
             )
         })
         .with_context(|| format!("failed to record that {} was bulk-indexed", manifest.language))?;

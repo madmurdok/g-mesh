@@ -817,7 +817,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let db_path = state.path().join("index.db");
         let conn = Connection::open(&db_path).unwrap();
-        schema::ensure_current(&conn, &crate::daemon::registry::fixture_indexer_version()).unwrap();
+        schema::ensure_current(&conn, &crate::plugin_manifest::fingerprint::fixture_indexer_version())
+            .unwrap();
         owe_and_give_up(&conn, "typescript", "src/gone.ts");
         owe_and_give_up(&conn, "rust", "src/gone.ts");
         conn.execute(

@@ -269,7 +269,7 @@ fn rerank_status(core: CoreState, state_dir: &Path) -> RerankStatus {
     {
         Some(record) => RerankStatus::Daemon(record),
         None => {
-            let settings = crate::config::embedding::rerank_settings();
+            let settings = crate::embedding::settings::rerank_settings();
             RerankStatus::OnDisk {
                 daemon_alive: live_pid.is_some(),
                 variant: settings.variant,

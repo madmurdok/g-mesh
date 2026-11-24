@@ -78,15 +78,13 @@
 //! read every `plugin-<language>.pid` file present
 //! ([`StateDir::plugin_pid_files`]) rather than assuming exactly one.
 //!
-//! # The index's generation string (task 163)
+//! # The index's generation string
 //!
-//! [`indexer_version`] lives here too, beside the type that owns discovery's
-//! results, though it is a free function over [`DiscoveredPlugins`] rather
-//! than a method - see its own doc comment for both halves of that (what it
-//! hashes, and why no caller has a registry to ask it). It is why `daemon::run`
-//! now discovers plugins *before* it opens and validates the index: with N
-//! plugins, "is what is in this index still what today's pipeline would
-//! produce?" cannot be answered by looking at one of them.
+//! [`indexer_version`] (in `plugin_manifest::fingerprint`, re-exported here)
+//! hashes every discovered plugin, so `daemon::run` discovers plugins
+//! *before* it opens and validates the index: with N plugins, "is what is in
+//! this index still what today's pipeline would produce?" cannot be answered
+//! by looking at one of them.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -95,104 +93,22 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
+use crate::daemon::path_case;
 use crate::daemon::watch_loop::WatcherClock;
-use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
 use crate::ingest::staleness::{self, StalenessOutcome};
 use crate::mcp::PathCoverage;
 use crate::model::Diff;
 use crate::paths::state_dir::StateDir;
+pub use crate::plugin_manifest::fingerprint::indexer_version;
 use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::project_walk::{extension_of, under_excluded_dir};
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{self, IndexStore, Unit};
 use crate::storage::language_outcome::LanguageOutcome;
-use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
-
-/// The generation string an index is stamped with, and the thing
-/// `storage::schema::ensure_current` compares: core's hand-maintained pipeline
-/// generation ([`CURRENT_INDEXER_VERSION`]) and the plugin *builds* that
-/// filled the index, joined.
-///
-/// Both halves have to be in it. The constant alone misses every plugin-side
-/// change (the failure task 116 fixes); the plugin half alone would miss every
-/// change in `link::imports` / `link::symbol_links`, which run in core and
-/// leave every plugin's bytes untouched.
-///
-/// # Why every discovered plugin, and not just the one that was spawned
-///
-/// An index is a single artifact filled by whichever plugins had something to
-/// say about the project, so it is only as current as the *least* current of
-/// the builds behind it: a Python plugin rebuilt with a different extractor
-/// invalidates the same `index.db` a JS/TS rebuild does. Keying this off one
-/// bundled plugin (which is what `daemon::plugin::indexer_version` did until
-/// task 163) would reproduce task 116's exact failure for every language that
-/// is not the bundled one - a current schema, a current constant, and a graph
-/// nothing will ever refresh.
-///
-/// Discovered rather than *active*, for the same reason: which supervisors
-/// happen to have been spawned is a property of what the daemon has been asked
-/// so far, not of what filled the index, and reading it would make the answer
-/// change under a running daemon.
-///
-/// # Why this spawns nothing
-///
-/// [`plugin::fingerprint`] only reads files under a manifest's
-/// `manifest_dir`, so the whole answer comes off the filesystem. That is what
-/// lets this run at daemon startup - before the index is trusted for anything,
-/// and long before the first file of any language brings its plugin up - and
-/// keeps `PluginRegistry`'s lazy-spawn promise intact (see this module's doc
-/// comment).
-///
-/// # A free function, not a `PluginRegistry` method
-///
-/// The architecture doc sketches this as `PluginRegistry::indexer_version()`,
-/// but no caller has a registry when it needs the answer: `daemon::run` has to
-/// stamp/validate the index *before* it builds one (the registry needs the
-/// canonicalized root, the project's config and the embedding pipeline; the
-/// version check needs only discovery's output and has to run before anything
-/// trusts the index at all), and `cli::init`/`cli::reindex` never build a
-/// registry in the first place. Taking `&DiscoveredPlugins` directly removes
-/// that ordering problem rather than working around it.
-pub fn indexer_version(discovered: &DiscoveredPlugins) -> String {
-    format!("{CURRENT_INDEXER_VERSION}+{}", plugins_digest(discovered))
-}
-
-/// One digest over every discovered plugin's `(language, fingerprint)` pair.
-///
-/// Re-hashed rather than concatenated so the result stays one fixed-width
-/// value however many plugins are installed - `meta.indexer_version` is
-/// compared, printed and eyeballed, and a string that grows with the plugin
-/// count would make all three worse for no gain.
-///
-/// Sorted by language first. `DiscoveredPlugins::manifests` is a `HashMap`, so
-/// its iteration order varies between processes for reasons that have nothing
-/// to do with what any plugin contains; hashing in that order would make two
-/// daemons of the same install disagree about the index they share and wipe
-/// each other's work. Same hazard [`plugin::fingerprint`]'s own file sort
-/// exists for, one level up. The language is hashed alongside its fingerprint
-/// (and both are length-delimited by a NUL) so that renaming a plugin, or two
-/// languages swapping builds, cannot leave the concatenation unchanged.
-pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
-    let mut fingerprinted: Vec<(&str, String)> = discovered
-        .manifests
-        .iter()
-        .map(|(language, manifest)| (language.as_str(), plugin::fingerprint(manifest)))
-        .collect();
-    fingerprinted.sort_unstable_by_key(|(one, _)| *one);
-
-    let mut hasher = Sha256::new();
-    for (language, fingerprint) in &fingerprinted {
-        hasher.update(language.as_bytes());
-        hasher.update([0]);
-        hasher.update(fingerprint.as_bytes());
-        hasher.update([0]);
-    }
-    plugin::truncated_hex(hasher)
-}
+use crate::storage::schema;
 
 /// Above this many files one language would gain from a `.gitignore` change,
 /// [`PluginRegistry::gitignore_changed`] does not reindex it and records the
@@ -283,22 +199,6 @@ pub(crate) enum ReconcileScope<'a> {
     /// while the project may have changed ([`PluginRegistry::starvation_sweep`]).
     /// Logged only when it changed something.
     Starved,
-}
-
-/// [`indexer_version`] for a discovery that found nothing - the generation
-/// string a *test* stamps a fixture index with when it needs `meta` to exist
-/// and nothing will ever compare that stamp against a live daemon's.
-///
-/// Shared (`gc::last_used`, `gc::warning`, `cli::clean`, `cli::status`) rather
-/// than repeated as a literal per test module, so those fixtures keep tracking
-/// the real shape of what `schema::ensure_current` stores instead of drifting
-/// into four hand-written strings. Deliberately over an empty
-/// [`DiscoveredPlugins`]: a real discovery would make every one of those
-/// fixtures walk and hash the installed plugins' whole build for a value none
-/// of them reads back.
-#[cfg(test)]
-pub(crate) fn fixture_indexer_version() -> String {
-    indexer_version(&DiscoveredPlugins::default())
 }
 
 /// What the `supervisors` map holds for one language: a plugin that is up, or

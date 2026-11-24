@@ -579,7 +579,8 @@ mod tests {
 
     fn index_with_bulk_indexed_at(state_dir: &Path, completed: bool) {
         let conn = Connection::open(state_dir.join("index.db")).unwrap();
-        schema::ensure_current(&conn, &crate::daemon::registry::fixture_indexer_version()).unwrap();
+        schema::ensure_current(&conn, &crate::plugin_manifest::fingerprint::fixture_indexer_version())
+            .unwrap();
         let value: Option<&str> = completed.then_some("2026-09-24 00:00:00");
         conn.execute("UPDATE meta SET bulkIndexedAt = ?1 WHERE id = 1", [value]).unwrap();
     }

@@ -255,7 +255,7 @@ pub(crate) trait Scorer: Send + Sync {
 }
 
 /// `variant`'s directory: `dir_override` (`$G_MESH_RERANK_MODEL_DIR`, read
-/// by `config::embedding::rerank_model_dir`), else
+/// by `embedding::settings::rerank_model_dir`), else
 /// `~/.g-mesh/models/<variant's dir_name>`, beside the embedding model.
 pub fn rerank_model_dir_from(dir_override: Option<&Path>, variant: RerankVariant) -> Result<PathBuf> {
     if let Some(dir) = dir_override {

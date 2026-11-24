@@ -15,11 +15,23 @@ if the largest component has more than N modules. `--drop A->B` / `--add A->B` (
 edit the computed graph before Tarjan runs, to project the components a planned move leaves.
 Quote edge arguments in a shell (`'A->B'`): an unquoted `>` is a redirection.
 
+`--layers` checks the target crate DAG of docs/design/GM-718-core-crate-decomposition.md
+(`CRATES`, lowest first, and `CRATE_MAP`, module path prefix -> crate). It exits 1 on any
+reference from a module of a lower crate to a module of a higher one, and on any module the map
+does not cover. It always counts test code (test files and `#[cfg(test)]` items), `use` and inline
+`crate::` paths at full depth (so `crate::config::embedding` maps to its own crate), and `mod x`
+declarations whose child maps to another crate; `--include-tests`, `--use-only`, `--drop` and
+`--add` do not change it. The scan is regex-based and does not see `super::` chains up to the
+crate root, `use crate::*` followed by a bare path, `use crate as x`, `crate :: x` with spaces, or
+a `#[path]` into another directory. Each failure prints from/to module, from/to crate, prod or test, the
+kind and `file:line`.
+
 Examples:
     scripts/module-cycles.py
     scripts/module-cycles.py --edges --use-only
     scripts/module-cycles.py --absent 'project_walk->watcher' --absent 'protocol->graph'
     scripts/module-cycles.py --drop 'storage->daemon' --add 'plugin_manifest->graph'
+    scripts/module-cycles.py --layers
 """
 
 import argparse
@@ -67,7 +79,7 @@ def strip_comments_and_strings(src):
             while j < n and src[j] != '"':
                 j += 2 if src[j] == "\\" else 1
             j = min(j + 1, n)
-            out.append('""' + re.sub(r"[^\n]", " ", src[i + 2:j]))
+            out.append('""' + re.sub(r"[^\n]", " ", src[i + 1:j]))
             i = j
             continue
         if c == "'":
@@ -214,6 +226,214 @@ def collect(src_root, include_tests, use_only):
     return sorted(modules), dict(edges)
 
 
+# Target crates of docs/design/GM-718-core-crate-decomposition.md section 2, lowest first. An edge
+# may point only to the same crate or to a lower one.
+CRATES = ["g-mesh-base", "g-mesh-index", "g-mesh-embed", "g-mesh-mcp", "g-mesh"]
+
+# Module path prefix (under `crate::`) -> target crate; the longest matching prefix wins. Every
+# top-level module must be covered: `--layers` reports an unmapped one as a failure.
+CRATE_MAP = {
+    "knobs": "g-mesh-base",
+    "fsutil": "g-mesh-base",
+    "paths": "g-mesh-base",
+    "log": "g-mesh-base",
+    "process": "g-mesh-base",
+    "ipc": "g-mesh-base",
+    "control": "g-mesh-base",
+    "indexing_status": "g-mesh-base",
+    "protocol": "g-mesh-base",
+    "project_walk": "g-mesh-base",
+    "config": "g-mesh-base",
+    "model": "g-mesh-index",
+    "graph": "g-mesh-index",
+    "link": "g-mesh-index",
+    "storage": "g-mesh-index",
+    "project_detect": "g-mesh-index",
+    "languages": "g-mesh-index",
+    "plugin_manifest": "g-mesh-index",
+    "index_health": "g-mesh-index",
+    "gc": "g-mesh-index",
+    "test_plugin": "g-mesh-index",
+    "embedding": "g-mesh-embed",
+    "config::embedding": "g-mesh-embed",
+    "mcp": "g-mesh-mcp",
+    "daemon": "g-mesh",
+    "shim": "g-mesh",
+    "cli": "g-mesh",
+    "ingest": "g-mesh",
+    "watcher": "g-mesh",
+}
+
+MOD_DECL = re.compile(r"\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*[;{]")
+
+
+def crate_of(path, crate_map):
+    """Target crate of a module path (list of segments under `crate::`), or None if unmapped."""
+    for k in range(len(path), 0, -1):
+        c = crate_map.get("::".join(path[:k]))
+        if c is not None:
+            return c
+    return None
+
+
+def module_path_of_file(rel):
+    """`config/embedding.rs` -> [config, embedding]; `config/mod.rs` -> [config]."""
+    parts = rel[:-3].split(os.sep)
+    if parts[-1] == "mod":
+        parts = parts[:-1]
+    return parts
+
+
+def crate_paths_of_use(body):
+    """Every `crate::...` path a `use` tree body names, as segment lists (`self` in a group names
+    the group's prefix; globs and `as` renames end the path)."""
+    body = re.sub(r"\s+as\s+[A-Za-z_][A-Za-z0-9_]*", "", body)
+    body = re.sub(r"\s+", "", body)
+    out = []
+
+    def walk(tree, prefix):
+        # prefix: None outside `crate::`, else the segments after `crate::` so far
+        if tree.startswith("{"):
+            for p in split_top(tree[1:-1]):
+                walk(p, prefix)
+            return
+        if prefix is None:
+            if tree.startswith("crate::"):
+                walk(tree[len("crate::"):], [])
+            return
+        segs = []
+        rest = tree
+        while True:
+            m = IDENT.match(rest)
+            if not m:
+                break
+            segs.append(m.group(0))
+            rest = rest[m.end():]
+            if not rest.startswith("::"):
+                break
+            rest = rest[2:]
+            if rest.startswith("{"):
+                for p in split_top(rest[1:-1]):
+                    walk(p, prefix + segs)
+                return
+        for i, s in enumerate(segs):
+            if s in ("self", "super", "crate"):
+                segs = segs[:i]
+                break
+        if prefix + segs:
+            out.append(prefix + segs)
+
+    walk(body, None)
+    return out
+
+
+INLINE_PATH = re.compile(r"(?<![A-Za-z0-9_:])crate((?:::[A-Za-z_][A-Za-z0-9_]*)+)")
+
+
+MACRO_EXPORT = re.compile(r"#\[macro_export\]\s*macro_rules!\s*([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def exported_macros(src_root):
+    """`#[macro_export]` macro name -> module path of the file defining it (such a macro is named
+    `crate::name` but belongs to that module's crate)."""
+    out = {}
+    for dirpath, _, files in os.walk(src_root):
+        for f in files:
+            if not f.endswith(".rs"):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, f), src_root)
+            if rel in ("lib.rs", "main.rs"):
+                continue
+            with open(os.path.join(dirpath, f), encoding="utf-8") as fh:
+                src = strip_comments_and_strings(fh.read())
+            for m in MACRO_EXPORT.finditer(src):
+                out[m.group(1)] = module_path_of_file(rel)
+    return out
+
+
+def collect_sites(src_root, crate_map):
+    """Every crate-crossing reference site, test code included.
+
+    Returns (unmapped, sites): `unmapped` is the sorted list of top-level modules the crate map
+    does not cover; each site is (rel file, line, from module path, to module path, from crate,
+    to crate, kind, is_test). Kind is `use`, `inline`, or `mod` (a `mod x` declaration whose child
+    maps to another crate). A site is test code when its file is a test file (`is_test_file`) or
+    it lies in a `#[cfg(test)]` item.
+    """
+    unmapped = set()
+    sites = []
+    macros = exported_macros(src_root)
+    for dirpath, dirs, files in os.walk(src_root):
+        dirs.sort()
+        for f in sorted(files):
+            if not f.endswith(".rs"):
+                continue
+            path = os.path.join(dirpath, f)
+            rel = os.path.relpath(path, src_root)
+            if rel in ("lib.rs", "main.rs"):
+                continue
+            from_path = module_path_of_file(rel)
+            from_crate = crate_of(from_path, crate_map)
+            if from_crate is None:
+                unmapped.add(from_path[0])
+                continue
+            file_is_test = is_test_file(rel)
+            with open(path, encoding="utf-8") as fh:
+                src = strip_comments_and_strings(fh.read())
+            # same length as src; a `#[cfg(test)]` item is blanked
+            prod = src if file_is_test else strip_cfg_test(src)
+
+            def add(pos, to_path, kind):
+                if to_path[0] in macros:
+                    to_path = macros[to_path[0]] + to_path
+                to_crate = crate_of(to_path, crate_map)
+                if to_crate is None:
+                    unmapped.add(to_path[0])
+                    return
+                if to_crate == from_crate:
+                    return
+                is_test = file_is_test or prod[pos] != src[pos]
+                line = src.count("\n", 0, pos) + 1
+                sites.append((rel, line, "::".join(from_path), "::".join(to_path), from_crate, to_crate, kind, is_test))
+
+            use_spans = []
+            for m in USE_STMT.finditer(src):
+                use_spans.append((m.start(), m.end()))
+                for p in crate_paths_of_use(m.group(1)):
+                    add(m.start(), p, "use")
+            for m in INLINE_PATH.finditer(src):
+                if any(s <= m.start() < e for s, e in use_spans):
+                    continue
+                add(m.start(), m.group(1)[2:].split("::"), "inline")
+            for m in MOD_DECL.finditer(src):
+                child = from_path + [m.group(1)]
+                if crate_of(child, crate_map) != from_crate:
+                    add(m.start(), child, "mod")
+    return sorted(unmapped), sites
+
+
+def check_layers(src_root, crate_map=None):
+    """Print every upward crate edge and every unmapped module; return True if there is none."""
+    crate_map = CRATE_MAP if crate_map is None else crate_map
+    rank = {c: i for i, c in enumerate(CRATES)}
+    unmapped, sites = collect_sites(src_root, crate_map)
+    ok = True
+    for mod in unmapped:
+        print(f"FAIL: module {mod} is not in the crate map (CRATE_MAP in scripts/module-cycles.py)")
+        ok = False
+    upward = [s for s in sites if rank[s[5]] > rank[s[4]]]
+    for rel, line, a, b, ca, cb, kind, is_test in sorted(upward, key=lambda s: (s[7], s[4], s[5], s[0], s[1])):
+        where = "test" if is_test else "prod"
+        print(f"FAIL: upward edge {a} -> {b} ({ca} -> {cb}) {where} {kind} {rel}:{line}")
+        ok = False
+    if ok:
+        print("ok: no upward crate edges")
+    else:
+        n_test = sum(1 for s in upward if s[7])
+        print(f"layers: {len(upward)} upward sites ({len(upward) - n_test} prod, {n_test} test), {len(unmapped)} unmapped modules")
+    return ok
+
+
 def tarjan(nodes, adj):
     index, low, on, stack, sccs, counter = {}, {}, set(), [], [], [0]
 
@@ -262,6 +482,7 @@ def main():
     ap.add_argument("--drop", action="append", default=[], metavar="A->B", help="remove edge A->B before Tarjan")
     ap.add_argument("--add", action="append", default=[], metavar="A->B", help="add edge A->B before Tarjan")
     ap.add_argument("--max-scc", type=int, help="fail if the largest component has more than N modules")
+    ap.add_argument("--layers", action="store_true", help="fail on an edge from a lower target crate to a higher one (test code included)")
     args = ap.parse_args()
 
     modules, edges = collect(os.path.normpath(args.src), args.include_tests, args.use_only)
@@ -296,6 +517,8 @@ def main():
     largest = max((len(c) for c in sccs), default=1)
     if args.max_scc is not None and largest > args.max_scc:
         print(f"FAIL: largest SCC has {largest} modules > {args.max_scc}")
+        failed = True
+    if args.layers and not check_layers(os.path.normpath(args.src)):
         failed = True
     return 1 if failed else 0
 

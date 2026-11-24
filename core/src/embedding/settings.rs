@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use super::{read_global_config, EmbeddingConfig, GlobalConfig};
+use crate::config::{read_global_config, EmbeddingConfig, GlobalConfig};
 use crate::embedding::cache::{self, CACHE_ENV};
 use crate::embedding::model::{default_model_dir_from, InferenceOptions};
 use crate::embedding::rerank::{rerank_model_dir_from, RERANK_ENV, RERANK_MODEL_ENV};
@@ -309,8 +309,8 @@ mod tests {
 
     fn file(cache_enabled: bool, max_size_mb: u64, rerank_enabled: bool) -> Result<GlobalConfig> {
         Ok(GlobalConfig {
-            embedding_cache: super::super::EmbeddingCacheConfig { enabled: cache_enabled, max_size_mb },
-            rerank: super::super::RerankConfig { enabled: rerank_enabled, model: None },
+            embedding_cache: crate::config::EmbeddingCacheConfig { enabled: cache_enabled, max_size_mb },
+            rerank: crate::config::RerankConfig { enabled: rerank_enabled, model: None },
             ..GlobalConfig::default()
         })
     }
@@ -418,7 +418,7 @@ mod tests {
         let lookup =
             |name: &str| env.iter().find(|(key, _)| *key == name).map(|(_, value)| OsString::from(value));
         let file = GlobalConfig {
-            rerank: super::super::RerankConfig { enabled: true, model: file_model.map(str::to_string) },
+            rerank: crate::config::RerankConfig { enabled: true, model: file_model.map(str::to_string) },
             ..GlobalConfig::default()
         };
         let mut lines = Vec::new();

@@ -150,7 +150,7 @@ const SEMANTIC_PASS_GATE_OPEN: &str = "semantic-pass.allow";
 /// reads it as `semantic_pass = false`: this fixture's plugin is never sent a
 /// `semanticPass` request. Use [`install_semantic_pass_capable`] for a
 /// language GM-270's per-language scheduler should ask for a pass.
-pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+pub fn install(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
     install_inner(root, language, extensions, false, false, false, false, &[], &[])
 }
 
@@ -165,7 +165,7 @@ pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathB
 /// (`"*.csproj"`) both compile the same way through `plugin_manifest::
 /// read_manifest`'s `Glob::new`, so this fixture needs no separate "glob"
 /// variant to test glob matching specifically.
-pub(crate) fn install_with_workspace(
+pub fn install_with_workspace(
     root: &Path,
     language: &str,
     extensions: &[&str],
@@ -181,7 +181,7 @@ pub(crate) fn install_with_workspace(
 /// (`daemon::workspace_reindex::run`) is asked for, and its
 /// `language_state.semanticPassAt` recorded, exactly for the one language
 /// being reindexed.
-pub(crate) fn install_with_workspace_semantic_pass_capable(
+pub fn install_with_workspace_semantic_pass_capable(
     root: &Path,
     language: &str,
     extensions: &[&str],
@@ -207,7 +207,7 @@ pub(crate) fn install_with_workspace_semantic_pass_capable(
 /// languages with different capabilities - one via this function, one via
 /// [`install`] - is what lets a test prove only the capable one ever receives
 /// it.
-pub(crate) fn install_semantic_pass_capable(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+pub fn install_semantic_pass_capable(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
     install_inner(root, language, extensions, false, false, true, false, &[], &[])
 }
 
@@ -235,14 +235,14 @@ pub(crate) fn install_semantic_pass_capable(root: &Path, language: &str, extensi
 /// Every test that installs one of these **must** open its gate, on every path
 /// including a failing assertion: a spawning thread that is never let go never
 /// joins.
-pub(crate) fn install_gated(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+pub fn install_gated(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
     install_inner(root, language, extensions, true, false, false, false, &[], &[])
 }
 
 /// Lets the plugin(s) installed in `plugin_dir` finish their handshake - see
 /// [`install_gated`]. Idempotent, and safe to call on a plugin that was never
 /// gated in the first place.
-pub(crate) fn open_handshake_gate(plugin_dir: &Path) {
+pub fn open_handshake_gate(plugin_dir: &Path) {
     fs::write(plugin_dir.join(HANDSHAKE_GATE), "go\n")
         .expect("failed to open the fake plugin's handshake gate");
 }
@@ -257,14 +257,14 @@ pub(crate) fn open_handshake_gate(plugin_dir: &Path) {
 /// Every test that gates a pass **must** open the gate on every path,
 /// including a failing assertion: the thread waiting on the pass never
 /// returns otherwise.
-pub(crate) fn gate_semantic_pass(plugin_dir: &Path) {
+pub fn gate_semantic_pass(plugin_dir: &Path) {
     fs::write(plugin_dir.join(SEMANTIC_PASS_GATED), "gated\n")
         .expect("failed to gate the fake plugin's semantic pass");
 }
 
 /// Lets a plugin gated by [`gate_semantic_pass`] answer its `semanticPass`
 /// requests. Idempotent.
-pub(crate) fn open_semantic_pass_gate(plugin_dir: &Path) {
+pub fn open_semantic_pass_gate(plugin_dir: &Path) {
     fs::write(plugin_dir.join(SEMANTIC_PASS_GATE_OPEN), "go\n")
         .expect("failed to open the fake plugin's semantic pass gate");
 }
@@ -275,13 +275,13 @@ pub(crate) fn open_semantic_pass_gate(plugin_dir: &Path) {
 ///
 /// Every test that gates a walk **must** open the gate on every path,
 /// including a failing assertion: the walking thread never returns otherwise.
-pub(crate) fn gate_bulk_walks(plugin_dir: &Path) {
+pub fn gate_bulk_walks(plugin_dir: &Path) {
     fs::write(plugin_dir.join("bulk-walk.gated"), "gated\n")
         .expect("failed to gate the fake plugin's bulk walk");
 }
 
 /// Lets the walks gated by [`gate_bulk_walks`] stream. Idempotent.
-pub(crate) fn open_bulk_walk_gate(plugin_dir: &Path) {
+pub fn open_bulk_walk_gate(plugin_dir: &Path) {
     fs::write(plugin_dir.join("bulk-walk.allow"), "go\n")
         .expect("failed to open the fake plugin's bulk walk gate");
 }
@@ -319,7 +319,7 @@ pub(crate) fn open_bulk_walk_gate(plugin_dir: &Path) {
 /// it dies immediately if killed - which is exactly what
 /// `daemon::plugin::PluginProcess`'s `on_timeout` does once a request against
 /// it runs past its budget.
-pub(crate) fn install_stalling(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+pub fn install_stalling(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
     install_inner(root, language, extensions, false, true, false, false, &[], &[])
 }
 
@@ -342,7 +342,7 @@ pub(crate) fn install_stalling(root: &Path, language: &str, extensions: &[&str])
 /// point is a real, measurable spike a low test-only `memoryLimitMb` (well
 /// under 200MB, well over the idle baseline) can reliably catch, not a
 /// pathological one.
-pub(crate) fn install_memory_hungry(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
+pub fn install_memory_hungry(root: &Path, language: &str, extensions: &[&str]) -> PathBuf {
     install_inner(root, language, extensions, false, false, true, true, &[], &[])
 }
 
@@ -353,7 +353,7 @@ pub(crate) fn install_memory_hungry(root: &Path, language: &str, extensions: &[&
 /// `incompleteReason` at all when `reason` is `None`, as a plugin that
 /// predates the field does. Every later request is answered normally, so a
 /// retry completes.
-pub(crate) fn install_incomplete_once(
+pub fn install_incomplete_once(
     root: &Path,
     language: &str,
     extensions: &[&str],
@@ -368,7 +368,7 @@ pub(crate) fn install_incomplete_once(
 /// its next process answers the first `semanticPass` as
 /// [`install_incomplete_once`] describes (and is neither gated, stalling nor
 /// memory-hungry), keeping the manifest it was installed with.
-pub(crate) fn answer_first_semantic_pass_incomplete(dir: &Path, language: &str, reason: Option<&str>) {
+pub fn answer_first_semantic_pass_incomplete(dir: &Path, language: &str, reason: Option<&str>) {
     assert_eq!(
         dir.file_name().and_then(|name| name.to_str()),
         Some(language),
@@ -402,7 +402,7 @@ fn install_inner(
 
 /// Adds `semantic_sweep = true` to a semantic-pass-capable plugin's
 /// `[plugin.capabilities]`. Takes effect at the next `discover`.
-pub(crate) fn declare_semantic_sweep(plugin_dir: &Path) {
+pub fn declare_semantic_sweep(plugin_dir: &Path) {
     let path = plugin_dir.join("plugin.toml");
     let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
     assert!(manifest.contains("semantic_pass = true\n"), "only a semantic-pass-capable manifest sweeps");
@@ -413,7 +413,7 @@ pub(crate) fn declare_semantic_sweep(plugin_dir: &Path) {
 /// Replaces a semantic-pass-capable plugin's `[plugin.capabilities]` table
 /// with `table`, a whole table, header included (a bundled plugin's, read
 /// from its `plugin.toml`). Takes effect at the next `discover`.
-pub(crate) fn replace_capabilities(plugin_dir: &Path, table: &str) {
+pub fn replace_capabilities(plugin_dir: &Path, table: &str) {
     let path = plugin_dir.join("plugin.toml");
     let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
     let own = "\n[plugin.capabilities]\nsemantic_pass = true\n";
@@ -426,7 +426,7 @@ pub(crate) fn replace_capabilities(plugin_dir: &Path, table: &str) {
 /// Makes every later complete `semanticPass` to the plugin in `plugin_dir`
 /// answer with `diff` (a `FileChangeDiff` as JSON), or, with `None`, with an
 /// empty diff again. Read per request, so it takes effect without a respawn.
-pub(crate) fn set_semantic_pass_answer(plugin_dir: &Path, diff: Option<&str>) {
+pub fn set_semantic_pass_answer(plugin_dir: &Path, diff: Option<&str>) {
     let path = plugin_dir.join(SEMANTIC_ANSWER);
     match diff {
         Some(diff) => fs::write(&path, diff).expect("failed to write the fake plugin's semantic answer"),
@@ -439,7 +439,7 @@ pub(crate) fn set_semantic_pass_answer(plugin_dir: &Path, diff: Option<&str>) {
 /// Adds `resolution_delta = true` to any fake plugin's
 /// `[plugin.capabilities]`, adding the table if the manifest has none. Takes
 /// effect at the next `discover`.
-pub(crate) fn declare_resolution_delta(plugin_dir: &Path) {
+pub fn declare_resolution_delta(plugin_dir: &Path) {
     let path = plugin_dir.join("plugin.toml");
     let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
     let table = "[plugin.capabilities]\n";
@@ -456,7 +456,7 @@ pub(crate) fn declare_resolution_delta(plugin_dir: &Path) {
 /// included when the test wants core to store some), or, with `None`, with
 /// an `unknown` delta again. Read per request, so it takes effect without a
 /// respawn.
-pub(crate) fn set_resolution_changed_answer(plugin_dir: &Path, result: Option<&str>) {
+pub fn set_resolution_changed_answer(plugin_dir: &Path, result: Option<&str>) {
     let path = plugin_dir.join(RESOLUTION_ANSWER);
     match result {
         Some(result) => {
@@ -473,7 +473,7 @@ pub(crate) fn set_resolution_changed_answer(plugin_dir: &Path, result: Option<&s
 /// response fields, e.g. `{"incomplete": true, "unfinishedFiles": [...]}`), or,
 /// with `None`, none again. Read per request, so it takes effect without a
 /// respawn.
-pub(crate) fn set_semantic_pass_fields(plugin_dir: &Path, fields: Option<&str>) {
+pub fn set_semantic_pass_fields(plugin_dir: &Path, fields: Option<&str>) {
     let path = plugin_dir.join(SEMANTIC_FIELDS);
     match fields {
         Some(fields) => fs::write(&path, fields).expect("failed to write the fake plugin's answer fields"),
@@ -486,7 +486,7 @@ pub(crate) fn set_semantic_pass_fields(plugin_dir: &Path, fields: Option<&str>) 
 /// The `filePaths` of every `semanticPass` this plugin directory's
 /// process(es) have ever been sent, oldest first, as JSON arrays (`[]` for a
 /// whole-project pass). Empty before the first one.
-pub(crate) fn semantic_passes(plugin_dir: &Path) -> Vec<String> {
+pub fn semantic_passes(plugin_dir: &Path) -> Vec<String> {
     let Ok(log) = fs::read_to_string(plugin_dir.join(SEMANTIC_PASS_LOG)) else { return Vec::new() };
     log.lines().map(str::to_string).collect()
 }
@@ -494,14 +494,14 @@ pub(crate) fn semantic_passes(plugin_dir: &Path) -> Vec<String> {
 /// Every pid this plugin directory has ever been spawned as, oldest first.
 /// Empty (rather than a panic) before the first spawn - "never spawned" is a
 /// perfectly ordinary thing for a test to assert.
-pub(crate) fn spawns(plugin_dir: &Path) -> Vec<u32> {
+pub fn spawns(plugin_dir: &Path) -> Vec<u32> {
     let Ok(log) = fs::read_to_string(plugin_dir.join(SPAWN_LOG)) else { return Vec::new() };
     log.lines().filter_map(|line| line.trim().parse().ok()).collect()
 }
 
 /// How many `--bulk-index` walks this plugin directory has ever been spawned
 /// for (a subset of [`spawns`]). 0 before the first one.
-pub(crate) fn bulk_walks(plugin_dir: &Path) -> usize {
+pub fn bulk_walks(plugin_dir: &Path) -> usize {
     let Ok(log) = fs::read_to_string(plugin_dir.join("bulk-walks.log")) else { return 0 };
     log.lines().filter(|line| !line.trim().is_empty()).count()
 }
@@ -510,7 +510,7 @@ pub(crate) fn bulk_walks(plugin_dir: &Path) -> usize {
 /// answered, oldest first, across every spawn, as `"<method> <filePath>"`
 /// (`filePath` empty for a request with no such field, e.g. `status`).
 /// Empty (rather than a panic) before the first one, same as [`spawns`].
-pub(crate) fn requests(plugin_dir: &Path) -> Vec<String> {
+pub fn requests(plugin_dir: &Path) -> Vec<String> {
     let Ok(log) = fs::read_to_string(plugin_dir.join(REQUEST_LOG)) else { return Vec::new() };
     log.lines().map(str::to_string).collect()
 }
@@ -521,21 +521,21 @@ pub(crate) fn requests(plugin_dir: &Path) -> Vec<String> {
 /// `"filesCreated <path>,<path>"`) - see [`NOTIFICATION_LOG`]'s own doc
 /// comment for why this is a separate log from [`requests`] rather than the
 /// same one. Empty before the first one, same as [`requests`]/[`spawns`].
-pub(crate) fn notifications(plugin_dir: &Path) -> Vec<String> {
+pub fn notifications(plugin_dir: &Path) -> Vec<String> {
     let Ok(log) = fs::read_to_string(plugin_dir.join(NOTIFICATION_LOG)) else { return Vec::new() };
     log.lines().map(str::to_string).collect()
 }
 
 /// Every framed message any fake plugin installed under `plugins_root` has
 /// received, oldest first, as `"<language> <method>"` - see [`FRAME_LOG`].
-pub(crate) fn frames(plugins_root: &Path) -> Vec<String> {
+pub fn frames(plugins_root: &Path) -> Vec<String> {
     let Ok(log) = fs::read_to_string(plugins_root.join(FRAME_LOG)) else { return Vec::new() };
     log.lines().map(str::to_string).collect()
 }
 
 /// Adds `semantic_prepare = true` to a semantic-pass-capable plugin's
 /// `[plugin.capabilities]`. Takes effect at the next `discover`.
-pub(crate) fn declare_semantic_prepare(plugin_dir: &Path) {
+pub fn declare_semantic_prepare(plugin_dir: &Path) {
     let path = plugin_dir.join("plugin.toml");
     let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
     assert!(manifest.contains("semantic_pass = true\n"), "only a semantic-pass-capable manifest prepares");
@@ -547,7 +547,7 @@ pub(crate) fn declare_semantic_prepare(plugin_dir: &Path) {
 /// Adds `files_created = true` to any fake plugin's `[plugin.capabilities]`,
 /// adding the table if the manifest has none. Takes effect at the next
 /// `discover`.
-pub(crate) fn declare_files_created(plugin_dir: &Path) {
+pub fn declare_files_created(plugin_dir: &Path) {
     let path = plugin_dir.join("plugin.toml");
     let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
     let table = "[plugin.capabilities]\n";
@@ -568,7 +568,7 @@ pub(crate) fn declare_files_created(plugin_dir: &Path) {
 /// pre-existing 1:1 side effect of *this* one, not a second thing debouncing
 /// could coalesce away, and counting it in would double every number below
 /// for a reason that has nothing to do with what this test is checking.
-pub(crate) fn file_changed_requests(plugin_dir: &Path) -> Vec<String> {
+pub fn file_changed_requests(plugin_dir: &Path) -> Vec<String> {
     requests(plugin_dir)
         .into_iter()
         .filter_map(|line| line.strip_prefix("fileChanged ").map(str::to_string))
@@ -578,7 +578,7 @@ pub(crate) fn file_changed_requests(plugin_dir: &Path) -> Vec<String> {
 /// Makes every later bulk walk of `language` over `project` emit `lines`
 /// (NDJSON, one item each) instead of its fixed stream, then exit with
 /// `exit_code`.
-pub(crate) fn set_bulk_stream(project: &Path, language: &str, lines: &[String], exit_code: i32) {
+pub fn set_bulk_stream(project: &Path, language: &str, lines: &[String], exit_code: i32) {
     let mut stream = lines.join("\n");
     stream.push('\n');
     fs::write(project.join(format!(".{language}-bulk.ndjson")), stream)
@@ -590,7 +590,7 @@ pub(crate) fn set_bulk_stream(project: &Path, language: &str, lines: &[String], 
 /// The bulk-walk trailer line a `resolution_delta` plugin ends its stream
 /// with, for [`set_bulk_stream`]'s `lines`: `facts`, plus `watchPaths` when
 /// `watch_paths` is non-empty (absent otherwise, as the SDK writes it).
-pub(crate) fn resolution_facts_line(facts: &str, watch_paths: &[&str]) -> String {
+pub fn resolution_facts_line(facts: &str, watch_paths: &[&str]) -> String {
     let mut line = serde_json::json!({ "resolutionFacts": facts });
     if !watch_paths.is_empty() {
         line["watchPaths"] = serde_json::json!(watch_paths);
@@ -602,7 +602,7 @@ pub(crate) fn resolution_facts_line(facts: &str, watch_paths: &[&str]) -> String
 /// commit. Shared by every caller of this module, because none of them cares
 /// what is in it - only that the commit path a real file change takes is the
 /// one being exercised.
-pub(crate) fn empty_index() -> IndexStore {
+pub fn empty_index() -> IndexStore {
     let conn = Connection::open_in_memory().expect("failed to open an in-memory index");
     conn.pragma_update(None, "foreign_keys", "ON").expect("failed to enable foreign keys");
     schema::apply(&conn).expect("failed to apply the schema");
@@ -658,7 +658,7 @@ extensions = [{extensions}]
 /// starts, says nothing for `after_ms` (long enough for other callers to pile
 /// in behind its spawn), then exits 1 without a handshake - the failure
 /// `PluginProcess::spawn` reports.
-pub(crate) fn never_handshake(plugin_dir: &Path, after_ms: u64) {
+pub fn never_handshake(plugin_dir: &Path, after_ms: u64) {
     write_options(
         plugin_dir,
         &Options { exit_without_handshake_after_ms: Some(after_ms), ..Options::default() },
@@ -668,7 +668,7 @@ pub(crate) fn never_handshake(plugin_dir: &Path, after_ms: u64) {
 /// Points the manifest in `plugin_dir` at a fake binary that was never built,
 /// so its spawn fails the way a never-built workspace plugin's does; returns
 /// the missing path. Takes effect at the next `discover`.
-pub(crate) fn point_at_a_missing_binary(plugin_dir: &Path) -> PathBuf {
+pub fn point_at_a_missing_binary(plugin_dir: &Path) -> PathBuf {
     let path = plugin_dir.join("plugin.toml");
     let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
     let command = format!("command = \"${{G_MESH_BIN_DIR}}/{FAKE_PLUGIN_BIN}\"");
@@ -680,9 +680,9 @@ pub(crate) fn point_at_a_missing_binary(plugin_dir: &Path) -> PathBuf {
 }
 
 /// The file whose bytes stand for the plugin's build in its directory's
-/// fingerprint (`daemon::plugin::fingerprint` hashes the whole directory):
+/// fingerprint (`plugin_manifest::fingerprint::fingerprint` hashes the whole directory):
 /// rewriting it with different bytes is a rebuild that changed something.
-pub(crate) fn build_artifact(plugin_dir: &Path) -> PathBuf {
+pub fn build_artifact(plugin_dir: &Path) -> PathBuf {
     plugin_dir.join(OPTIONS_FILE)
 }
 

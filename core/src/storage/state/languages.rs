@@ -130,7 +130,7 @@ pub fn language_semantic_pass_done(conn: &Connection, language: &str) -> Result<
 /// every language's walk is done, no longer takes a language at all and only
 /// re-checks the roll-up condition.
 ///
-/// `plugin_fingerprint` is `daemon::plugin::fingerprint`'s digest of the
+/// `plugin_fingerprint` is `plugin_manifest::fingerprint::fingerprint`'s digest of the
 /// plugin build that produced this walk, when the caller has it "readily
 /// available" (this task's own scope note) - `walk_one_language` does,
 /// because it already holds the `PluginManifest`. `None` leaves whatever

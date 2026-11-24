@@ -66,7 +66,7 @@ pub fn run(args: &ProbeArgs) -> Result<()> {
     }
     let base = variants.encoder_of(variant)?;
     let options = if args.options_from_env {
-        crate::config::embedding::inference_options()
+        crate::embedding::settings::inference_options()
     } else {
         InferenceOptions::default()
     };

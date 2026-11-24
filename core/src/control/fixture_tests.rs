@@ -4,35 +4,36 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+/// Writes a project directory's `index.db` for a project idle `idle_days`.
+pub(crate) type WriteIndex = fn(&Path, u64);
 
 /// A `~/.g-mesh/projects/` of its own, so every test here - including the
 /// ones that delete everything - is confined to a temp directory.
 pub(crate) struct Projects {
     pub(crate) dir: tempfile::TempDir,
+    write_index: WriteIndex,
 }
 
 impl Projects {
+    /// Projects whose `index.db` is an opaque file. The purge and the sweep
+    /// never open it, so it only has to exist.
     pub(crate) fn new() -> Self {
-        Self { dir: tempfile::tempdir().unwrap() }
+        Self::with_index(write_opaque_index)
+    }
+
+    /// Projects whose `index.db` `write_index` writes.
+    pub(crate) fn with_index(write_index: WriteIndex) -> Self {
+        Self { dir: tempfile::tempdir().unwrap(), write_index }
     }
 
     pub(crate) fn root(&self) -> &Path {
         self.dir.path()
     }
 
-    /// A project directory with an index whose `lastUsed` is `idle_days`
-    /// old, exactly as a real one would record it.
+    /// A project directory with an index for a project idle `idle_days`.
     pub(crate) fn add(&self, id: &str, idle_days: u64) -> PathBuf {
         let path = self.add_empty(id);
-        let conn = Connection::open(path.join("index.db")).unwrap();
-        crate::storage::schema::ensure_current(&conn, &crate::daemon::registry::fixture_indexer_version())
-            .unwrap();
-        conn.execute(
-            "UPDATE meta SET lastUsed = datetime('now', ?1) WHERE id = 1",
-            rusqlite::params![format!("-{idle_days} days")],
-        )
-        .unwrap();
+        (self.write_index)(&path, idle_days);
         path
     }
 
@@ -61,6 +62,10 @@ impl Projects {
     }
 }
 
+fn write_opaque_index(project: &Path, _idle_days: u64) {
+    fs::write(project.join("index.db"), b"").unwrap();
+}
+
 /// The fixture the whole target has to get right at once: one project
 /// still on disk, one whose directory was deleted, one whose root is
 /// missing along with its parent, one predating recorded roots, and one
@@ -75,8 +80,11 @@ pub(crate) struct OrphanFixture {
 }
 
 pub(crate) fn orphan_fixture() -> OrphanFixture {
-    let projects = Projects::new();
+    orphan_fixture_in(Projects::new())
+}
 
+/// [`orphan_fixture`] in `projects`.
+pub(crate) fn orphan_fixture_in(projects: Projects) -> OrphanFixture {
     let live_root = tempfile::tempdir().unwrap();
     projects.add("aaaa1111", 1);
     projects.record_root("aaaa1111", live_root.path());

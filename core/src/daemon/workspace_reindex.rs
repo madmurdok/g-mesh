@@ -84,7 +84,6 @@ use anyhow::{Context, Result};
 
 use crate::daemon::bulk_index::{self, WalkContext};
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::plugin;
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
@@ -442,7 +441,7 @@ fn rebuild(
     at(Stage::Planned);
 
     let semantic_pass_languages: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
-    let fingerprint = plugin::fingerprint(manifest);
+    let fingerprint = crate::plugin_manifest::fingerprint::fingerprint(manifest);
     let write = embedding.vector_write(&computed);
     let vectors = match kind {
         Rebuild::Reindex => Some(&write as &dyn VectorWrite),
@@ -2262,7 +2261,7 @@ mod tests {
         let generation = || {
             let discovered =
                 discover(&[plugins.path().to_path_buf()]).expect("the fixtures discover cleanly");
-            crate::daemon::registry::indexer_version(&discovered)
+            crate::plugin_manifest::fingerprint::indexer_version(&discovered)
         };
         let conn = Connection::open_in_memory().unwrap();
         schema::ensure_current(&conn, &generation()).unwrap();

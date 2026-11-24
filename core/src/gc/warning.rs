@@ -172,7 +172,7 @@ mod tests {
             let conn = Connection::open(path.join("index.db")).unwrap();
             crate::storage::schema::ensure_current(
                 &conn,
-                &crate::daemon::registry::fixture_indexer_version(),
+                &crate::plugin_manifest::fingerprint::fixture_indexer_version(),
             )
             .unwrap();
             conn.execute(

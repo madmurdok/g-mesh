@@ -7,7 +7,7 @@
 ///
 /// `-buildvcs=false`: by default Go stamps the enclosing repository's
 /// revision, commit time and "tree is dirty" bit into the binary. The index's
-/// generation (`daemon::registry::indexer_version`) digests the plugin
+/// generation (`plugin_manifest::fingerprint::indexer_version`) digests the plugin
 /// directory's bytes, binary included, so a stamped binary changes with any
 /// edit or commit anywhere in the checkout, and each rebuild then wipes indexes
 /// an unchanged extractor built. Nothing in the plugin reads that stamp.
