@@ -142,3 +142,93 @@ fn the_checker_fails_on_a_present_edge_and_an_oversized_cycle() {
         describe(&size)
     );
 }
+
+/// Writes `files` (relative path, contents) under a fresh temp dir with a `lib.rs` that declares
+/// nothing: the script reads every other `.rs` file by its path.
+fn fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let src = tempfile::tempdir().unwrap();
+    fs::write(src.path().join("lib.rs"), "").unwrap();
+    for (rel, text) in files {
+        let path = src.path().join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    src
+}
+
+fn layers(src: &Path) -> (Output, String) {
+    let output = module_cycles(src, &["--layers"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    (output, stdout)
+}
+
+#[test]
+fn the_real_tree_has_no_upward_crate_edge() {
+    let (output, stdout) = layers(&repo_root().join("core/src"));
+
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(stdout.contains("ok: no upward crate edges"), "{}", describe(&output));
+}
+
+#[test]
+fn layers_fails_on_an_upward_production_edge_and_names_it() {
+    let src = fixture(&[("config.rs", "use crate::daemon::Thing;\n"), ("daemon.rs", "pub struct Thing;\n")]);
+
+    let (output, stdout) = layers(src.path());
+
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("upward edge config -> daemon"))
+        .unwrap_or_else(|| panic!("{}", describe(&output)));
+    assert!(line.contains("(g-mesh-base -> g-mesh)"), "{line}");
+    assert!(line.contains("prod"), "{line}");
+}
+
+#[test]
+fn layers_fails_on_an_upward_edge_that_only_test_code_has() {
+    let in_cfg_test = fixture(&[
+        ("config.rs", "#[cfg(test)]\nmod tests {\n    use crate::daemon::Thing;\n}\n"),
+        ("daemon.rs", ""),
+    ]);
+    let (output, stdout) = layers(in_cfg_test.path());
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("upward edge config -> daemon"))
+        .unwrap_or_else(|| panic!("{}", describe(&output)));
+    assert!(line.contains("test"), "{line}");
+
+    let in_tests_file = fixture(&[
+        ("config/mod.rs", ""),
+        ("config/tests.rs", "use crate::daemon::Thing;\n"),
+        ("daemon.rs", ""),
+    ]);
+    let (output, stdout) = layers(in_tests_file.path());
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("upward edge config::tests -> daemon"))
+        .unwrap_or_else(|| panic!("{}", describe(&output)));
+    assert!(line.contains("test"), "{line}");
+}
+
+#[test]
+fn layers_fails_on_a_module_the_crate_map_does_not_cover() {
+    let src = fixture(&[("config.rs", ""), ("not_in_the_map.rs", "")]);
+
+    let (output, stdout) = layers(src.path());
+
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(stdout.contains("FAIL: module not_in_the_map is not in the crate map"), "{}", describe(&output));
+}
+
+#[test]
+fn layers_passes_on_a_downward_edge() {
+    let src = fixture(&[("daemon.rs", "use crate::config::Thing;\n"), ("config.rs", "pub struct Thing;\n")]);
+
+    let (output, stdout) = layers(src.path());
+
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(stdout.contains("ok: no upward crate edges"), "{}", describe(&output));
+}

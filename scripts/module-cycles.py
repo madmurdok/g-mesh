@@ -21,7 +21,9 @@ reference from a module of a lower crate to a module of a higher one, and on any
 does not cover. It always counts test code (test files and `#[cfg(test)]` items), `use` and inline
 `crate::` paths at full depth (so `crate::config::embedding` maps to its own crate), and `mod x`
 declarations whose child maps to another crate; `--include-tests`, `--use-only`, `--drop` and
-`--add` do not change it. Each failure prints from/to module, from/to crate, prod or test, the
+`--add` do not change it. The scan is regex-based and does not see `super::` chains up to the
+crate root, `use crate::*` followed by a bare path, `use crate as x`, `crate :: x` with spaces, or
+a `#[path]` into another directory. Each failure prints from/to module, from/to crate, prod or test, the
 kind and `file:line`.
 
 Examples:

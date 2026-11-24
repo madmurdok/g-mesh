@@ -1081,6 +1081,14 @@ pub fn default_model_dir_from(dir_override: Option<&Path>, model_name: &str) -> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_default_model_name_is_one_value_on_every_path() {
+        assert_eq!(DEFAULT_MODEL_NAME, "jina-embeddings-v2-base-code");
+        assert_eq!(crate::embedding::DEFAULT_MODEL_NAME, DEFAULT_MODEL_NAME);
+        assert_eq!(crate::config::DEFAULT_MODEL_NAME, DEFAULT_MODEL_NAME);
+        assert_eq!(crate::config::EmbeddingConfig::default().model, DEFAULT_MODEL_NAME);
+    }
+
     /// Where the tests below expect the default model's weights.
     fn test_model_dir() -> PathBuf {
         let dir_override = std::env::var_os(MODEL_DIR_ENV).map(PathBuf::from);
