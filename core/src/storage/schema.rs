@@ -741,6 +741,19 @@ CREATE TABLE IF NOT EXISTS embedding_noise_purge (
     ruleVersion TEXT NOT NULL,
     purgedAt    TEXT NOT NULL
 );
+
+-- When a full project walk last compared every file under the `.gitignore`
+-- rules of that moment (`walkedAt`, SQLite UTC `CURRENT_TIMESTAMP`): the
+-- baseline a daemon start rechecks `.gitignore` mtimes against. Moved only by
+-- a full walk (cold start, `g-mesh init`, `g-mesh reindex`), never by a
+-- per-language swap, which moves `meta.bulkIndexedAt` but does not compare
+-- the other languages. An index without the row takes `bulkIndexedAt` once
+-- (`gitignore_baseline_unix`). Dropped by `wipe`. Added by `CREATE TABLE IF
+-- NOT EXISTS`, so an existing index gains it without a schema-version bump.
+CREATE TABLE IF NOT EXISTS gitignore_baseline (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    walkedAt TEXT NOT NULL
+);
 "#;
 
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
@@ -899,7 +912,7 @@ fn wipe(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS language_retry; \
          DROP TABLE IF EXISTS resolution_facts; DROP TABLE IF EXISTS resolution_watch_paths; \
          DROP TABLE IF EXISTS seed_origin; \
-         DROP TABLE IF EXISTS embedding_noise_purge;",
+         DROP TABLE IF EXISTS embedding_noise_purge; DROP TABLE IF EXISTS gitignore_baseline;",
     )
     .context("failed to wipe schema")
 }

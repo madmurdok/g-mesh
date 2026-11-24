@@ -158,13 +158,30 @@ nothing more. Bookkeeping:
 - a gate run that trips the guard again for a set already deferred (same
   language, same count) does not log again, so "one log line" holds across
   Rescans (section 3.3);
-- `g-mesh reindex` stops the daemon (`cli/reindex.rs:179-190`) and stamps a
-  new `bulkIndexedAt`: the next daemon starts with an empty set and the
-  recheck no longer sees the `.gitignore` as newer;
+- the restart recheck compares `.gitignore` mtimes with a separate
+  `.gitignore` baseline (table `gitignore_baseline`, one row), not with
+  `meta.bulkIndexedAt`: every per-language swap (`language_swap.rs`
+  `swap_attached` -> `record_bulk_index`) moves `bulkIndexedAt` to now, so a
+  recheck against it would skip the gate after any language's reindex and
+  the `Start` reconcile would index the un-ignored files. Only a full walk
+  writes the baseline (`record_gitignore_baseline`: daemon cold start in
+  `activation.rs`, `g-mesh init`, `g-mesh reindex`); a per-language swap,
+  a config reindex and an owed reindex do not. An index without the row
+  (built before the table existed) adopts its `bulkIndexedAt` as the
+  baseline at the first recheck (`gitignore_baseline_unix`);
+- `g-mesh reindex` stops the daemon (`cli/reindex.rs:179-190`), wipes the
+  index and writes a new baseline: the next daemon starts with an empty set
+  and the recheck no longer sees the `.gitignore` as newer;
 - a restart without reindex rebuilds the set: the `.gitignore` is still newer
-  than `bulkIndexedAt`, so `recheck_gitignores_since_index` re-runs the gate
-  on the consumer thread before the `Start` reconcile (P2 closed with no
-  persistence);
+  than the baseline, so `recheck_gitignores_since_index` re-runs the gate on
+  the consumer thread before the `Start` reconcile (P2 closed with no
+  persistence of the set). Accepted cost: until the next `g-mesh reindex`,
+  every daemon start re-runs the gate for those `.gitignore` files and logs
+  the guard line once more;
+- a whole-language reindex for any reason (`workspace_reindex::run_with`)
+  clears that language's set: it walked the language under the current
+  rules;
+- a file whose own change is routed (`file_changed`) leaves the set;
 - the `Starved` per-language count block (l.1420-1446) is replaced by the
   same filter, removing GM-727/S7's accepted limitation (a sweep skipping
   every new file of an over-guard language).
@@ -220,9 +237,13 @@ recommended; listed because the task asked "test assumption vs bypass".
 A whole-language reindex for another reason (a `tsconfig.json` edit,
 `workspace_reindex::run` via `reindex_workspace`, registry.rs:1119-1143)
 walks the language's files with the current rules and indexes deferred files
-too. That is a user-triggered config change, not an un-ignore; A would clear
-the deferred set for that language when it happens (or should, see edit
-map). Not a GM-742 regression; flag for the owner if the guard should cover it.
+too. That is a user-triggered config change, not an un-ignore; the owner
+chose to let it index them and clear the language's deferred set.
+
+Accepted known gap: a `.gitignore` **deleted** while the watcher's events were
+dropped. The gate sees `.gitignore` files by mtime and a deleted file has
+none, so no gate runs, nothing is deferred, and the following `Rescan` or
+`Starved` reconcile indexes every file it un-ignored, past the guard.
 
 ## 5. Edit map (option A)
 
@@ -235,8 +256,12 @@ Change:
 | `core/src/daemon/registry.rs` | `gitignore_changed` | 1145-1204 | on guard: insert the added set per language, log only if new; otherwise remove the language's deferred paths under `subtrees` |
 | `core/src/daemon/registry.rs` | `reconcile_counted` | 1364-1554 | replace the `Starved` block (1420-1446) with a filter of `created` by the deferred set for every `Plain` scope (`Seeded` unchanged) |
 | `core/src/daemon/registry.rs` | `GITIGNORE_REINDEX_GUARD` doc, `starvation_sweep` doc | 197-200, 1276-1283 | say the guard holds for every plain reconcile via the deferred set |
-| `core/src/daemon/registry.rs` | `reindex_workspace` | 1119-1143 | after a successful whole-language reindex, clear that language's deferred set |
-| `core/src/daemon/registry.rs` | `route_settled_path` / `file_changed` | 968-, 1054- | optional: drop a routed path from the deferred set |
+| `core/src/daemon/registry.rs` | `file_changed` | 1054- | drop a routed path from the deferred set |
+| `core/src/daemon/workspace_reindex.rs` | `run_with` | after the swap | clear the language's deferred set (every whole-language reindex, whoever asked) |
+| `core/src/storage/schema.rs` | DDL, `wipe` | | table `gitignore_baseline (id, walkedAt)`, dropped by `wipe` |
+| `core/src/storage/state/languages.rs` | `record_gitignore_baseline`, `gitignore_baseline_unix` | | write the baseline from `bulkIndexedAt`; read it, adopting `bulkIndexedAt` when the row is missing |
+| `core/src/daemon/activation.rs`, `core/src/cli/init.rs`, `core/src/cli/reindex.rs` | after `record_bulk_index` | | `record_gitignore_baseline` (full walks only; `language_swap.rs` does not) |
+| `core/src/daemon/registry.rs` | `recheck_gitignores_since_index` | 1211-1231 | compare with `gitignore_baseline_unix` instead of `bulk_indexed_at_unix` |
 
 Read for context: `reload_and_reconcile` (1293-1307),
 `recheck_gitignores_since_index` (1211-1231), `rescan_subtrees` (1266-1274),

@@ -350,6 +350,9 @@ impl ActivationCtx {
         // ever sees it once structural answers are already being given.
         self.indexing.set_phase(Phase::Structural);
         self.conn.with(schema::record_bulk_index).context("failed to record that the project was indexed")?;
+        self.conn
+            .with(schema::record_gitignore_baseline)
+            .context("failed to record the .gitignore baseline")?;
         self.needs_walk = false;
         // A walk that took minutes is minutes the core spent working - the
         // same reasoning `last_used::touch` applies to a GC scan, applied to

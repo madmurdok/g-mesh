@@ -34,6 +34,41 @@ pub fn bulk_indexed_at_unix(conn: &Connection) -> Result<Option<i64>> {
     Ok(recorded.flatten())
 }
 
+/// Records `meta.bulkIndexedAt` as the `.gitignore` baseline, after a full
+/// project walk has recorded it; nothing when it is unset. A per-language
+/// swap must not call this.
+pub fn record_gitignore_baseline(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO gitignore_baseline (id, walkedAt) \
+         SELECT 1, bulkIndexedAt FROM meta WHERE id = 1 AND bulkIndexedAt IS NOT NULL",
+        [],
+    )
+    .context("failed to record the .gitignore baseline")?;
+    Ok(())
+}
+
+/// The `.gitignore` baseline ([`record_gitignore_baseline`]) as Unix
+/// seconds; `None` before a walk has completed. An index with no baseline row
+/// adopts `meta.bulkIndexedAt` as its baseline first, so later per-language
+/// swaps no longer move it.
+pub fn gitignore_baseline_unix(conn: &Connection) -> Result<Option<i64>> {
+    conn.execute(
+        "INSERT OR IGNORE INTO gitignore_baseline (id, walkedAt) \
+         SELECT 1, bulkIndexedAt FROM meta WHERE id = 1 AND bulkIndexedAt IS NOT NULL",
+        [],
+    )
+    .context("failed to adopt bulkIndexedAt as the .gitignore baseline")?;
+    let recorded: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT CAST(strftime('%s', walkedAt) AS INTEGER) FROM gitignore_baseline WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read the .gitignore baseline")?;
+    Ok(recorded.flatten())
+}
+
 /// [`present_languages`], each paired with whether that language's
 /// `language_state.semanticPassAt` is set. `mcp::instructions` reads only
 /// the languages: its text is rendered from manifest capabilities, never

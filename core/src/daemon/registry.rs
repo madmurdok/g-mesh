@@ -1252,16 +1252,17 @@ impl PluginRegistry {
         new
     }
 
-    /// GM-508, owner's Q3: at daemon start on an indexed project, the
-    /// `.gitignore` files edited since the last walk recorded `bulkIndexedAt`
-    /// go through [`gitignore_changed`](Self::gitignore_changed). A
-    /// `.gitignore` deleted while the daemon was down leaves no mtime and is
-    /// not seen here.
+    /// At daemon start on an indexed project, the `.gitignore` files edited
+    /// since the last full walk ([`schema::gitignore_baseline_unix`], not
+    /// `bulkIndexedAt`, which a per-language swap moves) go through
+    /// [`gitignore_changed`](Self::gitignore_changed), which also rebuilds
+    /// the deferred un-ignores before the start's reconcile. A `.gitignore`
+    /// deleted while the daemon was down leaves no mtime and is not seen here.
     pub(crate) fn recheck_gitignores_since_index(&self, conn: &IndexStore) {
         // A seeded index's reconcile compared every walked file under the
         // `.gitignore` files of that moment, as a walk does: it counts as one.
         let indexed_at = conn.with(|conn| {
-            let walked = schema::bulk_indexed_at_unix(conn)?;
+            let walked = schema::gitignore_baseline_unix(conn)?;
             let seeded = schema::seed_reconciled_at_unix(conn)?;
             Ok::<_, anyhow::Error>(walked.map(|walked| seeded.map_or(walked, |seeded| walked.max(seeded))))
         });
