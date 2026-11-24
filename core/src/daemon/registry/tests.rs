@@ -2018,6 +2018,11 @@ fn a_restart_after_an_unignore_and_another_languages_reindex_indexes_none_of_the
     unignore_more_than_the_guard(project.path());
     let edited = WALKED_AT_SECS + 3600;
     set_mtime(&project.path().join(".gitignore"), edited);
+    // The un-ignored files predate the edit, as they would on a real disk.
+    for index in 0..GITIGNORE_REINDEX_GUARD {
+        set_mtime(&project.path().join(format!("generated/f{index}.alpha-src")), edited - 60);
+    }
+    set_mtime(&project.path().join(DEFERRED_ONE), edited - 60);
 
     registry.workspace_file_changed(&conn, "beta", "beta.mod");
     let (bulk, baseline) = conn

@@ -145,7 +145,29 @@ The g-mesh index answered for code shared with `main`; it did not know
 ### A (recommended): remember the files an over-guard gate left out
 
 `gitignore_changed` already computes, per language, the exact set it would
-add (`now.difference(indexed)`). When the guard trips, keep that set in the
+add (`now.difference(indexed)`). Of that set, the files the edit un-ignored
+are those whose mtime is not later than the edit
+(`PluginRegistry::predates_unignore`); a file newer than the edit was
+created after it and is a genuine new file, which a live daemon indexes by
+its own event. The guard counts, logs and defers only the files that predate
+the edit:
+
+- the edit's time for a file is the latest mtime among the triggering
+  `.gitignore` files in its own or an ancestor directory (several
+  `.gitignore` files in one gate run: each file takes the ones governing its
+  subtree);
+- a file is counted as un-ignored (deferred) when its own mtime cannot be
+  read, when a governing `.gitignore` has no readable mtime (deleted), or
+  when no triggering `.gitignore` governs it (a gate triggered by links
+  only);
+- only when more than the guard predate the edit does the language trip it;
+  the newer files are then left to their own events and to the next plain
+  reconcile, which indexes them as created. Below the guard the language is
+  reindexed whole as before;
+- the stat runs only for a language whose whole difference exceeds the
+  guard.
+
+When the guard trips, keep the predating set in the
 registry (`deferred_unignores: Mutex<BTreeMap<String /*language*/,
 HashSet<String>>>`); `reconcile_counted` in `Plain` mode (every scope:
 `Start`, `Rescan`, `Starved`) drops created files that are in it, logging
@@ -240,10 +262,16 @@ walks the language's files with the current rules and indexes deferred files
 too. That is a user-triggered config change, not an un-ignore; the owner
 chose to let it index them and clear the language's deferred set.
 
-Accepted known gap: a `.gitignore` **deleted** while the watcher's events were
-dropped. The gate sees `.gitignore` files by mtime and a deleted file has
-none, so no gate runs, nothing is deferred, and the following `Rescan` or
-`Starved` reconcile indexes every file it un-ignored, past the guard.
+Accepted known gaps:
+
+- a `.gitignore` **deleted** while the watcher's events were dropped. The
+  gate sees `.gitignore` files by mtime and a deleted file has none, so no
+  gate runs, nothing is deferred, and the following `Rescan` or `Starved`
+  reconcile indexes every file it un-ignored, past the guard;
+- un-ignored files rewritten after the edit (build output regenerated) are
+  newer than the edit, so they are not deferred and a restart or Rescan
+  indexes them past the guard. This matches a live daemon, which indexes
+  each of them by its own event.
 
 ## 5. Edit map (option A)
 
@@ -253,7 +281,8 @@ Change:
 |---|---|---|---|
 | `core/src/daemon/registry.rs` | `struct PluginRegistry` + `PluginRegistry::new` | l.452-, l.548- | field `deferred_unignores: Mutex<BTreeMap<String, HashSet<String>>>`, empty |
 | `core/src/daemon/registry.rs` | `over_reindex_guard` | 202-214 | take an "already reported" flag (or move the log out) so a repeat of the same deferral logs nothing |
-| `core/src/daemon/registry.rs` | `gitignore_changed` | 1145-1204 | on guard: insert the added set per language, log only if new; otherwise remove the language's deferred paths under `subtrees` |
+| `core/src/daemon/registry.rs` | `gitignore_changed` | 1145-1204 | count only the added files that predate the edit; on guard: defer that set per language, log its count only if new; otherwise remove the language's deferred paths under `subtrees` |
+| `core/src/daemon/registry.rs` | `predates_unignore` | new | file mtime not later than the latest governing triggering `.gitignore` mtime; unreadable or ungoverned counts as predating |
 | `core/src/daemon/registry.rs` | `reconcile_counted` | 1364-1554 | replace the `Starved` block (1420-1446) with a filter of `created` by the deferred set for every `Plain` scope (`Seeded` unchanged) |
 | `core/src/daemon/registry.rs` | `GITIGNORE_REINDEX_GUARD` doc, `starvation_sweep` doc | 197-200, 1276-1283 | say the guard holds for every plain reconcile via the deferred set |
 | `core/src/daemon/registry.rs` | `file_changed` | 1054- | drop a routed path from the deferred set |

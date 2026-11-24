@@ -1165,13 +1165,15 @@ impl PluginRegistry {
     /// language with a difference is reindexed whole
     /// ([`reindex_workspace`](Self::reindex_workspace), never asking for a
     /// resolution delta, since a `.gitignore` changes which files are indexed;
-    /// the first of `gitignores`, else of `links`, as the trigger), unless it would gain more than
-    /// [`GITIGNORE_REINDEX_GUARD`] files: then those files become the
+    /// the first of `gitignores`, else of `links`, as the trigger), unless more
+    /// than [`GITIGNORE_REINDEX_GUARD`] of the files it would gain predate the
+    /// edit ([`Self::predates_unignore`]): then those files become the
     /// language's deferred un-ignores under these directories, and one log
-    /// line asks for `g-mesh reindex`, unless every one of them was already
-    /// deferred. A compared language that does not trip the guard has its
-    /// deferred files under these directories forgotten. No difference, no
-    /// reindex.
+    /// line naming their count asks for `g-mesh reindex`, unless every one of
+    /// them was already deferred. The newer files it would gain are left to
+    /// their own events and to the next plain reconcile. A compared language
+    /// that does not trip the guard has its deferred files under these
+    /// directories forgotten. No difference, no reindex.
     pub(crate) fn gitignore_changed(&self, conn: &IndexStore, gitignores: &[String], links: &[String]) {
         let Some(trigger) = gitignores.first().or(links.first()) else { return };
         let subtrees = gitignore_subtrees(gitignores, links);
@@ -1200,22 +1202,41 @@ impl PluginRegistry {
             self.deferred_unignores.lock().unwrap().keys().cloned().collect();
         let languages: std::collections::BTreeSet<String> =
             languages.into_iter().chain(deferred_languages).collect();
+        let edits: Vec<(String, Option<std::time::SystemTime>)> = gitignores
+            .iter()
+            .map(|gitignore| {
+                let dir = gitignore.rsplit_once('/').map_or(String::new(), |(dir, _)| dir.to_string());
+                let mtime = fs::metadata(self.project_root.join(gitignore)).and_then(|m| m.modified()).ok();
+                (dir, mtime)
+            })
+            .collect();
         for language in languages {
             if !self.has_manifest(&language) || self.is_failed_language(&language) {
                 continue;
             }
             let now = walked.get(&language).unwrap_or(&none);
             let indexed = live.get(&language).unwrap_or(&none);
-            let added_files: HashSet<String> = now.difference(indexed).cloned().collect();
+            let added_files: Vec<&String> = now.difference(indexed).collect();
             let added = added_files.len();
             let removed = indexed.difference(now).count();
-            if self.defer_unignores(&language, &subtrees, added_files) {
+            // At most `added` files predate the edit: no stat below the guard.
+            let unignored: HashSet<String> = if added > GITIGNORE_REINDEX_GUARD {
+                added_files
+                    .into_iter()
+                    .filter(|file_path| self.predates_unignore(file_path, &edits))
+                    .cloned()
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let deferred = unignored.len();
+            if self.defer_unignores(&language, &subtrees, unignored) {
                 crate::log_role!(
-                    "{trigger} changed would add {added} {language} files to the index - more than \
+                    "{trigger} changed would add {deferred} {language} files to the index - more than \
                      {GITIGNORE_REINDEX_GUARD}, so nothing was reindexed; run `g-mesh reindex` to index them"
                 );
             }
-            if added > GITIGNORE_REINDEX_GUARD || (added == 0 && removed == 0) {
+            if deferred > GITIGNORE_REINDEX_GUARD || (added == 0 && removed == 0) {
                 continue;
             }
             crate::log_role!(
@@ -1226,6 +1247,29 @@ impl PluginRegistry {
             // `.gitignore` change added or removed.
             self.reindex_workspace(conn, &language, trigger, false);
         }
+    }
+
+    /// Whether `file_path` (project-relative) counts as un-ignored by the
+    /// `.gitignore` edits `edits` (each `.gitignore`'s directory and mtime)
+    /// rather than created after them: its mtime is not later than the latest
+    /// mtime of the edited `.gitignore` files in its own or an ancestor
+    /// directory. Counted as un-ignored when no edited `.gitignore` governs it
+    /// (a link-only gate), when one of them has no readable mtime (deleted),
+    /// or when its own mtime cannot be read.
+    fn predates_unignore(&self, file_path: &str, edits: &[(String, Option<std::time::SystemTime>)]) -> bool {
+        let mut latest = None;
+        for (dir, mtime) in edits {
+            if !crate::project_walk::under_any(file_path, std::slice::from_ref(dir)) {
+                continue;
+            }
+            let Some(mtime) = mtime else { return true };
+            latest = latest.max(Some(*mtime));
+        }
+        let Some(latest) = latest else { return true };
+        fs::metadata(self.project_root.join(file_path))
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .is_none_or(|modified| modified <= latest)
     }
 
     /// Replaces `language`'s deferred un-ignores under `subtrees` with
