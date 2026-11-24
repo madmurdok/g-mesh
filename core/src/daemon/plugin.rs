@@ -26,7 +26,6 @@
 //! paths were still pending against it, transparently to the caller besides
 //! the added latency of doing so.
 
-use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -35,7 +34,6 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
 
 use crate::embedding::EmbeddingPipeline;
 use crate::ingest::apply::{
@@ -43,6 +41,8 @@ use crate::ingest::apply::{
     apply_semantic_pass, reextract_file, FileChangeOutcome, SemanticPassOutcome,
 };
 use crate::ingest::staleness::{self, StalenessOutcome};
+pub use crate::plugin_manifest::fingerprint::fingerprint;
+use crate::plugin_manifest::fingerprint::{plugins_digest, FINGERPRINT_UNAVAILABLE};
 use crate::plugin_manifest::PluginManifest;
 use crate::protocol::handshake;
 use crate::protocol::jsonrpc::{is_timeout, read_message_with_timeout, write_message};
@@ -254,25 +254,6 @@ impl RoundTripTimeouts {
     }
 }
 
-/// How much of the digest [`fingerprint`] keeps. 64 bits is far more than
-/// enough to tell two builds of one plugin apart, and short enough that a
-/// human reading a build stamp file can compare two of them at a glance.
-const FINGERPRINT_HEX_CHARS: usize = 16;
-
-/// What [`fingerprint`] answers when it cannot read the plugin's build at
-/// all. Deliberately a fixed string rather than a random or timestamped one:
-/// two processes that both fail to look compare *equal*, which degrades to
-/// the behavior there was before this existed instead of making every start
-/// look like a change. It cannot collide with a real answer, which is hex.
-pub const FINGERPRINT_UNAVAILABLE: &str = "unavailable";
-
-/// Directory names skipped while fingerprinting *every* plugin, regardless of
-/// what its own manifest says - see `docs/architecture/plugin-modularity.md`'s
-/// Data Model section ("Built-in baseline ignore"). A manifest's own
-/// `fingerprint_ignore` extends this list; it never replaces it.
-const BASELINE_FINGERPRINT_IGNORE: &[&str] =
-    &[".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"];
-
 /// The language whose pid file `StateDir::plugin_pid_file` is asked for: the
 /// bundled TypeScript plugin's manifest `language`, which is also its
 /// directory name under a plugin root.
@@ -283,63 +264,9 @@ const BASELINE_FINGERPRINT_IGNORE: &[&str] =
 /// this one.
 pub const BUNDLED_LANGUAGE: &str = "typescript";
 
-/// Identifies the plugin *logic* this process would run, as a short hex
-/// digest of its compiled output.
-///
-/// # Why this exists
-///
-/// The whole graph is computed by the plugin, but until task 116 nothing in
-/// g-mesh could tell that the plugin had changed. The two staleness checks
-/// that existed both looked somewhere else: `daemon::build_stamp` at the core
-/// executable, and `storage::schema::CURRENT_INDEXER_VERSION` at a constant
-/// somebody has to remember to bump. Task 115 rewrote how the extractor
-/// resolves same-file edges and - correctly following every rule that was
-/// written down, none of which is enforced by anything - did not bump that
-/// constant. Every existing index went on serving the previous extractor's
-/// output, with a current schema, a current core binary, and no symptom other
-/// than wrong answers.
-///
-/// So this is the plugin's half of "which pipeline produced what is in the
-/// index", derived the way `build_stamp`'s docs argue the core's half should
-/// be: from the artifact itself, so it needs no discipline to maintain and
-/// cannot silently agree when it should not.
-///
-/// # Content, not mtime
-///
-/// `build_stamp` compares the core executable's mtime because it only needs an
-/// *ordering* ("is that daemon behind me?"). This one has to answer a
-/// different question - "would that build produce a different graph?" - where
-/// mtime is both too eager and unordered: a rebuild can rewrite a file with
-/// identical bytes, and a re-emitted but byte-identical build must not cost a
-/// project a full re-walk. A digest over the bytes changes exactly when the
-/// logic does.
-///
-/// # What it does not cover
-///
-/// A plugin's dependency/VCS junk - `node_modules`, `.git`, and the rest of
-/// [`BASELINE_FINGERPRINT_IGNORE`] (plus anything a manifest's own
-/// `fingerprint_ignore` adds) - is walked but skipped by name, not hashed:
-/// those directories are large, are not what a plugin's own build emits, and
-/// walking them on every shim start would turn a sub-millisecond check into a
-/// directory crawl. A dependency upgrade that changes extraction is therefore
-/// still a manual [`CURRENT_INDEXER_VERSION`](crate::storage::schema::CURRENT_INDEXER_VERSION)
-/// bump, which is exactly what that constant remains for - the two halves are
-/// complementary, not redundant.
-pub fn fingerprint(manifest: &PluginManifest) -> String {
-    digest_of_plugin_build(&manifest.manifest_dir, &manifest.fingerprint_ignore).unwrap_or_else(|err| {
-        crate::log_line!(
-            "g-mesh: could not fingerprint the {} plugin at {}: {err:#} - \
-                 a change to its extraction logic will not be noticed",
-            manifest.language,
-            manifest.manifest_dir.display()
-        );
-        FINGERPRINT_UNAVAILABLE.to_string()
-    })
-}
-
 /// One digest over every plugin `plugin_manifest::discover` finds from
-/// `plugin_manifest::default_roots` - the same value `daemon::registry::indexer_version`
-/// appends to the core pipeline's generation - memoized for the process's
+/// `plugin_manifest::default_roots` - the same value
+/// [`indexer_version`](crate::plugin_manifest::fingerprint::indexer_version) appends to the core pipeline's generation - memoized for the process's
 /// lifetime. It is what `build_stamp::of_running_process` records, so a shim
 /// can tell that a running daemon's plugins were rebuilt under an unchanged
 /// core executable.
@@ -354,7 +281,7 @@ pub fn discovered_fingerprint() -> &'static str {
     static FINGERPRINT: OnceLock<String> = OnceLock::new();
     FINGERPRINT.get_or_init(|| {
         match crate::plugin_manifest::discover(&crate::plugin_manifest::default_roots()) {
-            Ok(discovered) => crate::daemon::registry::plugins_digest(&discovered),
+            Ok(discovered) => plugins_digest(&discovered),
             Err(err) => {
                 crate::log_line!(
                     "g-mesh: could not discover plugins to fingerprint: {err:#} - a rebuilt plugin will \
@@ -364,96 +291,6 @@ pub fn discovered_fingerprint() -> &'static str {
             }
         }
     })
-}
-
-/// Digests every regular file under `dir`, skipping any subdirectory whose
-/// name is in [`BASELINE_FINGERPRINT_IGNORE`] or `ignore`, in a stable order.
-///
-/// The whole directory rather than just an entry point's siblings: a plugin's
-/// own build output can be laid out however it likes, and the file most
-/// likely to change what the graph looks like is not necessarily the entry
-/// file. Each file's path and length go into the digest alongside its bytes,
-/// so moving code between two files cannot leave the concatenation unchanged.
-fn digest_of_plugin_build(dir: &Path, ignore: &[String]) -> Result<String> {
-    let mut files = Vec::new();
-    collect_fingerprinted_files(dir, dir, ignore, &mut files)?;
-    if files.is_empty() {
-        bail!("no plugin files found under {}", dir.display());
-    }
-    // Directory iteration order is whatever the filesystem feels like, and a
-    // fingerprint that depends on it would differ between two identical
-    // checkouts.
-    files.sort();
-
-    let mut hasher = Sha256::new();
-    for (relative, path) in &files {
-        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        hasher.update(relative.as_bytes());
-        hasher.update([0]);
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(&bytes);
-    }
-
-    Ok(truncated_hex(hasher))
-}
-
-/// Finishes `hasher` the one way this daemon renders a digest: lowercase hex,
-/// cut to [`FINGERPRINT_HEX_CHARS`].
-///
-/// Shared with `daemon::registry::indexer_version`, which hashes every
-/// discovered plugin's fingerprint into a single digest of its own. Two
-/// digests that mean different things may as well look alike - both are read
-/// by humans comparing a build stamp or a `meta.indexer_version` at a glance -
-/// and a second, subtly different truncation convention invented next door is
-/// exactly the kind of drift a shared helper costs nothing to rule out.
-pub(crate) fn truncated_hex(hasher: Sha256) -> String {
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
-        .chars()
-        .take(FINGERPRINT_HEX_CHARS)
-        .collect()
-}
-
-/// Gathers every regular file under `dir` as a pair of its path relative to
-/// `root` and its full path, recursing into subdirectories except those named
-/// in [`BASELINE_FINGERPRINT_IGNORE`] or `ignore`. Recursive rather than one
-/// flat `read_dir` so a plugin laid out in subdirectories does not silently
-/// fall outside the fingerprint - a blind spot in this function is a wrong
-/// answer served later, which is the exact failure it exists to prevent.
-fn collect_fingerprinted_files(
-    root: &Path,
-    dir: &Path,
-    ignore: &[String],
-    out: &mut Vec<(String, PathBuf)>,
-) -> Result<()> {
-    let entries = fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
-        let path = entry.path();
-        let file_type = entry.file_type().with_context(|| format!("failed to stat {}", path.display()))?;
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if BASELINE_FINGERPRINT_IGNORE.contains(&name.as_ref())
-                || ignore.iter().any(|ignored| ignored == name.as_ref())
-            {
-                continue;
-            }
-            collect_fingerprinted_files(root, &path, ignore, out)?;
-            continue;
-        }
-        if !file_type.is_file() {
-            // Symlinks, sockets, etc. - not a regular file this plugin's
-            // build emitted.
-            continue;
-        }
-        let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
-        out.push((relative, path));
-    }
-    Ok(())
 }
 
 struct PluginIo {

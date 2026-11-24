@@ -135,8 +135,8 @@ pub const CURRENT_SCHEMA_VERSION: &str = "17";
 ///
 /// What is written to `meta.indexer_version` is therefore this constant *plus*
 /// a digest of the plugin's compiled output - see
-/// `daemon::plugin::indexer_version`, which composes the two, and
-/// `daemon::plugin::fingerprint` for why the plugin's half is derived from the
+/// `plugin_manifest::fingerprint::indexer_version`, which composes the two,
+/// and `plugin_manifest::fingerprint::fingerprint` for why the plugin's half is derived from the
 /// artifact rather than declared. This half remains for everything that digest
 /// cannot see, which is why it is still worth keeping honest by hand.
 ///

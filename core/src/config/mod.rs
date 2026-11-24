@@ -39,11 +39,9 @@
 //! # Who reads them
 //!
 //! The daemon's startup and the CLI commands read these files and hand plain
-//! values to the modules that use them. [`embedding`] turns the embedding
-//! sections plus their environment overrides into
-//! [`crate::embedding::EmbeddingSettings`], once per daemon or CLI run.
-
-pub mod embedding;
+//! values to the modules that use them. `embedding::settings` turns the
+//! embedding sections plus their environment overrides into
+//! `embedding::EmbeddingSettings`, once per daemon or CLI run.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -121,6 +119,9 @@ impl Default for DaemonConfig {
     }
 }
 
+/// The embedding model a project uses unless its config names another.
+pub const DEFAULT_MODEL_NAME: &str = "jina-embeddings-v2-base-code";
+
 /// `[embedding]`: which embedding model this project's semantic search uses.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
@@ -130,7 +131,7 @@ pub struct EmbeddingConfig {
 
 impl Default for EmbeddingConfig {
     fn default() -> Self {
-        Self { model: crate::embedding::DEFAULT_MODEL_NAME.to_string() }
+        Self { model: DEFAULT_MODEL_NAME.to_string() }
     }
 }
 
@@ -152,7 +153,7 @@ pub struct GlobalConfig {
 /// cross-encoder (`embedding::rerank`), and which one. The environment
 /// variables `G_MESH_RERANK=off` and `G_MESH_RERANK_MODEL` override `enabled`
 /// and `model`. Read once per daemon or CLI run, at its start
-/// ([`embedding::embedding_settings`]).
+/// (`embedding::settings::embedding_settings`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RerankConfig {

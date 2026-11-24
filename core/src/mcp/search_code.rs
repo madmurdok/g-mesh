@@ -778,7 +778,7 @@ mod tests {
     fn handle_reports_a_tool_error_when_the_configured_model_is_unavailable() {
         let conn = Arc::new(IndexStore::new(setup()));
         let mut settings =
-            crate::config::embedding::embedding_settings(&crate::config::EmbeddingConfig::default());
+            crate::embedding::settings::embedding_settings(&crate::config::EmbeddingConfig::default());
         settings.model.dir_override = Some(Path::new("/nonexistent-g-mesh-test-model-dir").to_path_buf());
         let embedding = EmbeddingPipeline::load(settings);
 
@@ -980,7 +980,7 @@ mod tests {
     #[test]
     #[ignore = "needs the real model weights; run `g-mesh model fetch` first"]
     fn a_query_related_to_a_docstring_ranks_that_symbol_above_an_unrelated_one() {
-        let dir = crate::config::embedding::model_dir(crate::embedding::DEFAULT_MODEL_NAME)
+        let dir = crate::embedding::settings::model_dir(crate::embedding::DEFAULT_MODEL_NAME)
             .expect("failed to resolve the default model directory");
         assert!(
             dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists(),
@@ -1025,7 +1025,7 @@ mod tests {
         .unwrap();
 
         let conn = Arc::new(IndexStore::new(conn));
-        let embedding = EmbeddingPipeline::load(crate::config::embedding::embedding_settings(
+        let embedding = EmbeddingPipeline::load(crate::embedding::settings::embedding_settings(
             &crate::config::EmbeddingConfig::default(),
         ));
         let params = SearchCodeParams {

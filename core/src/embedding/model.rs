@@ -45,7 +45,7 @@
 //! of the repository it came from.
 //!
 //! `g-mesh model fetch` (see [`crate::cli::model`]) does exactly that, into the
-//! directory `config::embedding::resolve_model_dir` resolves to - it is a user-typed command,
+//! directory `embedding::settings::resolve_model_dir` resolves to - it is a user-typed command,
 //! never something this module or the daemon triggers.
 //! `core/scripts/fetch-embedding-model.sh` is the same download as a shell
 //! one-liner, kept for a source checkout that has no built binary yet; both
@@ -212,8 +212,7 @@ pub const MAX_SEQUENCE_LENGTH: usize = 8192;
 /// is still there for a caller that deliberately wants more.
 pub const DEFAULT_MAX_SEQUENCE_LENGTH: usize = 1024;
 
-/// The embedding model a project uses unless its config names another.
-pub const DEFAULT_MODEL_NAME: &str = "jina-embeddings-v2-base-code";
+pub use crate::config::DEFAULT_MODEL_NAME;
 
 /// Overrides where [`default_model_dir_from`] looks. Exists so tests and
 /// development checkouts can point at a model directory outside the user's
@@ -1057,7 +1056,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// Where the weights for `model_name` are expected to live:
 /// `~/.g-mesh/models/<model_name>/`, or `dir_override` (`$G_MESH_MODEL_DIR`,
-/// read by `config::embedding::model_dir`) if set.
+/// read by `embedding::settings::model_dir`) if set.
 ///
 /// `~/.g-mesh/` is already where g-mesh keeps everything else it owns (indexes
 /// and config), and models are per-machine rather than per-project - the same

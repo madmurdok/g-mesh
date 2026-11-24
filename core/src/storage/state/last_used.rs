@@ -90,7 +90,8 @@ mod tests {
     /// time anything touches `lastUsed`.
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::ensure_current(&conn, &crate::daemon::registry::fixture_indexer_version()).unwrap();
+        schema::ensure_current(&conn, &crate::plugin_manifest::fingerprint::fixture_indexer_version())
+            .unwrap();
         conn
     }
 

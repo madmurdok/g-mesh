@@ -2,7 +2,10 @@ use super::*;
 use rusqlite::Connection;
 
 use crate::plugin_manifest::discover;
-use crate::storage::schema;
+use crate::plugin_manifest::fingerprint::{
+    fingerprint, fixture_indexer_version, plugins_digest, FINGERPRINT_UNAVAILABLE,
+};
+use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
 use crate::test_plugin;
 
 /// A registry over `languages`, each installed as a fake plugin claiming
@@ -252,7 +255,7 @@ fn ensure_current_reindexes_when_any_one_plugins_build_changes() {
 
 /// Against the real bundled plugin rather than a stub: the generation a
 /// daemon on this machine would actually compute names a readable build,
-/// not [`plugin::FINGERPRINT_UNAVAILABLE`] - discovery finds the
+/// not [`FINGERPRINT_UNAVAILABLE`] - discovery finds the
 /// checkout's own plugin directories.
 #[test]
 fn the_real_bundled_plugin_root_produces_a_readable_generation() {
@@ -265,8 +268,8 @@ fn the_real_bundled_plugin_root_produces_a_readable_generation() {
     );
     for manifest in discovered.manifests.values() {
         assert_ne!(
-            plugin::fingerprint(manifest),
-            plugin::FINGERPRINT_UNAVAILABLE,
+            fingerprint(manifest),
+            FINGERPRINT_UNAVAILABLE,
             "{} must be fingerprintable - `cargo test` builds it",
             manifest.language
         );

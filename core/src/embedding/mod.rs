@@ -23,6 +23,7 @@ pub(crate) mod ce_text;
 pub mod model;
 pub mod pipeline;
 pub mod rerank;
+pub mod settings;
 pub(crate) mod text;
 
 pub use model::{

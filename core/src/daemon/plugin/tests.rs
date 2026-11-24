@@ -1,4 +1,9 @@
+use std::fs;
+
+use sha2::{Digest, Sha256};
+
 use super::*;
+use crate::plugin_manifest::fingerprint::{digest_of_plugin_build, FINGERPRINT_HEX_CHARS};
 use crate::plugin_manifest::{Capabilities, WorkspaceConfig};
 use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
 use crate::storage::index_store::IndexStore;

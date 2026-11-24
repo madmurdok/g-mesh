@@ -680,7 +680,7 @@ pub(crate) fn point_at_a_missing_binary(plugin_dir: &Path) -> PathBuf {
 }
 
 /// The file whose bytes stand for the plugin's build in its directory's
-/// fingerprint (`daemon::plugin::fingerprint` hashes the whole directory):
+/// fingerprint (`plugin_manifest::fingerprint::fingerprint` hashes the whole directory):
 /// rewriting it with different bytes is a rebuild that changed something.
 pub(crate) fn build_artifact(plugin_dir: &Path) -> PathBuf {
     plugin_dir.join(OPTIONS_FILE)

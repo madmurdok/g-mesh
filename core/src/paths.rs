@@ -31,7 +31,7 @@ pub const HOME_ENV: &str = crate::knobs::HOME.name;
 ///   per-run state. Pointing it at a test root would mean re-downloading it
 ///   rather than reusing what is already on disk, which is why it keeps its
 ///   own, older `G_MESH_MODEL_DIR` override
-///   ([`crate::config::embedding::model_dir`]).
+///   ([`crate::embedding::settings::model_dir`]).
 /// - `bin/` - written by `scripts/install.sh`, which this binary never reads.
 ///   `G_MESH_HOME` moves where g-mesh *works*, not where it is installed.
 pub fn g_mesh_home() -> Result<PathBuf> {

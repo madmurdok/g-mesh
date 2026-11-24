@@ -136,14 +136,14 @@ fn vector_row_exists(conn: &Connection, node_id: &str) -> bool {
 }
 
 fn model_dir() -> PathBuf {
-    g_mesh::config::embedding::model_dir(g_mesh::embedding::DEFAULT_MODEL_NAME).unwrap()
+    g_mesh::embedding::settings::model_dir(g_mesh::embedding::DEFAULT_MODEL_NAME).unwrap()
 }
 
 /// The default model's pipeline as the daemon resolves it, with `cache` in
 /// place of the global config's.
 fn pipeline_with_cache(cache: Option<CacheSettings>) -> EmbeddingPipeline {
     let mut settings =
-        g_mesh::config::embedding::embedding_settings(&g_mesh::config::EmbeddingConfig::default());
+        g_mesh::embedding::settings::embedding_settings(&g_mesh::config::EmbeddingConfig::default());
     settings.cache = cache;
     EmbeddingPipeline::load(settings)
 }
