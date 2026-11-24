@@ -1499,8 +1499,18 @@ fn at_start_only_a_gitignore_newer_than_the_last_walk_runs_the_gate() {
         write_file(project.path(), "generated/x.alpha-src", "");
         write_file(project.path(), "src/a.alpha-src", "");
         write_file(project.path(), ".gitignore", "");
-        set_mtime(&project.path().join(".gitignore"), (WALKED_AT_SECS as i64 + offset) as u64);
+        // A `.gitignore`'s ctime cannot be set back, so the walk is moved
+        // instead: `offset` is the `.gitignore`'s age relative to the walk.
         let conn = index_walked_at(WALKED_AT);
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        conn.with(|c| {
+            c.execute(
+                "UPDATE meta SET bulkIndexedAt = datetime(?1, 'unixepoch') WHERE id = 1",
+                [now - offset],
+            )
+        })
+        .unwrap();
         insert_file_nodes(&conn, &[("alpha", "src/a.alpha-src")]);
 
         registry.recheck_gitignores_since_index(&conn);

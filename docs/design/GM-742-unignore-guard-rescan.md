@@ -152,7 +152,13 @@ created after it and is a genuine new file, which a live daemon indexes by
 its own event. The guard counts, logs and defers only the files that predate
 the edit:
 
-- the edit's time for a file is the latest mtime among the triggering
+- a `.gitignore`'s edit time is the later of its mtime and, on Unix, its
+  ctime (`gitignore_edit_time`): `mv`, `cp -p`, `rsync -a` and `tar x` keep
+  an old mtime but set the ctime. Off Unix it is the mtime alone. The same
+  edit time decides which `.gitignore` files the restart recheck and a
+  Rescan pass to the gate (`gitignores_newer_than`), so a `.gitignore`
+  moved in while the daemon was down is rechecked;
+- the edit's time for a file is the latest edit time among the triggering
   `.gitignore` files in its own or an ancestor directory (several
   `.gitignore` files in one gate run: each file takes the ones governing its
   subtree);
@@ -268,6 +274,10 @@ Accepted known gaps:
   gate sees `.gitignore` files by mtime and a deleted file has none, so no
   gate runs, nothing is deferred, and the following `Rescan` or `Starved`
   reconcile indexes every file it un-ignored, past the guard;
+- genuinely new files that keep an old mtime (extracted by `tar`, copied by
+  `cp -p`) under an over-guard un-ignore are deferred at a restart or
+  Rescan, while a live daemon indexes each of them by its own event; they
+  stay unindexed until their next save or `g-mesh reindex`;
 - un-ignored files rewritten after the edit (build output regenerated) are
   newer than the edit, so they are not deferred and a restart or Rescan
   indexes them past the guard. This matches a live daemon, which indexes
@@ -282,7 +292,8 @@ Change:
 | `core/src/daemon/registry.rs` | `struct PluginRegistry` + `PluginRegistry::new` | l.452-, l.548- | field `deferred_unignores: Mutex<BTreeMap<String, HashSet<String>>>`, empty |
 | `core/src/daemon/registry.rs` | `over_reindex_guard` | 202-214 | take an "already reported" flag (or move the log out) so a repeat of the same deferral logs nothing |
 | `core/src/daemon/registry.rs` | `gitignore_changed` | 1145-1204 | count only the added files that predate the edit; on guard: defer that set per language, log its count only if new; otherwise remove the language's deferred paths under `subtrees` |
-| `core/src/daemon/registry.rs` | `predates_unignore` | new | file mtime not later than the latest governing triggering `.gitignore` mtime; unreadable or ungoverned counts as predating |
+| `core/src/daemon/registry.rs` | `predates_unignore` | new | file mtime not later than the latest governing triggering `.gitignore` edit time; unreadable or ungoverned counts as predating |
+| `core/src/daemon/registry.rs` | `gitignore_edit_time`, `gitignores_newer_than` | new, 1236- | edit time = max(mtime, ctime) on Unix, mtime elsewhere; used for the cutoff and for the recheck/Rescan selection |
 | `core/src/daemon/registry.rs` | `reconcile_counted` | 1364-1554 | replace the `Starved` block (1420-1446) with a filter of `created` by the deferred set for every `Plain` scope (`Seeded` unchanged) |
 | `core/src/daemon/registry.rs` | `GITIGNORE_REINDEX_GUARD` doc, `starvation_sweep` doc | 197-200, 1276-1283 | say the guard holds for every plain reconcile via the deferred set |
 | `core/src/daemon/registry.rs` | `file_changed` | 1054- | drop a routed path from the deferred set |

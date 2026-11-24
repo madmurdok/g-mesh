@@ -200,6 +200,26 @@ pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
 /// dropped-event rescan, starvation sweep) indexes a deferred file.
 pub(crate) const GITIGNORE_REINDEX_GUARD: usize = 10_000;
 
+/// When a `.gitignore` last took its current content and place: the later of
+/// its mtime and its ctime, since a move, `cp -p`, `rsync -a` or archive
+/// extraction keeps an older mtime but sets the ctime. `None` when neither
+/// can be read.
+fn gitignore_edit_time(metadata: &fs::Metadata) -> Option<std::time::SystemTime> {
+    let modified = metadata.modified().ok();
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        u64::try_from(metadata.ctime()).ok().map(|secs| {
+            std::time::UNIX_EPOCH
+                + std::time::Duration::new(secs, metadata.ctime_nsec().clamp(0, 999_999_999) as u32)
+        })
+    };
+    // Mtime alone off Unix.
+    #[cfg(not(unix))]
+    let changed = None;
+    modified.max(changed)
+}
+
 /// The directories holding `gitignores` and `links` (project-relative, `""`
 /// for the root), deduplicated; just the root when one of them is in the
 /// root. A link's directory covers the files listed through it and, for a
@@ -1206,8 +1226,11 @@ impl PluginRegistry {
             .iter()
             .map(|gitignore| {
                 let dir = gitignore.rsplit_once('/').map_or(String::new(), |(dir, _)| dir.to_string());
-                let mtime = fs::metadata(self.project_root.join(gitignore)).and_then(|m| m.modified()).ok();
-                (dir, mtime)
+                let edited = fs::metadata(self.project_root.join(gitignore))
+                    .ok()
+                    .as_ref()
+                    .and_then(gitignore_edit_time);
+                (dir, edited)
             })
             .collect();
         for language in languages {
@@ -1250,20 +1273,20 @@ impl PluginRegistry {
     }
 
     /// Whether `file_path` (project-relative) counts as un-ignored by the
-    /// `.gitignore` edits `edits` (each `.gitignore`'s directory and mtime)
-    /// rather than created after them: its mtime is not later than the latest
-    /// mtime of the edited `.gitignore` files in its own or an ancestor
-    /// directory. Counted as un-ignored when no edited `.gitignore` governs it
-    /// (a link-only gate), when one of them has no readable mtime (deleted),
-    /// or when its own mtime cannot be read.
+    /// `.gitignore` edits `edits` (each `.gitignore`'s directory and
+    /// [`gitignore_edit_time`]) rather than created after them: its mtime is
+    /// not later than the latest edit time of the edited `.gitignore` files in
+    /// its own or an ancestor directory. Counted as un-ignored when no edited
+    /// `.gitignore` governs it (a link-only gate), when one of them has no
+    /// readable edit time (deleted), or when its own mtime cannot be read.
     fn predates_unignore(&self, file_path: &str, edits: &[(String, Option<std::time::SystemTime>)]) -> bool {
         let mut latest = None;
-        for (dir, mtime) in edits {
+        for (dir, edited) in edits {
             if !crate::project_walk::under_any(file_path, std::slice::from_ref(dir)) {
                 continue;
             }
-            let Some(mtime) = mtime else { return true };
-            latest = latest.max(Some(*mtime));
+            let Some(edited) = edited else { return true };
+            latest = latest.max(Some(*edited));
         }
         let Some(latest) = latest else { return true };
         fs::metadata(self.project_root.join(file_path))
@@ -1325,16 +1348,18 @@ impl PluginRegistry {
     }
 
     /// The project-relative `.gitignore` files (the bulk walk's, with the
-    /// directories every language excludes pruned) whose mtime, in whole
-    /// seconds since the epoch, is strictly greater than `secs`.
+    /// directories every language excludes pruned) whose
+    /// [`gitignore_edit_time`], in whole seconds since the epoch, is strictly
+    /// greater than `secs`.
     pub(crate) fn gitignores_newer_than(&self, secs: i64) -> Vec<String> {
         let pruned = self.discovered.excluded_by_every_language();
         crate::project_walk::gitignore_files(&self.project_root, &pruned)
             .filter(|file| {
                 fs::metadata(&file.path)
-                    .and_then(|metadata| metadata.modified())
                     .ok()
-                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .as_ref()
+                    .and_then(gitignore_edit_time)
+                    .and_then(|edited| edited.duration_since(std::time::UNIX_EPOCH).ok())
                     // Whole seconds, like `bulkIndexedAt`. Strictly newer:
                     // a file written in the walk's own last second is taken
                     // as walked (an edit landing there is missed until the
@@ -1354,7 +1379,7 @@ impl PluginRegistry {
     /// 1. reloads the watcher's ignore layers and link table, since a dropped
     ///    `.gitignore` or link event would otherwise leave them stale;
     /// 2. passes the links the reload changed, and the `.gitignore` files
-    ///    whose mtime is newer than `gitignores_since` (unix seconds; the
+    ///    edited after `gitignores_since` ([`gitignores_newer_than`](Self::gitignores_newer_than); unix seconds; the
     ///    previous run's start), to [`gitignore_changed`](Self::gitignore_changed);
     /// 3. runs the [`ReconcileMode::Plain`] reconcile over `subtrees`.
     pub(crate) fn rescan_subtrees(
