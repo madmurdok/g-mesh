@@ -460,3 +460,49 @@ async fn an_unignore_over_the_guard_stays_unindexed_across_a_repeated_gate_and_a
 
     client.cancel().await.expect("failed to shut the client down");
 }
+
+/// The guard counts only the files the edit un-ignored: with files newer
+/// than the `.gitignore` edit (mtime a day ahead) beside them, the line
+/// names the older files' count alone, and none of the older files is
+/// indexed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_guard_line_names_only_the_files_older_than_the_gitignore_edit() {
+    const OLDER: usize = 10_001;
+    const NEWER: usize = 3;
+    let harness = Harness::new();
+    harness.write(".gitignore", "generated/\n");
+    let generated = harness.root().join("generated");
+    fs::create_dir_all(&generated).unwrap();
+    let now = std::time::SystemTime::now();
+    let day = Duration::from_secs(86_400);
+    for index in 0..OLDER {
+        fs::File::create(generated.join(format!("f{index}.ts"))).unwrap().set_modified(now - day).unwrap();
+    }
+    for index in 0..NEWER {
+        fs::File::create(generated.join(format!("n{index}.ts"))).unwrap().set_modified(now + day).unwrap();
+    }
+    harness.write("src/a.ts", "export const a = 1;\n");
+    let client = harness.connect().await;
+
+    let is_guard_line = |line: &&str| line.contains("g-mesh reindex") && line.contains(".gitignore");
+    harness.write(".gitignore", "");
+    let deadline = Instant::now() + CHANGE_DEADLINE;
+    while !harness.log_text().lines().any(|line| is_guard_line(&line)) {
+        assert!(Instant::now() < deadline, "no guard line was logged; daemon log:\n{}", harness.log_text());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    harness.probe("probe-after.ts").await;
+
+    let log = harness.log_text();
+    let line = log.lines().find(is_guard_line).unwrap();
+    assert!(
+        line.contains(&format!(" add {OLDER} typescript files")),
+        "the line names the older count: {line}"
+    );
+    let index = Index::open(harness.root()).unwrap();
+    let older_indexed: Vec<String> =
+        index.files_under("generated").into_iter().filter(|file| file.starts_with("generated/f")).collect();
+    assert!(older_indexed.is_empty(), "no older file was indexed: {older_indexed:?}");
+
+    client.cancel().await.expect("failed to shut the client down");
+}

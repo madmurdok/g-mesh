@@ -2050,3 +2050,192 @@ fn a_restart_after_an_unignore_and_another_languages_reindex_indexes_none_of_the
     assert_eq!(test_plugin::file_changed_requests(alpha), vec!["src/late.alpha-src".to_string()]);
     assert!(!has_baseline(&conn, DEFERRED_ONE), "no un-ignored file is indexed");
 }
+
+/// A day: how far from now a fixture's mtime is set, so that no assertion
+/// rests on the clock order of two writes.
+const DAY_SECS: u64 = 86_400;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// Creates the empty file `relative` under `root` with its mtime at
+/// `since_epoch_secs`.
+fn write_at(root: &Path, relative: &str, since_epoch_secs: u64) {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = fs::File::create(path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(since_epoch_secs)).unwrap();
+}
+
+/// Writes `old` alpha files under `generated/` with an mtime a day in the
+/// past and `new` alpha files under `generated/new/` with an mtime a day
+/// ahead, then an empty root `.gitignore`, edited now: the files the edit
+/// un-ignored and files created after it. Returns both sets of paths.
+fn unignore_old_and_new(root: &Path, old: usize, new: usize) -> (HashSet<String>, Vec<String>) {
+    let now = now_secs();
+    let old: HashSet<String> = (0..old).map(|index| format!("generated/f{index}.alpha-src")).collect();
+    for file_path in &old {
+        write_at(root, file_path, now - DAY_SECS);
+    }
+    let new: Vec<String> = (0..new).map(|index| format!("generated/new/n{index}.alpha-src")).collect();
+    for file_path in &new {
+        write_at(root, file_path, now + DAY_SECS);
+    }
+    write_file(root, ".gitignore", "");
+    (old, new)
+}
+
+/// A daemon start after an over-guard un-ignore whose directory also holds
+/// files newer than the `.gitignore` edit: the recheck defers only the files
+/// that predate the edit, and the start's reconcile indexes the newer ones
+/// and none of the deferred.
+///
+/// Control: make `predates_unignore` return `true` - the newer files are
+/// deferred too, and the reconcile indexes nothing.
+#[test]
+fn a_restart_defers_only_the_files_older_than_the_gitignore_edit_and_indexes_the_newer_ones() {
+    let (project, _plugins, dirs, registry) = registry_over(&["alpha"]);
+    let alpha = &dirs[0];
+    let conn = index_walked_at(WALKED_AT);
+    let (old, new) = unignore_old_and_new(project.path(), GITIGNORE_REINDEX_GUARD + 1, 3);
+
+    registry.recheck_gitignores_since_index(&conn);
+    assert_eq!(deferred(&registry, "alpha"), Some(old), "exactly the files older than the edit");
+    registry.reconcile_since_index(&conn, ReconcileMode::Plain, ReconcileScope::Start);
+
+    let mut indexed = test_plugin::file_changed_requests(alpha);
+    indexed.sort();
+    assert_eq!(indexed, new, "the newer files are indexed as created");
+    assert_eq!(test_plugin::bulk_walks(alpha), 0, "alpha was not reindexed whole");
+    assert!(!has_baseline(&conn, "generated/f0.alpha-src"), "no deferred file is indexed");
+}
+
+/// More files than the guard in the difference, but no more than the guard
+/// older than the `.gitignore` edit: the guard does not trip, so the
+/// language is reindexed whole and nothing is deferred.
+///
+/// Control: decide the trip on the whole difference (`added`) instead of the
+/// older files' count - alpha is not reindexed.
+#[test]
+fn an_unignore_over_the_guard_only_with_files_newer_than_the_edit_reindexes_the_language() {
+    let (project, _plugins, dirs, registry) = registry_over(&["alpha"]);
+    unignore_old_and_new(project.path(), 9_000, 1_500);
+    let conn = index_walked_at(WALKED_AT);
+
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
+
+    assert!(!test_plugin::spawns(&dirs[0]).is_empty(), "alpha is reindexed whole");
+    assert_eq!(deferred(&registry, "alpha"), None);
+}
+
+/// A governing `.gitignore` deleted by the edit has no edit time, so every
+/// file under it counts as un-ignored, a file newer than the other
+/// governing `.gitignore` included.
+///
+/// Control: skip a governing `.gitignore` with no edit time in
+/// `predates_unignore` - the nested one governs alone and the newer files
+/// are not deferred.
+#[test]
+fn a_deleted_governing_gitignore_defers_every_file_under_it_however_new() {
+    let (project, _plugins, dirs, registry) = registry_over(&["alpha"]);
+    unignore_old_and_new(project.path(), GITIGNORE_REINDEX_GUARD + 1, 3);
+    write_file(project.path(), "generated/.gitignore", "");
+    fs::remove_file(project.path().join(".gitignore")).unwrap();
+    let conn = index_walked_at(WALKED_AT);
+
+    registry.gitignore_changed(&conn, &[".gitignore".to_string(), "generated/.gitignore".to_string()], &[]);
+
+    let deferred = deferred(&registry, "alpha").expect("the gate tripped the guard");
+    assert_eq!(deferred.len(), GITIGNORE_REINDEX_GUARD + 4);
+    assert!(deferred.contains("generated/new/n0.alpha-src"));
+    assert!(test_plugin::spawns(&dirs[0]).is_empty());
+}
+
+/// A gate triggered by links alone has no `.gitignore` edit to compare
+/// with: every file it would gain through the link counts as un-ignored,
+/// however new.
+///
+/// Control: count a file with no governing `.gitignore` as newer in
+/// `predates_unignore` - nothing is deferred and alpha is reindexed.
+#[cfg(unix)]
+#[test]
+fn a_gate_on_links_alone_defers_every_file_it_would_gain_however_new() {
+    let (_project, root, _plugins, dir, registry) = canonical_alpha_registry(&[]);
+    unignore_old_and_new(&root, GITIGNORE_REINDEX_GUARD + 1, 3);
+    write_file(&root, ".gitignore", "generated/\n");
+    link_at(&root, "src/api", "../generated");
+    let conn = index_walked_at(WALKED_AT);
+
+    registry.gitignore_changed(&conn, &[], &["src/api".to_string()]);
+
+    let deferred = deferred(&registry, "alpha").expect("the gate tripped the guard");
+    assert_eq!(deferred.len(), GITIGNORE_REINDEX_GUARD + 4);
+    assert!(deferred.contains("src/api/new/n0.alpha-src"));
+    assert!(test_plugin::spawns(&dir).is_empty());
+}
+
+/// A file counts as un-ignored when its mtime is not later than the latest
+/// edit among the edited `.gitignore` files in its own or an ancestor
+/// directory, matched by whole path component; an equal mtime and an
+/// unreadable one count as un-ignored.
+///
+/// Control: compare with the earliest governing edit - `gen/a` reads as
+/// newer; match the directory as a string prefix - `generated/x` reads as
+/// un-ignored; count an unreadable mtime as newer - `missing` reads as
+/// newer.
+#[test]
+fn a_file_predates_the_latest_edit_of_the_gitignore_files_governing_its_directory() {
+    let (project, _plugins, _dirs, registry) = registry_over(&["alpha"]);
+    let root = project.path();
+    let at = |secs: u64| Some(std::time::UNIX_EPOCH + Duration::from_secs(secs));
+    let edits = vec![(String::new(), at(WALKED_AT_SECS)), ("gen".to_string(), at(WALKED_AT_SECS + 7200))];
+    for file_path in ["gen/a.alpha-src", "generated/x.alpha-src", "top.alpha-src"] {
+        write_at(root, file_path, WALKED_AT_SECS + 3600);
+    }
+    write_at(root, "same.alpha-src", WALKED_AT_SECS);
+
+    assert!(registry.predates_unignore("gen/a.alpha-src", &edits), "under gen/ its later edit governs");
+    assert!(!registry.predates_unignore("generated/x.alpha-src", &edits), "gen/ does not govern generated/");
+    assert!(!registry.predates_unignore("top.alpha-src", &edits), "newer than the root's edit");
+    assert!(registry.predates_unignore("same.alpha-src", &edits), "an equal mtime predates the edit");
+    assert!(registry.predates_unignore("missing.alpha-src", &edits), "an unreadable mtime");
+}
+
+/// A `.gitignore` moved into place while the daemon was down keeps an mtime
+/// older than the last walk but takes a new ctime: the start's recheck still
+/// passes it to the gate, and the gate defers the un-ignored files, whose
+/// mtimes lie between the `.gitignore`'s mtime and its move.
+///
+/// Control: date a `.gitignore` by its mtime alone in `gitignore_edit_time`
+/// (or only in `gitignores_newer_than`) - nothing is deferred.
+#[test]
+fn a_gitignore_moved_in_with_an_old_mtime_still_trips_the_guard_at_the_restart_recheck() {
+    let (project, _plugins, dirs, registry) = registry_over(&["alpha"]);
+    for index in 0..=GITIGNORE_REINDEX_GUARD {
+        write_at(project.path(), &format!("generated/f{index}.alpha-src"), WALKED_AT_SECS - 60);
+    }
+    write_file(project.path(), ".gitignore", "");
+    set_mtime(&project.path().join(".gitignore"), WALKED_AT_SECS - 3600);
+    let conn = index_walked_at(WALKED_AT);
+
+    registry.recheck_gitignores_since_index(&conn);
+
+    assert_eq!(deferred(&registry, "alpha").map(|files| files.len()), Some(GITIGNORE_REINDEX_GUARD + 1));
+    assert!(test_plugin::spawns(&dirs[0]).is_empty());
+}
+
+/// A Rescan rechecks a `.gitignore` whose mtime is older than its watermark
+/// when its ctime is newer (moved into place), and none edited after it.
+///
+/// Control: date a `.gitignore` by its mtime alone in
+/// `gitignores_newer_than` - the moved-in file is not listed.
+#[test]
+fn a_gitignore_with_an_old_mtime_and_a_new_ctime_is_newer_than_the_watermark() {
+    let (project, _plugins, _dirs, registry) = registry_over(&["alpha"]);
+    write_file(project.path(), ".gitignore", "");
+    set_mtime(&project.path().join(".gitignore"), WALKED_AT_SECS - 3600);
+
+    assert_eq!(registry.gitignores_newer_than(WALKED_AT_SECS as i64), vec![".gitignore".to_string()]);
+    assert!(registry.gitignores_newer_than((now_secs() + DAY_SECS) as i64).is_empty());
+}
