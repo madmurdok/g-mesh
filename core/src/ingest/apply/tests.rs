@@ -217,6 +217,51 @@ fn a_wire_nodes_declaration_list_becomes_storage_records() {
     assert!(to_node_record(canned_node("n2"), &mut PathWarnings::default()).declarations.is_empty());
 }
 
+/// The daemon's own write path: a real `FileChangeDiff`-shaped wire node
+/// goes through `ingest::convert::to_node_record`, which carries
+/// `containerParent` through to the container row.
+#[test]
+fn the_wire_conversion_carries_container_parent_through_to_the_row() {
+    let wire = WireNode {
+        id: "w".to_string(),
+        kind: NodeKind::Function,
+        name: "Run".to_string(),
+        qualified_name: "Run".to_string(),
+        file_path: "server/run.go".to_string(),
+        range: Range { start: Position { line: 0, col: 0 }, end: Position { line: 1, col: 0 } },
+        signature: None,
+        visibility: Visibility::Public,
+        doc_comment: None,
+        language: "go".to_string(),
+        native_kind: None,
+        has_syntax_errors: false,
+        generated: false,
+        declarations: None,
+        container: Some("github.com/x/app/server".to_string()),
+        container_parent: Some("github.com/x/app".to_string()),
+        target: None,
+        alias_paths: Vec::new(),
+        untyped_calls: Vec::new(),
+        qualified_path: None,
+    };
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    schema::apply(&conn).unwrap();
+    apply_diff(
+        &mut conn,
+        &Diff { upsert_nodes: vec![to_node_record(wire, &mut Default::default())], ..Default::default() },
+    )
+    .unwrap();
+    let parent_key: Option<String> = conn
+        .query_row(
+            "SELECT parentKey FROM containers WHERE language = 'go' AND key = 'github.com/x/app/server'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent_key.as_deref(), Some("github.com/x/app"));
+}
+
 #[test]
 fn a_wire_edges_declaration_binding_becomes_a_storage_record() {
     let mut edge = unresolved_edge("e1", "n1", "n2");

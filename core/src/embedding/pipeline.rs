@@ -260,7 +260,7 @@ impl EmbeddingPipeline {
     /// A pipeline whose model is whatever `loader` builds from `model_dir`,
     /// for tests that count inference calls. `model_dir` must hold the two
     /// files the cache fingerprints (`model.onnx`, `tokenizer.json`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub(crate) fn with_loader(
         model_dir: &Path,
         loader: impl Fn(&Path) -> Result<Box<dyn Embedder>> + Send + Sync + 'static,
@@ -870,8 +870,9 @@ pub(crate) fn embed_node(
     vectors::insert(conn, node_id, &embedding, embedding_version)
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "testkit"))]
+#[doc(hidden)]
+pub mod test_support {
     //! A deterministic stand-in for the model, for tests that count how
     //! often the pipeline actually embeds.
 
@@ -888,7 +889,7 @@ pub(crate) mod test_support {
     /// How many times the fake model was loaded, and which texts it
     /// embedded, across every pipeline sharing these counters.
     #[derive(Clone, Default)]
-    pub(crate) struct Counters {
+    pub struct Counters {
         loads: Arc<AtomicUsize>,
         embeds: Arc<AtomicUsize>,
         received: Arc<Mutex<Vec<String>>>,
@@ -897,20 +898,20 @@ pub(crate) mod test_support {
 
     impl Counters {
         /// The size of every `embed_batch` call the batching fake served.
-        pub(crate) fn batches(&self) -> Vec<usize> {
+        pub fn batches(&self) -> Vec<usize> {
             self.batches.lock().unwrap_or_else(PoisonError::into_inner).clone()
         }
 
-        pub(crate) fn loads(&self) -> usize {
+        pub fn loads(&self) -> usize {
             self.loads.load(Ordering::SeqCst)
         }
 
-        pub(crate) fn embeds(&self) -> usize {
+        pub fn embeds(&self) -> usize {
             self.embeds.load(Ordering::SeqCst)
         }
 
         /// Every text the fake model was handed, in order.
-        pub(crate) fn received(&self) -> Vec<String> {
+        pub fn received(&self) -> Vec<String> {
             self.received.lock().unwrap_or_else(PoisonError::into_inner).clone()
         }
     }
@@ -955,7 +956,7 @@ pub(crate) mod test_support {
 
     /// A pipeline over [`BatchingFakeEmbedder`] in `model_dir`, counting
     /// into `counters`.
-    pub(crate) fn fake_batching_pipeline(
+    pub fn fake_batching_pipeline(
         model_dir: &Path,
         cache: Option<CacheSettings>,
         counters: &Counters,
@@ -980,14 +981,14 @@ pub(crate) mod test_support {
     }
 
     /// The fake model's vector for `text`: a function of the text alone.
-    pub(crate) fn fake_vector(text: &str) -> Vec<f32> {
+    pub fn fake_vector(text: &str) -> Vec<f32> {
         let hash = cache::text_hash(text);
         (0..EMBEDDING_DIM).map(|i| f32::from(hash[i % 32]) / 255.0 + i as f32 * 1e-3).collect()
     }
 
     /// Writes stand-in model files into `dir`; `weights` decides the
     /// fingerprint.
-    pub(crate) fn fake_model_dir(dir: &Path, weights: &str) -> PathBuf {
+    pub fn fake_model_dir(dir: &Path, weights: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(ONNX_FILE_NAME), weights).unwrap();
         std::fs::write(dir.join(TOKENIZER_FILE_NAME), "{}").unwrap();
@@ -996,7 +997,7 @@ pub(crate) mod test_support {
 
     /// A pipeline over the fake model in `model_dir`, counting into
     /// `counters`.
-    pub(crate) fn fake_pipeline(
+    pub fn fake_pipeline(
         model_dir: &Path,
         cache: Option<CacheSettings>,
         counters: &Counters,
@@ -1015,7 +1016,7 @@ pub(crate) mod test_support {
         )
     }
 
-    pub(crate) fn cache_at(dir: &Path) -> CacheSettings {
+    pub fn cache_at(dir: &Path) -> CacheSettings {
         CacheSettings::new(dir.join("embedding-cache").join("cache.sqlite"), 512)
     }
 }

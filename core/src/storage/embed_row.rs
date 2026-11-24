@@ -152,6 +152,28 @@ pub fn embedded_rows_after(conn: &Connection, after_id: &str, limit: i64) -> Res
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// A [`NodeText`] for storage's own tests: a node's doc comment and
+/// signature, or nothing for a generated node or one with neither.
+#[cfg(test)]
+pub(crate) struct SignatureText<'a> {
+    pub(crate) version: &'a str,
+}
+
+#[cfg(test)]
+impl NodeText for SignatureText<'_> {
+    fn embedding_version(&self) -> &str {
+        self.version
+    }
+
+    fn text(&self, row: &EmbedRow) -> Option<String> {
+        if row.generated {
+            return None;
+        }
+        let parts: Vec<&str> = [row.doc.as_deref(), row.signature.as_deref()].into_iter().flatten().collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

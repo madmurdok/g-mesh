@@ -564,46 +564,6 @@ fn parent_chain_ends_at_a_cycle() {
     assert_eq!(parent_chain(&conn, "rust", "x").unwrap(), vec!["y"]);
 }
 
-/// The daemon's own write path: a real `FileChangeDiff`-shaped wire node
-/// goes through `ingest::convert::to_node_record`, which must carry
-/// `containerParent` through rather than drop it as it did before GM-265.
-#[test]
-fn the_wire_conversion_carries_container_parent_through_to_the_row() {
-    use crate::protocol::types::{NodeKind, Position, Range, Visibility, WireNode};
-    let wire = WireNode {
-        id: "w".to_string(),
-        kind: NodeKind::Function,
-        name: "Run".to_string(),
-        qualified_name: "Run".to_string(),
-        file_path: "server/run.go".to_string(),
-        range: Range { start: Position { line: 0, col: 0 }, end: Position { line: 1, col: 0 } },
-        signature: None,
-        visibility: Visibility::Public,
-        doc_comment: None,
-        language: "go".to_string(),
-        native_kind: None,
-        has_syntax_errors: false,
-        generated: false,
-        declarations: None,
-        container: Some("github.com/x/app/server".to_string()),
-        container_parent: Some("github.com/x/app".to_string()),
-        target: None,
-        alias_paths: Vec::new(),
-        untyped_calls: Vec::new(),
-        qualified_path: None,
-    };
-    let mut conn = setup(false);
-    apply_diff(
-        &mut conn,
-        &upsert(vec![crate::ingest::convert::to_node_record(wire, &mut Default::default())]),
-    )
-    .unwrap();
-    assert_eq!(
-        row(&conn, "go", "github.com/x/app/server").unwrap().parent_key.as_deref(),
-        Some("github.com/x/app")
-    );
-}
-
 // ---------------------------------------------------------------------
 // Sequence test: random diffs against a model, invariants after each.
 // ---------------------------------------------------------------------

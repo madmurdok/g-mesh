@@ -3570,8 +3570,8 @@ fn gm491_an_unchanged_answer_writes_nothing() {
 fn gm491_a_language_swap_keeps_the_provenance() {
     use std::collections::HashSet;
 
-    use crate::embedding::text::TextRule;
     use crate::storage::connection::open_staging;
+    use crate::storage::embed_row::SignatureText;
     use crate::storage::language_swap::{plan, swap, SwapBookkeeping};
 
     let dir = tempfile::tempdir().unwrap();
@@ -3605,9 +3605,14 @@ fn gm491_a_language_swap_keeps_the_provenance() {
     apply_diff(&mut staging, &diff).unwrap();
     link_all(&mut staging).unwrap();
     assert_eq!(gm491_linked_from(&staging, &edge), Some(placeholder.clone()));
-    let planned =
-        plan(&mut staging, live_path.to_str().unwrap(), "typescript", &TextRule { version: "model" }, true)
-            .unwrap();
+    let planned = plan(
+        &mut staging,
+        live_path.to_str().unwrap(),
+        "typescript",
+        &SignatureText { version: "model" },
+        true,
+    )
+    .unwrap();
     assert_eq!(planned.counts.upsert_edges, 1, "{:?}", planned.counts);
     drop(staging);
     let capable = HashSet::new();

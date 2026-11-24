@@ -104,10 +104,11 @@ it:wedged_daemon                                         typescript
 it:worktree_daemon_lifecycle                             typescript rust python go
 it:worktree_seed                                         typescript
 lib:daemon::registry::tests                              typescript rust python go
-lib:plugin_manifest::tests                              typescript
+lib:plugin_manifest::tests                               none
+lib:daemon::failed_language_tests                        none
 lib:daemon::plugin::tests                                typescript
-lib:mcp::member_name_collision_tests                     typescript rust python go
-lib:mcp::unlinked::tests                                 rust
+lib:daemon::member_name_collision_tests                  typescript rust python go
+lib:daemon::unlinked_usages_tests                        rust
 lib:mcp::instructions::tests                             none
 lib:link::symbol_links::tests                            none
 lib:languages::tests                                     none

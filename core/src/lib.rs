@@ -25,6 +25,7 @@ pub mod protocol;
 pub mod shim;
 pub mod storage;
 /// A fake, protocol-speaking plugin for unit tests that need two languages.
-#[cfg(test)]
-pub(crate) mod test_plugin;
+#[cfg(any(test, feature = "testkit"))]
+#[doc(hidden)]
+pub mod test_plugin;
 pub mod watcher;

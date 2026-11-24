@@ -452,6 +452,26 @@ mod tests {
     use crate::control::fixture_tests::*;
     use crate::control::sweep::sweep_orphaned;
 
+    /// Projects whose `index.db` is a real index with `lastUsed` `idle_days`
+    /// old, exactly as a real one would record it: what [`candidates`] reads.
+    fn indexed_projects() -> Projects {
+        Projects::with_index(write_real_index)
+    }
+
+    fn write_real_index(project: &std::path::Path, idle_days: u64) {
+        let conn = rusqlite::Connection::open(project.join("index.db")).unwrap();
+        crate::storage::schema::ensure_current(
+            &conn,
+            &crate::plugin_manifest::fingerprint::fixture_indexer_version(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE meta SET lastUsed = datetime('now', ?1) WHERE id = 1",
+            rusqlite::params![format!("-{idle_days} days")],
+        )
+        .unwrap();
+    }
+
     /// A cwd that is not any of the fixture's projects.
     fn unrelated_cwd() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -503,7 +523,7 @@ mod tests {
 
     #[test]
     fn cleaning_a_named_project_removes_its_directory_and_nothing_else() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", 1);
         projects.add("bbbb2222", 1);
 
@@ -516,7 +536,7 @@ mod tests {
 
     #[test]
     fn cleaning_a_project_that_does_not_exist_is_an_error() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
 
         let err = clean_in(&projects, Target::Project("deadbeef".to_string()), false)
             .expect_err("there is no such project");
@@ -528,7 +548,7 @@ mod tests {
     /// anything path-shaped has to be refused before it gets there.
     #[test]
     fn a_path_shaped_project_id_is_refused_rather_than_joined() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         let outside = projects.root().parent().unwrap().join("not-a-g-mesh-directory");
         fs::create_dir_all(&outside).unwrap();
 
@@ -543,7 +563,7 @@ mod tests {
 
     #[test]
     fn an_unrecognized_cwd_asks_for_an_explicit_id_instead_of_guessing() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", 1);
         let cwd = unrelated_cwd();
 
@@ -556,7 +576,7 @@ mod tests {
 
     #[test]
     fn cleaning_the_cwds_own_project_removes_it() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         let cwd = unrelated_cwd();
         let id = project_hash(cwd.path()).unwrap();
         projects.add(&id, 1);
@@ -571,7 +591,7 @@ mod tests {
     #[test]
     fn expired_deletes_only_what_is_past_the_threshold() {
         let threshold = default_idle_threshold_days();
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", threshold + 10);
         projects.add("bbbb2222", threshold - 10);
         projects.add("cccc3333", threshold + 200);
@@ -595,7 +615,7 @@ mod tests {
     /// default (90 days) would still consider fresh.
     #[test]
     fn a_shortened_config_threshold_expires_a_project_the_default_would_spare() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         // Idle 10 days: well inside the 90-day default, so nothing here would
         // move if the threshold were still hard-coded.
         projects.add("aaaa1111", 10);
@@ -617,7 +637,7 @@ mod tests {
     /// default itself.
     #[test]
     fn the_same_idle_time_survives_under_the_unshortened_default() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", 10);
 
         let outcome = clean_in(&projects, Target::Expired, false).unwrap();
@@ -629,7 +649,7 @@ mod tests {
     /// `expired` needs no `--force`: it is already scoped by the data.
     #[test]
     fn expired_needs_no_force() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", default_idle_threshold_days() + 1);
 
         clean_in(&projects, Target::Expired, false).unwrap();
@@ -641,7 +661,7 @@ mod tests {
     /// idleness, so `expired` must leave it alone.
     #[test]
     fn a_project_with_no_readable_last_used_is_never_expired() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add_empty("aaaa1111");
 
         let outcome = clean_in(&projects, Target::Expired, false).unwrap();
@@ -652,7 +672,7 @@ mod tests {
 
     #[test]
     fn expired_with_nothing_expired_reports_so_and_deletes_nothing() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", 1);
 
         let outcome = clean_in(&projects, Target::Expired, false).unwrap();
@@ -665,7 +685,7 @@ mod tests {
     /// count and deletes nothing at all.
     #[test]
     fn all_without_force_only_counts_and_deletes_nothing() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", 1);
         projects.add("bbbb2222", 500);
         projects.add_empty("cccc3333");
@@ -681,7 +701,7 @@ mod tests {
 
     #[test]
     fn all_with_force_deletes_every_project_regardless_of_idle_time() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", 0);
         projects.add("bbbb2222", 500);
         projects.add_empty("cccc3333");
@@ -702,7 +722,7 @@ mod tests {
 
     #[test]
     fn a_project_with_a_live_daemon_is_refused_when_named_explicitly() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", 500);
         projects.mark_daemon_running("aaaa1111");
 
@@ -715,7 +735,7 @@ mod tests {
 
     #[test]
     fn a_project_with_a_live_daemon_is_skipped_and_reported_by_the_bulk_forms() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         projects.add("aaaa1111", 500);
         projects.add("bbbb2222", 500);
         projects.mark_daemon_running("aaaa1111");
@@ -760,7 +780,7 @@ mod tests {
     /// refuses to judge - survives.
     #[test]
     fn orphaned_deletes_only_state_whose_project_directory_was_deleted() {
-        let fixture = orphan_fixture();
+        let fixture = orphan_fixture_in(indexed_projects());
 
         let outcome = clean_in(&fixture.projects, Target::Orphaned, true).unwrap();
 
@@ -782,7 +802,7 @@ mod tests {
     /// Without `--force` it is a report, exactly as `all` is.
     #[test]
     fn orphaned_without_force_names_what_would_go_and_deletes_nothing() {
-        let fixture = orphan_fixture();
+        let fixture = orphan_fixture_in(indexed_projects());
 
         let outcome = clean_in(&fixture.projects, Target::Orphaned, false).unwrap();
 
@@ -796,7 +816,7 @@ mod tests {
 
     #[test]
     fn orphaned_on_a_root_with_nothing_in_it_reports_nothing_to_do() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
 
         let outcome = clean_in(&projects, Target::Orphaned, true).unwrap();
 
@@ -856,7 +876,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_sweep_keeps_state_whose_root_is_only_unreadable() {
-        let projects = Projects::new();
+        let projects = indexed_projects();
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("p");
         let root = parent.join("root");

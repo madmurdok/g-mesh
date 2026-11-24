@@ -22,6 +22,11 @@ embed-eval = []
 # Off by default: release and CI builds stay CPU-only and the daemon never
 # reads the switch.
 ep-coreml = ["embed-eval", "ort/coreml", "dep:tracing-subscriber"]
+# Test fixtures other crates' tests link against: `test_plugin` and
+# `embedding::pipeline::test_support`. Off by default, so the shipped binary
+# carries none of it; this crate's own tests turn it on through the
+# self dev-dependency below.
+testkit = []
 
 [dependencies]
 anyhow = "1"
@@ -198,6 +203,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Enables `testkit` for every test target of this crate, unit tests included.
+g-mesh = { path = ".", features = ["testkit"] }
 # Also a normal dependency - repeated here because integration tests link
 # against the library's public API plus dev-dependencies only, and
 # `tests/it/state_isolation.rs` has to spell out the *real* `~/.g-mesh` it must

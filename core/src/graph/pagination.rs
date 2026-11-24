@@ -782,7 +782,6 @@ pub fn paginate_by_score<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::response_bound::{bound_page_within, tally_edge_files_bounded};
     use crate::storage::schema;
 
     fn setup() -> Connection {
@@ -1236,12 +1235,6 @@ mod tests {
         assert!(message.contains("without a cursor"), "{message}");
     }
 
-    #[derive(Serialize)]
-    struct Item {
-        id: String,
-        blob: String,
-    }
-
     // --- ranking: EdgeRank's keys, one at a time ---------------------------
 
     fn make_ranked_node(conn: &Connection, id: &str, kind: &str, file_path: &str, start_line: i64) {
@@ -1458,36 +1451,6 @@ mod tests {
         assert!(message.contains("without a cursor"), "{message}");
     }
 
-    /// A page cut for bytes rather than rows hands back a cursor built from
-    /// the last kept row's whole rank, so the next SQL page starts exactly
-    /// after it.
-    #[test]
-    fn a_page_cut_for_bytes_resumes_exactly_after_its_last_kept_row() {
-        let conn = mixed_fixture();
-        let page = ranked_page(&conn, "src/a/root.rs", MAX_PAGE_SIZE, None);
-        let whole: Vec<String> = page.results.iter().map(|row| row.edge.id.clone()).collect();
-        let rows: Vec<EdgeRow<Item>> = page
-            .results
-            .into_iter()
-            .map(|row| EdgeRow {
-                item: Item { id: row.edge.id.clone(), blob: "x".repeat(100) },
-                rank: row.rank,
-            })
-            .collect();
-        let budget =
-            serde_json::to_vec(&rows.iter().take(3).map(|row| &row.item).collect::<Vec<_>>()).unwrap().len();
-
-        let cut = bound_page_within(rows, false, None, budget);
-        assert_eq!(cut.results.len(), 3, "precondition: the budget keeps three rows");
-        assert!(cut.has_more);
-
-        let mut served: Vec<String> = cut.results.into_iter().map(|item| item.id).collect();
-        let rest = ranked_page(&conn, "src/a/root.rs", MAX_PAGE_SIZE, cut.next_cursor.as_deref());
-        served.extend(rest.results.into_iter().map(|row| row.edge.id));
-
-        assert_eq!(served, whole);
-    }
-
     /// A collapsed `CALLS` edge (no `toDeclaration`) beside a bound one from
     /// the same caller onto the same callee: rows, counts and file tallies
     /// all list the call once, through the bound edge.
@@ -1594,10 +1557,6 @@ mod tests {
                 tally(&conn, CALLEE, Direction::Incoming, &["CALLS"]),
                 vec![("use.ts".to_string(), 1)]
             );
-            let (files, truncated) =
-                tally_edge_files_bounded(&conn, CALLEE, Direction::Incoming, &["CALLS"], &[]).unwrap();
-            assert_eq!(files.iter().map(|file| file.refs).sum::<i64>(), 1);
-            assert!(!truncated);
         }
 
         #[test]

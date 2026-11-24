@@ -641,4 +641,6 @@ pub fn build_front(root: &Path, detection: &Detection, indexed: &HashSet<&str>) 
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests;

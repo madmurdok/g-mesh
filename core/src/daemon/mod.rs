@@ -229,4 +229,10 @@ pub(crate) fn acquire_singleton_lock(dir: &StateDir) -> Result<Option<File>> {
 }
 
 #[cfg(test)]
+mod failed_language_tests;
+#[cfg(test)]
+mod member_name_collision_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unlinked_usages_tests;

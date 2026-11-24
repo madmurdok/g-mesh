@@ -52,7 +52,7 @@ mod host_fake;
 mod host_tests;
 mod instructions;
 #[cfg(test)]
-mod member_name_collision_tests;
+pub(crate) use instructions::test_support as instructions_test_support;
 mod not_indexed;
 mod overrides;
 mod progress;

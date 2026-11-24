@@ -24,6 +24,8 @@ pub mod model;
 pub mod pipeline;
 pub mod rerank;
 pub mod settings;
+#[cfg(test)]
+mod swap_text_tests;
 pub(crate) mod text;
 
 pub use model::{
