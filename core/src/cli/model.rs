@@ -58,6 +58,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -655,18 +656,20 @@ fn report_files(dir: &Path, files: &[RemoteFile], out: &mut impl Write) -> Resul
     Ok(complete)
 }
 
-/// Downloads one file to `<dest>.partial`, verifies it, and only then renames
-/// it into place.
+/// Downloads one file to a partial name of its own (see [`partial_path`]),
+/// verifies it, and only then renames it into place.
 ///
 /// The two-step is the whole point. If an interrupted download could leave
 /// bytes under the final name, the very next run would see the file, call it
 /// present and skip it - and the failure would surface much later as an ONNX
 /// parse error inside the daemon, or, for a half-written `tokenizer.json`, as
 /// vectors that are quietly wrong rather than as an error at all. So the final
-/// name never exists until the bytes have been counted and hashed, and a
-/// failed attempt deletes its own `.partial` instead of leaving debris. A
-/// process killed mid-download still leaves a `.partial`; that is the point -
-/// it is not a name anything else looks for.
+/// name never exists until the bytes have been counted and hashed, and every
+/// way out of this function other than a successful rename deletes its own
+/// partial instead of leaving debris. A process killed mid-download still
+/// leaves a partial; that is the point - it is not a name anything else looks
+/// for, and nothing deletes partials it did not create, since another process
+/// may still be writing one.
 fn download(
     agent: &ureq::Agent,
     file: &RemoteFile,
@@ -674,28 +677,26 @@ fn download(
     sources: &[Source],
     out: &mut impl Write,
 ) -> Result<()> {
-    let partial = dest.with_file_name(format!("{}.partial", file.local_name));
+    let partial = PartialFile(partial_path(dest, file));
 
     // Every attempt is kept, not just the last. One generic "download failed"
     // for a list of sources is the same mistake as one generic "not indexed"
     // for a list of reasons: it names the symptom of the last try and hides
-    // that the others were tried at all (GM-247's shape, in a different file).
+    // that the others were tried at all.
     let mut failures = Vec::new();
     for source in sources {
-        match download_to_partial(agent, file, &partial, source) {
+        match download_to_partial(agent, file, &partial.0, source) {
             Ok(()) => {
                 if !failures.is_empty() {
                     writeln!(out, "  fetched from {} instead", source.describe(file))?;
                 }
-                return fs::rename(&partial, dest).with_context(|| {
-                    format!("failed to move {} into place as {}", partial.display(), dest.display())
-                });
+                return move_into_place(&partial.0, dest, file);
             }
             Err(err) => {
                 // Best-effort: if this fails too there is nothing useful left
                 // to do, and the message about *why* the download failed is
                 // worth more than one about the leftover file.
-                let _ = fs::remove_file(&partial);
+                let _ = fs::remove_file(&partial.0);
                 writeln!(out, "  {} failed: {err:#}", source.describe(file))?;
                 failures.push(format!("{}: {err:#}", source.describe(file)));
             }
@@ -703,6 +704,47 @@ fn download(
     }
 
     bail!("could not download {} from any source.\n  {}", file.local_name, failures.join("\n  "))
+}
+
+/// Where this writer streams `file` before renaming it to `dest`:
+/// `<local_name>.<pid>-<n>.partial` next to `dest`.
+///
+/// Unique per call, so two processes (or two calls in one process) fetching
+/// into the same directory never write, truncate or rename each other's
+/// partial. The name extends the final name rather than replacing its
+/// extension, so it never matches a name the loader reads.
+fn partial_path(dest: &Path, file: &RemoteFile) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    dest.with_file_name(format!("{}.{}-{n}.partial", file.local_name, std::process::id()))
+}
+
+/// A partial this call created; dropping it deletes the file, best-effort, so
+/// an early return or a panic does not leave it behind. After a successful
+/// rename the path no longer exists and the delete is a no-op.
+struct PartialFile(PathBuf);
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Renames a verified `partial` to `dest`, replacing whatever is there.
+///
+/// A failed rename is still success when `dest` now holds the file at its
+/// pinned size: a concurrent fetch got there first (on Windows the rename
+/// over a file another process has open fails), and every writer of `dest`
+/// in this module verified size and digest before its own rename. Size is
+/// the same presence check [`on_disk`] and `status` use.
+fn move_into_place(partial: &Path, dest: &Path, file: &RemoteFile) -> Result<()> {
+    match fs::rename(partial, dest) {
+        Ok(()) => Ok(()),
+        Err(_) if on_disk(dest, file) == OnDisk::Pinned => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!("failed to move {} into place as {}", partial.display(), dest.display())
+        }),
+    }
 }
 
 /// Streams the response into `partial`, hashing as it goes, and fails if what
@@ -1152,14 +1194,18 @@ mod tests {
         assert_eq!(names.len(), 2);
     }
 
-    /// A `.partial` must not shadow the real name by replacing the extension:
-    /// `model.onnx` -> `model.onnx.partial`, never `model.partial`, and above
-    /// all never something the loader would pick up.
+    /// A partial must not shadow the real name by replacing the extension:
+    /// `model.onnx` -> `model.onnx.<pid>-<n>.partial`, never `model.partial`,
+    /// and above all never something the loader would pick up.
     #[test]
     fn the_partial_name_extends_the_final_name_rather_than_replacing_its_extension() {
         let dest = Path::new("/models/jina").join(ONNX_FILE_NAME);
-        let partial = dest.with_file_name(format!("{ONNX_FILE_NAME}.partial"));
-        assert_eq!(partial.file_name().unwrap(), "model.onnx.partial");
+        let file = RemoteFile { local_name: ONNX_FILE_NAME, ..test_file() };
+        let partial = partial_path(&dest, &file);
+        let name = partial.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("model.onnx."), "{name}");
+        assert!(name.ends_with(".partial"), "{name}");
+        assert_eq!(partial.parent(), dest.parent());
         assert_ne!(partial, dest);
     }
 
