@@ -73,7 +73,8 @@ fn place(dir: &Path, files: [(&str, u64); 2]) {
 }
 
 /// A home of its own: `~/.g-mesh` (the global config, the rerank models'
-/// default directories) and the embedding model, present at its sizes.
+/// default directories) and the embedding model, present at its sizes. `HOME`
+/// redirects the home directory on Unix only.
 struct Home {
     home: tempfile::TempDir,
     cwd: tempfile::TempDir,
@@ -92,6 +93,7 @@ impl Home {
         self.home.path().join(".g-mesh")
     }
 
+    #[cfg(unix)]
     fn rerank_dir(&self, dir_name: &str) -> PathBuf {
         self.g_mesh_home().join("models").join(dir_name)
     }
@@ -114,12 +116,15 @@ impl Home {
         dir
     }
 
+    #[cfg(unix)]
     fn write_global_config(&self, toml: &str) {
         std::fs::create_dir_all(self.g_mesh_home()).unwrap();
         std::fs::write(self.g_mesh_home().join("config.toml"), toml).unwrap();
     }
 
     /// `g-mesh model <args>` with `env` set over a clean rerank setting.
+    /// `HOME` redirects `dirs::home_dir` on Unix only; on Windows the real
+    /// profile directory is used.
     fn model(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
         let mut command = Command::new(BIN);
         command
@@ -152,6 +157,7 @@ fn stdout_of(output: &Output) -> String {
 /// `model fetch` with `qat` asked for and not published: the note comes
 /// first, `l6` is fetched into its own directory, nothing is downloaded,
 /// no `qat` directory appears, and the command succeeds.
+#[cfg(unix)]
 fn assert_fetch_stands_in_l6(home: &Home, output: &Output) {
     let stdout = stdout_of(output);
     assert_eq!(stdout.lines().next(), Some(STAND_IN_NOTE), "{stdout}");
@@ -161,9 +167,13 @@ fn assert_fetch_stands_in_l6(home: &Home, output: &Output) {
     assert!(!home.rerank_dir(QAT_DIR_NAME).exists(), "no qat directory");
 }
 
+// `dirs::home_dir` ignores `HOME` on Windows, so the default rerank model
+// directory cannot be redirected there: the tests below that rely on it run
+// on Unix only.
 /// *Control:* drop the `!selected.published()` arm of `settle_rerank` ->
 /// the fetch is refused as unpublished and exits non-zero.
 #[test]
+#[cfg(unix)]
 fn fetch_with_qat_in_the_environment_fetches_l6_and_succeeds() {
     let home = Home::new();
     home.place_l6(&home.rerank_dir(L6_DIR_NAME));
@@ -172,6 +182,7 @@ fn fetch_with_qat_in_the_environment_fetches_l6_and_succeeds() {
 }
 
 #[test]
+#[cfg(unix)]
 fn fetch_with_qat_in_the_global_config_fetches_l6_and_succeeds() {
     let home = Home::new();
     home.place_l6(&home.rerank_dir(L6_DIR_NAME));
@@ -182,6 +193,7 @@ fn fetch_with_qat_in_the_global_config_fetches_l6_and_succeeds() {
 
 /// The environment's `l6` beats the config's `qat`: no note.
 #[test]
+#[cfg(unix)]
 fn the_environment_variant_beats_the_global_config() {
     let home = Home::new();
     home.place_l6(&home.rerank_dir(L6_DIR_NAME));
@@ -211,6 +223,7 @@ fn a_rerank_directory_with_no_variant_set_keeps_holding_l6() {
 /// `model status` with `qat` asked for: `l6` is reported, the note right
 /// after its line.
 #[test]
+#[cfg(unix)]
 fn status_with_qat_asked_for_reports_l6_with_the_note() {
     let home = Home::new();
     let stdout = stdout_of(&home.model(&["status"], &[(RERANK_MODEL_ENV, Path::new("qat"))]));
@@ -258,6 +271,7 @@ fn onnx_len(dir: &Path) -> u64 {
 /// *Control:* pass `dir_override` to the stand-in in `settle_rerank` ->
 /// fetch and status name the `qat` directory.
 #[test]
+#[cfg(unix)]
 fn the_stand_in_never_touches_a_directory_set_for_qat() {
     let home = Home::new();
     let l6_dir = home.rerank_dir(L6_DIR_NAME);
