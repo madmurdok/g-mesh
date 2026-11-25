@@ -154,6 +154,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// single read, not the transfer.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// A partial untouched for this long belongs to no live fetch and is deleted
+/// by the next fetch of the same file (see [`sweep_stale_partials`]).
+///
+/// Invariant: well above [`READ_TIMEOUT`]. A live fetch writes its partial at
+/// least once per read, and a read that waits longer than `READ_TIMEOUT`
+/// fails the fetch, so a live partial's mtime is never older than that.
+const STALE_PARTIAL_AGE: Duration = Duration::from_secs(60 * 60);
+const _: () = assert!(STALE_PARTIAL_AGE.as_secs() >= 10 * READ_TIMEOUT.as_secs());
+
 /// One file of a model, with everything needed to verify it arrived intact.
 struct RemoteFile {
     /// The Hugging Face repository, and the pinned revision inside it.
@@ -666,10 +675,9 @@ fn report_files(dir: &Path, files: &[RemoteFile], out: &mut impl Write) -> Resul
 /// vectors that are quietly wrong rather than as an error at all. So the final
 /// name never exists until the bytes have been counted and hashed, and every
 /// way out of this function other than a successful rename deletes its own
-/// partial instead of leaving debris. A process killed mid-download still
-/// leaves a partial; that is the point - it is not a name anything else looks
-/// for, and nothing deletes partials it did not create, since another process
-/// may still be writing one.
+/// partial instead of leaving debris. A process killed mid-download cannot,
+/// so its partial is left for [`sweep_stale_partials`] to delete once it has
+/// gone stale.
 fn download(
     agent: &ureq::Agent,
     file: &RemoteFile,
@@ -677,6 +685,7 @@ fn download(
     sources: &[Source],
     out: &mut impl Write,
 ) -> Result<()> {
+    sweep_stale_partials(dest, file, STALE_PARTIAL_AGE, out)?;
     let partial = PartialFile(partial_path(dest, file));
 
     // Every attempt is kept, not just the last. One generic "download failed"
@@ -719,6 +728,68 @@ fn partial_path(dest: &Path, file: &RemoteFile) -> PathBuf {
     dest.with_file_name(format!("{}.{}-{n}.partial", file.local_name, std::process::id()))
 }
 
+/// Whether `name` is a partial of `local_name` written by any fetcher: the
+/// per-process `<local_name>.<pid>-<n>.partial` of [`partial_path`], the
+/// shell script's `<local_name>.<pid>.partial`, or the shared
+/// `<local_name>.partial` older releases wrote.
+fn is_partial_of(name: &str, local_name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(local_name).and_then(|rest| rest.strip_prefix('.')) else {
+        return false;
+    };
+    if rest == "partial" {
+        return true;
+    }
+    rest.strip_suffix(".partial").is_some_and(|tag| {
+        let mut parts = tag.split('-');
+        let all_digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        parts.next().is_some_and(all_digits) && parts.next().is_none_or(all_digits) && parts.next().is_none()
+    })
+}
+
+/// Deletes partials of `file` next to `dest` whose last write is at least
+/// `max_age` ago: debris of fetches that were killed before their
+/// [`PartialFile`] guard could run. A partial written more recently is left
+/// alone, since a concurrent fetch may still be writing it; a modification
+/// time in the future counts as recent. Failing to delete one is reported
+/// and does not stop the fetch.
+fn sweep_stale_partials(
+    dest: &Path,
+    file: &RemoteFile,
+    max_age: Duration,
+    out: &mut impl Write,
+) -> Result<()> {
+    let Some(dir) = dest.parent() else {
+        return Ok(());
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_partial_of(name, file.local_name) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_file(&path) {
+            Ok(()) => writeln!(out, "removed stale partial {}", path.display())?,
+            Err(err) => writeln!(out, "  could not remove stale partial {}: {err}", path.display())?,
+        }
+    }
+    Ok(())
+}
+
 /// A partial this call created; dropping it deletes the file, best-effort, so
 /// an early return or a panic does not leave it behind. After a successful
 /// rename the path no longer exists and the delete is a no-op.
@@ -732,19 +803,39 @@ impl Drop for PartialFile {
 
 /// Renames a verified `partial` to `dest`, replacing whatever is there.
 ///
-/// A failed rename is still success when `dest` now holds the file at its
-/// pinned size: a concurrent fetch got there first (on Windows the rename
-/// over a file another process has open fails), and every writer of `dest`
-/// in this module verified size and digest before its own rename. Size is
-/// the same presence check [`on_disk`] and `status` use.
+/// A failed rename is still success when `dest` now holds the pinned file,
+/// checked by size and digest like a fresh download: a concurrent fetch got
+/// there first (on Windows the rename over a file another process has open
+/// fails).
 fn move_into_place(partial: &Path, dest: &Path, file: &RemoteFile) -> Result<()> {
     match fs::rename(partial, dest) {
         Ok(()) => Ok(()),
-        Err(_) if on_disk(dest, file) == OnDisk::Pinned => Ok(()),
+        Err(_) if holds_pinned(dest, file) => Ok(()),
         Err(err) => Err(err).with_context(|| {
             format!("failed to move {} into place as {}", partial.display(), dest.display())
         }),
     }
+}
+
+/// Whether `path` holds exactly the pinned bytes of `file`: its size, then
+/// its sha256. An unreadable file does not.
+fn holds_pinned(path: &Path, file: &RemoteFile) -> bool {
+    on_disk(path, file) == OnDisk::Pinned && sha256_of(path).is_ok_and(|digest| digest == file.sha256)
+}
+
+/// The SHA-256 of the file at `path`, as lowercase hex.
+fn sha256_of(path: &Path) -> std::io::Result<String> {
+    let mut source = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex(&hasher.finalize()))
 }
 
 /// Streams the response into `partial`, hashing as it goes, and fails if what
