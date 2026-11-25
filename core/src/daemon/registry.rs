@@ -257,7 +257,7 @@ fn windows_change_time(path: &Path) -> Option<std::time::SystemTime> {
 /// A Windows FILETIME value (100 ns ticks since 1601-01-01 UTC) as a
 /// `SystemTime`; `None` for a non-positive value or one `SystemTime` cannot
 /// hold.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn filetime_to_system_time(ticks: i64) -> Option<std::time::SystemTime> {
     const TICKS_PER_SEC: u64 = 10_000_000;
     const UNIX_EPOCH_SECS_AFTER_1601: u64 = 11_644_473_600;
