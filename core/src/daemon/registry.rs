@@ -200,11 +200,12 @@ pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
 /// dropped-event rescan, starvation sweep) indexes a deferred file.
 pub(crate) const GITIGNORE_REINDEX_GUARD: usize = 10_000;
 
-/// When a `.gitignore` last took its current content and place: the later of
-/// its mtime and its ctime, since a move, `cp -p`, `rsync -a` or archive
-/// extraction keeps an older mtime but sets the ctime. `None` when neither
-/// can be read.
-fn gitignore_edit_time(metadata: &fs::Metadata) -> Option<std::time::SystemTime> {
+/// When the `.gitignore` at `path` last took its current content and place:
+/// the later of its mtime and its change time (POSIX ctime, NTFS
+/// ChangeTime), since a move, `cp -p`, `rsync -a` or archive extraction keeps
+/// an older mtime but sets the change time. `None` when neither can be read.
+fn gitignore_edit_time(path: &Path) -> Option<std::time::SystemTime> {
+    let metadata = fs::metadata(path).ok()?;
     let modified = metadata.modified().ok();
     #[cfg(unix)]
     let changed = {
@@ -214,10 +215,57 @@ fn gitignore_edit_time(metadata: &fs::Metadata) -> Option<std::time::SystemTime>
                 + std::time::Duration::new(secs, metadata.ctime_nsec().clamp(0, 999_999_999) as u32)
         })
     };
-    // Mtime alone off Unix.
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let changed = windows_change_time(path);
+    #[cfg(not(any(unix, windows)))]
     let changed = None;
     modified.max(changed)
+}
+
+/// The NTFS ChangeTime of `path`, the analogue of POSIX ctime that stable std
+/// does not expose. `None` when the file cannot be opened or queried, or the
+/// file system keeps no change time (FAT/exFAT report 0).
+#[cfg(windows)]
+fn windows_change_time(path: &Path) -> Option<std::time::SystemTime> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO, FILE_READ_ATTRIBUTES,
+    };
+    // Attribute access only: no read permission on the content is needed.
+    let file = fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(path).ok()?;
+    let mut info = std::mem::MaybeUninit::<FILE_BASIC_INFO>::zeroed();
+    // SAFETY: `file` stays open for the call, so the handle is valid, and the
+    // buffer is a `FILE_BASIC_INFO` whose exact size is passed, which is what
+    // the `FileBasicInfo` class writes.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    // SAFETY: a non-zero return means the call filled the buffer.
+    let ticks = unsafe { info.assume_init() }.ChangeTime;
+    filetime_to_system_time(ticks)
+}
+
+/// A Windows FILETIME value (100 ns ticks since 1601-01-01 UTC) as a
+/// `SystemTime`; `None` for a non-positive value or one `SystemTime` cannot
+/// hold.
+#[cfg(windows)]
+fn filetime_to_system_time(ticks: i64) -> Option<std::time::SystemTime> {
+    const TICKS_PER_SEC: u64 = 10_000_000;
+    const UNIX_EPOCH_SECS_AFTER_1601: u64 = 11_644_473_600;
+    let ticks = u64::try_from(ticks).ok().filter(|&t| t > 0)?;
+    let since_1601 = std::time::Duration::new(ticks / TICKS_PER_SEC, ((ticks % TICKS_PER_SEC) * 100) as u32);
+    let epoch_1601 =
+        std::time::UNIX_EPOCH.checked_sub(std::time::Duration::from_secs(UNIX_EPOCH_SECS_AFTER_1601))?;
+    epoch_1601.checked_add(since_1601)
 }
 
 /// The directories holding `gitignores` and `links` (project-relative, `""`
@@ -1226,10 +1274,7 @@ impl PluginRegistry {
             .iter()
             .map(|gitignore| {
                 let dir = gitignore.rsplit_once('/').map_or(String::new(), |(dir, _)| dir.to_string());
-                let edited = fs::metadata(self.project_root.join(gitignore))
-                    .ok()
-                    .as_ref()
-                    .and_then(gitignore_edit_time);
+                let edited = gitignore_edit_time(&self.project_root.join(gitignore));
                 (dir, edited)
             })
             .collect();
@@ -1355,10 +1400,7 @@ impl PluginRegistry {
         let pruned = self.discovered.excluded_by_every_language();
         crate::project_walk::gitignore_files(&self.project_root, &pruned)
             .filter(|file| {
-                fs::metadata(&file.path)
-                    .ok()
-                    .as_ref()
-                    .and_then(gitignore_edit_time)
+                gitignore_edit_time(&file.path)
                     .and_then(|edited| edited.duration_since(std::time::UNIX_EPOCH).ok())
                     // Whole seconds, like `bulkIndexedAt`. Strictly newer:
                     // a file written in the walk's own last second is taken
