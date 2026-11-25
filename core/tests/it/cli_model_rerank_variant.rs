@@ -20,7 +20,9 @@ const EMBEDDING_SOURCE: &str = include_str!("../../src/embedding/model.rs");
 const MODEL_CLI_SOURCE: &str = include_str!("../../src/cli/model.rs");
 
 const STAND_IN_NOTE: &str = "rerank model qat is not published yet - using l6, at its own beta";
+#[cfg(unix)]
 const L6_DIR_NAME: &str = "ms-marco-MiniLM-L6-v2";
+#[cfg(unix)]
 const QAT_DIR_NAME: &str = "g-mesh-reranker-l6-qat";
 
 fn size(text: &str) -> u64 {
@@ -134,7 +136,8 @@ impl Home {
             .env("HOME", self.home.path())
             .env("G_MESH_HOME", self.g_mesh_home())
             .env(MODEL_DIR_ENV, &self.embedding_dir)
-            // Unreachable: a download attempt fails here instead of reaching out.
+            // Unreachable base URL: a download from it fails. The rerank models
+            // still fall back to their own host when their files are missing.
             .env("G_MESH_MODEL_BASE_URL", "http://127.0.0.1:9")
             .env_remove(RERANK_ENV)
             .env_remove(RERANK_MODEL_ENV)
