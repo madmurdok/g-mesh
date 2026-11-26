@@ -23,6 +23,7 @@
 mod ci_green_for_commit_script;
 mod ci_junit_summary_script;
 mod cut_release_plugin_versions;
+mod fetch_embedding_model_script;
 mod install_script_text;
 mod module_cycles_script;
 mod new_task_worktree_script;

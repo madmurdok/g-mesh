@@ -55,6 +55,19 @@ UPSTREAM_URL="https://huggingface.co/${REPO}/resolve/${REVISION}"
 
 mkdir -p "${TARGET_DIR}"
 
+# The partial being written, if any. Named per process, so concurrent runs
+# (of this script or of `g-mesh model fetch`) never truncate or delete each
+# other's; removed on any exit, including Ctrl-C and kill.
+PARTIAL=""
+cleanup() {
+  if [ -n "${PARTIAL}" ]; then
+    rm -f "${PARTIAL}"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 fetch() {
   local remote_path="$1"
   local local_name="$2"
@@ -83,14 +96,17 @@ fetch() {
   local url
   for url in "${urls[@]}"; do
     echo "downloading ${local_name} from ${url} ..."
-    if curl --fail --location --progress-bar --output "${dest}.partial" "${url}"; then
-      mv "${dest}.partial" "${dest}"
+    PARTIAL="${dest}.$$.partial"
+    if curl --fail --location --progress-bar --output "${PARTIAL}" "${url}"; then
+      mv "${PARTIAL}" "${dest}"
+      PARTIAL=""
       return
     fi
     # Every attempt is reported rather than only the last, so "the download
     # failed" never hides which sources were tried.
     echo "  ${url} failed" >&2
-    rm -f "${dest}.partial"
+    rm -f "${PARTIAL}"
+    PARTIAL=""
   done
 
   echo "could not download ${local_name} from any source" >&2

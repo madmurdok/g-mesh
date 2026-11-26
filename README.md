@@ -288,8 +288,11 @@ fetched the fp32 weights before, run `g-mesh model fetch` again: it replaces a
 `model.onnx` of the wrong size, the daemon will not load the old one, and
 every stored vector is re-embedded once in the background. Each
 file is checked against a pinned SHA-256 and only then moved into place, so an
-interrupted download leaves a `.partial` you can delete, never a truncated
-`model.onnx` that loads as garbage. Pass `--dir`, or set `G_MESH_MODEL_DIR`, to
+interrupted download never leaves a truncated `model.onnx` that loads as
+garbage. Each fetch downloads to a `.partial` of its own, so concurrent
+fetches into one directory do not disturb each other; a fetch that was killed
+leaves its partial behind, and the next `g-mesh model fetch` deletes any
+partial of the same file untouched for an hour. Pass `--dir`, or set `G_MESH_MODEL_DIR`, to
 put it elsewhere; the command and the loader share one resolution function, and
 now pass it the same model name too — they used to share the function and hand
 it different arguments, which is a way of disagreeing that sharing a function
