@@ -1502,8 +1502,9 @@ fn at_start_only_a_gitignore_newer_than_the_last_walk_runs_the_gate() {
         write_file(project.path(), "generated/x.alpha-src", "");
         write_file(project.path(), "src/a.alpha-src", "");
         write_file(project.path(), ".gitignore", "");
-        // A `.gitignore`'s ctime cannot be set back, so the walk is moved
-        // instead: `offset` is the `.gitignore`'s age relative to the walk.
+        // A `.gitignore`'s change time (POSIX ctime, NTFS ChangeTime) cannot
+        // be set back, so the walk is moved instead: `offset` is the
+        // `.gitignore`'s age relative to the walk.
         let conn = index_walked_at(WALKED_AT);
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
@@ -2206,7 +2207,8 @@ fn a_file_predates_the_latest_edit_of_the_gitignore_files_governing_its_director
 }
 
 /// A `.gitignore` moved into place while the daemon was down keeps an mtime
-/// older than the last walk but takes a new ctime: the start's recheck still
+/// older than the last walk but takes a new change time (POSIX ctime, NTFS
+/// ChangeTime): the start's recheck still
 /// passes it to the gate, and the gate defers the un-ignored files, whose
 /// mtimes lie between the `.gitignore`'s mtime and its move.
 ///
@@ -2229,16 +2231,109 @@ fn a_gitignore_moved_in_with_an_old_mtime_still_trips_the_guard_at_the_restart_r
 }
 
 /// A Rescan rechecks a `.gitignore` whose mtime is older than its watermark
-/// when its ctime is newer (moved into place), and none edited after it.
+/// when its change time (POSIX ctime, NTFS ChangeTime) is newer (moved into
+/// place), and none edited after it.
 ///
 /// Control: date a `.gitignore` by its mtime alone in
 /// `gitignores_newer_than` - the moved-in file is not listed.
 #[test]
-fn a_gitignore_with_an_old_mtime_and_a_new_ctime_is_newer_than_the_watermark() {
+fn a_gitignore_with_an_old_mtime_and_a_new_change_time_is_newer_than_the_watermark() {
     let (project, _plugins, _dirs, registry) = registry_over(&["alpha"]);
     write_file(project.path(), ".gitignore", "");
     set_mtime(&project.path().join(".gitignore"), WALKED_AT_SECS - 3600);
 
     assert_eq!(registry.gitignores_newer_than(WALKED_AT_SECS as i64), vec![".gitignore".to_string()]);
     assert!(registry.gitignores_newer_than((now_secs() + DAY_SECS) as i64).is_empty());
+}
+
+/// A `.gitignore` written now and then backdated keeps the change time of
+/// the backdating, so its edit time is the change time; one whose mtime lies
+/// ahead of the change time is dated by the mtime; a missing file has none.
+///
+/// Control: return `modified` alone from `gitignore_edit_time` - the
+/// backdated file is dated by its old mtime.
+#[test]
+fn a_gitignore_edit_time_is_the_later_of_its_mtime_and_its_change_time() {
+    let project = tempfile::tempdir().unwrap();
+    let path = project.path().join(".gitignore");
+    // Margin for file systems that store times coarser than the clock.
+    let before = std::time::SystemTime::now() - Duration::from_secs(2);
+    write_file(project.path(), ".gitignore", "");
+
+    set_mtime(&path, WALKED_AT_SECS - 3600);
+    let edited = gitignore_edit_time(&path).expect("a readable .gitignore has an edit time");
+    assert!(edited >= before, "an old mtime: dated by the change time, got {edited:?}");
+
+    let ahead = now_secs() + DAY_SECS;
+    set_mtime(&path, ahead);
+    assert_eq!(gitignore_edit_time(&path), Some(std::time::UNIX_EPOCH + Duration::from_secs(ahead)));
+
+    assert_eq!(gitignore_edit_time(&project.path().join("missing")), None);
+}
+
+/// FILETIME counts 100 ns ticks from 1601-01-01 UTC; zero (FAT/exFAT keep no
+/// change time) and negative values are no time at all.
+///
+/// Control: drop the `t > 0` filter in `filetime_to_system_time` - zero
+/// reads as 1601-01-01.
+#[test]
+fn a_filetime_converts_from_the_1601_epoch_and_a_non_positive_one_is_none() {
+    const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+    assert_eq!(filetime_to_system_time(UNIX_EPOCH_TICKS), Some(std::time::UNIX_EPOCH));
+    assert_eq!(
+        filetime_to_system_time(UNIX_EPOCH_TICKS + 1),
+        Some(std::time::UNIX_EPOCH + Duration::from_nanos(100))
+    );
+    assert_eq!(
+        filetime_to_system_time(UNIX_EPOCH_TICKS + WALKED_AT_SECS as i64 * 10_000_000 + 12_345_678),
+        Some(std::time::UNIX_EPOCH + Duration::new(WALKED_AT_SECS + 1, 234_567_800))
+    );
+    assert_eq!(filetime_to_system_time(0), None);
+    assert_eq!(filetime_to_system_time(-1), None);
+    assert_eq!(filetime_to_system_time(i64::MIN), None);
+}
+
+/// The NTFS ChangeTime of a file written now is now, and stays now after its
+/// mtime is set back; a path that cannot be opened has none.
+///
+/// Control: return `None` from `windows_change_time` - no change time.
+#[cfg(windows)]
+#[test]
+fn the_windows_change_time_of_a_backdated_file_is_the_backdating() {
+    let project = tempfile::tempdir().unwrap();
+    let path = project.path().join(".gitignore");
+    let before = std::time::SystemTime::now() - Duration::from_secs(2);
+    write_file(project.path(), ".gitignore", "");
+    set_mtime(&path, WALKED_AT_SECS - 3600);
+
+    let changed = windows_change_time(&path).expect("an NTFS file has a change time");
+    assert!(changed >= before, "change time {changed:?} is older than the backdating");
+    assert_eq!(windows_change_time(&project.path().join("missing")), None);
+}
+
+/// A `.gitignore` whose mtime and creation time both predate the walk,
+/// renamed into the project, is newer than the walk: only its ChangeTime
+/// says it moved, the creation time does not.
+///
+/// Control: date the `.gitignore` by `metadata.created()` instead of
+/// `windows_change_time` in `gitignore_edit_time` - it is not listed.
+#[cfg(windows)]
+#[test]
+fn a_gitignore_renamed_in_with_an_old_mtime_and_creation_time_is_newer_than_the_watermark() {
+    use std::os::windows::fs::FileTimesExt;
+    let (project, _plugins, _dirs, registry) = registry_over(&["alpha"]);
+    let outside = tempfile::tempdir().unwrap();
+    let staged = outside.path().join(".gitignore");
+    let old = std::time::UNIX_EPOCH + Duration::from_secs(WALKED_AT_SECS - 3600);
+    let file = fs::File::create(&staged).unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(old).set_created(old)).unwrap();
+    drop(file);
+
+    let moved = project.path().join(".gitignore");
+    fs::rename(&staged, &moved).unwrap();
+
+    let metadata = fs::metadata(&moved).unwrap();
+    assert_eq!(metadata.modified().unwrap(), old, "the rename keeps the old mtime");
+    assert_eq!(metadata.created().unwrap(), old, "the rename keeps the old creation time");
+    assert_eq!(registry.gitignores_newer_than(WALKED_AT_SECS as i64), vec![".gitignore".to_string()]);
 }

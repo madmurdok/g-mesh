@@ -58,6 +58,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -152,6 +153,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// A stalled socket, on the other hand, should not hang forever. This bounds a
 /// single read, not the transfer.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A partial untouched for this long belongs to no live fetch and is deleted
+/// by the next fetch of the same file (see [`sweep_stale_partials`]).
+///
+/// Invariant: well above [`READ_TIMEOUT`]. A live fetch writes its partial at
+/// least once per read, and a read that waits longer than `READ_TIMEOUT`
+/// fails the fetch, so a live partial's mtime is never older than that.
+const STALE_PARTIAL_AGE: Duration = Duration::from_secs(60 * 60);
+const _: () = assert!(STALE_PARTIAL_AGE.as_secs() >= 10 * READ_TIMEOUT.as_secs());
 
 /// One file of a model, with everything needed to verify it arrived intact.
 struct RemoteFile {
@@ -655,18 +665,19 @@ fn report_files(dir: &Path, files: &[RemoteFile], out: &mut impl Write) -> Resul
     Ok(complete)
 }
 
-/// Downloads one file to `<dest>.partial`, verifies it, and only then renames
-/// it into place.
+/// Downloads one file to a partial name of its own (see [`partial_path`]),
+/// verifies it, and only then renames it into place.
 ///
 /// The two-step is the whole point. If an interrupted download could leave
 /// bytes under the final name, the very next run would see the file, call it
 /// present and skip it - and the failure would surface much later as an ONNX
 /// parse error inside the daemon, or, for a half-written `tokenizer.json`, as
 /// vectors that are quietly wrong rather than as an error at all. So the final
-/// name never exists until the bytes have been counted and hashed, and a
-/// failed attempt deletes its own `.partial` instead of leaving debris. A
-/// process killed mid-download still leaves a `.partial`; that is the point -
-/// it is not a name anything else looks for.
+/// name never exists until the bytes have been counted and hashed, and every
+/// way out of this function other than a successful rename deletes its own
+/// partial instead of leaving debris. A process killed mid-download cannot,
+/// so its partial is left for [`sweep_stale_partials`] to delete once it has
+/// gone stale.
 fn download(
     agent: &ureq::Agent,
     file: &RemoteFile,
@@ -674,28 +685,27 @@ fn download(
     sources: &[Source],
     out: &mut impl Write,
 ) -> Result<()> {
-    let partial = dest.with_file_name(format!("{}.partial", file.local_name));
+    sweep_stale_partials(dest, file, STALE_PARTIAL_AGE, out)?;
+    let partial = PartialFile(partial_path(dest, file));
 
     // Every attempt is kept, not just the last. One generic "download failed"
     // for a list of sources is the same mistake as one generic "not indexed"
     // for a list of reasons: it names the symptom of the last try and hides
-    // that the others were tried at all (GM-247's shape, in a different file).
+    // that the others were tried at all.
     let mut failures = Vec::new();
     for source in sources {
-        match download_to_partial(agent, file, &partial, source) {
+        match download_to_partial(agent, file, &partial.0, source) {
             Ok(()) => {
                 if !failures.is_empty() {
                     writeln!(out, "  fetched from {} instead", source.describe(file))?;
                 }
-                return fs::rename(&partial, dest).with_context(|| {
-                    format!("failed to move {} into place as {}", partial.display(), dest.display())
-                });
+                return move_into_place(&partial.0, dest, file);
             }
             Err(err) => {
                 // Best-effort: if this fails too there is nothing useful left
                 // to do, and the message about *why* the download failed is
                 // worth more than one about the leftover file.
-                let _ = fs::remove_file(&partial);
+                let _ = fs::remove_file(&partial.0);
                 writeln!(out, "  {} failed: {err:#}", source.describe(file))?;
                 failures.push(format!("{}: {err:#}", source.describe(file)));
             }
@@ -703,6 +713,129 @@ fn download(
     }
 
     bail!("could not download {} from any source.\n  {}", file.local_name, failures.join("\n  "))
+}
+
+/// Where this writer streams `file` before renaming it to `dest`:
+/// `<local_name>.<pid>-<n>.partial` next to `dest`.
+///
+/// Unique per call, so two processes (or two calls in one process) fetching
+/// into the same directory never write, truncate or rename each other's
+/// partial. The name extends the final name rather than replacing its
+/// extension, so it never matches a name the loader reads.
+fn partial_path(dest: &Path, file: &RemoteFile) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    dest.with_file_name(format!("{}.{}-{n}.partial", file.local_name, std::process::id()))
+}
+
+/// Whether `name` is a partial of `local_name` written by any fetcher: the
+/// per-process `<local_name>.<pid>-<n>.partial` of [`partial_path`], the
+/// shell script's `<local_name>.<pid>.partial`, or the shared
+/// `<local_name>.partial` older releases wrote.
+fn is_partial_of(name: &str, local_name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(local_name).and_then(|rest| rest.strip_prefix('.')) else {
+        return false;
+    };
+    if rest == "partial" {
+        return true;
+    }
+    rest.strip_suffix(".partial").is_some_and(|tag| {
+        let mut parts = tag.split('-');
+        let all_digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        parts.next().is_some_and(all_digits) && parts.next().is_none_or(all_digits) && parts.next().is_none()
+    })
+}
+
+/// Deletes partials of `file` next to `dest` whose last write is at least
+/// `max_age` ago: debris of fetches that were killed before their
+/// [`PartialFile`] guard could run. A partial written more recently is left
+/// alone, since a concurrent fetch may still be writing it; a modification
+/// time in the future counts as recent. Failing to delete one is reported
+/// and does not stop the fetch.
+fn sweep_stale_partials(
+    dest: &Path,
+    file: &RemoteFile,
+    max_age: Duration,
+    out: &mut impl Write,
+) -> Result<()> {
+    let Some(dir) = dest.parent() else {
+        return Ok(());
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_partial_of(name, file.local_name) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_file(&path) {
+            Ok(()) => writeln!(out, "removed stale partial {}", path.display())?,
+            Err(err) => writeln!(out, "  could not remove stale partial {}: {err}", path.display())?,
+        }
+    }
+    Ok(())
+}
+
+/// A partial this call created; dropping it deletes the file, best-effort, so
+/// an early return or a panic does not leave it behind. After a successful
+/// rename the path no longer exists and the delete is a no-op.
+struct PartialFile(PathBuf);
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Renames a verified `partial` to `dest`, replacing whatever is there.
+///
+/// A failed rename is still success when `dest` now holds the pinned file,
+/// checked by size and digest like a fresh download: a concurrent fetch got
+/// there first (on Windows the rename over a file another process has open
+/// fails).
+fn move_into_place(partial: &Path, dest: &Path, file: &RemoteFile) -> Result<()> {
+    match fs::rename(partial, dest) {
+        Ok(()) => Ok(()),
+        Err(_) if holds_pinned(dest, file) => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!("failed to move {} into place as {}", partial.display(), dest.display())
+        }),
+    }
+}
+
+/// Whether `path` holds exactly the pinned bytes of `file`: its size, then
+/// its sha256. An unreadable file does not.
+fn holds_pinned(path: &Path, file: &RemoteFile) -> bool {
+    on_disk(path, file) == OnDisk::Pinned && sha256_of(path).is_ok_and(|digest| digest == file.sha256)
+}
+
+/// The SHA-256 of the file at `path`, as lowercase hex.
+fn sha256_of(path: &Path) -> std::io::Result<String> {
+    let mut source = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex(&hasher.finalize()))
 }
 
 /// Streams the response into `partial`, hashing as it goes, and fails if what
@@ -1152,14 +1285,18 @@ mod tests {
         assert_eq!(names.len(), 2);
     }
 
-    /// A `.partial` must not shadow the real name by replacing the extension:
-    /// `model.onnx` -> `model.onnx.partial`, never `model.partial`, and above
-    /// all never something the loader would pick up.
+    /// A partial must not shadow the real name by replacing the extension:
+    /// `model.onnx` -> `model.onnx.<pid>-<n>.partial`, never `model.partial`,
+    /// and above all never something the loader would pick up.
     #[test]
     fn the_partial_name_extends_the_final_name_rather_than_replacing_its_extension() {
         let dest = Path::new("/models/jina").join(ONNX_FILE_NAME);
-        let partial = dest.with_file_name(format!("{ONNX_FILE_NAME}.partial"));
-        assert_eq!(partial.file_name().unwrap(), "model.onnx.partial");
+        let file = RemoteFile { local_name: ONNX_FILE_NAME, ..test_file() };
+        let partial = partial_path(&dest, &file);
+        let name = partial.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("model.onnx."), "{name}");
+        assert!(name.ends_with(".partial"), "{name}");
+        assert_eq!(partial.parent(), dest.parent());
         assert_ne!(partial, dest);
     }
 
@@ -1508,5 +1645,510 @@ mod tests {
             // under exactly this condition. One predicate, so they cannot drift.
             assert_eq!(refused, fetch_refusal(explicit, &model, &dir).is_some());
         }
+    }
+
+    /// The names in `dir` that start with `local_name` and end in `.partial`,
+    /// sorted.
+    fn partials_in(dir: &Path, local_name: &str) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+            .filter(|name| name.starts_with(local_name) && name.ends_with(".partial"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Every name in `dir`, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Bytes of another file than [`TEST_BODY`].
+    const WRONG_BODY: &[u8] = b"not the bytes the digest pins\n";
+
+    /// Two calls for one destination never share a partial, and each is
+    /// `<local_name>.<pid>-<n>.partial` next to the destination.
+    ///
+    /// *Control:* name the partial `<local_name>.partial` in `partial_path`
+    /// -> the two names are equal.
+    #[test]
+    fn each_download_gets_a_partial_of_its_own() {
+        let dest = Path::new("/models/jina").join(ONNX_FILE_NAME);
+        let file = RemoteFile { local_name: ONNX_FILE_NAME, ..test_file() };
+        let (first, second) = (partial_path(&dest, &file), partial_path(&dest, &file));
+
+        assert_ne!(first, second, "two downloads must not share a partial");
+        for partial in [&first, &second] {
+            assert_eq!(partial.parent(), dest.parent(), "{}", partial.display());
+            let name = partial.file_name().unwrap().to_str().unwrap();
+            let tag = name
+                .strip_prefix("model.onnx.")
+                .and_then(|rest| rest.strip_suffix(".partial"))
+                .unwrap_or_else(|| panic!("not <local_name>.<tag>.partial: {name}"));
+            let (pid, n) = tag.split_once('-').unwrap_or_else(|| panic!("no <pid>-<n>: {name}"));
+            assert_eq!(pid, std::process::id().to_string(), "{name}");
+            assert!(!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()), "{name}");
+        }
+    }
+
+    /// Serves `body` once, like [`serve_once`], and reports the partials of
+    /// `local_name` in `dir` at the moment the request arrived.
+    fn serve_once_noting_partials(
+        body: &'static [u8],
+        dir: PathBuf,
+        local_name: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind a test server");
+        let port = listener.local_addr().unwrap().port();
+        let (seen, partials) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let mut scratch = [0u8; 1024];
+                let _ = socket.read(&mut scratch);
+                let _ = seen.send(partials_in(&dir, local_name));
+                let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = socket.write_all(body);
+                let _ = socket.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), partials)
+    }
+
+    /// A source that serves the wrong bytes leaves no partial behind when the
+    /// next source is asked.
+    ///
+    /// *Control:* drop the `fs::remove_file` in `download`'s error arm -> the
+    /// first source's partial is still there when the second is asked.
+    #[test]
+    fn a_failed_source_removes_its_partial_before_the_next_is_tried() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mirrored.bin");
+        let (second, seen) = serve_once_noting_partials(TEST_BODY, dir.path().to_path_buf(), "mirrored.bin");
+        let sources = vec![Source::Flat(serve_once(WRONG_BODY)), Source::Flat(second)];
+        let mut out = Vec::new();
+
+        download(&http_agent(), &test_file(), &dest, &sources, &mut out)
+            .expect("the second source serves the pinned bytes");
+
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("failed:"), "the first source must have failed: {said}");
+        assert_eq!(
+            seen.recv().unwrap(),
+            Vec::<String>::new(),
+            "partials left when the second source was asked"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), TEST_BODY);
+        assert_eq!(partials_in(dir.path(), "mirrored.bin"), Vec::<String>::new());
+    }
+
+    /// A writer that fails as soon as it is asked to write `poison`.
+    struct FailsOn(&'static str);
+
+    impl Write for FailsOn {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if String::from_utf8_lossy(buf).contains(self.0) {
+                return Err(std::io::Error::other("the output is gone"));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An early return after the partial is complete (here the output failing
+    /// on "fetched from ... instead") leaves neither the partial nor a file
+    /// under the final name.
+    ///
+    /// *Control:* make `PartialFile::drop` a no-op -> the complete partial is
+    /// left behind.
+    #[test]
+    fn an_early_return_after_the_download_leaves_no_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mirrored.bin");
+        let sources = vec![Source::Flat(dead_source()), Source::Flat(serve_once(TEST_BODY))];
+
+        let err = download(&http_agent(), &test_file(), &dest, &sources, &mut FailsOn("instead"))
+            .expect_err("the failing output must end the download");
+
+        assert!(format!("{err:#}").contains("the output is gone"), "{err:#}");
+        assert!(!dest.exists(), "nothing under the final name");
+        assert_eq!(partials_in(dir.path(), "mirrored.bin"), Vec::<String>::new());
+    }
+
+    /// A panic while a partial is held deletes it on the way out.
+    ///
+    /// *Control:* make `PartialFile::drop` a no-op -> the file survives.
+    #[test]
+    fn a_panic_while_a_partial_is_held_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mirrored.bin.1-0.partial");
+        fs::write(&path, &TEST_BODY[..10]).unwrap();
+
+        let unwound = std::panic::catch_unwind(|| {
+            let _partial = PartialFile(path.clone());
+            panic!("a panic mid-download");
+        });
+
+        assert!(unwound.is_err());
+        assert!(!path.exists(), "the partial must go with the unwinding");
+    }
+
+    /// A verified partial replaces whatever is at the destination.
+    #[test]
+    fn a_verified_partial_replaces_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mirrored.bin");
+        let partial = dir.path().join("mirrored.bin.1-0.partial");
+        fs::write(&dest, WRONG_BODY).unwrap();
+        fs::write(&partial, TEST_BODY).unwrap();
+
+        move_into_place(&partial, &dest, &test_file()).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), TEST_BODY);
+        assert!(!partial.exists());
+    }
+
+    /// A rename that fails onto a destination already holding the pinned
+    /// bytes (a concurrent fetch got there first) is success.
+    ///
+    /// *Control:* drop the `holds_pinned` arm of `move_into_place` -> the
+    /// failed rename is an error.
+    #[test]
+    fn a_failed_rename_onto_the_pinned_file_is_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mirrored.bin");
+        fs::write(&dest, TEST_BODY).unwrap();
+        let gone = dir.path().join("mirrored.bin.1-0.partial");
+
+        move_into_place(&gone, &dest, &test_file()).expect("the pinned file is already in place");
+
+        assert_eq!(fs::read(&dest).unwrap(), TEST_BODY);
+    }
+
+    /// A failed rename is an error when the destination is anything but the
+    /// pinned bytes: the pinned size with another digest, another size, or
+    /// nothing at all.
+    ///
+    /// *Control:* compare only the size in `holds_pinned` -> the same-size
+    /// file with another digest is accepted.
+    #[test]
+    fn a_failed_rename_onto_anything_but_the_pinned_file_is_an_error() {
+        let mut same_size = TEST_BODY.to_vec();
+        same_size[0] ^= 1;
+        for (what, content) in [
+            ("same size, other digest", Some(same_size)),
+            ("other size", Some(WRONG_BODY.to_vec())),
+            ("nothing", None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("mirrored.bin");
+            if let Some(content) = &content {
+                fs::write(&dest, content).unwrap();
+            }
+            let gone = dir.path().join("mirrored.bin.1-0.partial");
+
+            let err = move_into_place(&gone, &dest, &test_file())
+                .expect_err(&format!("{what} at the destination must not count as success"));
+
+            assert!(format!("{err:#}").contains("failed to move"), "{what}: {err:#}");
+        }
+    }
+
+    /// Every fetcher's partial name matches: the shared one older releases
+    /// wrote, the shell script's `<pid>`, and this module's `<pid>-<n>`.
+    /// Nothing else does, the final name and other files' partials included.
+    ///
+    /// *Control:* drop the `rest == "partial"` arm of `is_partial_of` -> the
+    /// legacy name no longer matches; drop its `parts.next().is_none()` -> a
+    /// three-part tag matches.
+    #[test]
+    fn partial_names_of_every_fetcher_match_and_nothing_else_does() {
+        let ours = partial_path(
+            Path::new("/m").join(ONNX_FILE_NAME).as_path(),
+            &RemoteFile { local_name: ONNX_FILE_NAME, ..test_file() },
+        );
+        let ours = ours.file_name().unwrap().to_str().unwrap().to_string();
+        for name in
+            ["model.onnx.partial", "model.onnx.4242.partial", "model.onnx.4242-0.partial", ours.as_str()]
+        {
+            assert!(is_partial_of(name, "model.onnx"), "{name} must match");
+        }
+        for name in [
+            "model.onnx",
+            "model.partial",
+            "model.onnx.partial.bak",
+            "model.onnx.1.partial.partial",
+            "model.onnxx.1.partial",
+            "xmodel.onnx.partial",
+            "model.onnx..partial",
+            "model.onnx.-1.partial",
+            "model.onnx.1-.partial",
+            "model.onnx.1-2-3.partial",
+            "model.onnx.12a.partial",
+            "tokenizer.json.4242.partial",
+        ] {
+            assert!(!is_partial_of(name, "model.onnx"), "{name} must not match");
+        }
+        assert!(
+            FETCH_SCRIPT.contains(r#"PARTIAL="${dest}.$$.partial""#),
+            "the script's partial name is the `<pid>` form matched above"
+        );
+    }
+
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        fs::OpenOptions::new().write(true).open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    /// Partials of the file last written `STALE_PARTIAL_AGE` ago or earlier
+    /// are deleted and named; a younger one, one dated in the future, the
+    /// final file and other files' partials are kept.
+    ///
+    /// *Control:* count a modification time in the future as stale
+    /// (`elapsed()` error -> `Duration::MAX`) -> the future partial is
+    /// deleted.
+    #[test]
+    fn stale_partials_are_swept_and_everything_else_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mirrored.bin");
+        let now = std::time::SystemTime::now();
+        let stale = now - STALE_PARTIAL_AGE - Duration::from_secs(60);
+        let young = now - STALE_PARTIAL_AGE + Duration::from_secs(300);
+        let future = now + Duration::from_secs(3600);
+        let swept = ["mirrored.bin.partial", "mirrored.bin.4242.partial", "mirrored.bin.4242-3.partial"];
+        let kept = [
+            ("mirrored.bin.4243-0.partial", young),
+            ("mirrored.bin.4244-0.partial", future),
+            ("mirrored.bin", stale),
+            ("mirrored.bin.bak", stale),
+            ("other.bin.4242.partial", stale),
+        ];
+        for name in swept {
+            fs::write(dir.path().join(name), b"half").unwrap();
+            set_mtime(&dir.path().join(name), stale);
+        }
+        for (name, when) in kept {
+            fs::write(dir.path().join(name), b"half").unwrap();
+            set_mtime(&dir.path().join(name), when);
+        }
+        let mut out = Vec::new();
+
+        sweep_stale_partials(&dest, &test_file(), STALE_PARTIAL_AGE, &mut out).unwrap();
+
+        let said = String::from_utf8(out).unwrap();
+        for name in swept {
+            assert!(!dir.path().join(name).exists(), "{name} is stale and must be deleted");
+            assert!(said.contains(name), "{name} must be named as removed: {said}");
+        }
+        for (name, _) in kept {
+            assert!(dir.path().join(name).exists(), "{name} must be kept");
+        }
+    }
+
+    /// A download deletes its file's stale partials, here the shared name a
+    /// killed older release left.
+    ///
+    /// *Control:* drop the `sweep_stale_partials` call from `download` ->
+    /// the stale partial survives.
+    #[test]
+    fn a_download_sweeps_stale_partials_of_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mirrored.bin");
+        let legacy = dir.path().join("mirrored.bin.partial");
+        fs::write(&legacy, &TEST_BODY[..10]).unwrap();
+        set_mtime(&legacy, std::time::SystemTime::now() - STALE_PARTIAL_AGE - Duration::from_secs(60));
+
+        download(&http_agent(), &test_file(), &dest, &[Source::Flat(serve_once(TEST_BODY))], &mut Vec::new())
+            .unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), TEST_BODY);
+        assert_eq!(names_in(dir.path()), vec!["mirrored.bin".to_string()]);
+    }
+
+    /// `<model dir>|<base url>` for [`fetch_race_child`].
+    const RACE_CHILD_ENV: &str = "G_MESH_TEST_FETCH_RACE_CHILD";
+
+    /// How long the race waits for any one step before failing.
+    const RACE_STEP_DEADLINE: Duration = Duration::from_secs(60);
+
+    /// One `fetch_files` of [`test_file`] as [`RACE_CHILD_ENV`] says; does
+    /// nothing without it.
+    #[test]
+    #[ignore = "a child process of two_concurrent_fetches_into_one_directory_both_succeed"]
+    fn fetch_race_child() {
+        let Ok(spec) = std::env::var(RACE_CHILD_ENV) else {
+            return;
+        };
+        let (dir, base) = spec.split_once('|').expect("<model dir>|<base url>");
+        fetch_files(
+            &http_agent(),
+            Path::new(dir),
+            &[test_file()],
+            &[Source::Flat(base.to_string())],
+            &mut std::io::stdout(),
+        )
+        .unwrap();
+    }
+
+    /// Polls `probe` until it answers, failing after [`RACE_STEP_DEADLINE`].
+    fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + RACE_STEP_DEADLINE;
+        loop {
+            if let Some(found) = probe() {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn describe(output: &std::process::Output) -> String {
+        format!(
+            "{}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// A [`fetch_race_child`] process, killed if the test fails first.
+    struct Racer(Option<std::process::Child>);
+
+    impl Racer {
+        fn spawn(dir: &Path, base: &str) -> Self {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::model::tests::fetch_race_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(RACE_CHILD_ENV, format!("{}|{base}", dir.display()))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn a fetch");
+            Self(Some(child))
+        }
+
+        fn output_if_exited(&mut self) -> Option<std::process::Output> {
+            self.0.as_mut()?.try_wait().unwrap()?;
+            Some(self.0.take().unwrap().wait_with_output().unwrap())
+        }
+
+        /// Waits for the fetch to exit; it must have succeeded.
+        fn succeeds(mut self, name: &str) {
+            let output = wait_for(&format!("fetch {name} to exit"), || self.output_if_exited());
+            assert!(output.status.success(), "fetch {name} failed: {}", describe(&output));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("verified mirrored.bin"),
+                "fetch {name} fetched nothing: {}",
+                describe(&output)
+            );
+        }
+
+        /// Accepts this fetch's request on `listener`, failing if it exits
+        /// first.
+        fn accept(&mut self, listener: &std::net::TcpListener) -> std::net::TcpStream {
+            listener.set_nonblocking(true).unwrap();
+            let mut socket = wait_for("a fetch to connect", || {
+                if let Some(output) = self.output_if_exited() {
+                    panic!("a fetch exited before connecting: {}", describe(&output));
+                }
+                match listener.accept() {
+                    Ok((socket, _)) => Some(socket),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => None,
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            });
+            socket.set_nonblocking(false).unwrap();
+            let mut request = Vec::new();
+            let mut scratch = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut scratch).unwrap();
+                assert_ne!(read, 0, "the fetch closed before finishing its request");
+                request.extend_from_slice(&scratch[..read]);
+            }
+            socket
+        }
+    }
+
+    impl Drop for Racer {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// The sizes of the partials of `mirrored.bin` in `dir`.
+    fn partial_sizes(dir: &Path) -> Vec<u64> {
+        partials_in(dir, "mirrored.bin")
+            .iter()
+            .filter_map(|name| fs::metadata(dir.join(name)).ok())
+            .map(|meta| meta.len())
+            .collect()
+    }
+
+    /// Two fetches into one directory at once, as separate processes, both
+    /// succeed and leave one complete file and no partial. The server holds
+    /// the responses so the two overlap: A has written all but the tail when
+    /// B starts and creates its partial, then A gets the tail and exits
+    /// before B gets a byte. A fetch that reports success has the pinned
+    /// bytes in place when it exits, whatever the other is doing.
+    ///
+    /// *Control:* name the partial `<local_name>.partial` in `partial_path`
+    /// -> B's create truncates A's partial, A writes its tail after a hole
+    /// and renames that into place, and the file A reported is not the pinned
+    /// bytes.
+    #[test]
+    fn two_concurrent_fetches_into_one_directory_both_succeed() {
+        const SPLIT: usize = 20;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mirrored.bin");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind a test server");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let header =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", TEST_BODY.len());
+
+        let mut a = Racer::spawn(dir.path(), &base);
+        let mut a_socket = a.accept(&listener);
+        a_socket.write_all(header.as_bytes()).unwrap();
+        a_socket.write_all(&TEST_BODY[..SPLIT]).unwrap();
+        a_socket.flush().unwrap();
+        wait_for("A to write all but its tail", || {
+            partial_sizes(dir.path()).contains(&(SPLIT as u64)).then_some(())
+        });
+
+        let mut b = Racer::spawn(dir.path(), &base);
+        let mut b_socket = b.accept(&listener);
+        b_socket.write_all(header.as_bytes()).unwrap();
+        b_socket.flush().unwrap();
+        wait_for("B to create its partial", || partial_sizes(dir.path()).contains(&0).then_some(()));
+
+        a_socket.write_all(&TEST_BODY[SPLIT..]).unwrap();
+        drop(a_socket);
+        a.succeeds("A");
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            TEST_BODY,
+            "A reported success, so the pinned bytes are in place"
+        );
+
+        b_socket.write_all(TEST_BODY).unwrap();
+        drop(b_socket);
+        b.succeeds("B");
+        assert_eq!(fs::read(&dest).unwrap(), TEST_BODY);
+        assert_eq!(names_in(dir.path()), vec!["mirrored.bin".to_string()], "one file, no partial");
     }
 }
